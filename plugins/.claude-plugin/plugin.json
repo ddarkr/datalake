@@ -1,0 +1,6 @@
+{
+  "name": "doda-datalake-otel",
+  "version": "1.0.0",
+  "description": "Metadata-only session, tool, subagent and API usage telemetry for Doda Datalake.",
+  "author": { "name": "Doda" }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "doda-datalake-codex",
+  "version": "1.0.0",
+  "description": "Metadata-only Codex lifecycle and numeric token usage telemetry; no prompt, result, or transcript export.",
+  "hooks": "./codex/hooks.json"
+}

@@ -2,3 +2,4 @@
 __pycache__/
 *.py[cod]
 .DS_Store
+/plugins/node_modules/

@@ -1,0 +1,19 @@
+{
+  "name": "doda-datalake-otel",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Metadata-only OTLP adapters for Codex, OMP, opencode2, and Claude Code",
+  "engines": { "node": ">=22" },
+  "exports": {
+    "./otel": "./otel.mjs",
+    "./omp": "./omp/index.mjs",
+    "./opencode2": "./opencode2/index.js"
+  },
+  "bin": {
+    "datalake-otel-install": "./install.mjs",
+    "datalake-otel-configure": "./configure.mjs"
+  },
+  "omp": { "extensions": ["./omp/index.mjs"] },
+  "dependencies": { "jsonc-parser": "3.3.1" }
+}

@@ -17,6 +17,15 @@ jobs:
           python-version: '3.12'
       - name: Install renderer dependency
         run: python -m pip install PyYAML==6.0.2
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: plugins/package-lock.json
+      - name: Check coding-agent plugin privacy and installers
+        run: |
+          npm ci --prefix plugins --ignore-scripts --no-audit --no-fund
+          node --test tests/test_plugin_*.mjs
       - name: Check environment contract and renderer regressions
         run: |
           python tools/check_env.py
