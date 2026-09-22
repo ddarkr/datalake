@@ -1,0 +1,136 @@
+services:
+  redecode-setup:
+    image: ${REDECODE_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [redecode]
+    command: ["python3", "/scripts/vehicle_setup.py"]
+    restart: "no"
+    configs:
+      - source: redecode_vehicle_setup_py
+        target: /scripts/vehicle_setup.py
+    volumes:
+      - vehicle-data:/data
+    environment:
+      DATA_DIR: /data
+      SETUP_ACTIVATE_GENERATION: "0"
+      DECODE_EPOCH: ${REDECODE_DECODE_EPOCH:-}
+      DBC_PRIMARY_URL: ${DBC_PRIMARY_URL:-}
+      DBC_PRIMARY_SHA256: ${DBC_PRIMARY_SHA256:-}
+      DBC_PRIMARY_COMMIT: ${DBC_PRIMARY_COMMIT:-}
+      DBC_SUPPLEMENTAL_URL: ${DBC_SUPPLEMENTAL_URL:-}
+      DBC_SUPPLEMENTAL_SHA256: ${DBC_SUPPLEMENTAL_SHA256:-}
+      DBC_SUPPLEMENTAL_COMMIT: ${DBC_SUPPLEMENTAL_COMMIT:-}
+      DBC_OVERRIDE_URL: ${DBC_OVERRIDE_URL:-}
+      DBC_OVERRIDE_SHA256: ${DBC_OVERRIDE_SHA256:-}
+      DBC_OVERRIDE_COMMIT: ${DBC_OVERRIDE_COMMIT:-}
+      DBC_OVERRIDE_VERSION: ${DBC_OVERRIDE_VERSION:-}
+      VSS_MAPPING_URL: ${VSS_MAPPING_URL:-}
+      VSS_MAPPING_SHA256: ${VSS_MAPPING_SHA256:-}
+      VSS_MAPPING_COMMIT: ${VSS_MAPPING_COMMIT:-}
+      VEHICLE_FIRMWARE: ${VEHICLE_FIRMWARE:-}
+      VSS_VERSION: ${VSS_VERSION:-}
+
+  redecode-deps:
+    image: ${REDECODE_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [redecode]
+    volumes:
+      - redecode-venv:/opt/venv
+    # Prerequisite: needs network (PyPI + raw.githubusercontent) at first boot only.
+    # Pinned-content guard: recreate the venv when pins change, so a stale
+    # venv can never silently run mismatched decode versions (same
+    # printf/cmp/.<name>_ready convention as vehicle-raw-deps/vss-deps).
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        printf '%s' 'python-can==4.6.1 asammdf==8.8.27 zstd==1.5.6.1 cantools==40.7.1 py-expression-eval==0.3.14 boto3==1.43.98|KUKSA_C=d03dd7db364dd1ce9f7d0c614d80ebf6642ad167|c1e13294c563beb313ed3a19a36e4839a0a4f98133ae4df5410c6c84be1786e6 2f478a0bd6032426ef589f4b479b589a72be7fb50b195da4facce042cc387774 9dfc995b906c58ccd4b3ff89ae6cab78b061ebb737bee5ab5c7b2a06e4ab84cb 58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd' > /tmp/.redecode_want;
+        if test -f /opt/venv/.redecode_ready &&
+        cmp -s /tmp/.redecode_want /opt/venv/.redecode_ready; then exit 0; fi;
+        python3 -m venv --clear /opt/venv &&
+        /opt/venv/bin/pip install --no-cache-dir --only-binary=:all:
+        python-can==4.6.1 asammdf==8.8.27 zstd==1.5.6.1 cantools==40.7.1
+        py-expression-eval==0.3.14 boto3==1.43.98 &&
+        mkdir -p /opt/venv/kuksa_verified/dbcfeederlib &&
+        export KUKSA_C=d03dd7db364dd1ce9f7d0c614d80ebf6642ad167 &&
+        export KUKSA_B=https://raw.githubusercontent.com/eclipse-kuksa/kuksa-can-provider/$$KUKSA_C/dbcfeederlib/ &&
+        export KUKSA_D=/opt/venv/kuksa_verified/dbcfeederlib &&
+        for m in __init__ dbcparser dbc2vssmapper; do
+        export KUKSA_M=$$m;
+        python3 -c "import urllib.request,os;open(os.environ['KUKSA_D']+'/'+os.environ['KUKSA_M']+'.py','wb').write(urllib.request.urlopen(os.environ['KUKSA_B']+os.environ['KUKSA_M']+'.py',timeout=120).read())";
+        done &&
+        python3 -c "import urllib.request;open('/opt/venv/kuksa_verified/LICENSE','wb').write(urllib.request.urlopen('https://raw.githubusercontent.com/eclipse-kuksa/kuksa-can-provider/d03dd7db364dd1ce9f7d0c614d80ebf6642ad167/LICENSE',timeout=120).read())" &&
+        echo "c1e13294c563beb313ed3a19a36e4839a0a4f98133ae4df5410c6c84be1786e6  /opt/venv/kuksa_verified/dbcfeederlib/__init__.py" | sha256sum -c - &&
+        echo "2f478a0bd6032426ef589f4b479b589a72be7fb50b195da4facce042cc387774  /opt/venv/kuksa_verified/dbcfeederlib/dbcparser.py" | sha256sum -c - &&
+        echo "9dfc995b906c58ccd4b3ff89ae6cab78b061ebb737bee5ab5c7b2a06e4ab84cb  /opt/venv/kuksa_verified/dbcfeederlib/dbc2vssmapper.py" | sha256sum -c - &&
+        echo "58d1e17ffe5109a7ae296caafcadfdbe6a7d176f0bc4ab01e12a689b0499d8bd  /opt/venv/kuksa_verified/LICENSE" | sha256sum -c - &&
+        cp /tmp/.redecode_want /opt/venv/.redecode_ready
+    restart: "no"
+
+  # One-shot offline regeneration: MF4 files in, derived rows out.
+  # Receive-only: no CAN socket, no TX, no ports, no host network.
+  redecode:
+    image: ${REDECODE_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [redecode]
+    depends_on:
+      redecode-deps:
+        condition: service_completed_successfully
+      redecode-setup:
+        condition: service_completed_successfully
+    configs:
+      - source: redecode_py
+        target: /app/redecode.py
+        mode: 0444
+      - source: redecode_vss_recorder_py
+        target: /app/vss_recorder.py
+        mode: 0444
+      - source: redecode_vehicle_setup_py
+        target: /app/vehicle_setup.py
+        mode: 0444
+      - source: redecode_raw_recorder_py
+        target: /app/raw_recorder.py
+        mode: 0444
+    volumes:
+      - redecode-venv:/opt/venv:ro
+      - vehicle-data:/data
+      - raw-spool:/spool/raw:ro
+    environment:
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      REDECODE_VEHICLE_ID: ${REDECODE_VEHICLE_ID:-}
+      REDECODE_DECODE_EPOCH: ${REDECODE_DECODE_EPOCH:-}
+      REDECODE_INPUT_URL: ${REDECODE_INPUT_URL:-}
+      REDECODE_INPUT_SHA256: ${REDECODE_INPUT_SHA256:-}
+      REDECODE_INPUT_MANIFEST_URL: ${REDECODE_INPUT_MANIFEST_URL:-}
+      REDECODE_INPUT_SIDECAR_URL: ${REDECODE_INPUT_SIDECAR_URL:-}
+      REDECODE_SPOOL_DIR: ${REDECODE_SPOOL_DIR:-/spool/raw}
+      REDECODE_WORKDIR: ${REDECODE_WORKDIR:-/tmp/redecode}
+      REDECODE_OUTBOX_PATH: ${REDECODE_OUTBOX_PATH:-/data/redecode-outbox.sqlite}
+      REDECODE_BATCH_N: ${REDECODE_BATCH_N:-500}
+      COLLECTOR_VERSION: ${COLLECTOR_VERSION:-vss-recorder-1}
+      REDECODE_COLLECTOR_VERSION: ${REDECODE_COLLECTOR_VERSION:-}
+      MANIFEST_PATH: ${MANIFEST_PATH:-/data/generations/${REDECODE_DECODE_EPOCH:-}/manifest.json}
+      MAPPING_PATH: ${MAPPING_PATH:-/data/generations/${REDECODE_DECODE_EPOCH:-}/mapping/vss_dbc.json}
+      DBC_PRIMARY_PATH: ${DBC_PRIMARY_PATH:-/data/generations/${REDECODE_DECODE_EPOCH:-}/dbc/primary.dbc}
+      DBC_SUPPLEMENTAL_PATH: ${DBC_SUPPLEMENTAL_PATH:-/data/generations/${REDECODE_DECODE_EPOCH:-}/dbc/supplemental.dbc}
+      KUKSA_SRC_DIR: /opt/venv/kuksa_verified
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-}
+      GREPTIME_DB: ${GREPTIME_DB:-}
+      GREPTIME_USER: ${GREPTIME_USER:-}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+      RAW_S3_ENDPOINT_URL: ${RAW_S3_ENDPOINT_URL:-}
+      RAW_S3_REGION: ${RAW_S3_REGION:-}
+      RAW_S3_ACCESS_KEY_ID: ${RAW_S3_ACCESS_KEY_ID:-}
+      RAW_S3_SECRET_ACCESS_KEY: ${RAW_S3_SECRET_ACCESS_KEY:-}
+    command: [/opt/venv/bin/python, /app/redecode.py]
+    restart: "no"
+
+configs:
+  redecode_py:
+    x-source: scripts/redecode.py
+  redecode_vss_recorder_py:
+    x-source: scripts/vss_recorder.py
+  redecode_vehicle_setup_py:
+    x-source: scripts/vehicle_setup.py
+  redecode_raw_recorder_py:
+    x-source: scripts/raw_recorder.py
+
+volumes:
+  redecode-venv:

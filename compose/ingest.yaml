@@ -1,0 +1,499 @@
+services:
+  alloy:
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.19.2}
+    profiles: [server]
+    ports:
+      - ${OTLP_GRPC_BIND_ADDRESS:-127.0.0.1}:${OTLP_GRPC_PORT:-4317}:4317
+      - ${OTLP_HTTP_BIND_ADDRESS:-127.0.0.1}:${OTLP_HTTP_PORT:-4318}:4318
+    command: ["run", "--stability.level=public-preview", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    environment:
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
+      GREPTIME_DB: ${GREPTIME_DB:-datalake}
+      GREPTIME_USER: ${GREPTIME_USER:-}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+      OTLP_USER: ${OTLP_USER:-}
+      OTLP_PASSWORD: ${OTLP_PASSWORD:-}
+      OTLP_QUEUE_SIZE: ${OTLP_QUEUE_SIZE:-1000}
+      OTLP_BATCH_MIN_SIZE: ${OTLP_BATCH_MIN_SIZE:-200}
+      OTLP_BATCH_MAX_SIZE: ${OTLP_BATCH_MAX_SIZE:-500}
+      OTLP_BATCH_FLUSH_TIMEOUT: ${OTLP_BATCH_FLUSH_TIMEOUT:-5s}
+      INFRA_SCRAPE_INTERVAL: ${INFRA_SCRAPE_INTERVAL:-30s}
+      TELEGRAF_SCRAPE_TARGETS: "${TELEGRAF_SCRAPE_TARGETS:-[]}"
+      VEHICLE_METRICS_TARGETS: "${VEHICLE_METRICS_TARGETS:-[]}"
+    configs:
+      - source: alloy_config
+        target: /etc/alloy/config.alloy
+    volumes:
+      - alloy-data:/var/lib/alloy/data
+    depends_on:
+      db-schema:
+        condition: service_completed_successfully
+      trace-privacy:
+        condition: service_started
+    restart: unless-stopped
+
+  trace-privacy:
+    image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server]
+    user: "65534:65534"
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    # Internal only; it forwards Alloy's private auth without storing credentials.
+    command: ["python", "/opt/datalake/trace_privacy.py"]
+    configs:
+      - source: trace_privacy_script
+        target: /opt/datalake/trace_privacy.py
+    restart: unless-stopped
+
+  alloy-home:
+    image: ${ALLOY_IMAGE:-grafana/alloy:v1.19.2}
+    profiles: [home]
+    command: ["run", "--storage.path=/var/lib/alloy/data", "/etc/alloy/config.alloy"]
+    environment:
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
+      GREPTIME_DB: ${GREPTIME_DB:-datalake}
+      GREPTIME_USER: ${GREPTIME_USER:-}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+      HA_HOST: ${HA_HOST:-127.0.0.1:8123}
+      HA_SCHEME: ${HA_SCHEME:-http}
+      HA_TOKEN: ${HA_TOKEN:-}
+      HA_SCRAPE_INTERVAL: ${HA_SCRAPE_INTERVAL:-60s}
+    configs:
+      - source: alloy_home_config
+        target: /etc/alloy/config.alloy
+    volumes:
+      - alloy-home-data:/var/lib/alloy/data
+    depends_on:
+      db-schema:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  telegraf:
+    image: ${TELEGRAF_IMAGE:-telegraf:1.40.0}
+    user: telegraf:telegraf
+    profiles: [mqtt]
+    ports:
+      - ${TELEGRAF_BIND_ADDRESS:-127.0.0.1}:${TELEGRAF_PORT:-9273}:9273
+    environment:
+      MQTT_USERNAME: ${MQTT_USERNAME:-}
+      MQTT_PASSWORD: ${MQTT_PASSWORD:-}
+      GREPTIME_USER: ${GREPTIME_USER:-}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+    configs:
+      - source: telegraf_config
+        target: /etc/telegraf/telegraf.conf
+    volumes:
+      - telegraf-buffer:/var/lib/telegraf
+    depends_on:
+      db-schema:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+configs:
+  trace_privacy_script:
+    x-source: scripts/trace_privacy.py
+  alloy_config:
+    content: |
+      // Server ingest: OTLP in -> privacy redact -> durable OTLP/HTTP -> GreptimeDB.
+      // Secrets only via sys.env, never baked in. OTLP ports loopback-bound by compose.
+      // Queue/batch/scrape tuning via env (see service environment); privacy allowlist,
+      // fsync, and infinite retry stay fixed safety policy.
+      // Exporter clients send Basic auth directly; ingress auth is separate.
+
+      // Plaintext htpasswd inline is valid server auth (upstream
+      // basicauthextension extension_test.go uses Inline "username:password");
+      // env keeps secrets out of this file. OTLP_USER/PASSWORD are required:
+      // server preflight fails fast when they are empty (never a ":" default).
+      otelcol.auth.basic "ingress" {
+        htpasswd {
+          inline = sys.env("OTLP_USER") + ":" + sys.env("OTLP_PASSWORD")
+        }
+      }
+
+      otelcol.auth.basic "redacted_ingress" {
+        htpasswd {
+          inline = sys.env("GREPTIME_USER") + ":" + sys.env("GREPTIME_PASSWORD")
+        }
+      }
+
+      // Public preview: needs --stability.level=public-preview (see service command).
+      otelcol.storage.file "queue" {
+        directory = "/var/lib/alloy/data"
+        fsync     = true
+      }
+
+      otelcol.receiver.otlp "ingress" {
+        grpc {
+          endpoint = "0.0.0.0:4317"
+          auth     = otelcol.auth.basic.ingress.handler
+        }
+        http {
+          endpoint = "0.0.0.0:4318"
+          auth     = otelcol.auth.basic.ingress.handler
+        }
+        output {
+          metrics = [otelcol.processor.transform.privacy.input]
+          logs    = [otelcol.processor.transform.privacy.input]
+          traces  = [otelcol.exporter.otlphttp.trace_privacy.input]
+        }
+      }
+
+      // No queue before content removal: downstream failures reach the sender.
+      otelcol.exporter.otlphttp "trace_privacy" {
+        client {
+          endpoint = "http://trace-privacy:4320"
+          headers = {
+            "Authorization" = "Basic " + encoding.to_base64(sys.env("GREPTIME_USER") + ":" + sys.env("GREPTIME_PASSWORD")),
+          }
+          compression = "none"
+        }
+        encoding = "json"
+        sending_queue { enabled = false }
+        retry_on_failure { enabled = false }
+      }
+
+      otelcol.receiver.otlp "redacted_traces" {
+        http {
+          endpoint = "0.0.0.0:4319"
+          auth = otelcol.auth.basic.redacted_ingress.handler
+        }
+        output { traces = [otelcol.processor.transform.privacy.input] }
+      }
+
+      // metadata_only, fail-closed: error_mode propagate drops (never passes
+      // through) any record whose redaction errors, before the durable queue.
+      // Keeps gen_ai/coding_agent plus documented native vendor counts/IDs
+      // (OMP pi.gen_ai usage+cost incl. estimated cost_usd, Codex model/tool/
+      // token_type/status fields, Claude input/cache_creation/cost_usd/
+      // request/tool/session fields) plus v4 activity scalars (OpenLIT
+      // session/edit/subagent/git, Claude decision/subagent, explicit branch
+      // and hashed coding_agent.repository.id). Raw vcs.repository.url.full
+      // is SHA256-hashed into coding_agent.repository.id then deleted before
+      // keep_keys, ahead of the durable queue. Drops prompt, completion, tool
+      // args/output, file/shell/env content, cwd, raw repo URL, commit
+      // message/PR title, user email/account, org identifiers. Native OMP
+      // pi.omp.agent.run.completed is a rollup (body redacted, numeric
+      // summary attrs only), never another LLM call. Activity counters alone
+      // gain datalake.temporality/start_time_unix_nano as datapoint attrs
+      // after keep_keys (Greptime drops non-default resource attrs) so
+      // cumulative Sums stay reset-safe without trusting caller annotations.
+      // Explicit resource coding_agent.client/session IDs (+client/session.id
+      // fallbacks, hashed repository.id, branch) are copied to span/log/
+      // datapoint attrs only when the local key is absent, before keep_keys;
+      // otherwise OTEL_RESOURCE_ATTRIBUTES identity is silently lost in flat
+      // ingestion. No end-timestamp tag (series cardinality); metrics stay
+      // native millisecond storage, values/temporality untouched.
+      otelcol.processor.transform "privacy" {
+        error_mode = "propagate"
+
+        trace_statements {
+          context = "resource"
+          statements = [
+            `set(attributes["coding_agent.repository.id"], SHA256(attributes["vcs.repository.url.full"])) where attributes["vcs.repository.url.full"] != nil`,
+            `delete_key(attributes, "vcs.repository.url.full")`,
+            `keep_keys(attributes, ["service.name", "service.version", "host.name", "terminal.type", "app.version", "app.entrypoint", "telemetry.sdk.language", "telemetry.sdk.name", "telemetry.sdk.version", "coding_agent.client", "coding_agent.session.id", "client", "session.id", "coding_agent.repository.id", "vcs.ref.head.name"])`,
+          ]
+        }
+        metric_statements {
+          context = "resource"
+          statements = [
+            `set(attributes["coding_agent.repository.id"], SHA256(attributes["vcs.repository.url.full"])) where attributes["vcs.repository.url.full"] != nil`,
+            `delete_key(attributes, "vcs.repository.url.full")`,
+            `keep_keys(attributes, ["service.name", "service.version", "host.name", "terminal.type", "app.version", "app.entrypoint", "telemetry.sdk.language", "telemetry.sdk.name", "telemetry.sdk.version", "service.instance.id", "coding_agent.client", "coding_agent.session.id", "client", "session.id", "coding_agent.repository.id", "vcs.ref.head.name"])`,
+          ]
+        }
+        log_statements {
+          context = "resource"
+          statements = [
+            `set(attributes["coding_agent.repository.id"], SHA256(attributes["vcs.repository.url.full"])) where attributes["vcs.repository.url.full"] != nil`,
+            `delete_key(attributes, "vcs.repository.url.full")`,
+            `keep_keys(attributes, ["service.name", "service.version", "host.name", "terminal.type", "app.version", "app.entrypoint", "telemetry.sdk.language", "telemetry.sdk.name", "telemetry.sdk.version", "coding_agent.client", "coding_agent.session.id", "client", "session.id", "coding_agent.repository.id", "vcs.ref.head.name"])`,
+          ]
+        }
+
+        trace_statements {
+          context = "scope"
+          statements = [`keep_keys(attributes, [])`]
+        }
+        metric_statements {
+          context = "scope"
+          statements = [`keep_keys(attributes, [])`]
+        }
+        log_statements {
+          context = "scope"
+          statements = [`keep_keys(attributes, [])`]
+        }
+
+        trace_statements {
+          context = "span"
+          statements = [
+            `set(attributes["coding_agent.repository.id"], SHA256(attributes["vcs.repository.url.full"])) where attributes["vcs.repository.url.full"] != nil`,
+            `delete_key(attributes, "vcs.repository.url.full")`,
+            `set(attributes["coding_agent.client"], resource.attributes["coding_agent.client"]) where attributes["coding_agent.client"] == nil and resource.attributes["coding_agent.client"] != nil`,
+            `set(attributes["coding_agent.session.id"], resource.attributes["coding_agent.session.id"]) where attributes["coding_agent.session.id"] == nil and resource.attributes["coding_agent.session.id"] != nil`,
+            `set(attributes["client"], resource.attributes["client"]) where attributes["client"] == nil and resource.attributes["client"] != nil`,
+            `set(attributes["session.id"], resource.attributes["session.id"]) where attributes["session.id"] == nil and resource.attributes["session.id"] != nil`,
+            `set(attributes["coding_agent.repository.id"], resource.attributes["coding_agent.repository.id"]) where attributes["coding_agent.repository.id"] == nil and resource.attributes["coding_agent.repository.id"] != nil`,
+            `set(attributes["vcs.ref.head.name"], resource.attributes["vcs.ref.head.name"]) where attributes["vcs.ref.head.name"] == nil and resource.attributes["vcs.ref.head.name"] != nil`,
+            `keep_keys(attributes, ["gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.response.model", "gen_ai.response.id", "gen_ai.response.finish_reasons", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.reasoning.output_tokens", "gen_ai.tool.name", "gen_ai.tool.call.id", "gen_ai.conversation.id", "gen_ai.agent.id", "gen_ai.agent.name", "gen_ai.system", "coding_agent.client", "coding_agent.session.id", "coding_agent.agent.parent_id", "coding_agent.content_capture_mode", "coding_agent.signal_source", "error.type", "error_class", "cost_usd", "pi.gen_ai.usage.total_tokens", "pi.gen_ai.usage.server_tool_requests", "pi.gen_ai.cost.estimated_usd", "pi.gen_ai.cost.input_usd", "pi.gen_ai.cost.output_usd", "pi.gen_ai.cost.unavailable_reason", "pi.gen_ai.tool.status", "pi.gen_ai.oneshot.kind", "pi.gen_ai.agent.step.number", "pi.gen_ai.agent.step.count", "pi.gen_ai.handoff.from_agent.name", "pi.gen_ai.handoff.from_agent.id", "pi.gen_ai.handoff.to_agent.name", "pi.gen_ai.handoff.to_agent.id", "openai.request.service_tier", "openai.response.service_tier", "model", "query_source", "query_source_safe", "agent_id", "parent_agent_id", "speed", "duration_ms", "ttft_ms", "first_content_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_id", "client_request_id", "attempt", "success", "status_code", "tool_name", "tool_name_safe", "result_tokens", "tool_use_id", "interaction.sequence", "parent.source", "session.id", "session_source", "originator", "auth_mode", "app.version", "app.entrypoint", "terminal.type", "token_type", "kind", "status", "tool", "type", "start_type", "prompt.id", "turn.id", "workflow.run_id", "coding_agent.session.subagent_count", "coding_agent.session.lines.added", "coding_agent.session.lines.removed", "coding_agent.session.lines.accepted", "coding_agent.session.lines.rejected", "coding_agent.session.edit.accept_count", "coding_agent.session.edit.reject_count", "coding_agent.session.commit_count", "coding_agent.session.pr_count", "coding_agent.session.duration_ms", "coding_agent.session.outcome", "coding_agent.agent.id", "coding_agent.subagent.type", "coding_agent.subagent.status", "coding_agent.subagent.duration_ms", "coding_agent.edit.decision", "coding_agent.edit.lines.added", "coding_agent.edit.lines.removed", "coding_agent.edit.tool.name", "coding_agent.edit.language", "coding_agent.repository.id", "conversation.id", "event.name", "event.timestamp", "event.sequence", "agent_type", "agent.source", "is_built_in", "is_async", "total_tool_uses", "tool_namespace", "call_id", "decision", "source", "language", "client", "vcs.ref.head.name", "vcs.ref.head.revision"])`,
+            `set(name, "invoke_agent") where IsMatch(name, "^invoke_agent[ ].*")`,
+            `set(name, "chat") where IsMatch(name, "^chat[ ].*")`,
+            `set(name, "execute_tool") where IsMatch(name, "^execute_tool[ ].*")`,
+            `set(name, "handoff") where IsMatch(name, "^handoff[ ].*")`,
+            `set(name, "redacted") where not IsMatch(name, "^(coding_agent[.](session|llm[.]turn|tool[.]call|edit[.]decision|subagent|git[.]commit|git[.]pull_request)|invoke_agent|chat|execute_tool|handoff|claude_code[.](interaction|llm_request|tool|tool[.]blocked_on_user|tool[.]execution|hook))$")`,
+            `set(status.message, "redacted") where status.message != ""`,
+            `set(trace_state, "")`,
+          ]
+        }
+
+        log_statements {
+          context = "log"
+          statements = [
+            `set(body, "redacted")`,
+            `set(event_name, "redacted") where event_name != "" and not IsMatch(event_name, "^(codex[.](conversation_starts|api_request|sse_event|websocket_request|websocket_event|user_prompt|tool_decision|tool_result|turn_cost|turn_ttft|startup_phase|sandbox_outcome|plugin_install_elicitation_sent|plugin_install_suggestion)|(claude_code[.])?(user_prompt|assistant_response|tool_result|api_request|api_error|api_refusal|api_request_body|api_response_body|tool_decision|permission_mode_changed|auth|mcp_server_connection|internal_error|plugin_installed|plugin_loaded|skill_activated|at_mention|api_retries_exhausted|hook_registered|hook_execution_start|hook_execution_complete|hook_plugin_metrics|compaction|subagent_completed|feedback_survey|retention_sweep)|gen_ai[.]client[.]inference[.]operation[.]details|pi[.]omp[.]agent[.]run[.]completed)$")`,
+            `set(attributes["event.name"], event_name) where attributes["event.name"] == nil and event_name != ""`,
+            `set(attributes["event.name"], "redacted") where attributes["event.name"] != nil and not IsMatch(attributes["event.name"], "^(codex[.](conversation_starts|api_request|sse_event|websocket_request|websocket_event|user_prompt|tool_decision|tool_result|turn_cost|turn_ttft|startup_phase|sandbox_outcome|plugin_install_elicitation_sent|plugin_install_suggestion)|(claude_code[.])?(user_prompt|assistant_response|tool_result|api_request|api_error|api_refusal|api_request_body|api_response_body|tool_decision|permission_mode_changed|auth|mcp_server_connection|internal_error|plugin_installed|plugin_loaded|skill_activated|at_mention|api_retries_exhausted|hook_registered|hook_execution_start|hook_execution_complete|hook_plugin_metrics|compaction|subagent_completed|feedback_survey|retention_sweep)|gen_ai[.]client[.]inference[.]operation[.]details|pi[.]omp[.]agent[.]run[.]completed)$")`,
+            `set(attributes["coding_agent.repository.id"], SHA256(attributes["vcs.repository.url.full"])) where attributes["vcs.repository.url.full"] != nil`,
+            `delete_key(attributes, "vcs.repository.url.full")`,
+            `set(attributes["coding_agent.client"], resource.attributes["coding_agent.client"]) where attributes["coding_agent.client"] == nil and resource.attributes["coding_agent.client"] != nil`,
+            `set(attributes["coding_agent.session.id"], resource.attributes["coding_agent.session.id"]) where attributes["coding_agent.session.id"] == nil and resource.attributes["coding_agent.session.id"] != nil`,
+            `set(attributes["client"], resource.attributes["client"]) where attributes["client"] == nil and resource.attributes["client"] != nil`,
+            `set(attributes["session.id"], resource.attributes["session.id"]) where attributes["session.id"] == nil and resource.attributes["session.id"] != nil`,
+            `set(attributes["coding_agent.repository.id"], resource.attributes["coding_agent.repository.id"]) where attributes["coding_agent.repository.id"] == nil and resource.attributes["coding_agent.repository.id"] != nil`,
+            `set(attributes["vcs.ref.head.name"], resource.attributes["vcs.ref.head.name"]) where attributes["vcs.ref.head.name"] == nil and resource.attributes["vcs.ref.head.name"] != nil`,
+            `keep_keys(attributes, ["event.name", "event.kind", "event.timestamp", "event.sequence", "message.uuid", "conversation.id", "turn.id", "call_id", "input_token_count", "output_token_count", "cached_token_count", "cache_write_token_count", "reasoning_token_count", "tool_token_count", "usage.estimated_usd", "cost_usd_micros", "gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.response.model", "gen_ai.response.id", "gen_ai.response.finish_reasons", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.reasoning.output_tokens", "gen_ai.tool.name", "gen_ai.tool.call.id", "gen_ai.conversation.id", "gen_ai.agent.id", "gen_ai.agent.name", "gen_ai.system", "coding_agent.client", "coding_agent.session.id", "coding_agent.agent.parent_id", "coding_agent.content_capture_mode", "coding_agent.signal_source", "error.type", "error_class", "cost_usd", "pi.gen_ai.usage.total_tokens", "pi.gen_ai.usage.server_tool_requests", "pi.gen_ai.cost.estimated_usd", "pi.gen_ai.cost.input_usd", "pi.gen_ai.cost.output_usd", "pi.gen_ai.cost.unavailable_reason", "pi.gen_ai.tool.status", "pi.gen_ai.oneshot.kind", "pi.gen_ai.agent.step.number", "pi.gen_ai.agent.step.count", "pi.gen_ai.handoff.from_agent.name", "pi.gen_ai.handoff.from_agent.id", "pi.gen_ai.handoff.to_agent.name", "pi.gen_ai.handoff.to_agent.id", "openai.request.service_tier", "openai.response.service_tier", "model", "query_source", "query_source_safe", "agent_id", "parent_agent_id", "speed", "duration_ms", "ttft_ms", "first_content_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_id", "client_request_id", "attempt", "success", "status_code", "tool_name", "tool_name_safe", "result_tokens", "tool_use_id", "interaction.sequence", "parent.source", "session.id", "session_source", "originator", "auth_mode", "app.version", "app.entrypoint", "terminal.type", "token_type", "kind", "status", "tool", "type", "start_type", "prompt.id", "workflow.run_id", "coding_agent.session.subagent_count", "coding_agent.session.lines.added", "coding_agent.session.lines.removed", "coding_agent.session.lines.accepted", "coding_agent.session.lines.rejected", "coding_agent.session.edit.accept_count", "coding_agent.session.edit.reject_count", "coding_agent.session.commit_count", "coding_agent.session.pr_count", "coding_agent.session.duration_ms", "coding_agent.session.outcome", "coding_agent.agent.id", "coding_agent.subagent.type", "coding_agent.subagent.status", "coding_agent.subagent.duration_ms", "coding_agent.edit.decision", "coding_agent.edit.lines.added", "coding_agent.edit.lines.removed", "coding_agent.edit.tool.name", "coding_agent.edit.language", "coding_agent.repository.id", "agent_type", "agent.source", "is_built_in", "is_async", "total_tool_uses", "tool_namespace", "decision", "source", "language", "client", "vcs.ref.head.name", "vcs.ref.head.revision", "pi.omp.agent.step_count", "pi.omp.agent.chats.total", "pi.omp.agent.chats.total_latency_ms", "pi.omp.agent.tools.total", "pi.omp.agent.tools.ok", "pi.omp.agent.tools.error", "pi.omp.agent.tools.skipped", "pi.omp.agent.tools.blocked", "pi.omp.agent.tools.timeout", "pi.omp.agent.tools.aborted", "pi.omp.agent.tools.total_latency_ms", "pi.omp.agent.usage.input_tokens", "pi.omp.agent.usage.output_tokens", "pi.omp.agent.usage.cached_input_tokens", "pi.omp.agent.usage.cache_write_tokens", "pi.omp.agent.usage.reasoning_output_tokens", "pi.omp.agent.usage.total_tokens", "pi.omp.agent.cost.estimated_usd", "pi.omp.agent.errors.total"])`,
+          ]
+        }
+
+        metric_statements {
+          context = "metric"
+          statements = [
+            `set(description, "")`,
+            `set(unit, "") where not IsMatch(unit, "^(1|count|s|ms|us|ns|min|h|By|KiBy|MiBy|GiBy|USD|%|m|km|m/s|km/h|W|kW|Wh|kWh|V|A|Hz|Cel|[{]token[}]|[{]call[}]|[{]request[}]|[{]line[}]|[{]commit[}]|[{]decision[}])$")`,
+            `keep_keys(metadata, [])`,
+          ]
+        }
+
+        metric_statements {
+          context = "datapoint"
+          statements = [
+            `set(datapoint.attributes["coding_agent.client"], resource.attributes["coding_agent.client"]) where datapoint.attributes["coding_agent.client"] == nil and resource.attributes["coding_agent.client"] != nil`,
+            `set(datapoint.attributes["coding_agent.session.id"], resource.attributes["coding_agent.session.id"]) where datapoint.attributes["coding_agent.session.id"] == nil and resource.attributes["coding_agent.session.id"] != nil`,
+            `set(datapoint.attributes["client"], resource.attributes["client"]) where datapoint.attributes["client"] == nil and resource.attributes["client"] != nil`,
+            `set(datapoint.attributes["session.id"], resource.attributes["session.id"]) where datapoint.attributes["session.id"] == nil and resource.attributes["session.id"] != nil`,
+            `set(datapoint.attributes["coding_agent.repository.id"], resource.attributes["coding_agent.repository.id"]) where datapoint.attributes["coding_agent.repository.id"] == nil and resource.attributes["coding_agent.repository.id"] != nil`,
+            `set(datapoint.attributes["vcs.ref.head.name"], resource.attributes["vcs.ref.head.name"]) where datapoint.attributes["vcs.ref.head.name"] == nil and resource.attributes["vcs.ref.head.name"] != nil`,
+            `keep_keys(attributes, ["service.name", "host.name", "gen_ai.provider.name", "gen_ai.request.model", "model", "tool", "tool_name", "tool_name_safe", "status", "success", "kind", "token_type", "session.id", "auth_mode", "originator", "session_source", "app.version", "app.entrypoint", "query_source", "query_source_safe", "speed", "type", "start_type", "terminal.type", "gen_ai.operation.name", "gen_ai.response.service_tier", "gen_ai.token.type", "gen_ai.tool.name", "gen_ai.response.finish_reason", "pi.gen_ai.agent.id", "pi.gen_ai.agent.name", "pi.omp.tool.status", "error.type", "decision", "language", "coding_agent.client", "coding_agent.session.id", "client", "service.instance.id", "coding_agent.repository.id", "vcs.ref.head.name", "conversation.id", "gen_ai.conversation.id"])`,
+            `set(datapoint.attributes["datalake.temporality"], metric.aggregation_temporality) where IsMatch(metric.name, "^(claude_code[.]lines_of_code[.]count|claude_code[.]code_edit_tool[.]decision|claude_code[.]commit[.]count|claude_code[.]pull_request[.]count|claude_code[.]active_time[.]total|coding_agent[.]lines_of_code[.]count|coding_agent[.]code_edit_tool[.]decision|coding_agent[.]commit[.]count|coding_agent[.]pull_request[.]count)$")`,
+            `set(datapoint.attributes["datalake.start_time_unix_nano"], datapoint.start_time_unix_nano) where metric.aggregation_temporality == 2 and IsMatch(metric.name, "^(claude_code[.]lines_of_code[.]count|claude_code[.]code_edit_tool[.]decision|claude_code[.]commit[.]count|claude_code[.]pull_request[.]count|claude_code[.]active_time[.]total|coding_agent[.]lines_of_code[.]count|coding_agent[.]code_edit_tool[.]decision|coding_agent[.]commit[.]count|coding_agent[.]pull_request[.]count)$")`,
+          ]
+        }
+
+        // Exemplar content is a separate context, not datapoint attributes.
+        // Infer it: Alloy's explicit context enum does not include exemplar.
+        statements {
+          metric = [`keep_keys(exemplar.filtered_attributes, [])`]
+        }
+
+        output {
+          metrics = [otelcol.exporter.otlphttp.greptime.input]
+          logs    = [otelcol.exporter.otlphttp.greptime.input]
+          traces  = [otelcol.exporter.otlphttp.greptime_traces.input]
+        }
+      }
+
+      // Logs+metrics exporter: no trace pipeline header here.
+      // batch lives INSIDE sending_queue (exporter-level batch{} is rejected
+      // by alloy validate in v1.14; source: config_queue.go QueueArguments).
+      otelcol.exporter.otlphttp "greptime" {
+        client {
+          endpoint = sys.env("GREPTIME_HTTP_URL")
+          headers = {
+            "X-Greptime-DB-Name" = sys.env("GREPTIME_DB"),
+            "Authorization"      = "Basic " + encoding.to_base64(sys.env("GREPTIME_USER") + ":" + sys.env("GREPTIME_PASSWORD")),
+          }
+        }
+        logs_endpoint    = sys.env("GREPTIME_HTTP_URL") + "/v1/otlp/v1/logs"
+        metrics_endpoint = sys.env("GREPTIME_HTTP_URL") + "/v1/otlp/v1/metrics"
+        encoding         = "proto"
+        sending_queue {
+          enabled           = true
+          sizer             = "requests"
+          queue_size        = encoding.from_json(sys.env("OTLP_QUEUE_SIZE"))
+          num_consumers     = 2
+          block_on_overflow = true
+          storage           = otelcol.storage.file.queue.handler
+          batch {
+            min_size      = encoding.from_json(sys.env("OTLP_BATCH_MIN_SIZE"))
+            max_size      = encoding.from_json(sys.env("OTLP_BATCH_MAX_SIZE"))
+            flush_timeout = sys.env("OTLP_BATCH_FLUSH_TIMEOUT")
+          }
+        }
+        retry_on_failure {
+          enabled          = true
+          initial_interval = "5s"
+          max_interval     = "30s"
+          max_elapsed_time = "0s"
+        }
+      }
+
+      // Traces-only exporter: carries the greptime_trace_v1 pipeline header.
+      otelcol.exporter.otlphttp "greptime_traces" {
+        client {
+          endpoint = sys.env("GREPTIME_HTTP_URL")
+          headers = {
+            "X-Greptime-DB-Name"      = sys.env("GREPTIME_DB"),
+            "X-Greptime-Pipeline-Name" = "greptime_trace_v1",
+            "Authorization"           = "Basic " + encoding.to_base64(sys.env("GREPTIME_USER") + ":" + sys.env("GREPTIME_PASSWORD")),
+          }
+        }
+        traces_endpoint = sys.env("GREPTIME_HTTP_URL") + "/v1/otlp/v1/traces"
+        encoding        = "proto"
+        sending_queue {
+          enabled           = true
+          sizer             = "requests"
+          queue_size        = encoding.from_json(sys.env("OTLP_QUEUE_SIZE"))
+          num_consumers     = 2
+          block_on_overflow = true
+          storage           = otelcol.storage.file.queue.handler
+          batch {
+            min_size      = encoding.from_json(sys.env("OTLP_BATCH_MIN_SIZE"))
+            max_size      = encoding.from_json(sys.env("OTLP_BATCH_MAX_SIZE"))
+            flush_timeout = sys.env("OTLP_BATCH_FLUSH_TIMEOUT")
+          }
+        }
+        retry_on_failure {
+          enabled          = true
+          initial_interval = "5s"
+          max_interval     = "30s"
+          max_elapsed_time = "0s"
+        }
+      }
+
+      // Self scrape: no auth. GreptimeDB has its own authenticated scrape
+      // below. Optional target lists default to [] (no scrape, no false up=0).
+      prometheus.scrape "infra" {
+        targets = [
+          {"__address__" = "127.0.0.1:12345", "job" = "alloy"},
+          {"__address__" = "storage-metrics:9105", "job" = "storage-metrics"},
+        ]
+        honor_labels    = true
+        scrape_interval = sys.env("INFRA_SCRAPE_INTERVAL")
+        forward_to      = [prometheus.remote_write.greptime.receiver]
+      }
+
+      // Telegraf scrape only when the mqtt profile is on: set
+      // TELEGRAF_SCRAPE_TARGETS='[{"__address__":"telegraf:9273","job":"telegraf"}]'.
+      prometheus.scrape "telegraf" {
+        targets         = encoding.from_json(sys.env("TELEGRAF_SCRAPE_TARGETS"))
+        honor_labels    = true
+        scrape_interval = sys.env("INFRA_SCRAPE_INTERVAL")
+        forward_to      = [prometheus.remote_write.greptime.receiver]
+      }
+
+      // Vehicle exporters run on the Pi (remote/Tailscale). Set e.g.
+      // VEHICLE_METRICS_TARGETS='[{"__address__":"<pi>:9102","job":"vehicle-raw-recorder"},{"__address__":"<pi>:9103","job":"vehicle-raw-uploader"},{"__address__":"<pi>:9104","job":"vss-recorder"}]'.
+      // Empty (default) means no vehicle scrape; dashboards must treat the
+      // absent series as not-configured, not as an outage.
+      prometheus.scrape "vehicle" {
+        targets         = encoding.from_json(sys.env("VEHICLE_METRICS_TARGETS"))
+        honor_labels    = true
+        scrape_interval = sys.env("INFRA_SCRAPE_INTERVAL")
+        forward_to      = [prometheus.remote_write.greptime.receiver]
+      }
+
+      // GreptimeDB self metrics need basic auth when auth is enabled.
+      prometheus.scrape "greptimedb" {
+        targets = [
+          {"__address__" = "greptimedb:4000", "job" = "greptimedb"},
+        ]
+        honor_labels    = true
+        scrape_interval = sys.env("INFRA_SCRAPE_INTERVAL")
+        basic_auth {
+          username = sys.env("GREPTIME_USER")
+          password = sys.env("GREPTIME_PASSWORD")
+        }
+        forward_to = [prometheus.remote_write.greptime.receiver]
+      }
+
+      prometheus.remote_write "greptime" {
+        endpoint {
+          url = sys.env("GREPTIME_HTTP_URL") + "/v1/prometheus/write?db=" + sys.env("GREPTIME_DB")
+          basic_auth {
+            username = sys.env("GREPTIME_USER")
+            password = sys.env("GREPTIME_PASSWORD")
+          }
+        }
+      }
+  alloy_home_config:
+    content: |
+      // Home profile: HA /api/prometheus scrape -> GreptimeDB remote_write. No ingress.
+      prometheus.scrape "ha" {
+        targets         = [{"__address__" = sys.env("HA_HOST")}]
+        scheme          = sys.env("HA_SCHEME")
+        metrics_path    = "/api/prometheus"
+        scrape_interval = sys.env("HA_SCRAPE_INTERVAL")
+        job_name        = "homeassistant"
+        bearer_token    = sys.env("HA_TOKEN")
+        forward_to      = [prometheus.remote_write.greptime.receiver]
+      }
+
+      prometheus.remote_write "greptime" {
+        external_labels = {"source" = "homeassistant"}
+        endpoint {
+          url = sys.env("GREPTIME_HTTP_URL") + "/v1/prometheus/write?db=" + sys.env("GREPTIME_DB")
+          basic_auth {
+            username = sys.env("GREPTIME_USER")
+            password = sys.env("GREPTIME_PASSWORD")
+          }
+        }
+      }
+  telegraf_config:
+    content: |
+      # MQTT consumer -> GreptimeDB InfluxDB v1 API (/v1/influxdb/write). No local broker.
+      # Escaped dollars defer credentials to Telegraf's runtime environment.
+      # Other interpolation uses Compose-time settings with safe defaults.
+      # Disk buffer keys verified in Telegraf v1.40 config.AgentConfig.
+      [agent]
+        interval = "60s"
+        flush_interval = "30s"
+        metric_batch_size = 1000
+        metric_buffer_limit = 10000
+        buffer_strategy = "disk_write_through"
+        buffer_directory = "/var/lib/telegraf/buffer"
+        buffer_disk_sync = true
+
+      [[inputs.mqtt_consumer]]
+        servers = ["${MQTT_BROKER:-tcp://127.0.0.1:1883}"]
+        topics = ${MQTT_TOPICS:-["home/#"]}
+        topic_tag = "topic"
+        qos = 1
+        persistent_session = true
+        client_id = "${MQTT_CLIENT_ID:-doda-datalake-telegraf}"
+        username = "$${MQTT_USERNAME}"
+        password = "$${MQTT_PASSWORD}"
+        max_undelivered_messages = 1000
+        data_format = "${MQTT_DATA_FORMAT:-json}"
+
+      [[inputs.internal]]
+        collect_memstats = false
+
+      [[outputs.influxdb]]
+        urls = ["${GREPTIME_HTTP_URL:-http://greptimedb:4000}/v1/influxdb"]
+        database = "${GREPTIME_DB:-datalake}"
+        username = "$${GREPTIME_USER}"
+        password = "$${GREPTIME_PASSWORD}"
+        skip_database_creation = true
+        timeout = "10s"
+
+      # internal_* only: mqtt_consumer measurements stay in GreptimeDB via the
+      # influxdb output; re-exposing them here would double-ingest on scrape.
+      [[outputs.prometheus_client]]
+        listen = ":9273"
+        path = "/metrics"
+        namepass = ["internal_*"]
+
+volumes:
+  alloy-data: {}
+  alloy-home-data: {}
+  telegraf-buffer: {}

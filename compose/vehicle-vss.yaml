@@ -1,0 +1,146 @@
+services:
+  vehicle-setup:
+    image: ${VEHICLE_VSS_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [vehicle]
+    command: ["python3", "/scripts/vehicle_setup.py"]
+    restart: "no"
+    configs:
+      - source: vehicle-setup-script
+        target: /scripts/vehicle_setup.py
+    volumes:
+      - vehicle-data:/data
+    environment:
+      DATA_DIR: /data
+      DBC_PRIMARY_URL: ${DBC_PRIMARY_URL:-}
+      DBC_PRIMARY_SHA256: ${DBC_PRIMARY_SHA256:-}
+      DBC_PRIMARY_COMMIT: ${DBC_PRIMARY_COMMIT:-}
+      DBC_SUPPLEMENTAL_URL: ${DBC_SUPPLEMENTAL_URL:-}
+      DBC_SUPPLEMENTAL_SHA256: ${DBC_SUPPLEMENTAL_SHA256:-}
+      DBC_SUPPLEMENTAL_COMMIT: ${DBC_SUPPLEMENTAL_COMMIT:-}
+      DBC_OVERRIDE_URL: ${DBC_OVERRIDE_URL:-}
+      DBC_OVERRIDE_SHA256: ${DBC_OVERRIDE_SHA256:-}
+      DBC_OVERRIDE_COMMIT: ${DBC_OVERRIDE_COMMIT:-}
+      DBC_OVERRIDE_VERSION: ${DBC_OVERRIDE_VERSION:-}
+      VSS_MAPPING_URL: ${VSS_MAPPING_URL:-}
+      VSS_MAPPING_SHA256: ${VSS_MAPPING_SHA256:-}
+      VSS_MAPPING_COMMIT: ${VSS_MAPPING_COMMIT:-}
+      VEHICLE_FIRMWARE: ${VEHICLE_FIRMWARE:-}
+      DECODE_EPOCH: ${DECODE_EPOCH:-}
+      VSS_VERSION: ${VSS_VERSION:-}
+  kuksa-databroker:
+    image: ${KUKSA_DATABROKER_IMAGE:-ghcr.io/eclipse-kuksa/kuksa-databroker:0.7.1}
+    profiles: [vehicle]
+    # --address 0.0.0.0: image default binds 127.0.0.1 (container loopback),
+    # which bridge-network clients (vss-recorder) could never reach.
+    command: ["--insecure", "--address", "0.0.0.0", "--port", "55555",
+      "--vss", "/data/current/mapping/vss_dbc.json"]
+    restart: unless-stopped
+    depends_on:
+      vehicle-setup:
+        condition: service_completed_successfully
+    volumes:
+      - vehicle-data:/data:ro
+    # Localhost-only publish so the host-network can-provider can reach the
+    # broker; no LAN exposure.
+    ports:
+      - 127.0.0.1:${KUKSA_PORT:-55555}:55555
+
+  kuksa-can-provider:
+    image: ${KUKSA_CAN_PROVIDER_IMAGE:-ghcr.io/eclipse-kuksa/kuksa-can-provider/can-provider:0.5.0}
+    profiles: [vehicle]
+    # Receive-only: --dbc2val + --no-val2dbc (never transmits). SocketCAN
+    # lives in the host netns, hence host mode + NET_RAW; the interface must
+    # already exist and be up -- this service never sets bitrate or link state.
+    network_mode: host
+    cap_add: [NET_RAW]
+    restart: unless-stopped
+    depends_on:
+      vehicle-setup:
+        condition: service_completed_successfully
+      kuksa-databroker:
+        condition: service_started
+    volumes:
+      - vehicle-data:/data:ro
+    command:
+      - --dbc2val
+      - --no-val2dbc
+      - --use-socketcan
+      - --canfd
+      - --canport
+      - ${CAN_INTERFACE:-can0}
+      - --dbcfile
+      - /data/current/dbc/primary.dbc,/data/current/dbc/supplemental.dbc
+      - --mapping
+      - /data/current/mapping/vss_dbc.json
+      - grpc://127.0.0.1:${KUKSA_PORT:-55555}
+
+  vss-deps:
+    image: ${VEHICLE_VSS_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [vehicle]
+    restart: "no"
+    depends_on:
+      vehicle-raw-deps:
+        condition: service_completed_successfully
+    volumes:
+      - vehicle-venv:/opt/venv
+    # vehicle-venv is owned by vehicle-raw.yaml; vehicle-raw-deps serializes
+    # venv creation first. This step only appends the one extra dep the raw
+    # recorder does not need. The marker embeds the pinned version so a pin
+    # bump re-runs the install instead of being skipped.
+    command:
+      - sh
+      - -c
+      - >-
+        echo "kuksa-client==0.6.0" | cmp -s - /opt/venv/.vss_ready ||
+        ([ -x /opt/venv/bin/python ] || python3 -m venv /opt/venv &&
+        /opt/venv/bin/pip install --no-cache-dir "kuksa-client==0.6.0" &&
+        echo "kuksa-client==0.6.0" > /opt/venv/.vss_ready)
+
+  vss-recorder:
+    image: ${VEHICLE_VSS_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [vehicle]
+    restart: unless-stopped
+    # Allow the in-flight HTTP timeout and bounded final drain to finish.
+    stop_grace_period: 90s
+    depends_on:
+      vehicle-setup:
+        condition: service_completed_successfully
+      vss-deps:
+        condition: service_completed_successfully
+      kuksa-databroker:
+        condition: service_started
+    configs:
+      - source: vehicle-setup-script
+        target: /scripts/vehicle_setup.py
+      - source: vss-recorder-script
+        target: /scripts/vss_recorder.py
+    volumes:
+      - vehicle-venv:/opt/venv:ro
+      - vehicle-data:/data
+    command: ["/opt/venv/bin/python", "-u", "/scripts/vss_recorder.py"]
+    environment:
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      DATABROKER_HOST: kuksa-databroker
+      # Container port (broker always listens on 55555 inside; KUKSA_PORT only remaps the host publish above).
+      DATABROKER_PORT: "55555"
+      OUTBOX_PATH: ${OUTBOX_PATH:-/data/outbox.sqlite}
+      MANIFEST_PATH: /data/current/manifest.json
+      MAPPING_PATH: /data/current/mapping/vss_dbc.json
+      VSS_BATCH_N: ${VSS_BATCH_N:-500}
+      VSS_FLUSH_SEC: ${VSS_FLUSH_SEC:-10}
+      COLLECTOR_VERSION: ${COLLECTOR_VERSION:-vss-recorder-1}
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-}
+      GREPTIME_DB: ${GREPTIME_DB:-}
+      GREPTIME_USER: ${GREPTIME_USER:-}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+    # Loopback by default; bind a Tailnet address explicitly for server scrapes.
+    ports:
+      - ${VSS_METRICS_HOST:-127.0.0.1}:${VSS_METRICS_PORT:-9104}:9104
+configs:
+  vehicle-setup-script:
+    x-source: scripts/vehicle_setup.py
+  vss-recorder-script:
+    x-source: scripts/vss_recorder.py
+
+volumes:
+  vehicle-data: {}

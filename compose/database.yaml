@@ -1,0 +1,81 @@
+# Database fragment: schema init + scheduled aggregation.
+# Core owns the greptimedb service and greptime-data/greptime-etc volumes;
+# this fragment only references them (never redefines). Top-level shape is
+# services/configs/volumes only. Scripts are embedded by tools/render.py via
+# x-source (no external file refs in the final bundle).
+#
+# Backup (service/config/volume) lives in BackupCorrectness's fragment;
+# this fragment declares none of those names.
+
+services:
+  db-schema:
+    image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server]
+    depends_on:
+      greptimedb:
+        condition: service_started
+    environment:
+      GREPTIME_HTTP_URL: http://greptimedb:4000
+      GREPTIME_DB: ${GREPTIME_DB:-datalake}
+      GREPTIME_USER: ${GREPTIME_USER:-datalake}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+      DB_INIT_WAIT_S: ${DB_INIT_WAIT_S:-300}
+      OTEL_TTL: ${OTEL_TTL:-}
+    configs:
+      - source: db_init_py
+        target: /app/db_init.py
+        mode: 0444
+      - source: activity_py
+        target: /app/activity.py
+        mode: 0444
+    command: ["python", "/app/db_init.py"]
+    restart: "no"
+
+  aggregate:
+    image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server]
+    depends_on:
+      greptimedb:
+        condition: service_started
+      db-schema:
+        condition: service_completed_successfully
+    environment:
+      GREPTIME_HTTP_URL: http://greptimedb:4000
+      GREPTIME_DB: ${GREPTIME_DB:-datalake}
+      GREPTIME_USER: ${GREPTIME_USER:-datalake}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+      AGG_INTERVAL_SECONDS: ${AGG_INTERVAL_SECONDS:-300}
+      AGG_LOOKBACK_HOURS: ${AGG_LOOKBACK_HOURS:-30}
+      AGG_MAX_ROWS: ${AGG_MAX_ROWS:-200000}
+      OTEL_TTL: ${OTEL_TTL:-}
+      HOME_RAW_TTL: ${HOME_RAW_TTL:-90d}
+      VEHICLE_SPEED_PATH: ${VEHICLE_SPEED_PATH:-}
+      VEHICLE_SOC_PATH: ${VEHICLE_SOC_PATH:-}
+      VEHICLE_DRIVE_ENERGY_PATH: ${VEHICLE_DRIVE_ENERGY_PATH:-}
+      VEHICLE_CHARGE_ENERGY_PATH: ${VEHICLE_CHARGE_ENERGY_PATH:-}
+      VEHICLE_CHARGING_POWER_PATH: ${VEHICLE_CHARGING_POWER_PATH:-}
+      VEHICLE_CHARGING_PATH: ${VEHICLE_CHARGING_PATH:-}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      TRIP_GAP_MINUTES: ${TRIP_GAP_MINUTES:-10}
+      TRIP_MIN_SPEED_KPH: ${TRIP_MIN_SPEED_KPH:-1}
+      CHARGE_GAP_MINUTES: ${CHARGE_GAP_MINUTES:-30}
+      VEHICLE_SIGNAL_MAX_AGE_SECONDS: ${VEHICLE_SIGNAL_MAX_AGE_SECONDS:-300}
+      HOME_AGG_SOURCES: "${HOME_AGG_SOURCES:-[]}"
+    configs:
+      - source: aggregate_py
+        target: /app/aggregate.py
+        mode: 0444
+      - source: activity_py
+        target: /app/activity.py
+        mode: 0444
+    command: ["python", "/app/aggregate.py"]
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+configs:
+  db_init_py:
+    x-source: scripts/db_init.py
+  aggregate_py:
+    x-source: scripts/aggregate.py
+  activity_py:
+    x-source: scripts/activity.py

@@ -1,0 +1,141 @@
+# Backup fragment: offline backup/restore with automated S3 workflow.
+# Top-level shape is services/configs/volumes only; scripts are embedded
+# by tools/render.py via x-source (no external
+# file refs in the final bundle). Declares the backup + backup-deps
+# services, the backup_py config, and the backup-data volume.
+#
+# Operator workflow (S3 keys live ONLY on this service; `.env` + two
+# commands, no manual volume surgery, no host CLI install):
+#   docker compose --profile server stop
+#   BACKUP_OFFLINE_CONFIRMED=1 docker compose --profile backup run --rm backup backup
+#   BACKUP_OFFLINE_CONFIRMED=1 docker compose --profile backup run --rm backup restore
+#   docker compose --profile server up -d
+# The tool probes GREPTIME_HTTP_URL and refuses when the DB is reachable.
+# There is no live-backup mode: a tar of a running standalone is torn WAL,
+# not crash-consistent, and no such claim is made here.
+#
+# Automated S3 workflow (all inside scripts/backup.py, boto3 pinned via
+# backup-deps venv; real B2 unverified — needs live credentials):
+# S3 backup: offline check -> SST objects copied from s3://BUCKET/ROOT/ to
+#   the immutable s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/sst/ (SHA256+size
+#   streamed and verified per object; failure rolls back own copies) -> local tar (0600,
+#   embeds manifest.json incl. the SST record) + .sha256 -> tar + sidecar +
+#   manifest uploaded to s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/ and
+#   GET-and-hash verified -> COMPLETE marker written -> only then old local
+#   generations pruned (never the file just written; remote objects never
+#   pruned, except a failed run's own writes). Overlapping live/backup
+#   prefixes fail closed. File mode keeps the same offline/tar/restore
+#   contract with no S3 at all.
+# S3 restore: offline check -> missing local archive auto-downloads the
+#   selected (BACKUP_FILE id/name) or newest COMPLETE remote backup and
+#   SHA-verifies it -> refuses non-empty local targets (no force flag) ->
+#   reuses live SST objects only after matching SHA256+size; conflicts or
+#   unreadable objects fail closed -> restores missing SSTs with per-object
+#   verification -> staged tar populate. Failure deletes only this run's
+#   writes. Legacy archives without an SST record are unrestorable in S3 mode.
+# Never set lifecycle expiry on the backup prefix; the raw MF4 bucket is
+# separate and never touched.
+# Fresh-host/disaster recovery: fresh COMPOSE_PROJECT_NAME (empty volumes by
+# construction) + same `.env`; S3 restore pulls the tar from S3 itself.
+# File mode sets BACKUP_VOLUME_NAME to the existing backup volume and
+# BACKUP_VOLUME_EXTERNAL=true in the fresh dotenv, so recovery cannot delete it.
+# Preflight then regenerates greptimedb.toml + auth/users from the current
+# .env, overwriting the stale restored credentials.
+
+services:
+  backup-deps:
+    image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [backup, server]
+    volumes:
+      - backup-venv:/opt/venv
+    # Pinned-content guard: recreate the venv when pins change, so a stale
+    # venv can never silently run a mismatched boto3.
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        printf '%s' 'boto3==1.43.98' > /tmp/.backup_want;
+        if test -f /opt/venv/.backup_ready &&
+        cmp -s /tmp/.backup_want /opt/venv/.backup_ready; then exit 0; fi;
+        python3 -m venv --clear /opt/venv &&
+        /opt/venv/bin/pip install --no-cache-dir
+        boto3==1.43.98 &&
+        cp /tmp/.backup_want /opt/venv/.backup_ready
+    restart: "no"
+
+  storage-metrics:
+    image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server]
+    depends_on:
+      backup-deps:
+        condition: service_completed_successfully
+    environment:
+      GREPTIME_STORAGE_TYPE: ${GREPTIME_STORAGE_TYPE:-S3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_REGION: ${S3_REGION:-}
+      STORAGE_METRICS_INTERVAL_SEC: ${STORAGE_METRICS_INTERVAL_SEC:-3600}
+    volumes:
+      - backup-venv:/opt/venv:ro
+      - greptime-data:/greptime-data:ro
+    configs:
+      - source: storage_metrics_py
+        target: /app/storage_metrics.py
+        mode: 0444
+      - source: greptime_preflight
+        target: /app/greptime_preflight.py
+    entrypoint: [/opt/venv/bin/python, /app/storage_metrics.py]
+    # Internal only: scraped via the server network, never host-published.
+    expose:
+      - "9105"
+    restart: unless-stopped
+
+  backup:
+    image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [backup]
+    depends_on:
+      backup-deps:
+        condition: service_completed_successfully
+    environment:
+      BACKUP_DIR: /backup
+      BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      BACKUP_FILE: ${BACKUP_FILE:-}
+      BACKUP_OFFLINE_CONFIRMED: ${BACKUP_OFFLINE_CONFIRMED:-}
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
+      GREPTIME_STORAGE_TYPE: ${GREPTIME_STORAGE_TYPE:-S3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_REGION: ${S3_REGION:-}
+      S3_ROOT: ${S3_ROOT:-greptime}
+      S3_BACKUP_PREFIX: ${S3_BACKUP_PREFIX:-greptime-backups}
+    volumes:
+      - greptime-data:/source/greptime-data
+      - greptime-etc:/source/greptime-etc
+      - backup-data:/backup
+      - backup-venv:/opt/venv:ro
+    configs:
+      - source: backup_py
+        target: /app/backup.py
+        mode: 0444
+      - source: greptime_preflight
+        target: /app/greptime_preflight.py
+    entrypoint: ["/opt/venv/bin/python", "/app/backup.py"]
+    command: ["backup"]
+    restart: "no"
+
+configs:
+  backup_py:
+    x-source: scripts/backup.py
+  storage_metrics_py:
+    x-source: scripts/storage_metrics.py
+
+
+volumes:
+  backup-data:
+    name: ${BACKUP_VOLUME_NAME:-${COMPOSE_PROJECT_NAME}_backup-data}
+    external: ${BACKUP_VOLUME_EXTERNAL:-false}
+  backup-venv:
