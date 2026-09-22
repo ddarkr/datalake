@@ -2,6 +2,9 @@ services:
   grafana:
     image: ${GRAFANA_IMAGE:-grafana/grafana:12.4.0}
     profiles: [server]
+    # Bump with dashboard changes: inline configs alone do not trigger recreation.
+    labels:
+      datalake.dashboard-revision: "2"
     depends_on:
       db-schema:
         condition: service_completed_successfully
