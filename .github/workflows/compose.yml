@@ -1,0 +1,37 @@
+name: Compose validation
+
+on:
+  push:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install renderer dependency
+        run: python -m pip install PyYAML==6.0.2
+      - name: Check environment contract and renderer regressions
+        run: |
+          python tools/check_env.py
+          python tests/test_render.py
+      - name: Check generated deployment bundle is current
+        run: |
+          python tools/render.py \
+            compose/core.yaml compose/database.yaml compose/ingest.yaml \
+            compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml \
+            compose/vehicle-vss.yaml compose/redecode.yaml \
+            --out "$RUNNER_TEMP/compose.yaml"
+          diff -u compose.yaml "$RUNNER_TEMP/compose.yaml"
+      - name: Validate every Compose profile without deployment credentials
+        run: |
+          docker compose version
+          for profile in server home mqtt vehicle backup redecode '*'; do
+            docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
+          done
