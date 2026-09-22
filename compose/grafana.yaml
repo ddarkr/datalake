@@ -2,8 +2,6 @@ services:
   grafana:
     image: ${GRAFANA_IMAGE:-grafana/grafana:12.4.0}
     profiles: [server]
-    labels:
-      io.doda.datalake.gitops-verification: "20260922"
     depends_on:
       db-schema:
         condition: service_completed_successfully
