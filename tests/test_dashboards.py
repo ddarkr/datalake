@@ -37,7 +37,37 @@ def test_coverage_distinguishes_absence_from_observed_zero():
                        [(1500,), (1500,), (3000,)])
         assert [db.execute(q).fetchone()[0] for q in queries] == [1, 1]
 
+def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-ai-usage"]["content"])
+    panel = next(p for p in dashboard["panels"] if p["id"] == 12)
+    query = panel["targets"][0]["rawSql"].replace("$$", "$")
+    query = query.replace("$__timeFilter(day_start)", "day_start BETWEEN 1000 AND 2000")
+    with sqlite3.connect(":memory:") as db:
+        db.execute("""CREATE TABLE ai_daily_summary (
+            day_start INTEGER, cost_usd REAL,
+            cost_estimated_usd REAL, cost_unpriced_calls INTEGER)""")
+        # Legacy/unprocessed row stays fully unknown.
+        db.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, NULL, NULL)")
+        assert db.execute(query).fetchone() == (None, None, None, None)
+        # Mixed reported + supplemental, explicit zero kept, unresolved counted.
+        db.execute("INSERT INTO ai_daily_summary VALUES (1500, 0.0, NULL, 0)")
+        db.execute("INSERT INTO ai_daily_summary VALUES (1500, 0.02, 0.015, 2)")
+        total, reported, supplemental, unpriced = db.execute(query).fetchone()
+        assert reported == 0.02 and supplemental == 0.015 and unpriced is None
+        assert abs(total - 0.035) < 1e-9
+        # Unknown legacy coverage must not disappear beside evaluated rows.
+        db.execute("DELETE FROM ai_daily_summary WHERE cost_unpriced_calls IS NULL")
+        assert db.execute(query).fetchone()[3] == 2
+        # Supplemental-only row: total equals the estimate, reported stays NULL.
+        with sqlite3.connect(":memory:") as only:
+            only.execute("""CREATE TABLE ai_daily_summary (
+                day_start INTEGER, cost_usd REAL,
+                cost_estimated_usd REAL, cost_unpriced_calls INTEGER)""")
+            only.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, 0.015, 0)")
+            assert only.execute(query).fetchone() == (0.015, None, 0.015, 0)
 
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
-    print("test_dashboards: ok (absence, observed zero, retransmission, time range)")
+    test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
+    print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost)")

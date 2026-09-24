@@ -18,9 +18,12 @@ import os
 import sys
 import threading
 import urllib.parse
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
 import aggregate as agg
+
+
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -544,6 +547,7 @@ def _ai_cfg(**over):
     return cfg
 
 
+@patch.object(agg, "load_price_table", lambda: None)
 def test_late_earlier_span_replaces_session_start_and_stays_idempotent():
     # Main's live repro: initial logical-smoke session starts at
     # 1790004181528579000 (input 11/output 5), then a late earlier span at
@@ -664,6 +668,7 @@ def test_arbitrary_span_service_never_becomes_client():
     assert unknown[0]["client"] == "unknown", unknown
 
 
+@patch.object(agg, "load_price_table", lambda: None)
 def test_ttl_preserves_partly_expired_windows_but_recomputes_retained():
     import datetime as dt
     now = dt.datetime(2026, 9, 21, 12, 0, 0)
@@ -800,6 +805,146 @@ def test_session_preserves_every_observed_model():
     assert session["model_count"] == 2, session
 
 
+def _priced(model="m", provider="openai", rates=(0.001, 0.002, 0.0005, 0.004, 0.002),
+            mode="chat"):
+    return {model: rates + (mode, provider)}
+
+
+def test_supplemental_mixed_present_missing_zero_untouched():
+    # Reported costs (including explicit 0) are never overwritten: the
+    # estimate covers only the missing-cost call; totals stay separate.
+    missing = billed_span("2026-09-21 10:00:00", "s1", "codex", "r1",
+                          110, 5, None)
+    missing.update(model="m", provider="openai", cache_read=10,
+                   cache_write=0, reasoning=0)
+    present = billed_span("2026-09-21 10:01:00", "s1", "codex", "r2",
+                          5, 5, 0.01)
+    present.update(model="m", provider="openai")
+    zero = billed_span("2026-09-21 10:02:00", "s1", "codex", "r3",
+                       5, 5, 0.0)
+    zero.update(model="m", provider="openai")
+    daily = agg.summarize_daily([missing, present, zero], _priced())[0]
+    assert daily["cost"] == 0.01, daily  # reported kept, never summed in
+    assert daily["cost_source"] == "estimated", daily
+    assert abs(daily["cost_estimated_usd"] - 0.115) < 1e-12, daily
+    assert daily["cost_unpriced_calls"] == 0, daily
+    sess = agg.summarize_sessions([missing, present, zero], _priced())[0]
+    assert (sess["cost"], sess["cost_estimated_usd"],
+            sess["cost_unpriced_calls"]) == (0.01, daily["cost_estimated_usd"], 0)
+
+
+def test_supplemental_unknown_model_counts_unpriced():
+    row = billed_span("2026-09-21 10:00:00", "s1", "codex", "r1",
+                      10, 5, None)
+    row.update(model="unknown-model", provider="openai")
+    daily = agg.summarize_daily([row], _priced())[0]
+    assert daily["cost"] is None and daily["cost_estimated_usd"] is None
+    assert daily["cost_unpriced_calls"] == 1, daily
+
+
+def test_supplemental_never_runs_without_prices_or_unverified_semantics():
+    # Legacy default (no prices arg) preserves NULLs for unprocessed rows.
+    row = billed_span("2026-09-21 10:00:00", "s1", "codex", "r1",
+                      10, 5, None)
+    row.update(model="m", provider="openai")
+    legacy = agg.summarize_daily([row])[0]
+    assert legacy["cost_estimated_usd"] is None
+    assert legacy["cost_unpriced_calls"] is None, legacy
+    # agy carries length-heuristic estimates (plugins/agy/hook.mjs), and
+    # unknown clients have no verified token contract: never estimated.
+    for client in ("agy", "unknown-client"):
+        unverified = billed_span("2026-09-21 10:00:00", "s1", client,
+                                 "r1", 10, 5, None)
+        unverified.update(model="m", provider="openai")
+        got = agg.summarize_daily([unverified], _priced())[0]
+        assert got["cost_estimated_usd"] is None
+        assert got["cost_unpriced_calls"] == 1, got
+
+
+def test_supplemental_cache_math_invalid_data_and_receipt_suppression():
+    table = _priced()
+    # claude-code input excludes cache buckets; opencode output includes
+    # reasoning; codex input includes cache (verified plugin mappings).
+    claude = billed_span("2026-09-21 10:00:00", "s1", "claude-code",
+                         "r1", 100, 5, None)
+    claude.update(model="m", provider="openai", cache_read=10,
+                  cache_write=0, reasoning=0)
+    assert abs(agg.estimate_call(claude, table) -
+               (100 * 0.001 + 10 * 0.0005 + 5 * 0.002)) < 1e-12
+    opencode = billed_span("2026-09-21 10:00:00", "s1", "opencode",
+                           "r1", 100, 7, None)
+    opencode.update(model="m", provider="openai", reasoning=2)
+    assert abs(agg.estimate_call(opencode, table) -
+               (100 * 0.001 + 5 * 0.002 + 2 * 0.002)) < 1e-12
+    codex = dict(opencode, client="codex")
+    assert abs(agg.estimate_call(codex, table) - 0.114) < 1e-12
+    assert agg.estimate_call(dict(codex, input=None), table) is None
+    assert agg.estimate_call(dict(codex, output=None), table) is None
+    assert agg.estimate_call(dict(codex, client="oh-my-pi"), table) is None
+    assert agg.estimate_call(claude, {"m": (0.001, 0.002, None, None,
+                                            None, "chat", "openai")}) is None
+    tiered = agg._parse_price_table({"m": {
+        "litellm_provider": "openai", "mode": "chat",
+        "input_cost_per_token": 0.001, "output_cost_per_token": 0.002,
+        "input_cost_per_token_above_200k_tokens": 0.002}})
+    assert agg.estimate_call(dict(codex, input=300000), tiered) is None
+    # Non-int counts, negative split remainder, missing rate, vendor or
+    # mode mismatch all fail closed (None, counted unpriced downstream).
+    bad = billed_span("2026-09-21 10:00:00", "s1", "codex", "r1",
+                      10, 5, None)
+    bad.update(model="m", provider="openai", cache_read="x")
+    assert agg.estimate_call(bad, table) is None
+    assert agg.estimate_call(claude, {"m": (None, 0.002, 0.0005, 0.004,
+                                            0.002, "chat", "openai")}) is None
+    assert agg.estimate_call(claude, {"m": (0.001, 0.002, 0.0005, 0.004,
+                                            0.002, "chat", "anthropic")}) is None
+    assert agg.estimate_call(claude, {"m": (0.001, 0.002, 0.0005, 0.004,
+                                            0.002, "embedding", "openai")}) is None
+    # Turn-suppressed parts are covered by the turn total: neither
+    # estimated nor counted unpriced.
+    part = billed_span("2026-09-21 10:00:00", "s1", "codex", "r1",
+                       10, 5, None)
+    part.update(model="m", provider="openai", turn="t1")
+    total = dict(part)
+    total.update(turn_total=True, input=None, output=None, cost_est=0.5,
+                 cost_source="estimated")
+    daily = agg.summarize_daily([part, total], table)[0]
+    assert daily["cost"] == 0.5 and daily["cost_estimated_usd"] is None
+    assert daily["cost_unpriced_calls"] == 0, daily
+
+
+@patch.dict(agg._PRICES, table=None, ok_at=0.0, attempt_at=0.0)
+def test_price_loader_caches_refresh_failure_and_rejects_bad_payload():
+    calls = {"n": 0}
+
+    def bad():
+        calls["n"] += 1
+        raise OSError("registry down")
+
+    assert agg.load_price_table(now=10000.0, fetch=bad) is None
+    assert calls["n"] == 1
+    # Retry backoff: no refetch every aggregate pass.
+    assert agg.load_price_table(now=10001.0, fetch=bad) is None
+    assert calls["n"] == 1
+    import json as _json
+    good = {"m": {"litellm_provider": "openai", "mode": "chat",
+                   "input_cost_per_token": 1, "output_cost_per_token": 2}}
+    table = agg.load_price_table(
+        now=20000.0, fetch=lambda: _json.dumps(good).encode())
+    assert table["m"][0] == 1.0
+    # Daily cache: no fetch; expired refresh failure keeps last-good.
+    assert agg.load_price_table(now=20001.0, fetch=bad)["m"][0] == 1.0
+    assert calls["n"] == 1
+    assert agg.load_price_table(now=20000.0 + 86400 + 1,
+                                fetch=bad)["m"][0] == 1.0
+    assert calls["n"] == 2
+    assert agg.load_price_table(now=20000.0 + 86400 + 3601,
+                                fetch=lambda: b"{}")["m"][0] == 1.0
+    # Prose/non-model keys skipped; non-object payload rejected.
+    assert agg._parse_price_table({"sample_spec": {},
+                                    "x": {"mode": "chat"}}) == {}
+    assert agg._parse_price_table(["nope"]) is None
+
 if __name__ == "__main__":
     test_sql_error_raises()
     test_per_call_billing_excludes_rollups_and_cumulative_parents()
@@ -829,4 +974,9 @@ if __name__ == "__main__":
     test_native_scope_selection_preserves_context_without_double_billing()
     test_missing_session_never_suppresses_unrelated_span_usage()
     test_session_preserves_every_observed_model()
-    print("test_database: ok (28 tests)")
+    test_supplemental_mixed_present_missing_zero_untouched()
+    test_supplemental_unknown_model_counts_unpriced()
+    test_supplemental_never_runs_without_prices_or_unverified_semantics()
+    test_supplemental_cache_math_invalid_data_and_receipt_suppression()
+    test_price_loader_caches_refresh_failure_and_rejects_bad_payload()
+    print("test_database: ok (33 tests)")

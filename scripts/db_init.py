@@ -282,6 +282,8 @@ def ddl_statements(otel_ttl):
   "total_tokens" Int64 NULL,
   "cost_usd" Float64 NULL,
   "cost_source" STRING NULL,
+  "cost_estimated_usd" Float64 NULL,
+  "cost_unpriced_calls" Int64 NULL,
   "llm_spans" Int64 NULL,
   "tool_calls" Int64 NULL,
   "error_count" Int64 NULL,
@@ -303,6 +305,8 @@ def ddl_statements(otel_ttl):
   "total_tokens" Int64 NULL,
   "cost_usd" Float64 NULL,
   "cost_source" STRING NULL,
+  "cost_estimated_usd" Float64 NULL,
+  "cost_unpriced_calls" Int64 NULL,
   "llm_spans" Int64 NULL,
   "tool_calls" Int64 NULL,
   "active_sessions" Int64 NULL,
@@ -411,6 +415,14 @@ def alter_statements():
         ' "trace_flags" UInt32',
         'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
         ' "cost_source" STRING',
+        'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
+        ' "cost_estimated_usd" Float64',
+        'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
+        ' "cost_unpriced_calls" Int64',
+        'ALTER TABLE "ai_session_summary" ADD COLUMN IF NOT EXISTS'
+        ' "cost_estimated_usd" Float64',
+        'ALTER TABLE "ai_session_summary" ADD COLUMN IF NOT EXISTS'
+        ' "cost_unpriced_calls" Int64',
         'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
         ' "error_count" Int64',
         'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'

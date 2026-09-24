@@ -57,6 +57,8 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles:
     - server
+    labels:
+      datalake.schema-revision: '1'
     depends_on:
       greptimedb:
         condition: service_started
@@ -82,6 +84,8 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles:
     - server
+    labels:
+      datalake.aggregate-revision: '1'
     depends_on:
       greptimedb:
         condition: service_started
@@ -226,7 +230,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.dashboard-revision: '4'
+      datalake.dashboard-revision: '5'
     depends_on:
       db-schema:
         condition: service_completed_successfully
@@ -1224,6 +1228,8 @@ configs:
         "total_tokens" Int64 NULL,
         "cost_usd" Float64 NULL,
         "cost_source" STRING NULL,
+        "cost_estimated_usd" Float64 NULL,
+        "cost_unpriced_calls" Int64 NULL,
         "llm_spans" Int64 NULL,
         "tool_calls" Int64 NULL,
         "error_count" Int64 NULL,
@@ -1245,6 +1251,8 @@ configs:
         "total_tokens" Int64 NULL,
         "cost_usd" Float64 NULL,
         "cost_source" STRING NULL,
+        "cost_estimated_usd" Float64 NULL,
+        "cost_unpriced_calls" Int64 NULL,
         "llm_spans" Int64 NULL,
         "tool_calls" Int64 NULL,
         "active_sessions" Int64 NULL,
@@ -1353,6 +1361,14 @@ configs:
               ' "trace_flags" UInt32',
               'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
               ' "cost_source" STRING',
+              'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
+              ' "cost_estimated_usd" Float64',
+              'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
+              ' "cost_unpriced_calls" Int64',
+              'ALTER TABLE "ai_session_summary" ADD COLUMN IF NOT EXISTS'
+              ' "cost_estimated_usd" Float64',
+              'ALTER TABLE "ai_session_summary" ADD COLUMN IF NOT EXISTS'
+              ' "cost_unpriced_calls" Int64',
               'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
               ' "error_count" Int64',
               'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'
@@ -1525,6 +1541,208 @@ configs:
       MIXED = "mixed"
       TTL_RE = re.compile(r"^[0-9]+[smhd]$$")
       TTL_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+      # --- Supplemental cost estimates (public list rates, never invoices) ---
+      #
+      # Stdlib-only load of LiteLLM's public model_prices_and_context_window.json
+      # (per-token USD fields input_cost_per_token, output_cost_per_token,
+      # cache_read_input_token_cost, cache_creation_input_token_cost,
+      # output_cost_per_reasoning_token; entry identity is the model key plus
+      # litellm_provider). Memory-only: the aggregate service has no volume, so a
+      # restart refetches. Refresh is at most daily per process; a failed refresh
+      # keeps the last-good table and waits PRICE_RETRY_S before retrying, so a
+      # down registry never retries every aggregate pass.
+      LITELLM_PRICE_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/main/"
+                           "model_prices_and_context_window.json")
+      PRICE_REFRESH_S = 86400
+      PRICE_RETRY_S = 3600
+      PRICE_TIMEOUT_S = 10
+      PRICE_MAX_BYTES = 8 * 1024 * 1024
+      # Clients whose token semantics are source-verified above (plugins/*):
+      # claude-code input excludes cache buckets (Anthropic API); the rest report
+      # input inclusive of cache. Unknown clients never receive estimates.
+      _EST_CLIENTS = frozenset({"codex", "oh-my-pi", "opencode", "claude-code"})
+      _CHAT_MODES = frozenset({"chat", "completion", "responses"})
+      _PRICES = {"table": None, "ok_at": 0.0, "attempt_at": 0.0}
+      def _price_num(value):
+          """Non-negative finite USD rate, or None when absent/unparseable."""
+          if value is None or isinstance(value, bool):
+              return None
+          if isinstance(value, (int, float)):
+              num = float(value)
+          elif isinstance(value, str):
+              try:
+                  num = float(value.strip())
+              except ValueError:
+                  return None
+          else:
+              return None
+          if num != num or num in (float("inf"), float("-inf")) or num < 0:
+              return None
+          return num
+
+
+      def _parse_price_table(data):
+          """{model key: (in, out, cache_read, cache_write, reasoning, mode,
+          provider)}. Entries without a litellm_provider string are skipped
+          (sample_spec prose, fallback_generalizations regex rules); unknown
+          fields ignored so new upstream fields never break parsing."""
+          if not isinstance(data, dict):
+              return None
+          out = {}
+          for key, entry in data.items():
+              if not isinstance(key, str) or not isinstance(entry, dict):
+                  continue
+              provider = entry.get("litellm_provider")
+              if not isinstance(provider, str) or not provider:
+                  continue
+              # Long-context tariffs need request-specific tiers; do not silently
+              # apply the base rate while this lightweight estimator lacks them.
+              if ("tiered_pricing" in entry or "off_peak_pricing" in entry
+                      or any("_above_" in field and "cost" in field for field in entry)):
+                  continue
+              out[key] = (
+                  _price_num(entry.get("input_cost_per_token")),
+                  _price_num(entry.get("output_cost_per_token")),
+                  _price_num(entry.get("cache_read_input_token_cost")),
+                  _price_num(entry.get("cache_creation_input_token_cost")),
+                  _price_num(entry.get("output_cost_per_reasoning_token")),
+                  entry.get("mode"), provider)
+          return out
+
+
+      def _fetch_price_bytes(url=LITELLM_PRICE_URL, timeout=PRICE_TIMEOUT_S):
+          req = urllib.request.Request(url, method="GET")
+          with urllib.request.urlopen(req, timeout=timeout) as resp:
+              raw = resp.read(PRICE_MAX_BYTES + 1)
+          if len(raw) > PRICE_MAX_BYTES:
+              raise SqlError("price payload too large")
+          return raw
+
+
+      def load_price_table(now=None, fetch=None):
+          """Cached LiteLLM price table, or None when never fetched successfully.
+          At most one fetch per PRICE_REFRESH_S; a failed refresh keeps the
+          last-good table and waits PRICE_RETRY_S, so a down registry never
+          retries every aggregate pass. Aggregation never fails for pricing:
+          failure returns the last-good table (or None). Tests pass fetch=...
+          to avoid network."""
+          now = time.time() if now is None else now
+          if _PRICES["table"] is not None and now - _PRICES["ok_at"] < PRICE_REFRESH_S:
+              return _PRICES["table"]
+          if now - _PRICES["attempt_at"] < PRICE_RETRY_S:
+              return _PRICES["table"]
+          _PRICES["attempt_at"] = now
+          try:
+              raw = fetch() if fetch is not None else _fetch_price_bytes()
+              table = _parse_price_table(json.loads(raw.decode("utf-8")))
+              if not table:
+                  raise SqlError("price payload has no usable entries")
+          except Exception:
+              return _PRICES["table"]
+          _PRICES["table"] = table
+          _PRICES["ok_at"] = now
+          return table
+
+
+      def _price_entry(table, model, provider):
+          """The one exact-matching entry billed by this call's vendor, in a
+          token-priced mode. The provider-prefixed key wins when it matches the
+          vendor, else the bare model key; anything else (unknown, vendor
+          mismatch, image/embedding/audio mode) is None: fail closed."""
+          if provider:
+              prefixed = table.get(provider + "/" + model)
+              if isinstance(prefixed, tuple) and prefixed[6] == provider and (
+                      prefixed[5] is None or prefixed[5] in _CHAT_MODES):
+                  return prefixed
+          bare = table.get(model)
+          if isinstance(bare, tuple) and bare[6] == provider and (
+                  bare[5] is None or bare[5] in _CHAT_MODES):
+              return bare
+          return None
+
+
+      def _tok(value):
+          if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+              return None
+          return value
+
+
+      def estimate_call(row, table):
+          """Supplemental USD for one missing-cost LLM call, or None (fail closed).
+          Callers only pass rows with no reported cost (including 0). Token
+          semantics are per verified plugin mapping: claude-code input excludes
+          cache buckets; the other supported clients include them. Codex and
+          OpenCode output includes reasoning, so never charge that subset twice.
+          OMP reasoning conventions are not inferred from a breakdown alone.
+          Missing cache rates remain unknown; reasoning defaults to output rates."""
+          if table is None or row.get("client") not in _EST_CLIENTS:
+              return None
+          model, provider = row.get("model"), row.get("provider")
+          if not model or not provider:
+              return None
+          entry = _price_entry(table, model, provider)
+          if entry is None:
+              return None
+          vals = [_tok(row.get(k)) for k in
+                  ("input", "output", "cache_read", "cache_write", "reasoning")]
+          if any(v is None and row.get(k) is not None
+                 for v, k in zip(vals, ("input", "output", "cache_read",
+                                        "cache_write", "reasoning"))):
+              return None
+          if vals[0] is None or vals[1] is None:
+              return None
+          inp, outp, cread, cwrite, reason = (v or 0 for v in vals)
+          if row["client"] == "claude-code":
+              text_in = inp
+          else:
+              text_in = inp - cread - cwrite
+          if text_in < 0:
+              return None
+          if reason and row["client"] not in ("codex", "opencode"):
+              return None
+          if row["client"] in ("codex", "opencode"):
+              text_out = outp - reason
+          else:
+              text_out = outp
+          if text_out < 0:
+              return None
+          rin, rout, rread, rwrite, rreason = entry[:5]
+          parts = [(text_in, rin),
+                   (cread, rread),
+                   (cwrite, rwrite),
+                   (text_out, rout),
+                   (reason, rreason if rreason is not None else rout)]
+          total = 0.0
+          for qty, rate in parts:
+              if qty == 0:
+                  continue
+              if rate is None:
+                  return None
+              total += qty * rate
+          return total
+
+
+      def _supplemental(bs, cost_ids, prices):
+          """(estimated_sum_or_None, unpriced_count_or_None) over money-eligible
+          missing-cost LLM calls. Rows already carrying cost (including 0) keep
+          it and are ignored; turn-suppressed parts (outside cost_ids) never get
+          fallback and never count as unpriced since the turn total covers them.
+          prices None (never loaded) means unevaluated: (None, None)."""
+          if prices is None:
+              return None, None
+          calls = {id(s) for s in llm_calls(bs)}
+          est, unpriced = [], 0
+          for s in bs:
+              if id(s) not in cost_ids or id(s) not in calls:
+                  continue
+              if resolve_cost(s) != (None, None):
+                  continue
+              val = estimate_call(s, prices)
+              if val is None:
+                  unpriced += 1
+              else:
+                  est.append(val)
+          return (sum(est) if est else None), unpriced
 
 
       STOP = False
@@ -2306,7 +2524,10 @@ configs:
                   or totals[(row.get("client"), row.get("session"), row.get("turn"))] is row}
 
 
-      def summarize_sessions(spans):
+      _SENTINEL = object()
+
+
+      def summarize_sessions(spans, prices=_SENTINEL):
           billed = billable(spans)
           bset = {id(s) for s in billed}
           cost_ids = _cost_ids(billed)
@@ -2341,6 +2562,10 @@ configs:
               money = [s for s in bs if id(s) in cost_ids]
               cost_total = sum_opt([resolve_cost(s)[0] for s in money])
               cost_src = cost_label(money)
+              if prices is _SENTINEL:
+                  cost_est, unpriced = None, None
+              else:
+                  cost_est, unpriced = _supplemental(bs, cost_ids, prices)
               out.append({
                   "session_start": start, "session_id": sid,
                   "client": client,  # group key fallback, never NULL
@@ -2359,14 +2584,15 @@ configs:
                                     for s in bs]),
                   "cost": cost_total,
                   "cost_source": cost_src,
+                  "cost_estimated_usd": cost_est,
+                  "cost_unpriced_calls": unpriced,
                   "llm_spans": len(llm_calls(bs)) or None,
                   "tool_calls": len([s for s in ss if s["tool"] and id(s) in kept_tools]) or None,
                   "errors": sum(1 for s in ss if s["error"] and (not s.get("tool") or id(s) in kept_tools)) or None,
               })
           return out
 
-
-      def summarize_daily(spans):
+      def summarize_daily(spans, prices=_SENTINEL):
           billed = billable(spans)
           bset = {id(s) for s in billed}
           cost_ids = _cost_ids(billed)
@@ -2391,6 +2617,10 @@ configs:
               money = [s for s in bs if id(s) in cost_ids]
               cost_total = sum_opt([resolve_cost(s)[0] for s in money])
               cost_src = cost_label(money)
+              if prices is _SENTINEL:
+                  cost_est, unpriced = None, None
+              else:
+                  cost_est, unpriced = _supplemental(bs, cost_ids, prices)
               out.append({
                   "day": day, "client": client, "provider": provider, "model": model,
                   "input": sum_opt([s["input"] for s in bs]),
@@ -2403,6 +2633,8 @@ configs:
                                     for s in bs]),
                   "cost": cost_total,
                   "cost_source": cost_src,
+                  "cost_estimated_usd": cost_est,
+                  "cost_unpriced_calls": unpriced,
                   "llm_spans": len(llm_calls(bs)) or None,
                   "tool_calls": len([s for s in g["all"] if s["tool"] and id(s) in kept_tools]) or None,
                   "sessions": len({s["session"] for s in g["all"] if s["session"]}) or None,
@@ -3169,9 +3401,12 @@ configs:
           now = utcnow()
           bound = retention_boundary(ctx, "otel", ttl, now)
           total = 0
+          # One registry fetch per pass at most (itself daily-cached in memory):
+          # aggregation never fails for pricing; None keeps legacy NULLs.
+          prices = load_price_table()
           activity_sessions, activity_days = summarize_activity(
               [dict(zip(cols, row)) for row in rows], raw_logs, activity_metric_rows(ctx, cfg))
-          sessions = {(s["client"], s["session_id"]): s for s in summarize_sessions(spans)}
+          sessions = {(s["client"], s["session_id"]): s for s in summarize_sessions(spans, prices)}
           for key, activity in activity_sessions.items():
               s = sessions.setdefault(key, {"client": key[0], "session_id": key[1]})
               starts = [v for v in (s.get("session_start"), activity.get("start")) if v is not None]
@@ -3197,6 +3432,7 @@ configs:
                            "model_count", "session_end", "duration_s", "input_tokens",
                            "output_tokens", "cache_read_tokens", "cache_write_tokens",
                            "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
+                           "cost_estimated_usd", "cost_unpriced_calls",
                            "llm_spans", "tool_calls", "error_count"] + list(ACTIVITY_FIELDS) +
                           ["repo", "branch", "outcome", "activity_sources"],
                           [[ts_lit(s["session_start"]), str_lit(s["session_id"]),
@@ -3207,7 +3443,8 @@ configs:
                             num_lit(s.get("output")), num_lit(s.get("cache_read")),
                             num_lit(s.get("cache_write")), num_lit(s.get("reasoning")),
                             num_lit(s.get("total")), num_lit(s.get("cost")),
-                            str_lit(s.get("cost_source")), num_lit(s.get("llm_spans")),
+                            str_lit(s.get("cost_source")), num_lit(s.get("cost_estimated_usd")),
+                            num_lit(s.get("cost_unpriced_calls")), num_lit(s.get("llm_spans")),
                             num_lit(s.get("tool_calls")), num_lit(s.get("errors"))] +
                            [num_lit(s.get(field)) for field in ACTIVITY_FIELDS] +
                            [str_lit(s.get(field)) for field in ("repo", "branch", "outcome")] +
@@ -3226,19 +3463,21 @@ configs:
                            [num_lit(day.get(field)) for field in ACTIVITY_FIELDS] +
                            [str_lit(json.dumps(day.get("activity_sources") or {}, sort_keys=True))]])
               total += 1
-          for d in summarize_daily(spans):
+          for d in summarize_daily(spans, prices):
               if bound and d["day"] < bound:
                   continue  # partly expired day: keep the old row
               insert_rows(base_url, auth, db, "ai_daily_summary",
                           ["day_start", "client", "provider", "model", "input_tokens",
                            "output_tokens", "cache_read_tokens", "cache_write_tokens",
                            "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
+                           "cost_estimated_usd", "cost_unpriced_calls",
                            "llm_spans", "tool_calls", "active_sessions", "error_count"],
                           [[ts_lit(d["day"]), str_lit(d["client"]), str_lit(d["provider"]),
                             str_lit(d["model"]), num_lit(d["input"]), num_lit(d["output"]),
                             num_lit(d["cache_read"]), num_lit(d["cache_write"]),
                             num_lit(d["reasoning"]), num_lit(d["total"]), num_lit(d["cost"]),
-                            str_lit(d["cost_source"]), num_lit(d["llm_spans"]),
+                            str_lit(d["cost_source"]), num_lit(d.get("cost_estimated_usd")),
+                            num_lit(d.get("cost_unpriced_calls")), num_lit(d["llm_spans"]),
                             num_lit(d["tool_calls"]), num_lit(d["sessions"]),
                             num_lit(d["errors"])]])
               total += 1
@@ -5133,19 +5372,19 @@ configs:
       ]}
   grafana-dash-ai-usage:
     content: |
-      {"uid":"datalake-ai-usage","title":"AI Usage","tags":["datalake","ai"],"timezone":"Asia/Seoul","schemaVersion":39,"version":3,"time":{"from":"now-30d","to":"now"},"description":"Token economics · model mix · observed usage. Costs are reported estimates, not invoices; missing values remain unknown.","refresh":"5m","links":[{"title":"Usage","type":"link","url":"/d/datalake-ai-usage","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Tools","type":"link","url":"/d/datalake-ai-tools","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Sessions","type":"link","url":"/d/datalake-ai-sessions","includeVars":false,"keepTime":true,"targetBlank":false}],"panels":[
+      {"uid":"datalake-ai-usage","title":"AI Usage","tags":["datalake","ai"],"timezone":"Asia/Seoul","schemaVersion":39,"version":4,"time":{"from":"now-30d","to":"now"},"description":"Token economics · model mix · observed usage. Costs are reported estimates plus supplemental public list-rate estimates (cached pricing, not invoices); missing values remain unknown. Known totals are partial when unpriced calls remain; NULL unpriced coverage marks legacy rows.","refresh":"5m","links":[{"title":"Usage","type":"link","url":"/d/datalake-ai-usage","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Tools","type":"link","url":"/d/datalake-ai-tools","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Sessions","type":"link","url":"/d/datalake-ai-sessions","includeVars":false,"keepTime":true,"targetBlank":false}],"panels":[
       {"id":10,"title":"Input tokens","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(input_tokens) AS tokens FROM ai_daily_summary WHERE $$__timeFilter(day_start)","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"No data","color":{"mode":"fixed","fixedColor":"blue"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":0,"y":0,"w":6,"h":4}},
       {"id":11,"title":"Output tokens","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(output_tokens) AS tokens FROM ai_daily_summary WHERE $$__timeFilter(day_start)","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"No data","color":{"mode":"fixed","fixedColor":"green"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":6,"y":0,"w":6,"h":4}},
-      {"id":12,"title":"Reported cost · USD","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(cost_usd) AS cost FROM ai_daily_summary WHERE $$__timeFilter(day_start)","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"currencyUSD","noValue":"No data","color":{"mode":"fixed","fixedColor":"orange"},"decimals":2,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":12,"y":0,"w":6,"h":4},"description":"Sum of observed cost_usd values; incomplete when a source does not report cost. Estimates, not invoices. Missing cost is not zero."},
+      {"id":12,"title":"Known cost · USD","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CASE WHEN SUM(cost_usd) IS NULL AND SUM(cost_estimated_usd) IS NULL THEN NULL ELSE COALESCE(SUM(cost_usd), 0) + COALESCE(SUM(cost_estimated_usd), 0) END AS cost_total, SUM(cost_usd) AS cost_reported, SUM(cost_estimated_usd) AS cost_supplemental, CASE WHEN COUNT(*) = COUNT(cost_unpriced_calls) THEN SUM(cost_unpriced_calls) ELSE NULL END AS unpriced_calls FROM ai_daily_summary WHERE $$__timeFilter(day_start)","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"currencyUSD","noValue":"Unknown","color":{"mode":"fixed","fixedColor":"orange"},"decimals":4,"mappings":[]},"overrides":[{"matcher":{"id":"byName","options":"cost_total"},"properties":[{"id":"displayName","value":"Known total"}]},{"matcher":{"id":"byName","options":"cost_reported"},"properties":[{"id":"displayName","value":"Reported"}]},{"matcher":{"id":"byName","options":"cost_supplemental"},"properties":[{"id":"displayName","value":"Estimated"}]},{"matcher":{"id":"byName","options":"unpriced_calls"},"properties":[{"id":"unit","value":"short"},{"id":"decimals","value":0},{"id":"displayName","value":"Unpriced"}]}]},"options":{"colorMode":"none","graphMode":"none","justifyMode":"center","orientation":"horizontal","textMode":"value_and_name","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":14,"titleSize":11}},"gridPos":{"x":12,"y":0,"w":6,"h":4},"description":"Known total = reported cost_usd + supplemental cost_estimated_usd (current LiteLLM public list-rate estimate, not invoice). Total NULL when both NULL; partial when unpriced calls > 0 or coverage is unknown. Unpriced 0 means all rows evaluated with no unresolved calls; Unknown includes legacy/unprocessed rows. Missing cost is not zero."},
       {"id":13,"title":"Sessions","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT NULLIF(COUNT(*), 0) AS sessions FROM (SELECT DISTINCT client, session_id FROM ai_session_summary WHERE $$__timeFilter(session_start)) AS observed_sessions","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"No data","color":{"mode":"fixed","fixedColor":"purple"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":18,"y":0,"w":6,"h":4}},
-      {"id":1,"type":"timeseries","title":"Daily token flow","description":"Observed daily usage from ai_daily_summary. Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported estimates are not billing invoices. Missing values stay NULL.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"time_series","rawSql":"SELECT day_start AS `time`, model, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM ai_daily_summary WHERE $$__timeFilter(day_start) GROUP BY `time`, model ORDER BY `time` ASC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","unit":"short","color":{"mode":"palette-classic"},"custom":{"drawStyle":"bars","lineInterpolation":"linear","barAlignment":0,"barWidthFactor":0.1,"lineWidth":1,"fillOpacity":75,"gradientMode":"opacity","showPoints":"auto","pointSize":5,"spanNulls":false,"axisBorderShow":false,"axisColorMode":"text","scaleDistribution":{"type":"linear"},"stacking":{"mode":"normal","group":"A"},"hideFrom":{"tooltip":false,"viz":false,"legend":false},"barMaxWidth":32}},"overrides":[]},"options":{"legend":{"displayMode":"table","placement":"bottom","calcs":["lastNotNull"],"showLegend":true},"tooltip":{"mode":"multi","sort":"desc"}},"gridPos":{"x":0,"y":4,"w":16,"h":10}},
+      {"id":1,"type":"timeseries","title":"Daily token flow","description":"Observed daily usage from ai_daily_summary. Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported plus supplemental public list-rate estimates are not billing invoices. cost_estimated_usd NULL means nothing estimated; cost_unpriced_calls 0 means evaluated with nothing unresolved, NULL marks legacy/unprocessed rows. Missing values stay NULL.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"time_series","rawSql":"SELECT day_start AS `time`, model, SUM(input_tokens) AS input_tokens, SUM(output_tokens) AS output_tokens FROM ai_daily_summary WHERE $$__timeFilter(day_start) GROUP BY `time`, model ORDER BY `time` ASC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","unit":"short","color":{"mode":"palette-classic"},"custom":{"drawStyle":"bars","lineInterpolation":"linear","barAlignment":0,"barWidthFactor":0.1,"lineWidth":1,"fillOpacity":75,"gradientMode":"opacity","showPoints":"auto","pointSize":5,"spanNulls":false,"axisBorderShow":false,"axisColorMode":"text","scaleDistribution":{"type":"linear"},"stacking":{"mode":"normal","group":"A"},"hideFrom":{"tooltip":false,"viz":false,"legend":false},"barMaxWidth":32}},"overrides":[]},"options":{"legend":{"displayMode":"table","placement":"bottom","calcs":["lastNotNull"],"showLegend":true},"tooltip":{"mode":"multi","sort":"desc"}},"gridPos":{"x":0,"y":4,"w":16,"h":10}},
       {"id":14,"title":"Model mix · input tokens","type":"bargauge","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT model, SUM(input_tokens) AS tokens FROM ai_daily_summary WHERE $$__timeFilter(day_start) AND input_tokens IS NOT NULL GROUP BY model ORDER BY tokens DESC LIMIT 8","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"—","color":{"mode":"continuous-BlPu"},"min":0},"overrides":[]},"options":{"displayMode":"gradient","orientation":"horizontal","showUnfilled":true,"valueMode":"color","namePlacement":"left","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":true},"text":{"titleSize":12,"valueSize":18}},"gridPos":{"x":16,"y":4,"w":8,"h":10}},
       {"id":20,"type":"row","title":"Usage ledger","collapsed":false,"panels":[],"gridPos":{"x":0,"y":14,"w":24,"h":1}},
-      {"id":2,"type":"table","title":"Usage by client & model","description":"Observed daily usage from ai_daily_summary. Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported estimates are not billing invoices. Missing values stay NULL.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, client, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, cost_usd, cost_source, llm_spans, active_sessions FROM ai_daily_summary WHERE $$__timeFilter(day_start) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":15,"w":24,"h":9}},
-      {"id":5,"type":"table","title":"Session ledger","description":"Identity is (client, session_id). Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported estimates are not billing invoices. Missing values stay NULL. Modified LOC, accepted/rejected added LOC, native active time, and observed session wall time are distinct. Repository is SHA256 only; branch and outcome require explicit source metadata. All observed session models are preserved as a JSON set.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT session_id, client, provider, models, model_count, CAST(session_start AS TIMESTAMP(6)) AS session_start, CAST(session_end AS TIMESTAMP(6)) AS session_end, duration_s, input_tokens, output_tokens, total_tokens, cost_usd, cost_source, llm_spans, tool_calls, error_count, subagents, lines_added, lines_removed, lines_accepted, lines_rejected, edit_accept_count, edit_reject_count, commit_count, pr_count, active_user_seconds, active_cli_seconds, session_wall_seconds, repo, branch, outcome, activity_sources FROM ai_session_summary WHERE $$__timeFilter(session_start) ORDER BY session_start DESC LIMIT 100","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":24,"w":24,"h":9}},
+      {"id":2,"type":"table","title":"Usage by client & model","description":"Observed daily usage from ai_daily_summary. Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported plus supplemental public list-rate estimates are not billing invoices. cost_estimated_usd NULL means nothing estimated; cost_unpriced_calls 0 means evaluated with nothing unresolved, NULL marks legacy/unprocessed rows. Missing values stay NULL.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, client, provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens, total_tokens, cost_usd, cost_estimated_usd, CASE WHEN cost_usd IS NULL AND cost_estimated_usd IS NULL THEN NULL ELSE COALESCE(cost_usd, 0) + COALESCE(cost_estimated_usd, 0) END AS cost_total, cost_unpriced_calls, cost_source, llm_spans, active_sessions FROM ai_daily_summary WHERE $$__timeFilter(day_start) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":15,"w":24,"h":9}},
+      {"id":5,"type":"table","title":"Session ledger","description":"Identity is (client, session_id). Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported plus supplemental public list-rate estimates are not billing invoices. cost_estimated_usd NULL means nothing estimated; cost_unpriced_calls 0 means evaluated with nothing unresolved, NULL marks legacy/unprocessed rows. Missing values stay NULL. Modified LOC, accepted/rejected added LOC, native active time, and observed session wall time are distinct. Repository is SHA256 only; branch and outcome require explicit source metadata. All observed session models are preserved as a JSON set.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT session_id, client, provider, models, model_count, CAST(session_start AS TIMESTAMP(6)) AS session_start, CAST(session_end AS TIMESTAMP(6)) AS session_end, duration_s, input_tokens, output_tokens, total_tokens, cost_usd, cost_estimated_usd, CASE WHEN cost_usd IS NULL AND cost_estimated_usd IS NULL THEN NULL ELSE COALESCE(cost_usd, 0) + COALESCE(cost_estimated_usd, 0) END AS cost_total, cost_unpriced_calls, cost_source, llm_spans, tool_calls, error_count, subagents, lines_added, lines_removed, lines_accepted, lines_rejected, edit_accept_count, edit_reject_count, commit_count, pr_count, active_user_seconds, active_cli_seconds, session_wall_seconds, repo, branch, outcome, activity_sources FROM ai_session_summary WHERE $$__timeFilter(session_start) ORDER BY session_start DESC LIMIT 100","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":24,"w":24,"h":9}},
       {"id":21,"type":"row","title":"Collection diagnostics","collapsed":false,"panels":[],"gridPos":{"x":0,"y":33,"w":24,"h":1}},
       {"id":3,"type":"stat","title":"Spans without token attributes","description":"Raw-span diagnostic: native OTel attributes absent on these spans; shown as missing, never as 0. Deduped by (trace_id, span_id). Final 48h of the selected range only. Empty input is No data; 0 means observed spans had the attribute. This is raw attribute coverage, not a claim every span should carry tokens/session identity.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(missing) AS spans_missing_tokens FROM (SELECT DISTINCT trace_id,span_id,CASE WHEN `span_attributes.gen_ai.usage.input_tokens` IS NULL AND `span_attributes.gen_ai.usage.output_tokens` IS NULL THEN 1 ELSE 0 END AS missing FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800)) AS observed","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"No data","unit":"short","color":{"mode":"fixed","fixedColor":"blue"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":0,"y":34,"w":6,"h":6}},
-      {"id":4,"type":"table","title":"Reported span errors","description":"Retransmitted error spans deduped by (trace_id, span_id).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT service_name, span_name, COUNT(*) AS errors FROM (SELECT DISTINCT trace_id, span_id, service_name, span_name FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND span_status_code = 'STATUS_CODE_ERROR') AS dedup GROUP BY service_name, span_name ORDER BY errors DESC LIMIT 50","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":6,"y":34,"w":18,"h":6}}
+      {"id":4,"type":"table","title":"Reported span errors","description":"Retransmitted error spans deduped by (trace_id, span_id).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT service_name, span_name, COUNT(*) AS errors FROM (SELECT DISTINCT trace_id, span_id, service_name, span_name FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND span_status_code = 'STATUS_CODE_ERROR') AS dedup GROUP BY service_name, span_name ORDER BY errors DESC LIMIT 50","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":6,"y":34,"w":18,"h":6}}
       ]}
   grafana-dash-ai-tools:
     content: |
@@ -5158,13 +5397,13 @@ configs:
       {"id":14,"title":"Daily tool activity","type":"timeseries","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"time_series","rawSql":"SELECT day_start AS `time`, client, SUM(calls) AS calls FROM ai_tool_daily WHERE $$__timeFilter(day_start) AND ($${client:sqlstring} = '' OR client = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR tool_name = $${tool:sqlstring}) GROUP BY `time`, client ORDER BY `time`","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"—","color":{"mode":"palette-classic"},"custom":{"drawStyle":"bars","lineInterpolation":"linear","barAlignment":0,"barWidthFactor":0.1,"lineWidth":1,"fillOpacity":75,"gradientMode":"opacity","showPoints":"auto","pointSize":5,"spanNulls":false,"axisBorderShow":false,"axisColorMode":"text","scaleDistribution":{"type":"linear"},"stacking":{"mode":"normal","group":"A"},"hideFrom":{"tooltip":false,"viz":false,"legend":false},"barMaxWidth":32}},"overrides":[]},"options":{"legend":{"displayMode":"table","placement":"bottom","calcs":["lastNotNull"],"showLegend":true},"tooltip":{"mode":"multi","sort":"desc"}},"gridPos":{"x":10,"y":4,"w":14,"h":10}},
       {"id":3,"type":"timeseries","title":"Tool latency · recent executions","description":"Raw-span diagnostic; retransmissions deduped by (trace_id, span_id). Latest 2000 tool spans, plotted oldest to newest; the inner query picks the recent window, the outer query restores chronological order. Only the final 48h of the selected range are scanned; client/tool filters apply.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"time_series","rawSql":"SELECT CAST(`time` AS TIMESTAMP(6)) AS `time`, client, tool, ms FROM (SELECT DISTINCT trace_id, span_id, COALESCE(`span_attributes.coding_agent.client`, service_name) AS client, timestamp AS `time`, `span_attributes.gen_ai.tool.name` AS tool, duration_nano / 1000000.0 AS ms FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800) AND ($${client:sqlstring} = '' OR COALESCE(`span_attributes.coding_agent.client`,service_name) = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR `span_attributes.gen_ai.tool.name` = $${tool:sqlstring}) AND `span_attributes.gen_ai.tool.name` IS NOT NULL AND duration_nano IS NOT NULL ORDER BY timestamp DESC LIMIT 2000) AS recent ORDER BY `time` ASC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","unit":"ms","color":{"mode":"palette-classic"},"custom":{"drawStyle":"points","lineInterpolation":"linear","barAlignment":0,"barWidthFactor":0.65,"lineWidth":1,"fillOpacity":75,"gradientMode":"opacity","showPoints":"always","pointSize":5,"spanNulls":false,"axisBorderShow":false,"axisColorMode":"text","scaleDistribution":{"type":"linear"},"stacking":{"mode":"none","group":"A"},"hideFrom":{"tooltip":false,"viz":false,"legend":false}}},"overrides":[]},"options":{"legend":{"displayMode":"table","placement":"bottom","calcs":["mean","max"],"showLegend":true},"tooltip":{"mode":"multi","sort":"desc"}},"gridPos":{"x":0,"y":14,"w":24,"h":9}},
       {"id":20,"type":"row","title":"Execution ledger","collapsed":false,"panels":[],"gridPos":{"x":0,"y":32,"w":24,"h":1}},
-      {"id":1,"type":"table","title":"Daily tool breakdown","description":"ai_tool_daily rows deduped at aggregate time; no raw-span double counting. Empty means no aggregates yet (absence).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, tool_name AS tool, client, calls, errors, avg_duration_ms FROM ai_tool_daily WHERE $$__timeFilter(day_start) AND ($${client:sqlstring} = '' OR client = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR tool_name = $${tool:sqlstring}) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":33,"w":24,"h":9}},
-      {"id":4,"type":"table","title":"Recent tool errors","description":"Latest 100 observed tool error spans in the final 48h of the selected range; exact retransmission duplicates removed. Client/tool filters apply. Click trace_id to inspect related spans/log metadata; error content stays redacted.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT DISTINCT CAST(timestamp AS TIMESTAMP(6)) AS time, service_name, span_name, `span_attributes.gen_ai.tool.name` AS tool, duration_nano / 1000000.0 AS duration_ms, trace_id, span_id FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800) AND `span_attributes.gen_ai.tool.name` IS NOT NULL AND ($${client:sqlstring} = '' OR COALESCE(`span_attributes.coding_agent.client`,service_name) = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR `span_attributes.gen_ai.tool.name` = $${tool:sqlstring}) AND span_status_code = 'STATUS_CODE_ERROR' ORDER BY time DESC LIMIT 100","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]},{"matcher":{"id":"byName","options":"trace_id"},"properties":[{"id":"links","value":[{"title":"Inspect this trace and correlated logs","url":"/d/datalake-overview?var-trace_id=$${__value.raw}&$${__url_time_range}","targetBlank":false}]}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":42,"w":24,"h":8}},
+      {"id":1,"type":"table","title":"Daily tool breakdown","description":"ai_tool_daily rows deduped at aggregate time; no raw-span double counting. Empty means no aggregates yet (absence).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, tool_name AS tool, client, calls, errors, avg_duration_ms FROM ai_tool_daily WHERE $$__timeFilter(day_start) AND ($${client:sqlstring} = '' OR client = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR tool_name = $${tool:sqlstring}) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":33,"w":24,"h":9}},
+      {"id":4,"type":"table","title":"Recent tool errors","description":"Latest 100 observed tool error spans in the final 48h of the selected range; exact retransmission duplicates removed. Client/tool filters apply. Click trace_id to inspect related spans/log metadata; error content stays redacted.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT DISTINCT CAST(timestamp AS TIMESTAMP(6)) AS time, service_name, span_name, `span_attributes.gen_ai.tool.name` AS tool, duration_nano / 1000000.0 AS duration_ms, trace_id, span_id FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800) AND `span_attributes.gen_ai.tool.name` IS NOT NULL AND ($${client:sqlstring} = '' OR COALESCE(`span_attributes.coding_agent.client`,service_name) = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR `span_attributes.gen_ai.tool.name` = $${tool:sqlstring}) AND span_status_code = 'STATUS_CODE_ERROR' ORDER BY time DESC LIMIT 100","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]},{"matcher":{"id":"byName","options":"trace_id"},"properties":[{"id":"links","value":[{"title":"Inspect this trace and correlated logs","url":"/d/datalake-overview?var-trace_id=$${__value.raw}&$${__url_time_range}","targetBlank":false}]}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":42,"w":24,"h":8}},
       {"id":15,"type":"table","title":"Tool latency tails · approximate p50 / p95 / p99","description":"Final 48h of the selected range, top 20 client/tool groups by p95. Computed from raw observations, NOT percentiles of daily averages. Small sample counts make tail estimates unstable. No matching spans means No data.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawSql":"SELECT client, tool, COUNT(*) AS duration_samples, approx_percentile_cont(ms,0.5) AS p50_ms, approx_percentile_cont(ms,0.95) AS p95_ms, approx_percentile_cont(ms,0.99) AS p99_ms, MAX(ms) AS max_ms FROM (SELECT DISTINCT trace_id,span_id,COALESCE(`span_attributes.coding_agent.client`,service_name) AS client,`span_attributes.gen_ai.tool.name` AS tool,duration_nano / 1000000.0 AS ms FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800) AND `span_attributes.gen_ai.tool.name` IS NOT NULL AND ($${client:sqlstring} = '' OR COALESCE(`span_attributes.coding_agent.client`,service_name) = $${client:sqlstring}) AND ($${tool:sqlstring} = '' OR `span_attributes.gen_ai.tool.name` = $${tool:sqlstring}) AND duration_nano IS NOT NULL) AS dedup GROUP BY client,tool ORDER BY p95_ms DESC LIMIT 20","format":"table"}],"fieldConfig":{"defaults":{"noValue":"No data","custom":{"minWidth":55,"width":80}},"overrides":[{"matcher":{"id":"byRegexp","options":".*_ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byName","options":"client"},"properties":[{"id":"custom.width","value":100}]},{"matcher":{"id":"byName","options":"tool"},"properties":[{"id":"custom.width","value":150}]},{"matcher":{"id":"byName","options":"duration_samples"},"properties":[{"id":"displayName","value":"n"}]}]},"options":{"showHeader":true,"cellHeight":"sm"},"gridPos":{"x":0,"y":23,"w":24,"h":9}}
       ]}
   grafana-dash-ai-sessions:
     content: |
-      {"uid":"datalake-ai-sessions","title":"AI Sessions","tags":["datalake","ai"],"timezone":"Asia/Seoul","schemaVersion":39,"version":3,"time":{"from":"now-30d","to":"now"},"description":"Session activity · client mix · coding outcomes. Session identity is (client, session_id). Observed wall time is not active work time.","refresh":"5m","links":[{"title":"Usage","type":"link","url":"/d/datalake-ai-usage","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Tools","type":"link","url":"/d/datalake-ai-tools","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Sessions","type":"link","url":"/d/datalake-ai-sessions","includeVars":false,"keepTime":true,"targetBlank":false}],"panels":[
+      {"uid":"datalake-ai-sessions","title":"AI Sessions","tags":["datalake","ai"],"timezone":"Asia/Seoul","schemaVersion":39,"version":4,"time":{"from":"now-30d","to":"now"},"description":"Session activity · client mix · coding outcomes. Session identity is (client, session_id). Observed wall time is not active work time.","refresh":"5m","links":[{"title":"Usage","type":"link","url":"/d/datalake-ai-usage","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Tools","type":"link","url":"/d/datalake-ai-tools","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Sessions","type":"link","url":"/d/datalake-ai-sessions","includeVars":false,"keepTime":true,"targetBlank":false}],"panels":[
       {"id":2,"type":"stat","title":"Sessions","description":"Session identity is (client, session_id); the same id across clients counts separately. Empty means no aggregates yet (absence), not zero.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT NULLIF(COUNT(*), 0) AS sessions FROM (SELECT DISTINCT client, session_id FROM ai_session_summary WHERE $$__timeFilter(session_start)) AS sessions_scoped","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"No data","unit":"short","color":{"mode":"fixed","fixedColor":"blue"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":0,"y":0,"w":6,"h":4}},
       {"id":10,"title":"Tool calls","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(tool_calls) AS calls FROM ai_session_summary WHERE $$__timeFilter(session_start)","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"No data","color":{"mode":"fixed","fixedColor":"green"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":6,"y":0,"w":6,"h":4}},
       {"id":11,"title":"Reported errors","type":"stat","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(error_count) AS errors FROM ai_session_summary WHERE $$__timeFilter(session_start)","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"No data","color":{"mode":"fixed","fixedColor":"orange"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":12,"y":0,"w":6,"h":4}},
@@ -5172,12 +5411,12 @@ configs:
       {"id":13,"title":"Session starts · by client","type":"timeseries","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"time_series","rawSql":"SELECT CAST(date_trunc('day', session_start) AS TIMESTAMP(6)) AS `time`, client, COUNT(*) AS sessions FROM ai_session_summary WHERE $$__timeFilter(session_start) GROUP BY `time`, client ORDER BY `time`","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"—","color":{"mode":"palette-classic"},"custom":{"drawStyle":"bars","lineInterpolation":"linear","barAlignment":0,"barWidthFactor":0.1,"lineWidth":1,"fillOpacity":75,"gradientMode":"opacity","showPoints":"auto","pointSize":5,"spanNulls":false,"axisBorderShow":false,"axisColorMode":"text","scaleDistribution":{"type":"linear"},"stacking":{"mode":"normal","group":"A"},"hideFrom":{"tooltip":false,"viz":false,"legend":false},"barMaxWidth":32}},"overrides":[]},"options":{"legend":{"displayMode":"table","placement":"bottom","calcs":["lastNotNull"],"showLegend":true},"tooltip":{"mode":"multi","sort":"desc"}},"gridPos":{"x":0,"y":4,"w":16,"h":10}},
       {"id":14,"title":"Client mix · sessions","type":"bargauge","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT client, COUNT(*) AS sessions FROM ai_session_summary WHERE $$__timeFilter(session_start) GROUP BY client ORDER BY sessions DESC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"short","noValue":"—","color":{"mode":"continuous-BlPu"},"min":0},"overrides":[]},"options":{"displayMode":"gradient","orientation":"horizontal","showUnfilled":true,"valueMode":"color","namePlacement":"left","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":true},"text":{"titleSize":12,"valueSize":18}},"gridPos":{"x":16,"y":4,"w":8,"h":10}},
       {"id":20,"type":"row","title":"Session & activity ledgers","collapsed":false,"panels":[],"gridPos":{"x":0,"y":14,"w":24,"h":1}},
-      {"id":1,"type":"table","title":"Session ledger","description":"Identity is (client, session_id). Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported estimates are not billing invoices. Missing values stay NULL. Modified LOC, accepted/rejected added LOC, native active time, and observed session wall time are distinct. Repository is SHA256 only; branch and outcome require explicit source metadata. All observed session models are preserved as a JSON set.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT session_id, client, provider, models, model_count, CAST(session_start AS TIMESTAMP(6)) AS session_start, CAST(session_end AS TIMESTAMP(6)) AS session_end, duration_s, input_tokens, output_tokens, total_tokens, cost_usd, cost_source, llm_spans, tool_calls, error_count, subagents, lines_added, lines_removed, lines_accepted, lines_rejected, edit_accept_count, edit_reject_count, commit_count, pr_count, active_user_seconds, active_cli_seconds, session_wall_seconds, repo, branch, outcome, activity_sources FROM ai_session_summary WHERE $$__timeFilter(session_start) ORDER BY session_start DESC LIMIT 100","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":15,"w":24,"h":10}},
-      {"id":6,"type":"table","title":"Daily coding activity","description":"ai_activity_daily rows keyed by (client, day_start); per-day rollups of subagents, modified vs accepted/rejected ADDED LOC, edit decisions, commits/PRs, and native active vs observed wall seconds. lines_added/removed are modified LOC; lines_accepted/rejected are accepted/rejected ADDED lines only (explicit decisions, never inferred). active_user/cli_seconds are native active counters; session_wall_seconds is the union of observed session intervals clipped per UTC day, not active time. NULL means unknown/unsupported, never zero-filled; activity_sources names the producer per field. Empty means no aggregates yet (absence).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, client, subagents, lines_added, lines_removed, lines_accepted, lines_rejected, edit_accept_count, edit_reject_count, commit_count, pr_count, active_user_seconds, active_cli_seconds, session_wall_seconds, activity_sources FROM ai_activity_daily WHERE $$__timeFilter(day_start) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":25,"w":24,"h":8}},
+      {"id":1,"type":"table","title":"Session ledger","description":"Identity is (client, session_id). Usage is source-selected, not summed across native and hook copies. Native Claude usage is authoritative; Codex turn-cost receipts replace overlapping per-call estimates. cost_source records provenance; reported plus supplemental public list-rate estimates are not billing invoices. cost_estimated_usd NULL means nothing estimated; cost_unpriced_calls 0 means evaluated with nothing unresolved, NULL marks legacy/unprocessed rows. Missing values stay NULL. Modified LOC, accepted/rejected added LOC, native active time, and observed session wall time are distinct. Repository is SHA256 only; branch and outcome require explicit source metadata. All observed session models are preserved as a JSON set.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT session_id, client, provider, models, model_count, CAST(session_start AS TIMESTAMP(6)) AS session_start, CAST(session_end AS TIMESTAMP(6)) AS session_end, duration_s, input_tokens, output_tokens, total_tokens, cost_usd, cost_estimated_usd, CASE WHEN cost_usd IS NULL AND cost_estimated_usd IS NULL THEN NULL ELSE COALESCE(cost_usd, 0) + COALESCE(cost_estimated_usd, 0) END AS cost_total, cost_unpriced_calls, cost_source, llm_spans, tool_calls, error_count, subagents, lines_added, lines_removed, lines_accepted, lines_rejected, edit_accept_count, edit_reject_count, commit_count, pr_count, active_user_seconds, active_cli_seconds, session_wall_seconds, repo, branch, outcome, activity_sources FROM ai_session_summary WHERE $$__timeFilter(session_start) ORDER BY session_start DESC LIMIT 100","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":15,"w":24,"h":10}},
+      {"id":6,"type":"table","title":"Daily coding activity","description":"ai_activity_daily rows keyed by (client, day_start); per-day rollups of subagents, modified vs accepted/rejected ADDED LOC, edit decisions, commits/PRs, and native active vs observed wall seconds. lines_added/removed are modified LOC; lines_accepted/rejected are accepted/rejected ADDED lines only (explicit decisions, never inferred). active_user/cli_seconds are native active counters; session_wall_seconds is the union of observed session intervals clipped per UTC day, not active time. NULL means unknown/unsupported, never zero-filled; activity_sources names the producer per field. Empty means no aggregates yet (absence).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, client, subagents, lines_added, lines_removed, lines_accepted, lines_rejected, edit_accept_count, edit_reject_count, commit_count, pr_count, active_user_seconds, active_cli_seconds, session_wall_seconds, activity_sources FROM ai_activity_daily WHERE $$__timeFilter(day_start) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":25,"w":24,"h":8}},
       {"id":21,"type":"row","title":"Collection diagnostics","collapsed":false,"panels":[],"gridPos":{"x":0,"y":33,"w":24,"h":1}},
       {"id":3,"type":"stat","title":"Spans without session identity","description":"Raw-span diagnostic across supported canonical/native session keys; missing identity is not a zero session count. Final 48h of the selected range only. Empty input is No data; 0 means observed spans had the attribute. This is raw attribute coverage, not a claim every span should carry tokens/session identity.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(missing) AS spans_no_session FROM (SELECT DISTINCT trace_id,span_id,CASE WHEN COALESCE(NULLIF(`span_attributes.coding_agent.session.id`, ''), NULLIF(`span_attributes.session.id`, ''), NULLIF(`span_attributes.conversation.id`, ''), NULLIF(`span_attributes.gen_ai.conversation.id`, '')) IS NULL THEN 1 ELSE 0 END AS missing FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800)) AS observed","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"No data","unit":"short","color":{"mode":"fixed","fixedColor":"blue"},"decimals":0,"mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"background","graphMode":"none","justifyMode":"center","orientation":"auto","textMode":"value","wideLayout":true,"reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"text":{"valueSize":40}},"gridPos":{"x":0,"y":34,"w":6,"h":6}},
-      {"id":4,"type":"table","title":"Spans per day (deduped)","description":"Retransmitted spans deduped by (trace_id, span_id).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT `day`, COUNT(*) AS spans FROM (SELECT DISTINCT trace_id, span_id, CAST(timestamp AS DATE) AS `day` FROM opentelemetry_traces WHERE $$__timeFilter(timestamp)) AS dedup GROUP BY `day` ORDER BY `day` ASC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":6,"y":34,"w":18,"h":6}},
-      {"id":5,"type":"table","title":"Logs per day (ai_log_daily summary)","description":"ai_log_daily rollups by scope/severity; empty means no log aggregates yet (absence), not zero. Raw opentelemetry_logs remain queryable; body content is privacy-redacted at ingest so only counts are shown here.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, scope_name, severity_text, log_count, error_count FROM ai_log_daily WHERE $$__timeFilter(day_start) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":40,"w":24,"h":8}}
+      {"id":4,"type":"table","title":"Spans per day (deduped)","description":"Retransmitted spans deduped by (trace_id, span_id).","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT `day`, COUNT(*) AS spans FROM (SELECT DISTINCT trace_id, span_id, CAST(timestamp AS DATE) AS `day` FROM opentelemetry_traces WHERE $$__timeFilter(timestamp)) AS dedup GROUP BY `day` ORDER BY `day` ASC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":6,"y":34,"w":18,"h":6}},
+      {"id":5,"type":"table","title":"Logs per day (ai_log_daily summary)","description":"ai_log_daily rollups by scope/severity; empty means no log aggregates yet (absence), not zero. Raw opentelemetry_logs remain queryable; body content is privacy-redacted at ingest so only counts are shown here.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT day_start AS `day`, scope_name, severity_text, log_count, error_count FROM ai_log_daily WHERE $$__timeFilter(day_start) ORDER BY `day` DESC LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"—","custom":{"align":"auto","cellOptions":{"type":"auto"},"inspect":false}},"overrides":[{"matcher":{"id":"byRegexp","options":".*tokens$|^calls$|^llm_spans$|^tool_calls$"},"properties":[{"id":"unit","value":"short"}]},{"matcher":{"id":"byRegexp","options":"^cost_usd$|^cost_estimated_usd$|^cost_total$"},"properties":[{"id":"unit","value":"currencyUSD"}]},{"matcher":{"id":"byRegexp","options":".*duration_ms$|^ms$"},"properties":[{"id":"unit","value":"ms"}]},{"matcher":{"id":"byRegexp","options":".*seconds$|^duration_s$"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byRegexp","options":"^errors$|^error_count$"},"properties":[{"id":"custom.cellOptions","value":{"type":"color-text"}},{"id":"thresholds","value":{"mode":"absolute","steps":[{"color":"green","value":null},{"color":"red","value":1}]}},{"id":"color","value":{"mode":"thresholds"}}]}]},"options":{"showHeader":true,"cellHeight":"sm","enablePagination":true},"gridPos":{"x":0,"y":40,"w":24,"h":8}}
       ]}
   grafana-dash-vehicle-overview:
     content: |

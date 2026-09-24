@@ -69,6 +69,208 @@ MISSING_TABLE_HINTS = ("not found", "not exist", "does not exist", "unknown tabl
 MIXED = "mixed"
 TTL_RE = re.compile(r"^[0-9]+[smhd]$")
 TTL_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+# --- Supplemental cost estimates (public list rates, never invoices) ---
+#
+# Stdlib-only load of LiteLLM's public model_prices_and_context_window.json
+# (per-token USD fields input_cost_per_token, output_cost_per_token,
+# cache_read_input_token_cost, cache_creation_input_token_cost,
+# output_cost_per_reasoning_token; entry identity is the model key plus
+# litellm_provider). Memory-only: the aggregate service has no volume, so a
+# restart refetches. Refresh is at most daily per process; a failed refresh
+# keeps the last-good table and waits PRICE_RETRY_S before retrying, so a
+# down registry never retries every aggregate pass.
+LITELLM_PRICE_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/main/"
+                     "model_prices_and_context_window.json")
+PRICE_REFRESH_S = 86400
+PRICE_RETRY_S = 3600
+PRICE_TIMEOUT_S = 10
+PRICE_MAX_BYTES = 8 * 1024 * 1024
+# Clients whose token semantics are source-verified above (plugins/*):
+# claude-code input excludes cache buckets (Anthropic API); the rest report
+# input inclusive of cache. Unknown clients never receive estimates.
+_EST_CLIENTS = frozenset({"codex", "oh-my-pi", "opencode", "claude-code"})
+_CHAT_MODES = frozenset({"chat", "completion", "responses"})
+_PRICES = {"table": None, "ok_at": 0.0, "attempt_at": 0.0}
+def _price_num(value):
+    """Non-negative finite USD rate, or None when absent/unparseable."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        num = float(value)
+    elif isinstance(value, str):
+        try:
+            num = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if num != num or num in (float("inf"), float("-inf")) or num < 0:
+        return None
+    return num
+
+
+def _parse_price_table(data):
+    """{model key: (in, out, cache_read, cache_write, reasoning, mode,
+    provider)}. Entries without a litellm_provider string are skipped
+    (sample_spec prose, fallback_generalizations regex rules); unknown
+    fields ignored so new upstream fields never break parsing."""
+    if not isinstance(data, dict):
+        return None
+    out = {}
+    for key, entry in data.items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            continue
+        provider = entry.get("litellm_provider")
+        if not isinstance(provider, str) or not provider:
+            continue
+        # Long-context tariffs need request-specific tiers; do not silently
+        # apply the base rate while this lightweight estimator lacks them.
+        if ("tiered_pricing" in entry or "off_peak_pricing" in entry
+                or any("_above_" in field and "cost" in field for field in entry)):
+            continue
+        out[key] = (
+            _price_num(entry.get("input_cost_per_token")),
+            _price_num(entry.get("output_cost_per_token")),
+            _price_num(entry.get("cache_read_input_token_cost")),
+            _price_num(entry.get("cache_creation_input_token_cost")),
+            _price_num(entry.get("output_cost_per_reasoning_token")),
+            entry.get("mode"), provider)
+    return out
+
+
+def _fetch_price_bytes(url=LITELLM_PRICE_URL, timeout=PRICE_TIMEOUT_S):
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(PRICE_MAX_BYTES + 1)
+    if len(raw) > PRICE_MAX_BYTES:
+        raise SqlError("price payload too large")
+    return raw
+
+
+def load_price_table(now=None, fetch=None):
+    """Cached LiteLLM price table, or None when never fetched successfully.
+    At most one fetch per PRICE_REFRESH_S; a failed refresh keeps the
+    last-good table and waits PRICE_RETRY_S, so a down registry never
+    retries every aggregate pass. Aggregation never fails for pricing:
+    failure returns the last-good table (or None). Tests pass fetch=...
+    to avoid network."""
+    now = time.time() if now is None else now
+    if _PRICES["table"] is not None and now - _PRICES["ok_at"] < PRICE_REFRESH_S:
+        return _PRICES["table"]
+    if now - _PRICES["attempt_at"] < PRICE_RETRY_S:
+        return _PRICES["table"]
+    _PRICES["attempt_at"] = now
+    try:
+        raw = fetch() if fetch is not None else _fetch_price_bytes()
+        table = _parse_price_table(json.loads(raw.decode("utf-8")))
+        if not table:
+            raise SqlError("price payload has no usable entries")
+    except Exception:
+        return _PRICES["table"]
+    _PRICES["table"] = table
+    _PRICES["ok_at"] = now
+    return table
+
+
+def _price_entry(table, model, provider):
+    """The one exact-matching entry billed by this call's vendor, in a
+    token-priced mode. The provider-prefixed key wins when it matches the
+    vendor, else the bare model key; anything else (unknown, vendor
+    mismatch, image/embedding/audio mode) is None: fail closed."""
+    if provider:
+        prefixed = table.get(provider + "/" + model)
+        if isinstance(prefixed, tuple) and prefixed[6] == provider and (
+                prefixed[5] is None or prefixed[5] in _CHAT_MODES):
+            return prefixed
+    bare = table.get(model)
+    if isinstance(bare, tuple) and bare[6] == provider and (
+            bare[5] is None or bare[5] in _CHAT_MODES):
+        return bare
+    return None
+
+
+def _tok(value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def estimate_call(row, table):
+    """Supplemental USD for one missing-cost LLM call, or None (fail closed).
+    Callers only pass rows with no reported cost (including 0). Token
+    semantics are per verified plugin mapping: claude-code input excludes
+    cache buckets; the other supported clients include them. Codex and
+    OpenCode output includes reasoning, so never charge that subset twice.
+    OMP reasoning conventions are not inferred from a breakdown alone.
+    Missing cache rates remain unknown; reasoning defaults to output rates."""
+    if table is None or row.get("client") not in _EST_CLIENTS:
+        return None
+    model, provider = row.get("model"), row.get("provider")
+    if not model or not provider:
+        return None
+    entry = _price_entry(table, model, provider)
+    if entry is None:
+        return None
+    vals = [_tok(row.get(k)) for k in
+            ("input", "output", "cache_read", "cache_write", "reasoning")]
+    if any(v is None and row.get(k) is not None
+           for v, k in zip(vals, ("input", "output", "cache_read",
+                                  "cache_write", "reasoning"))):
+        return None
+    if vals[0] is None or vals[1] is None:
+        return None
+    inp, outp, cread, cwrite, reason = (v or 0 for v in vals)
+    if row["client"] == "claude-code":
+        text_in = inp
+    else:
+        text_in = inp - cread - cwrite
+    if text_in < 0:
+        return None
+    if reason and row["client"] not in ("codex", "opencode"):
+        return None
+    if row["client"] in ("codex", "opencode"):
+        text_out = outp - reason
+    else:
+        text_out = outp
+    if text_out < 0:
+        return None
+    rin, rout, rread, rwrite, rreason = entry[:5]
+    parts = [(text_in, rin),
+             (cread, rread),
+             (cwrite, rwrite),
+             (text_out, rout),
+             (reason, rreason if rreason is not None else rout)]
+    total = 0.0
+    for qty, rate in parts:
+        if qty == 0:
+            continue
+        if rate is None:
+            return None
+        total += qty * rate
+    return total
+
+
+def _supplemental(bs, cost_ids, prices):
+    """(estimated_sum_or_None, unpriced_count_or_None) over money-eligible
+    missing-cost LLM calls. Rows already carrying cost (including 0) keep
+    it and are ignored; turn-suppressed parts (outside cost_ids) never get
+    fallback and never count as unpriced since the turn total covers them.
+    prices None (never loaded) means unevaluated: (None, None)."""
+    if prices is None:
+        return None, None
+    calls = {id(s) for s in llm_calls(bs)}
+    est, unpriced = [], 0
+    for s in bs:
+        if id(s) not in cost_ids or id(s) not in calls:
+            continue
+        if resolve_cost(s) != (None, None):
+            continue
+        val = estimate_call(s, prices)
+        if val is None:
+            unpriced += 1
+        else:
+            est.append(val)
+    return (sum(est) if est else None), unpriced
 
 
 STOP = False
@@ -850,7 +1052,10 @@ def _cost_ids(rows):
             or totals[(row.get("client"), row.get("session"), row.get("turn"))] is row}
 
 
-def summarize_sessions(spans):
+_SENTINEL = object()
+
+
+def summarize_sessions(spans, prices=_SENTINEL):
     billed = billable(spans)
     bset = {id(s) for s in billed}
     cost_ids = _cost_ids(billed)
@@ -885,6 +1090,10 @@ def summarize_sessions(spans):
         money = [s for s in bs if id(s) in cost_ids]
         cost_total = sum_opt([resolve_cost(s)[0] for s in money])
         cost_src = cost_label(money)
+        if prices is _SENTINEL:
+            cost_est, unpriced = None, None
+        else:
+            cost_est, unpriced = _supplemental(bs, cost_ids, prices)
         out.append({
             "session_start": start, "session_id": sid,
             "client": client,  # group key fallback, never NULL
@@ -903,14 +1112,15 @@ def summarize_sessions(spans):
                               for s in bs]),
             "cost": cost_total,
             "cost_source": cost_src,
+            "cost_estimated_usd": cost_est,
+            "cost_unpriced_calls": unpriced,
             "llm_spans": len(llm_calls(bs)) or None,
             "tool_calls": len([s for s in ss if s["tool"] and id(s) in kept_tools]) or None,
             "errors": sum(1 for s in ss if s["error"] and (not s.get("tool") or id(s) in kept_tools)) or None,
         })
     return out
 
-
-def summarize_daily(spans):
+def summarize_daily(spans, prices=_SENTINEL):
     billed = billable(spans)
     bset = {id(s) for s in billed}
     cost_ids = _cost_ids(billed)
@@ -935,6 +1145,10 @@ def summarize_daily(spans):
         money = [s for s in bs if id(s) in cost_ids]
         cost_total = sum_opt([resolve_cost(s)[0] for s in money])
         cost_src = cost_label(money)
+        if prices is _SENTINEL:
+            cost_est, unpriced = None, None
+        else:
+            cost_est, unpriced = _supplemental(bs, cost_ids, prices)
         out.append({
             "day": day, "client": client, "provider": provider, "model": model,
             "input": sum_opt([s["input"] for s in bs]),
@@ -947,6 +1161,8 @@ def summarize_daily(spans):
                               for s in bs]),
             "cost": cost_total,
             "cost_source": cost_src,
+            "cost_estimated_usd": cost_est,
+            "cost_unpriced_calls": unpriced,
             "llm_spans": len(llm_calls(bs)) or None,
             "tool_calls": len([s for s in g["all"] if s["tool"] and id(s) in kept_tools]) or None,
             "sessions": len({s["session"] for s in g["all"] if s["session"]}) or None,
@@ -1713,9 +1929,12 @@ def ai_section(ctx, cfg):
     now = utcnow()
     bound = retention_boundary(ctx, "otel", ttl, now)
     total = 0
+    # One registry fetch per pass at most (itself daily-cached in memory):
+    # aggregation never fails for pricing; None keeps legacy NULLs.
+    prices = load_price_table()
     activity_sessions, activity_days = summarize_activity(
         [dict(zip(cols, row)) for row in rows], raw_logs, activity_metric_rows(ctx, cfg))
-    sessions = {(s["client"], s["session_id"]): s for s in summarize_sessions(spans)}
+    sessions = {(s["client"], s["session_id"]): s for s in summarize_sessions(spans, prices)}
     for key, activity in activity_sessions.items():
         s = sessions.setdefault(key, {"client": key[0], "session_id": key[1]})
         starts = [v for v in (s.get("session_start"), activity.get("start")) if v is not None]
@@ -1741,6 +1960,7 @@ def ai_section(ctx, cfg):
                      "model_count", "session_end", "duration_s", "input_tokens",
                      "output_tokens", "cache_read_tokens", "cache_write_tokens",
                      "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
+                     "cost_estimated_usd", "cost_unpriced_calls",
                      "llm_spans", "tool_calls", "error_count"] + list(ACTIVITY_FIELDS) +
                     ["repo", "branch", "outcome", "activity_sources"],
                     [[ts_lit(s["session_start"]), str_lit(s["session_id"]),
@@ -1751,7 +1971,8 @@ def ai_section(ctx, cfg):
                       num_lit(s.get("output")), num_lit(s.get("cache_read")),
                       num_lit(s.get("cache_write")), num_lit(s.get("reasoning")),
                       num_lit(s.get("total")), num_lit(s.get("cost")),
-                      str_lit(s.get("cost_source")), num_lit(s.get("llm_spans")),
+                      str_lit(s.get("cost_source")), num_lit(s.get("cost_estimated_usd")),
+                      num_lit(s.get("cost_unpriced_calls")), num_lit(s.get("llm_spans")),
                       num_lit(s.get("tool_calls")), num_lit(s.get("errors"))] +
                      [num_lit(s.get(field)) for field in ACTIVITY_FIELDS] +
                      [str_lit(s.get(field)) for field in ("repo", "branch", "outcome")] +
@@ -1770,19 +1991,21 @@ def ai_section(ctx, cfg):
                      [num_lit(day.get(field)) for field in ACTIVITY_FIELDS] +
                      [str_lit(json.dumps(day.get("activity_sources") or {}, sort_keys=True))]])
         total += 1
-    for d in summarize_daily(spans):
+    for d in summarize_daily(spans, prices):
         if bound and d["day"] < bound:
             continue  # partly expired day: keep the old row
         insert_rows(base_url, auth, db, "ai_daily_summary",
                     ["day_start", "client", "provider", "model", "input_tokens",
                      "output_tokens", "cache_read_tokens", "cache_write_tokens",
                      "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
+                     "cost_estimated_usd", "cost_unpriced_calls",
                      "llm_spans", "tool_calls", "active_sessions", "error_count"],
                     [[ts_lit(d["day"]), str_lit(d["client"]), str_lit(d["provider"]),
                       str_lit(d["model"]), num_lit(d["input"]), num_lit(d["output"]),
                       num_lit(d["cache_read"]), num_lit(d["cache_write"]),
                       num_lit(d["reasoning"]), num_lit(d["total"]), num_lit(d["cost"]),
-                      str_lit(d["cost_source"]), num_lit(d["llm_spans"]),
+                      str_lit(d["cost_source"]), num_lit(d.get("cost_estimated_usd")),
+                      num_lit(d.get("cost_unpriced_calls")), num_lit(d["llm_spans"]),
                       num_lit(d["tool_calls"]), num_lit(d["sessions"]),
                       num_lit(d["errors"])]])
         total += 1

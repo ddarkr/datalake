@@ -11,6 +11,9 @@ services:
   db-schema:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
+    # Inline script changes need a service revision to trigger recreation.
+    labels:
+      datalake.schema-revision: "1"
     depends_on:
       greptimedb:
         condition: service_started
@@ -34,6 +37,8 @@ services:
   aggregate:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
+    labels:
+      datalake.aggregate-revision: "1"
     depends_on:
       greptimedb:
         condition: service_started
