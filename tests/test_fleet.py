@@ -344,7 +344,9 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def test_official_fixture_to_greptime_smoke(self):
-        # Actual official sample from crates/tesla-api/src/telemetry.rs:141 plus tire pressure & related fields
+        # Actual official sample matching telemetry-config.sh:675-682 (8 official fields:
+        # Gear, DriverSeatOccupied, InsideTemp, OutsideTemp, HvacFanStatus, HvacACEnabled, HvacAutoMode, Soc)
+        # plus additional fleet allowlist fields (BatteryLevel, EstRange, IdealBatteryRange, VehicleSpeed, TpmsPressureFl).
         sample_json = (
             r'{"data":['
             r'{"key":"InsideTemp","value":{"floatValue":22.5}},'
@@ -353,6 +355,7 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
             r'{"key":"HvacACEnabled","value":{"booleanValue":true}},'
             r'{"key":"HvacAutoMode","value":{"hvacAutoModeValue":"HvacAutoModeStateOverride"}},'
             r'{"key":"Gear","value":{"shiftStateValue":"ShiftStateP"}},'
+            r'{"key":"DriverSeatOccupied","value":{"booleanValue":true}},'
             r'{"key":"Soc","value":{"longValue":"59"}},'
             r'{"key":"BatteryLevel","value":{"longValue":"59"}},'
             r'{"key":"EstRange","value":{"floatValue":250.0}},'
@@ -390,15 +393,17 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         }
 
         stored = fr.process_message(conn, payload, meta_env, stats)
-        # 12 valid allowlisted signals: InsideTemp, OutsideTemp, HvacFanStatus, HvacACEnabled,
-        # HvacAutoMode, Gear, Soc, BatteryLevel, EstRange, IdealBatteryRange, VehicleSpeed, TpmsPressureFl.
-        # Experimental_1 is dropped.
-        self.assertEqual(stored, 12)
-        self.assertEqual(stats["signals_stored"], 12)
+        # 13 valid allowlisted signals:
+        # 8 from telemetry-config.sh: InsideTemp, OutsideTemp, HvacFanStatus, HvacACEnabled,
+        # HvacAutoMode, Gear, DriverSeatOccupied, Soc.
+        # Plus BatteryLevel, EstRange, IdealBatteryRange, VehicleSpeed, TpmsPressureFl.
+        # Experimental_1 is dropped (invalid: true).
+        self.assertEqual(stored, 13)
+        self.assertEqual(stats["signals_stored"], 13)
 
         # Step 3: Batch upload to Greptime HTTP SQL endpoint
         uploaded = fr.upload_tick(conn, self.base_url, "datalake", "user", "pw", batch_size=100)
-        self.assertEqual(uploaded, 12)
+        self.assertEqual(uploaded, 13)
 
         # Outbox must be cleanly drained after successful ack
         cur = conn.execute("SELECT COUNT(*) FROM outbox")
@@ -415,6 +420,21 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.assertIn("'my-tesla'", sql)
         self.assertIn("'fleet-collector-1'", sql)
         self.assertIn("FALSE", sql)  # source_is_resend is False
+
+        # All 8 telemetry-config.sh fields are verified in output
+        self.assertIn("'Gear'", sql)
+        self.assertIn("'P'", sql)
+        self.assertIn("'DriverSeatOccupied'", sql)
+        self.assertIn("'Vehicle.Tesla.DriverSeatOccupied'", sql)
+        self.assertIn("'InsideTemp'", sql)
+        self.assertIn("22.5", sql)
+        self.assertIn("'OutsideTemp'", sql)
+        self.assertIn("34.0", sql)
+        self.assertIn("'HvacFanStatus'", sql)
+        self.assertIn("'HvacACEnabled'", sql)
+        self.assertIn("'HvacAutoMode'", sql)
+        self.assertIn("'Soc'", sql)
+        self.assertIn("59.0", sql)
 
         # Unverified VSS_VERSION and VEHICLE_FIRMWARE are NULL
         # Check that NULL exists in the generated SQL values

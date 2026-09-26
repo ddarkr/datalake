@@ -302,6 +302,12 @@ FIELD_ALLOWLIST = {
         "unit": None,
         "type": "bool",
     },
+    # DriverSeatOccupied: vendor-specific path to avoid guessing left/right seat VSS mapping
+    "DriverSeatOccupied": {
+        "path": "Vehicle.Tesla.DriverSeatOccupied",
+        "unit": None,
+        "type": "bool",
+    },
     "HvacFanStatus": {
         "path": "Vehicle.Cabin.HVAC.FanSpeed",
         "unit": None,
