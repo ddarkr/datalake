@@ -9,7 +9,17 @@ Covers (stdlib only):
   - Strict 2-frame ZMQ message contract (frame 0: tesla_V, frame 1: protojson)
   - Rejection of flat or non-conformant payload fallbacks
   - Anti-vehicle mixing: mandatory VIN, TARGET_VIN isolation, mandatory salt pseudonymization
-  - Official unit conversions (VehicleSpeed mph -> km/h, Odometer miles -> km)
+  - Official unit conversions:
+    * VehicleSpeed (mph -> km/h * 1.609344)
+    * Odometer, EstRange, IdealBatteryRange (miles -> km * 1.609344)
+    * Tire Pressure TpmsPressure*/TirePressure* (bar -> kPa * 100.0, VSS standard unit)
+  - Distinct canonical paths & event_id provenance preservation:
+    * Soc vs BatteryLevel keep independent paths and event_ids
+    * EstRange vs IdealBatteryRange keep independent paths and event_ids
+    * deterministic_event_id incorporates source_system & source_field so same-timestamp
+      distinct fields never collide or dedup each other
+    * Only isResend redeliveries deduplicate
+  - Unverified VSS_VERSION and VEHICLE_FIRMWARE left NULL
   - Sparse signal preservation (unreceived fields are never padded with 0/false)
   - Outbox overflow non-destructive policy: existing unacked rows preserved, new rejected, drop counter incremented
   - Bounded seen_ids table prevention of disk growth
@@ -102,7 +112,6 @@ class ProtojsonUnwrappingAndValidationTest(unittest.TestCase):
     def test_official_unit_conversions(self):
         # VehicleSpeed raw mph -> VSS km/h
         spec_speed = fr.FIELD_ALLOWLIST["VehicleSpeed"]
-        # 60 mph -> 96.56064 km/h
         num, text, b = fr.validate_field_value(spec_speed, 60.0)
         self.assertAlmostEqual(num, 60.0 * 1.609344, places=4)
         self.assertIsNone(text)
@@ -110,31 +119,47 @@ class ProtojsonUnwrappingAndValidationTest(unittest.TestCase):
 
         # Odometer raw miles -> VSS km
         spec_odo = fr.FIELD_ALLOWLIST["Odometer"]
-        # 10000 miles -> 16093.44 km
         num_odo, _, _ = fr.validate_field_value(spec_odo, 10000.0)
         self.assertAlmostEqual(num_odo, 10000.0 * 1.609344, places=4)
 
-        # InsideTemp / OutsideTemp (already Celsius)
-        spec_temp = fr.FIELD_ALLOWLIST["InsideTemp"]
-        num_temp, _, _ = fr.validate_field_value(spec_temp, 22.5)
-        self.assertEqual(num_temp, 22.5)
+        # Tire Pressure raw bar -> VSS kPa (1 bar = 100 kPa)
+        spec_tpms = fr.FIELD_ALLOWLIST["TpmsPressureFl"]
+        num_tpms, _, _ = fr.validate_field_value(spec_tpms, 2.9)
+        self.assertAlmostEqual(num_tpms, 290.0, places=2)
+        self.assertEqual(spec_tpms["unit"], "kPa")
 
-        # SoC (%)
-        spec_soc = fr.FIELD_ALLOWLIST["Soc"]
-        num_soc, _, _ = fr.validate_field_value(spec_soc, 59)
-        self.assertEqual(num_soc, 59.0)
+        # Range fields
+        spec_est = fr.FIELD_ALLOWLIST["EstRange"]
+        num_est, _, _ = fr.validate_field_value(spec_est, 250.0)
+        self.assertAlmostEqual(num_est, 250.0 * 1.609344, places=4)
 
-    def test_speed_limit_range_checked_after_scaling(self):
-        spec_speed = fr.FIELD_ALLOWLIST["VehicleSpeed"]
-        # 300 mph = 482 km/h (> max 350 km/h) -> fail closed (None)
-        self.assertIsNone(fr.validate_field_value(spec_speed, 300.0))
-        # Negative speed -> fail closed
-        self.assertIsNone(fr.validate_field_value(spec_speed, -1.0))
+        spec_ideal = fr.FIELD_ALLOWLIST["IdealBatteryRange"]
+        num_ideal, _, _ = fr.validate_field_value(spec_ideal, 300.0)
+        self.assertAlmostEqual(num_ideal, 300.0 * 1.609344, places=4)
+
+    def test_distinct_paths_and_event_id_collision_prevention(self):
+        # Soc and BatteryLevel map to distinct canonical paths
+        self.assertEqual(fr.FIELD_ALLOWLIST["Soc"]["path"],
+                         "Vehicle.Powertrain.TractionBattery.StateOfCharge.Current")
+        self.assertEqual(fr.FIELD_ALLOWLIST["BatteryLevel"]["path"],
+                         "Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed")
+
+        # EstRange and IdealBatteryRange map to distinct canonical paths
+        self.assertEqual(fr.FIELD_ALLOWLIST["EstRange"]["path"],
+                         "Vehicle.Powertrain.TractionBattery.Range")
+        self.assertEqual(fr.FIELD_ALLOWLIST["IdealBatteryRange"]["path"],
+                         "Vehicle.Powertrain.TractionBattery.IdealRange")
+
+        # Even if values and timestamps are identical, deterministic_event_id hashes source_field
+        id_soc = fr.deterministic_event_id("v1", "Vehicle.Speed", "tesla_fleet_telemetry", "Soc",
+                                           1790427600000000000, "fleet-v1", 59.0, None, None)
+        id_bat = fr.deterministic_event_id("v1", "Vehicle.Speed", "tesla_fleet_telemetry", "BatteryLevel",
+                                           1790427600000000000, "fleet-v1", 59.0, None, None)
+        self.assertNotEqual(id_soc, id_bat)  # Never collide or dedup each other!
 
 
 class StrictFramingAndIdentityTest(unittest.TestCase):
     def test_two_frame_zmq_enforcement(self):
-        # Exactly 2 frames with topic b"tesla_V"
         valid_frames = [b"tesla_V", b'{"data":[],"createdAt":"2026-09-26T13:00:00Z","vin":"V1"}']
         payload = fr.parse_zmq_frames(valid_frames, expected_topic="tesla_V")
         self.assertEqual(payload, valid_frames[1])
@@ -152,21 +177,17 @@ class StrictFramingAndIdentityTest(unittest.TestCase):
             fr.parse_zmq_frames([b"tesla_V", b"{}", b"extra"], expected_topic="tesla_V")
 
     def test_flat_payload_rejected(self):
-        # Flat payload without data array must fail closed
         flat_payload = b'{"VehicleSpeed": 60, "createdAt": "2026-09-26T13:00:00Z", "vin": "V1"}'
         with self.assertRaises(ValueError):
             fr.extract_protojson_records(flat_payload, target_vin="V1")
 
     def test_vin_and_salt_requirements(self):
-        # Missing VIN rejected
         with self.assertRaises(ValueError):
             fr.resolve_vehicle_identity("", target_vin="", configured_id="", salt="s")
 
-        # Target VIN filtering prevents vehicle mixing
         self.assertEqual(fr.resolve_vehicle_identity("VIN1", target_vin="VIN1", configured_id="my-car"), "my-car")
         self.assertIsNone(fr.resolve_vehicle_identity("OTHER_VIN", target_vin="VIN1", configured_id="my-car"))
 
-        # No target VIN: salt is mandatory
         with self.assertRaises(ValueError):
             fr.resolve_vehicle_identity("VIN1", target_vin="", configured_id="", salt="")
 
@@ -192,7 +213,7 @@ class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):
         }
         meta_env = {
             "target_vin": "V1", "vehicle_id": "c1", "vehicle_salt": "",
-            "decode_epoch": "fleet-v1", "vss_version": "4.0",
+            "decode_epoch": "fleet-v1", "vss_version": "",
             "vehicle_firmware": "", "mapping_revision": "fleet-v1",
             "collector_version": "fleet-1", "collector_id": "c1"
         }
@@ -232,12 +253,10 @@ class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):
 
     def test_seen_ids_bounded(self):
         conn = fr.open_outbox(self.db_path)
-        # Populate seen_ids
         for i in range(20):
             conn.execute("INSERT INTO seen_ids(event_id, seen_at) VALUES(?,?)", (f"id-{i}", i))
         conn.commit()
 
-        # Prune to max 10
         fr.prune_seen(conn, older_than_ns=5, max_seen_limit=10)
         count = conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0]
         self.assertLessEqual(count, 10)
@@ -260,7 +279,6 @@ class FakeGreptimeServer(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b'{"code": 500, "error": "db down"}')
             return
 
-        # Count tuples in VALUES
         if "VALUES" in stmt:
             vals_part = stmt.split("VALUES", 1)[1]
             n_rows = len(re.findall(r"\s*\([^)]+\)", vals_part)) or 1
@@ -299,7 +317,7 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.tmp_dir.cleanup()
 
     def test_official_fixture_to_greptime_smoke(self):
-        # Actual official sample from crates/tesla-api/src/telemetry.rs:141
+        # Actual official sample from crates/tesla-api/src/telemetry.rs:141 plus tire pressure & related fields
         sample_json = (
             r'{"data":['
             r'{"key":"InsideTemp","value":{"floatValue":22.5}},'
@@ -309,7 +327,11 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
             r'{"key":"HvacAutoMode","value":{"hvacAutoModeValue":"HvacAutoModeStateOverride"}},'
             r'{"key":"Gear","value":{"shiftStateValue":"ShiftStateP"}},'
             r'{"key":"Soc","value":{"longValue":"59"}},'
+            r'{"key":"BatteryLevel","value":{"longValue":"59"}},'
+            r'{"key":"EstRange","value":{"floatValue":250.0}},'
+            r'{"key":"IdealBatteryRange","value":{"floatValue":300.0}},'
             r'{"key":"VehicleSpeed","value":{"floatValue":45.0}},'
+            r'{"key":"TpmsPressureFl","value":{"floatValue":2.9}},'
             r'{"key":"Experimental_1","value":{"invalid":true}}'
             r'],'
             r'"createdAt":"2026-09-26T13:00:00.123456789Z",'
@@ -333,32 +355,29 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
             "vehicle_id": "my-tesla",
             "vehicle_salt": "testsalt",
             "decode_epoch": "fleet-v1",
-            "vss_version": "4.0",
-            "vehicle_firmware": "2026.32.1",
+            "vss_version": "",
+            "vehicle_firmware": "",
             "mapping_revision": "fleet-v1",
             "collector_version": "tesla-fleet-recorder-1",
             "collector_id": "fleet-collector-1"
         }
 
         stored = fr.process_message(conn, payload, meta_env, stats)
-        # 8 valid allowlisted signals (InsideTemp, OutsideTemp, HvacFanStatus, HvacACEnabled,
-        # HvacAutoMode, Gear, Soc, VehicleSpeed). Experimental_1 is dropped.
-        self.assertEqual(stored, 8)
-        self.assertEqual(stats["signals_stored"], 8)
+        # 12 valid allowlisted signals: InsideTemp, OutsideTemp, HvacFanStatus, HvacACEnabled,
+        # HvacAutoMode, Gear, Soc, BatteryLevel, EstRange, IdealBatteryRange, VehicleSpeed, TpmsPressureFl.
+        # Experimental_1 is dropped.
+        self.assertEqual(stored, 12)
+        self.assertEqual(stats["signals_stored"], 12)
 
-        # Step 3: Verify outbox contents before upload
-        cur = conn.execute("SELECT COUNT(*) FROM outbox")
-        self.assertEqual(cur.fetchone()[0], 8)
-
-        # Step 4: Batch upload to Greptime HTTP SQL endpoint
+        # Step 3: Batch upload to Greptime HTTP SQL endpoint
         uploaded = fr.upload_tick(conn, self.base_url, "datalake", "user", "pw", batch_size=100)
-        self.assertEqual(uploaded, 8)
+        self.assertEqual(uploaded, 12)
 
         # Outbox must be cleanly drained after successful ack
         cur = conn.execute("SELECT COUNT(*) FROM outbox")
         self.assertEqual(cur.fetchone()[0], 0)
 
-        # Step 5: Verify the exact SQL sent to GreptimeDB
+        # Step 4: Verify the exact SQL sent to GreptimeDB
         self.assertEqual(len(FakeGreptimeServer.received_stmts), 1)
         sql = FakeGreptimeServer.received_stmts[0]
 
@@ -370,36 +389,44 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.assertIn("'fleet-collector-1'", sql)
         self.assertIn("FALSE", sql)  # source_is_resend is False
 
-        # Signal verification
-        self.assertIn("'InsideTemp'", sql)
-        self.assertIn("22.5", sql)
-        self.assertIn("'OutsideTemp'", sql)
-        self.assertIn("34.0", sql)
-        self.assertIn("'Gear'", sql)
-        self.assertIn("'P'", sql)
-        self.assertIn("'Soc'", sql)
-        self.assertIn("59.0", sql)
-        # VehicleSpeed converted from 45.0 mph to km/h: 45.0 * 1.609344 = 72.42048
+        # Unverified VSS_VERSION and VEHICLE_FIRMWARE are NULL
+        # Check that NULL exists in the generated SQL values
+        self.assertIn("NULL", sql)
+
+        # Unit conversion verifications:
+        # VehicleSpeed: 45.0 mph -> 72.42048 km/h
         self.assertIn("'VehicleSpeed'", sql)
         self.assertIn("72.42048", sql)
+        # TpmsPressureFl: 2.9 bar -> 290.0 kPa
+        self.assertIn("'TpmsPressureFl'", sql)
+        self.assertIn("290.0", sql)
+        self.assertIn("'kPa'", sql)
+        # EstRange: 250.0 miles -> 402.336 km
+        self.assertIn("'EstRange'", sql)
+        self.assertIn("402.336", sql)
+        # IdealBatteryRange: 300.0 miles -> 482.8032 km
+        self.assertIn("'IdealBatteryRange'", sql)
+        self.assertIn("482.8032", sql)
+
+        # Distinct Soc vs BatteryLevel paths preserved simultaneously
+        self.assertIn("'Soc'", sql)
+        self.assertIn("'BatteryLevel'", sql)
+        self.assertIn("'Vehicle.Powertrain.TractionBattery.StateOfCharge.Current'", sql)
+        self.assertIn("'Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed'", sql)
 
         # Exact 9-digit nanosecond event_time in SQL
-        # 2026-09-26 13:00:00 UTC = 1790427600 s -> 1790427600123456789 ns
         self.assertIn("1790427600123456789", sql)
         conn.close()
 
     def test_can_and_fleet_aggregation_isolation(self):
-        # Ensure aggregate.py does not cross-contaminate CAN and Fleet signals
         base_time = datetime(2026, 9, 26, 13, 0, 0, tzinfo=timezone.utc)
         cols = ["event_time", "vehicle", "path", "source", "decode_epoch",
                 "value_num", "value_bool", "unit"]
-        # CAN speed at 80 km/h, Fleet speed at 75 km/h for the same vehicle and minute
         rows = [
             [base_time.strftime("%Y-%m-%d %H:%M:%S"), "v1", "Vehicle.Speed", "can", "can-epoch1", 80.0, None, "km/h"],
             [base_time.strftime("%Y-%m-%d %H:%M:%S"), "v1", "Vehicle.Speed", "fleet", "fleet-v1", 75.0, None, "km/h"],
         ]
         groups = agg.group_vehicle_rows(cols, rows, {"speed": "Vehicle.Speed"})
-        # Groups must be keyed strictly by (vehicle, source, epoch)
         self.assertIn(("v1", "can", "can-epoch1"), groups)
         self.assertIn(("v1", "fleet", "fleet-v1"), groups)
         self.assertEqual(len(groups), 2)

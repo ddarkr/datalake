@@ -17,16 +17,26 @@ Official Contract Compliance (crates/tesla-api/src/telemetry.rs):
      - When TARGET_VIN is not set, VEHICLE_ID_SALT is mandatory for deterministic SHA-256 hashing.
   5. Official unit handling & conversion:
      - VehicleSpeed (raw mph) converted to VSS km/h (* 1.609344).
-     - Odometer / EstRange (raw miles) converted to VSS km (* 1.609344).
+     - Odometer / EstRange / IdealBatteryRange (raw miles) converted to VSS km (* 1.609344).
+     - Tire pressure (raw bar from Tesla TpmsPressure*/TirePressure*) converted to VSS kPa (* 100.0).
+     - Distinct canonical paths for related fields:
+       * Soc -> Vehicle.Powertrain.TractionBattery.StateOfCharge.Current (%)
+       * BatteryLevel -> Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed (%)
+       * EstRange -> Vehicle.Powertrain.TractionBattery.Range (km)
+       * IdealBatteryRange -> Vehicle.Powertrain.TractionBattery.IdealRange (km)
      - InsideTemp / OutsideTemp (already Celsius) verified and preserved.
-     - Soc / BatteryLevel (%) verified and preserved.
      - Sparse unreceived fields are NEVER padded with 0 or false.
-  6. Deterministic event_id (isResend excluded) for redelivery deduplication.
-  7. Bounded SQLite outbox (PRAGMA WAL) guarded by MAX_OUTBOX_ROWS.
+  6. Provenance & event_id deduplication:
+     - deterministic_event_id hashes (vehicle, path, source='fleet', source_system,
+       source_field, event_time_ns, decode_epoch, value).
+     - Distinct fields arriving at identical timestamps keep separate event_ids (no data loss).
+     - Only redeliveries of the same logical field sample (isResend variation) are deduplicated.
+  7. Unverified VSS_VERSION and VEHICLE_FIRMWARE are left NULL (empty string).
+  8. Bounded SQLite outbox (PRAGMA WAL) guarded by MAX_OUTBOX_ROWS.
      Existing unacked rows are NEVER deleted on overflow; new arrivals are rejected
-     with explicit counter increments to ensure remaining disk (2.5 GiB) safety.
-  8. Seen table bounded by retention time and hard maximum row limit (MAX_SEEN_IDS).
-  9. Greptime HTTP SQL batch INSERT with fail-closed ack verification (affectedrows == batch size).
+     with explicit counter increments to ensure remaining disk (~2.5 GiB) safety.
+  9. Seen table bounded by 24h prune and MAX_SEEN_IDS=50000 limit.
+ 10. Greptime HTTP SQL batch INSERT with fail-closed ack verification (affectedrows == batch size).
 
 Tesla API / vehicle command transmission is strictly prohibited (receive-only).
 """
@@ -67,6 +77,7 @@ DEFAULT_ENDPOINT = "tcp://fleet-telemetry:5555"
 MAX_SEEN_IDS = 50000
 MPH_TO_KPH = 1.609344
 MILES_TO_KM = 1.609344
+BAR_TO_KPA = 100.0
 
 COLUMNS = [
     "event_time", "vehicle", "path", "source", "event_id",
@@ -130,7 +141,7 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 2000000.0,
     },
-    # Range (Tesla sends raw miles; VSS requires km)
+    # Range fields: distinct canonical paths prevent collision/deduplication loss
     "EstRange": {
         "path": "Vehicle.Powertrain.TractionBattery.Range",
         "unit": "km",
@@ -140,14 +151,14 @@ FIELD_ALLOWLIST = {
         "max": 2000.0,
     },
     "IdealBatteryRange": {
-        "path": "Vehicle.Powertrain.TractionBattery.Range",
+        "path": "Vehicle.Powertrain.TractionBattery.IdealRange",
         "unit": "km",
         "type": "num",
         "scale": MILES_TO_KM,
         "min": 0.0,
         "max": 2000.0,
     },
-    # Battery & Powertrain (percentage / electrical units)
+    # Battery & Powertrain (distinct paths: physical Soc vs displayed BatteryLevel)
     "Soc": {
         "path": "Vehicle.Powertrain.TractionBattery.StateOfCharge.Current",
         "unit": "%",
@@ -156,7 +167,7 @@ FIELD_ALLOWLIST = {
         "max": 100.0,
     },
     "BatteryLevel": {
-        "path": "Vehicle.Powertrain.TractionBattery.StateOfCharge.Current",
+        "path": "Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed",
         "unit": "%",
         "type": "num",
         "min": 0.0,
@@ -308,34 +319,70 @@ FIELD_ALLOWLIST = {
         "unit": None,
         "type": "bool",
     },
-    # Tire Pressures (bar)
+    # Tire Pressures (Tesla sends bar; VSS requires kPa, 1 bar = 100 kPa)
+    "TpmsPressureFl": {
+        "path": "Vehicle.Chassis.Axle.Row1.Wheel.Left.Tire.Pressure",
+        "unit": "kPa",
+        "type": "num",
+        "scale": BAR_TO_KPA,
+        "min": 0.0,
+        "max": 500.0,
+    },
     "TirePressureFL": {
         "path": "Vehicle.Chassis.Axle.Row1.Wheel.Left.Tire.Pressure",
-        "unit": "bar",
+        "unit": "kPa",
         "type": "num",
+        "scale": BAR_TO_KPA,
         "min": 0.0,
-        "max": 10.0,
+        "max": 500.0,
+    },
+    "TpmsPressureFr": {
+        "path": "Vehicle.Chassis.Axle.Row1.Wheel.Right.Tire.Pressure",
+        "unit": "kPa",
+        "type": "num",
+        "scale": BAR_TO_KPA,
+        "min": 0.0,
+        "max": 500.0,
     },
     "TirePressureFR": {
         "path": "Vehicle.Chassis.Axle.Row1.Wheel.Right.Tire.Pressure",
-        "unit": "bar",
+        "unit": "kPa",
         "type": "num",
+        "scale": BAR_TO_KPA,
         "min": 0.0,
-        "max": 10.0,
+        "max": 500.0,
+    },
+    "TpmsPressureRl": {
+        "path": "Vehicle.Chassis.Axle.Row2.Wheel.Left.Tire.Pressure",
+        "unit": "kPa",
+        "type": "num",
+        "scale": BAR_TO_KPA,
+        "min": 0.0,
+        "max": 500.0,
     },
     "TirePressureRL": {
         "path": "Vehicle.Chassis.Axle.Row2.Wheel.Left.Tire.Pressure",
-        "unit": "bar",
+        "unit": "kPa",
         "type": "num",
+        "scale": BAR_TO_KPA,
         "min": 0.0,
-        "max": 10.0,
+        "max": 500.0,
+    },
+    "TpmsPressureRr": {
+        "path": "Vehicle.Chassis.Axle.Row2.Wheel.Right.Tire.Pressure",
+        "unit": "kPa",
+        "type": "num",
+        "scale": BAR_TO_KPA,
+        "min": 0.0,
+        "max": 500.0,
     },
     "TirePressureRR": {
         "path": "Vehicle.Chassis.Axle.Row2.Wheel.Right.Tire.Pressure",
-        "unit": "bar",
+        "unit": "kPa",
         "type": "num",
+        "scale": BAR_TO_KPA,
         "min": 0.0,
-        "max": 10.0,
+        "max": 500.0,
     },
 }
 
@@ -527,7 +574,7 @@ def validate_field_value(spec, unwrapped_value):
         if math.isnan(val) or math.isinf(val):
             return None
 
-        # Unit scaling (e.g. mph -> km/h, miles -> km)
+        # Unit scaling (e.g. mph -> km/h, miles -> km, bar -> kPa)
         scale = spec.get("scale")
         if scale:
             val = val * scale
@@ -563,15 +610,18 @@ def validate_field_value(spec, unwrapped_value):
     return None
 
 
-def deterministic_event_id(vehicle, path, event_time_ns, decode_epoch,
-                           num, text, boolean):
+def deterministic_event_id(vehicle, path, source_system, source_field,
+                           event_time_ns, decode_epoch, num, text, boolean):
     """Stable id for one logical sample.
 
-    isResend is intentionally EXCLUDED so redeliveries of the same sample
-    yield identical event_id, deduplicating both in outbox and GreptimeDB.
+    Includes source_system and source_field so distinct fields arriving at
+    the same timestamp/value retain independent identity without collision.
+    isResend is intentionally EXCLUDED so redeliveries of the same field
+    yield identical event_id, deduplicating cleanly.
     """
     parts = [
-        vehicle, path, SOURCE, str(event_time_ns), str(decode_epoch),
+        vehicle, path, SOURCE, source_system, source_field,
+        str(event_time_ns), str(decode_epoch),
         repr(num), "" if text is None else str(text),
         "" if boolean is None else str(boolean)
     ]
@@ -720,9 +770,7 @@ def store_signal_update(conn, row, max_rows=50000):
 
 def prune_seen(conn, older_than_ns, max_seen_limit=MAX_SEEN_IDS):
     """Bound seen_ids table by age and absolute row limit to prevent unbounded disk growth."""
-    # 1. Prune entries older than retention window
     conn.execute("DELETE FROM seen_ids WHERE seen_at < ?", (older_than_ns,))
-    # 2. Hard count bounding: retain at most max_seen_limit newest entries
     conn.execute(
         "DELETE FROM seen_ids WHERE rowid NOT IN ("
         " SELECT rowid FROM seen_ids ORDER BY seen_at DESC LIMIT ?"
@@ -814,6 +862,8 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
         event_id = deterministic_event_id(
             vehicle=vehicle,
             path=path,
+            source_system=SOURCE_SYSTEM,
+            source_field=source_field,
             event_time_ns=event_time_ns,
             decode_epoch=meta_env["decode_epoch"],
             num=num,
@@ -832,8 +882,8 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
             "value_text": text,
             "value_bool": boolean,
             "unit": unit,
-            "vss_version": meta_env["vss_version"],
-            "vehicle_firmware": meta_env["vehicle_firmware"],
+            "vss_version": meta_env["vss_version"] or None,
+            "vehicle_firmware": meta_env["vehicle_firmware"] or None,
             "dbc_primary_commit": None,
             "dbc_supplemental_commit": None,
             "dbc_override_version": None,
@@ -974,7 +1024,7 @@ def run():
         "vehicle_id": env("VEHICLE_ID", ""),
         "vehicle_salt": env("VEHICLE_ID_SALT", ""),
         "decode_epoch": env("DECODE_EPOCH", "fleet-v1"),
-        "vss_version": env("VSS_VERSION", "4.0"),
+        "vss_version": env("VSS_VERSION", ""),
         "vehicle_firmware": env("VEHICLE_FIRMWARE", ""),
         "mapping_revision": env("MAPPING_REVISION", "fleet-v1"),
         "collector_version": env("COLLECTOR_VERSION", "tesla-fleet-recorder-1"),
