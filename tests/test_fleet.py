@@ -28,6 +28,7 @@ Covers (stdlib only):
   - CAN / Fleet source separation in aggregation
 """
 
+import hashlib
 import http.server
 import json
 import math
@@ -182,17 +183,43 @@ class StrictFramingAndIdentityTest(unittest.TestCase):
             fr.extract_protojson_records(flat_payload, target_vin="V1")
 
     def test_vin_and_salt_requirements(self):
+        # Missing or empty VIN strictly raises ValueError
         with self.assertRaises(ValueError):
             fr.resolve_vehicle_identity("", target_vin="", configured_id="", salt="s")
+        with self.assertRaises(ValueError):
+            fr.resolve_vehicle_identity("   ", target_vin="VIN1", configured_id="c1", salt="s")
 
+        # target_vin matches and configured_id provided
         self.assertEqual(fr.resolve_vehicle_identity("VIN1", target_vin="VIN1", configured_id="my-car"), "my-car")
-        self.assertIsNone(fr.resolve_vehicle_identity("OTHER_VIN", target_vin="VIN1", configured_id="my-car"))
+        self.assertEqual(fr.resolve_vehicle_identity("VIN1", target_vin="VIN1", configured_id="my-car", salt="salt"), "my-car")
 
+        # target_vin matches, configured_id empty, salt provided -> uses salted hash
+        pseudo_target = fr.resolve_vehicle_identity("5YJ3E1EB123456789", target_vin="5YJ3E1EB123456789", configured_id="", salt="mysalt")
+        self.assertTrue(pseudo_target.startswith("v-"))
+        self.assertNotEqual(pseudo_target, "v-5YJ3E1EB")  # Raw VIN prefix must NEVER be exposed
+        expected_hash = hashlib.sha256(b"mysalt5YJ3E1EB123456789").hexdigest()[:16]
+        self.assertEqual(pseudo_target, f"v-{expected_hash}")
+
+        # target_vin matches, configured_id empty, salt empty -> FAIL CLOSED
+        with self.assertRaises(ValueError):
+            fr.resolve_vehicle_identity("VIN1", target_vin="VIN1", configured_id="", salt="")
+        with self.assertRaises(ValueError):
+            fr.resolve_vehicle_identity("VIN1", target_vin="VIN1", configured_id="   ", salt="   ")
+
+        # target_vin mismatch -> drop (return None)
+        self.assertIsNone(fr.resolve_vehicle_identity("OTHER_VIN", target_vin="VIN1", configured_id="my-car"))
+        self.assertIsNone(fr.resolve_vehicle_identity("OTHER_VIN", target_vin="VIN1", configured_id="", salt="mysalt"))
+
+        # No target_vin and no salt -> FAIL CLOSED
         with self.assertRaises(ValueError):
             fr.resolve_vehicle_identity("VIN1", target_vin="", configured_id="", salt="")
+        with self.assertRaises(ValueError):
+            fr.resolve_vehicle_identity("VIN1", target_vin="", configured_id="my-car", salt="")
 
-        pseudo = fr.resolve_vehicle_identity("VIN1", target_vin="", configured_id="", salt="mysalt")
-        self.assertTrue(pseudo.startswith("v-"))
+        # No target_vin with salt -> salted hash
+        pseudo_notarget = fr.resolve_vehicle_identity("5YJ3E1EB123456789", target_vin="", configured_id="", salt="mysalt")
+        self.assertEqual(pseudo_notarget, f"v-{expected_hash}")
+        self.assertNotEqual(pseudo_notarget, "v-5YJ3E1EB")
 
 
 class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):

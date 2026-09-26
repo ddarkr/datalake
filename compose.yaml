@@ -10662,22 +10662,32 @@ configs:
 
           - VIN must be non-empty string.
           - If target_vin is configured: record must match target_vin, else returns None (drop).
+          - If target_vin matches: returns configured_id if set, otherwise salted hash if salt is set.
+            If neither configured_id nor salt is provided, fails closed (raises ValueError).
           - If target_vin is not configured: salt is mandatory; creates stable hash pseudonym.
-          - No unknown-vehicle or unsalted fallbacks.
+          - No raw VIN exposure, no unsalted fallbacks, no unknown-vehicle fallbacks.
           """
           if not vin or not isinstance(vin, str) or not vin.strip():
               raise ValueError("telemetry record missing or empty VIN")
           vin = vin.strip()
+          target_vin = target_vin.strip() if target_vin else ""
+          configured_id = configured_id.strip() if configured_id else ""
+          salt = salt.strip() if salt else ""
 
           if target_vin:
               if vin != target_vin:
                   return None  # Multi-vehicle isolation: ignore other vehicles
-              return configured_id if configured_id else f"v-{vin[:8]}"
+              if configured_id:
+                  return configured_id
+              if salt:
+                  h = hashlib.sha256((salt + vin).encode("utf-8")).hexdigest()[:16]
+                  return f"v-{h}"
+              raise ValueError("Either VEHICLE_ID or VEHICLE_ID_SALT is required when TARGET_VIN is set")
 
-          if not salt or not salt.strip():
+          if not salt:
               raise ValueError("VEHICLE_ID_SALT is required when TARGET_VIN is not set to prevent vehicle mixing")
 
-          h = hashlib.sha256((salt.strip() + vin).encode("utf-8")).hexdigest()[:16]
+          h = hashlib.sha256((salt + vin).encode("utf-8")).hexdigest()[:16]
           return f"v-{h}"
 
 
