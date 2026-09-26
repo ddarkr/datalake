@@ -1,0 +1,72 @@
+services:
+  fleet-deps:
+    image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server, fleet]
+    restart: "no"
+    volumes:
+      - fleet-venv:/opt/venv
+    command:
+      - sh
+      - -c
+      - >-
+        echo "pyzmq==26.2.0" | cmp -s - /opt/venv/.fleet_ready ||
+        ([ -x /opt/venv/bin/python ] || python3 -m venv /opt/venv &&
+        /opt/venv/bin/pip install --no-cache-dir "pyzmq==26.2.0" &&
+        echo "pyzmq==26.2.0" > /opt/venv/.fleet_ready)
+
+  tesla-fleet-recorder:
+    image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server, fleet]
+    restart: unless-stopped
+    stop_grace_period: 30s
+    depends_on:
+      fleet-deps:
+        condition: service_completed_successfully
+      greptimedb:
+        condition: service_started
+    configs:
+      - source: fleet_recorder_py
+        target: /app/fleet_recorder.py
+        mode: 0444
+    volumes:
+      - fleet-venv:/opt/venv:ro
+      - fleet-data:/data
+    networks:
+      - default
+      - tesla-helper-net
+    command: ["/opt/venv/bin/python", "-u", "/app/fleet_recorder.py"]
+    environment:
+      FLEET_ZMQ_ENDPOINT: ${FLEET_ZMQ_ENDPOINT:-tcp://tesla-helper:5555}
+      FLEET_ZMQ_TOPIC: ${FLEET_ZMQ_TOPIC:-}
+      VEHICLE_ID: ${VEHICLE_ID:-}
+      VEHICLE_ID_SALT: ${VEHICLE_ID_SALT:-}
+      DECODE_EPOCH: ${DECODE_EPOCH:-fleet-v1}
+      VSS_VERSION: ${VSS_VERSION:-4.0}
+      VEHICLE_FIRMWARE: ${VEHICLE_FIRMWARE:-}
+      MAPPING_REVISION: ${MAPPING_REVISION:-fleet-v1}
+      COLLECTOR_VERSION: ${COLLECTOR_VERSION:-tesla-fleet-recorder-1}
+      COLLECTOR_ID: ${COLLECTOR_ID:-fleet-collector-1}
+      OUTBOX_PATH: ${FLEET_OUTBOX_PATH:-/data/outbox.sqlite}
+      MAX_OUTBOX_ROWS: ${MAX_OUTBOX_ROWS:-50000}
+      FLEET_BATCH_N: ${FLEET_BATCH_N:-500}
+      FLEET_FLUSH_SEC: ${FLEET_FLUSH_SEC:-5}
+      FLEET_METRICS_PORT: ${FLEET_METRICS_PORT:-9105}
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
+      GREPTIME_DB: ${GREPTIME_DB:-datalake}
+      GREPTIME_USER: ${GREPTIME_USER:-datalake}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+    ports:
+      - 127.0.0.1:${FLEET_METRICS_PORT:-9105}:9105
+
+configs:
+  fleet_recorder_py:
+    x-source: scripts/fleet_recorder.py
+
+volumes:
+  fleet-venv: {}
+  fleet-data: {}
+
+networks:
+  tesla-helper-net:
+    name: ${TESLA_HELPER_NETWORK:-tesla-helper_default}
+    external: true

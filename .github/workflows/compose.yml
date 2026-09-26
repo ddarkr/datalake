@@ -35,12 +35,12 @@ jobs:
           python tools/render.py \
             compose/core.yaml compose/database.yaml compose/ingest.yaml \
             compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml \
-            compose/vehicle-vss.yaml compose/redecode.yaml \
+            compose/vehicle-vss.yaml compose/tesla-fleet.yaml compose/redecode.yaml \
             --out "$RUNNER_TEMP/compose.yaml"
           diff -u compose.yaml "$RUNNER_TEMP/compose.yaml"
       - name: Validate every Compose profile without deployment credentials
         run: |
           docker compose version
-          for profile in server home mqtt vehicle backup redecode '*'; do
+          for profile in server home mqtt vehicle fleet backup redecode '*'; do
             docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
           done

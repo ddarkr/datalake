@@ -260,6 +260,10 @@ def ddl_statements(otel_ttl):
   "mapping_revision" STRING NULL,
   "collector_version" STRING NULL,
   "ingest_time" TIMESTAMP(9) NULL,
+  "source_system" STRING NULL,
+  "source_field" STRING NULL,
+  "collector_id" STRING NULL,
+  "source_is_resend" Boolean NULL,
   PRIMARY KEY ("vehicle", "path", "source", "event_id", "decode_epoch")
 )"""))
     # Derived AI summaries: no TTL so raw-data expiry never silently drops
@@ -436,9 +440,16 @@ def alter_statements():
         'ALTER TABLE "charge_session" ADD COLUMN IF NOT EXISTS'
         ' "decode_epoch" STRING',
     ]
-    for name in ("dbc_override_version", "dbc_override_commit"):
+    for name, coltype in (
+        ("dbc_override_version", "STRING"),
+        ("dbc_override_commit", "STRING"),
+        ("source_system", "STRING"),
+        ("source_field", "STRING"),
+        ("collector_id", "STRING"),
+        ("source_is_resend", "Boolean"),
+    ):
         stmts.append('ALTER TABLE "vehicle_signal" ADD COLUMN IF NOT EXISTS'
-                     ' "' + name + '" STRING')
+                     ' "' + name + '" ' + coltype)
     # v4 activity repairs: mirror session_activity_columns() plus the flat
     # trace activity attributes for tables created before this change.
     for field in ACTIVITY_COUNT_FIELDS:

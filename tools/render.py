@@ -24,7 +24,7 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-TOP_KEYS = ("services", "configs", "volumes")
+TOP_KEYS = ("services", "configs", "volumes", "networks")
 
 
 class RenderError(Exception):
