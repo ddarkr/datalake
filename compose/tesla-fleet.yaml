@@ -1,7 +1,7 @@
 services:
   fleet-deps:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
-    profiles: [server, fleet]
+    profiles: [fleet]
     restart: "no"
     volumes:
       - fleet-venv:/opt/venv
@@ -16,7 +16,7 @@ services:
 
   tesla-fleet-recorder:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
-    profiles: [server, fleet]
+    profiles: [fleet]
     restart: unless-stopped
     stop_grace_period: 30s
     depends_on:
@@ -24,6 +24,8 @@ services:
         condition: service_completed_successfully
       greptimedb:
         condition: service_started
+      db-schema:
+        condition: service_completed_successfully
     configs:
       - source: fleet_recorder_py
         target: /app/fleet_recorder.py
@@ -36,8 +38,9 @@ services:
       - tesla-helper-net
     command: ["/opt/venv/bin/python", "-u", "/app/fleet_recorder.py"]
     environment:
-      FLEET_ZMQ_ENDPOINT: ${FLEET_ZMQ_ENDPOINT:-tcp://tesla-helper:5555}
-      FLEET_ZMQ_TOPIC: ${FLEET_ZMQ_TOPIC:-}
+      FLEET_ZMQ_ENDPOINT: ${FLEET_ZMQ_ENDPOINT:-tcp://fleet-telemetry:5555}
+      FLEET_ZMQ_TOPIC: ${FLEET_ZMQ_TOPIC:-tesla_V}
+      TARGET_VIN: ${TARGET_VIN:-}
       VEHICLE_ID: ${VEHICLE_ID:-}
       VEHICLE_ID_SALT: ${VEHICLE_ID_SALT:-}
       DECODE_EPOCH: ${DECODE_EPOCH:-fleet-v1}

@@ -1,21 +1,32 @@
 #!/usr/bin/env python3
 """Tesla Fleet Telemetry ZMQ subscriber -> SQLite outbox -> Greptime HTTP SQL uploader.
 
-Pipeline:
-  1. ZMQ SUB (5555) receives Tesla Fleet Telemetry JSON payloads (receive-only).
-  2. Normalize payload, parse original createdAt with nanosecond precision,
-     extract original isResend flag, resolve pseudonym vehicle ID.
-  3. Validate fields against strict allowlist & unit ranges.
-     Unknown timestamps or invalid fields fail closed.
-     Sparse unreceived fields are never padded with 0/false.
-  4. Generate deterministic event_id over (vehicle, path, source="fleet",
-     event_time, decode_epoch, num, text, boolean). isResend is excluded
-     so redeliveries produce the identical event_id and deduplicate.
-  5. Store to bounded SQLite outbox (PRAGMA WAL) guarded by MAX_OUTBOX_ROWS.
-  6. Timer-driven batch INSERT to GreptimeDB via HTTP SQL.
-     Fail-closed ack policy: deletes only acked rows.
-     DB down / restart / redelivery preserves queue and resumes cleanly.
-  7. HTTP GET /metrics on 0.0.0.0:9105 for Prometheus scraping.
+Official Contract Compliance (crates/tesla-api/src/telemetry.rs):
+  1. Two-frame ZMQ messages: frame[0] == topic (b"tesla_V"), frame[1] == protojson payload.
+     Any other framing or arbitrary flat fallback payloads are strictly rejected.
+  2. Protojson data[{key, value: {oneof}}] unwrapping:
+     - floatValue, doubleValue, intValue, longValue (quoted integer), booleanValue,
+       stringValue, shiftStateValue (e.g. "ShiftStateP" -> "P"),
+       hvacAutoMode / hvacAutoModeValue ("HvacAutoModeStateOn" -> true).
+     - kind == "invalid" is dropped.
+  3. Original createdAt preserved to exact nanosecond precision (9 digits).
+     Timestamps without an explicit timezone offset (Z or +/-HH:MM) or boolean types are rejected.
+  4. Strict VIN & pseudonymization policy:
+     - Non-empty VIN is required on every record (no unknown-vehicle fallback).
+     - When TARGET_VIN is set, non-matching VINs are dropped to prevent multi-vehicle mixing.
+     - When TARGET_VIN is not set, VEHICLE_ID_SALT is mandatory for deterministic SHA-256 hashing.
+  5. Official unit handling & conversion:
+     - VehicleSpeed (raw mph) converted to VSS km/h (* 1.609344).
+     - Odometer / EstRange (raw miles) converted to VSS km (* 1.609344).
+     - InsideTemp / OutsideTemp (already Celsius) verified and preserved.
+     - Soc / BatteryLevel (%) verified and preserved.
+     - Sparse unreceived fields are NEVER padded with 0 or false.
+  6. Deterministic event_id (isResend excluded) for redelivery deduplication.
+  7. Bounded SQLite outbox (PRAGMA WAL) guarded by MAX_OUTBOX_ROWS.
+     Existing unacked rows are NEVER deleted on overflow; new arrivals are rejected
+     with explicit counter increments to ensure remaining disk (2.5 GiB) safety.
+  8. Seen table bounded by retention time and hard maximum row limit (MAX_SEEN_IDS).
+  9. Greptime HTTP SQL batch INSERT with fail-closed ack verification (affectedrows == batch size).
 
 Tesla API / vehicle command transmission is strictly prohibited (receive-only).
 """
@@ -44,8 +55,18 @@ _FLOAT_EXACT_INT = 2 ** 53
 TABLE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
+# Strict ISO-8601 with mandatory timezone
+ISO_STRICT_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2}):(\d{2})(?:\.(\d+))?(Z|[+-]\d{2}:?\d{2})$"
+)
+
 SOURCE = "fleet"
 SOURCE_SYSTEM = "tesla_fleet_telemetry"
+DEFAULT_TOPIC = "tesla_V"
+DEFAULT_ENDPOINT = "tcp://fleet-telemetry:5555"
+MAX_SEEN_IDS = 50000
+MPH_TO_KPH = 1.609344
+MILES_TO_KM = 1.609344
 
 COLUMNS = [
     "event_time", "vehicle", "path", "source", "event_id",
@@ -88,24 +109,45 @@ SEEN_DDL = """CREATE TABLE IF NOT EXISTS seen_ids(
   seen_at INTEGER NOT NULL
 )"""
 
-# Field Allowlist with expected units and physical range limits
+# Field Allowlist with official Tesla telemetry field names, target VSS paths,
+# conversion multipliers, expected units, and physical range validation limits.
 FIELD_ALLOWLIST = {
-    # Speed & Motion
+    # Speed (Tesla sends raw mph; VSS requires km/h)
     "VehicleSpeed": {
         "path": "Vehicle.Speed",
         "unit": "km/h",
         "type": "num",
+        "scale": MPH_TO_KPH,
         "min": 0.0,
         "max": 350.0,
     },
-    "speed": {
-        "path": "Vehicle.Speed",
-        "unit": "km/h",
+    # Odometer (Tesla sends raw miles; VSS requires km)
+    "Odometer": {
+        "path": "Vehicle.TraveledDistance",
+        "unit": "km",
         "type": "num",
+        "scale": MILES_TO_KM,
         "min": 0.0,
-        "max": 350.0,
+        "max": 2000000.0,
     },
-    # Battery & Powertrain
+    # Range (Tesla sends raw miles; VSS requires km)
+    "EstRange": {
+        "path": "Vehicle.Powertrain.TractionBattery.Range",
+        "unit": "km",
+        "type": "num",
+        "scale": MILES_TO_KM,
+        "min": 0.0,
+        "max": 2000.0,
+    },
+    "IdealBatteryRange": {
+        "path": "Vehicle.Powertrain.TractionBattery.Range",
+        "unit": "km",
+        "type": "num",
+        "scale": MILES_TO_KM,
+        "min": 0.0,
+        "max": 2000.0,
+    },
+    # Battery & Powertrain (percentage / electrical units)
     "Soc": {
         "path": "Vehicle.Powertrain.TractionBattery.StateOfCharge.Current",
         "unit": "%",
@@ -119,41 +161,6 @@ FIELD_ALLOWLIST = {
         "type": "num",
         "min": 0.0,
         "max": 100.0,
-    },
-    "battery_level": {
-        "path": "Vehicle.Powertrain.TractionBattery.StateOfCharge.Current",
-        "unit": "%",
-        "type": "num",
-        "min": 0.0,
-        "max": 100.0,
-    },
-    "Odometer": {
-        "path": "Vehicle.TraveledDistance",
-        "unit": "km",
-        "type": "num",
-        "min": 0.0,
-        "max": 2000000.0,
-    },
-    "odometer": {
-        "path": "Vehicle.TraveledDistance",
-        "unit": "km",
-        "type": "num",
-        "min": 0.0,
-        "max": 2000000.0,
-    },
-    "EstRange": {
-        "path": "Vehicle.Powertrain.TractionBattery.Range",
-        "unit": "km",
-        "type": "num",
-        "min": 0.0,
-        "max": 2000.0,
-    },
-    "IdealBatteryRange": {
-        "path": "Vehicle.Powertrain.TractionBattery.Range",
-        "unit": "km",
-        "type": "num",
-        "min": 0.0,
-        "max": 2000.0,
     },
     "BatteryCurrent": {
         "path": "Vehicle.Powertrain.TractionBattery.Current",
@@ -188,26 +195,7 @@ FIELD_ALLOWLIST = {
         "unit": None,
         "type": "text",
     },
-    "gear": {
-        "path": "Vehicle.Powertrain.Transmission.CurrentGear",
-        "unit": None,
-        "type": "text",
-    },
-    # Temperatures
-    "OutsideTemp": {
-        "path": "Vehicle.Exterior.AirTemperature",
-        "unit": "celsius",
-        "type": "num",
-        "min": -60.0,
-        "max": 80.0,
-    },
-    "outside_temp": {
-        "path": "Vehicle.Exterior.AirTemperature",
-        "unit": "celsius",
-        "type": "num",
-        "min": -60.0,
-        "max": 80.0,
-    },
+    # Temperatures (Tesla sends Celsius directly)
     "InsideTemp": {
         "path": "Vehicle.Cabin.AirTemperature",
         "unit": "celsius",
@@ -215,8 +203,8 @@ FIELD_ALLOWLIST = {
         "min": -60.0,
         "max": 80.0,
     },
-    "inside_temp": {
-        "path": "Vehicle.Cabin.AirTemperature",
+    "OutsideTemp": {
+        "path": "Vehicle.Exterior.AirTemperature",
         "unit": "celsius",
         "type": "num",
         "min": -60.0,
@@ -230,21 +218,7 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 500.0,
     },
-    "charger_power": {
-        "path": "Vehicle.Powertrain.TractionBattery.Charging.ChargePower",
-        "unit": "kW",
-        "type": "num",
-        "min": 0.0,
-        "max": 500.0,
-    },
     "ChargeAmps": {
-        "path": "Vehicle.Powertrain.TractionBattery.Charging.ChargeCurrent",
-        "unit": "A",
-        "type": "num",
-        "min": 0.0,
-        "max": 1000.0,
-    },
-    "charge_amps": {
         "path": "Vehicle.Powertrain.TractionBattery.Charging.ChargeCurrent",
         "unit": "A",
         "type": "num",
@@ -258,21 +232,7 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 1000.0,
     },
-    "charge_voltage": {
-        "path": "Vehicle.Powertrain.TractionBattery.Charging.ChargeVoltage",
-        "unit": "V",
-        "type": "num",
-        "min": 0.0,
-        "max": 1000.0,
-    },
     "ChargeEnergyAdded": {
-        "path": "Vehicle.Powertrain.TractionBattery.Charging.AccumulatedEnergy",
-        "unit": "kWh",
-        "type": "num",
-        "min": 0.0,
-        "max": 500.0,
-    },
-    "charge_energy_added": {
         "path": "Vehicle.Powertrain.TractionBattery.Charging.AccumulatedEnergy",
         "unit": "kWh",
         "type": "num",
@@ -284,30 +244,13 @@ FIELD_ALLOWLIST = {
         "unit": None,
         "type": "text",
     },
-    "charging_state": {
-        "path": "Vehicle.Powertrain.TractionBattery.Charging.Status",
-        "unit": None,
-        "type": "text",
-    },
     "FastChargerPresent": {
-        "path": "Vehicle.Powertrain.TractionBattery.Charging.IsFastCharging",
-        "unit": None,
-        "type": "bool",
-    },
-    "fast_charger_present": {
         "path": "Vehicle.Powertrain.TractionBattery.Charging.IsFastCharging",
         "unit": None,
         "type": "bool",
     },
     # Location
     "Latitude": {
-        "path": "Vehicle.CurrentLocation.Latitude",
-        "unit": "degrees",
-        "type": "num",
-        "min": -90.0,
-        "max": 90.0,
-    },
-    "latitude": {
         "path": "Vehicle.CurrentLocation.Latitude",
         "unit": "degrees",
         "type": "num",
@@ -321,13 +264,6 @@ FIELD_ALLOWLIST = {
         "min": -180.0,
         "max": 180.0,
     },
-    "longitude": {
-        "path": "Vehicle.CurrentLocation.Longitude",
-        "unit": "degrees",
-        "type": "num",
-        "min": -180.0,
-        "max": 180.0,
-    },
     "Heading": {
         "path": "Vehicle.CurrentLocation.Heading",
         "unit": "degrees",
@@ -335,14 +271,7 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 360.0,
     },
-    "heading": {
-        "path": "Vehicle.CurrentLocation.Heading",
-        "unit": "degrees",
-        "type": "num",
-        "min": 0.0,
-        "max": 360.0,
-    },
-    # Pedals
+    # Chassis / Controls
     "BrakePedal": {
         "path": "Vehicle.Chassis.Brake.PedalPosition",
         "unit": "%",
@@ -357,13 +286,29 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 100.0,
     },
-    # Doors
     "DoorOpen": {
         "path": "Vehicle.Cabin.Door.IsOpen",
         "unit": None,
         "type": "bool",
     },
-    # Tires
+    "HvacFanStatus": {
+        "path": "Vehicle.Cabin.HVAC.FanSpeed",
+        "unit": None,
+        "type": "num",
+        "min": 0.0,
+        "max": 15.0,
+    },
+    "HvacACEnabled": {
+        "path": "Vehicle.Cabin.HVAC.IsAirConditioningActive",
+        "unit": None,
+        "type": "bool",
+    },
+    "HvacAutoMode": {
+        "path": "Vehicle.Cabin.HVAC.IsAutoActive",
+        "unit": None,
+        "type": "bool",
+    },
+    # Tire Pressures (bar)
     "TirePressureFL": {
         "path": "Vehicle.Chassis.Axle.Row1.Wheel.Left.Tire.Pressure",
         "unit": "bar",
@@ -408,20 +353,21 @@ class SqlError(Exception):
 
 
 def parse_created_at(val):
-    """Parse original createdAt into nanoseconds since Unix epoch.
+    """Parse original createdAt with exact 9-digit nanosecond precision.
 
-    Fail-closed policy: None, empty string, non-numeric unparseable strings,
-    non-positive values, or values outside signed int64 range raise ValueError.
-    Supports ISO-8601 strings and epoch timestamps (s, ms, us, ns).
+    Fail-closed requirements:
+      - None, boolean, or empty string are rejected.
+      - Timestamps without explicit timezone offset (Z or +/-HH:MM) are rejected.
+      - Floating point NaN, Inf, non-positive numbers are rejected.
     """
-    if val is None or val == "":
-        raise ValueError("missing timestamp")
+    if val is None or isinstance(val, bool):
+        raise ValueError("missing or boolean timestamp rejected")
 
     if isinstance(val, (int, float)):
-        if val <= 0:
-            raise ValueError(f"invalid non-positive timestamp: {val}")
         if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
             raise ValueError(f"invalid float timestamp: {val}")
+        if val <= 0:
+            raise ValueError(f"invalid non-positive timestamp: {val}")
         if val < 1e11:  # seconds
             ns = int(val * 1_000_000_000)
         elif val < 1e14:  # milliseconds
@@ -438,67 +384,154 @@ def parse_created_at(val):
         val = val.strip()
         if not val:
             raise ValueError("empty timestamp string")
-        # Direct digit check for epoch timestamps formatted as string
-        if val.isdigit():
-            return parse_created_at(int(val))
-        try:
-            if "." in val:
-                num = float(val)
-                return parse_created_at(num)
-        except ValueError:
-            pass
 
-        # Parse ISO-8601
-        iso_str = val
-        if iso_str.endswith("Z") or iso_str.endswith("z"):
-            iso_str = iso_str[:-1] + "+00:00"
-        try:
-            dt_obj = datetime.fromisoformat(iso_str)
-            if dt_obj.tzinfo is None:
-                dt_obj = dt_obj.replace(tzinfo=timezone.utc)
-            delta = dt_obj.astimezone(timezone.utc) - _EPOCH
-            ns = ((delta.days * 86400 + delta.seconds) * 1_000_000_000
-                  + delta.microseconds * 1000)
-            if ns < _INT64_MIN or ns > _INT64_MAX:
-                raise ValueError(f"timestamp out of range: {val}")
-            return ns
-        except Exception as ex:
-            raise ValueError(f"unparseable ISO timestamp: {val}") from ex
+        m = ISO_STRICT_RE.match(val)
+        if not m:
+            raise ValueError(f"invalid ISO timestamp (strict timezone required): {val}")
+
+        year = int(m.group(1))
+        month = int(m.group(2))
+        day = int(m.group(3))
+        hour = int(m.group(4))
+        minute = int(m.group(5))
+        second = int(m.group(6))
+        frac_str = m.group(7) or ""
+        tz_str = m.group(8)
+
+        # Exact 9-digit nanosecond fraction preservation
+        frac_ns = int(frac_str.ljust(9, "0")[:9]) if frac_str else 0
+
+        # Timezone offset resolution
+        if tz_str in ("Z", "z"):
+            offset_sec = 0
+        else:
+            tz_clean = tz_str.replace(":", "")
+            sign = -1 if tz_clean[0] == "-" else 1
+            tz_h = int(tz_clean[1:3])
+            tz_m = int(tz_clean[3:5])
+            offset_sec = sign * (tz_h * 3600 + tz_m * 60)
+
+        dt_utc = datetime(year, month, day, hour, minute, second, tzinfo=timezone.utc)
+        epoch_seconds = int((dt_utc - _EPOCH).total_seconds()) - offset_sec
+        total_ns = epoch_seconds * 1_000_000_000 + frac_ns
+        if total_ns < _INT64_MIN or total_ns > _INT64_MAX:
+            raise ValueError(f"timestamp out of range: {val}")
+        return total_ns
 
     raise ValueError(f"unsupported timestamp type: {type(val).__name__}")
 
 
-def resolve_pseudonym(configured_id, vin, salt=""):
-    """Resolve pseudonym vehicle ID.
+def resolve_vehicle_identity(vin, target_vin="", configured_id="", salt=""):
+    """Resolve pseudonym vehicle ID adhering to strict anti-mixing contract.
 
-    If configured_id (e.g. VEHICLE_ID env) is present, use it.
-    Else hash vin with salt to produce a stable pseudo-ID.
+    - VIN must be non-empty string.
+    - If target_vin is configured: record must match target_vin, else returns None (drop).
+    - If target_vin is not configured: salt is mandatory; creates stable hash pseudonym.
+    - No unknown-vehicle or unsalted fallbacks.
     """
-    if configured_id:
-        return configured_id
-    if vin:
-        h = hashlib.sha256((salt + str(vin)).encode("utf-8")).hexdigest()[:16]
-        return f"v-{h}"
-    return "unknown-vehicle"
+    if not vin or not isinstance(vin, str) or not vin.strip():
+        raise ValueError("telemetry record missing or empty VIN")
+    vin = vin.strip()
+
+    if target_vin:
+        if vin != target_vin:
+            return None  # Multi-vehicle isolation: ignore other vehicles
+        return configured_id if configured_id else f"v-{vin[:8]}"
+
+    if not salt or not salt.strip():
+        raise ValueError("VEHICLE_ID_SALT is required when TARGET_VIN is not set to prevent vehicle mixing")
+
+    h = hashlib.sha256((salt.strip() + vin).encode("utf-8")).hexdigest()[:16]
+    return f"v-{h}"
 
 
-def validate_field_value(spec, raw_value):
-    """Validate raw value against field specification.
+def unwrap_protojson_value(field, value_obj):
+    """Unwrap protojson oneof field mapping per official telemetry contract.
 
-    Returns (num, text, boolean) tuple, or None if validation fails.
-    Never pads missing or invalid values with 0/false.
+    Matches crates/tesla-api/src/telemetry.rs:45-97:
+      - floatValue, doubleValue -> float
+      - intValue -> int
+      - longValue -> int (protojson serializes 64-bit int as string)
+      - booleanValue -> bool
+      - stringValue -> str
+      - shiftStateValue -> strip 'ShiftState' prefix (e.g. 'ShiftStateP' -> 'P')
+      - hvacAutoMode / hvacAutoModeValue -> 'HvacAutoModeStateOn' -> true
+      - kind == 'invalid' -> None (dropped)
     """
-    if raw_value is None:
+    if not isinstance(value_obj, dict) or not value_obj:
+        return None
+
+    kind, raw_val = next(iter(value_obj.items()))
+    if kind == "invalid":
+        return None
+
+    # Normalization per telemetry.rs contract
+    if field == "Gear" and kind == "shiftStateValue":
+        if isinstance(raw_val, str):
+            return (raw_val.removeprefix("ShiftState"), kind)
+        return (str(raw_val), kind)
+
+    if field == "HvacAutoMode" and kind in ("hvacAutoModeValue", "hvacAutoMode"):
+        return (raw_val == "HvacAutoModeStateOn", kind)
+
+    if kind in ("floatValue", "doubleValue"):
+        try:
+            return (float(raw_val), kind)
+        except (ValueError, TypeError):
+            return None
+
+    if kind in ("intValue", "sintValue", "uintValue", "fixed32Value", "sfixed32Value"):
+        try:
+            return (int(raw_val), kind)
+        except (ValueError, TypeError):
+            return None
+
+    if kind in ("longValue", "sint64Value", "uint64Value", "fixed64Value", "sfixed64Value"):
+        # protojson represents 64-bit integers as strings or numbers
+        try:
+            return (int(raw_val), kind)
+        except (ValueError, TypeError):
+            return None
+
+    if kind == "booleanValue":
+        if isinstance(raw_val, bool):
+            return (raw_val, kind)
+        if isinstance(raw_val, (int, str)):
+            s = str(raw_val).lower()
+            if s in ("true", "1"):
+                return (True, kind)
+            if s in ("false", "0"):
+                return (False, kind)
+        return None
+
+    if kind == "stringValue":
+        return (str(raw_val), kind)
+
+    return None
+
+
+def validate_field_value(spec, unwrapped_value):
+    """Validate and convert unwrapped value according to spec (scale + range).
+
+    Returns (num, text, boolean) tuple, or None if invalid.
+    """
+    if unwrapped_value is None:
         return None
 
     ftype = spec["type"]
     if ftype == "num":
         try:
-            val = float(raw_value)
+            val = float(unwrapped_value)
         except (ValueError, TypeError):
             return None
         if math.isnan(val) or math.isinf(val):
             return None
+
+        # Unit scaling (e.g. mph -> km/h, miles -> km)
+        scale = spec.get("scale")
+        if scale:
+            val = val * scale
+
         min_v = spec.get("min")
         max_v = spec.get("max")
         if min_v is not None and val < min_v:
@@ -508,25 +541,24 @@ def validate_field_value(spec, raw_value):
         return (val, None, None)
 
     if ftype == "bool":
-        if isinstance(raw_value, bool):
-            return (None, None, 1 if raw_value else 0)
-        if isinstance(raw_value, (int, float)):
-            if raw_value in (0, 1):
-                return (None, None, int(raw_value))
+        if isinstance(unwrapped_value, bool):
+            return (None, None, 1 if unwrapped_value else 0)
+        if isinstance(unwrapped_value, (int, float)):
+            if unwrapped_value in (0, 1):
+                return (None, None, int(unwrapped_value))
             return None
-        if isinstance(raw_value, str):
-            s = raw_value.strip().lower()
-            if s in ("true", "1", "yes", "on"):
+        if isinstance(unwrapped_value, str):
+            s = unwrapped_value.strip().lower()
+            if s in ("true", "1"):
                 return (None, None, 1)
-            if s in ("false", "0", "no", "off"):
+            if s in ("false", "0"):
                 return (None, None, 0)
-            return None
         return None
 
     if ftype == "text":
-        if isinstance(raw_value, (dict, list, set, tuple)):
+        if isinstance(unwrapped_value, (dict, list, set, tuple)):
             return None
-        return (None, str(raw_value), None)
+        return (None, str(unwrapped_value), None)
 
     return None
 
@@ -546,18 +578,29 @@ def deterministic_event_id(vehicle, path, event_time_ns, decode_epoch,
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
-def extract_signals_and_metadata(payload_bytes, default_vehicle="", salt=""):
-    """Parse raw incoming ZMQ message into (metadata, signals_list).
+def parse_zmq_frames(frames, expected_topic=DEFAULT_TOPIC):
+    """Validate 2-frame ZMQ message and return payload bytes.
 
-    metadata: {
-        'event_time_ns': int,
-        'vehicle': str,
-        'is_resend': bool,
-        'vin': str
-    }
-    signals_list: list of (source_field, raw_value)
+    Strict contract: frame[0] must equal expected_topic (e.g. b"tesla_V").
+    Frame[1] must contain the protojson payload.
+    """
+    if len(frames) != 2:
+        raise ValueError(f"expected exactly 2 frames, got {len(frames)}")
+    topic_bytes = frames[0]
+    if topic_bytes != expected_topic.encode("utf-8"):
+        raise ValueError(f"unexpected topic frame: {topic_bytes!r}, expected {expected_topic!r}")
+    return frames[1]
 
-    Fails closed on malformed JSON or unparseable timestamp.
+
+def extract_protojson_records(payload_bytes, target_vin="", configured_vehicle_id="", salt=""):
+    """Parse strict protojson payload into (metadata, signals_list).
+
+    Strict official contract only:
+      - vin: non-empty string
+      - createdAt: strict ISO timestamp with timezone
+      - isResend: boolean
+      - data: list of {key: ..., value: {kind: ...}} objects
+    Flat or fallback payloads are rejected.
     """
     try:
         data = json.loads(payload_bytes.decode("utf-8"))
@@ -567,55 +610,40 @@ def extract_signals_and_metadata(payload_bytes, default_vehicle="", salt=""):
     if not isinstance(data, dict):
         raise ValueError("top-level payload must be a JSON object")
 
-    # Timestamp extraction (createdAt / timestamp / time)
-    created_at_raw = (data.get("createdAt") or data.get("created_at") or
-                      data.get("timestamp") or data.get("time"))
+    vin_raw = data.get("vin")
+    vehicle = resolve_vehicle_identity(vin_raw, target_vin, configured_vehicle_id, salt)
+    if vehicle is None:
+        # Non-matching VIN under target_vin filter: skip silently
+        return None, []
+
+    created_at_raw = data.get("createdAt")
     event_time_ns = parse_created_at(created_at_raw)
 
-    # Resend flag
-    is_resend_raw = data.get("isResend", data.get("is_resend", False))
-    is_resend = bool(is_resend_raw)
+    is_resend = bool(data.get("isResend", False))
 
-    # VIN / Vehicle ID
-    vin = str(data.get("vin", data.get("vehicle_id", "")))
-    vehicle = resolve_pseudonym(default_vehicle, vin, salt)
+    raw_data_list = data.get("data")
+    if not isinstance(raw_data_list, list):
+        raise ValueError("telemetry payload missing 'data' array")
 
-    # Collect signal candidates (sparse by design)
-    raw_signals = []
-    # 1. Check for nested list: data/signals/items
-    nested = data.get("data") or data.get("signals") or data.get("items")
-    if isinstance(nested, list):
-        for item in nested:
-            if isinstance(item, dict):
-                # {key: "VehicleSpeed", value: 60} or {name: ..., value: ...}
-                k = item.get("key") or item.get("name") or item.get("field")
-                v = item.get("value")
-                if k is not None and v is not None:
-                    raw_signals.append((str(k), v))
-    elif isinstance(nested, dict):
-        for k, v in nested.items():
-            if isinstance(v, dict) and "value" in v:
-                raw_signals.append((str(k), v["value"]))
-            elif not isinstance(v, (dict, list)):
-                raw_signals.append((str(k), v))
-
-    # 2. Check top-level keys
-    for k, v in data.items():
-        if k in ("createdAt", "created_at", "timestamp", "time", "isResend",
-                 "is_resend", "vin", "vehicle_id", "data", "signals", "items", "txid", "txId"):
+    unwrapped_signals = []
+    for datum in raw_data_list:
+        if not isinstance(datum, dict):
             continue
-        if isinstance(v, dict) and "value" in v:
-            raw_signals.append((str(k), v["value"]))
-        elif not isinstance(v, (dict, list)):
-            raw_signals.append((str(k), v))
+        key = datum.get("key")
+        val_obj = datum.get("value")
+        if not key or not isinstance(key, str) or not isinstance(val_obj, dict):
+            continue
+        unwrapped = unwrap_protojson_value(key, val_obj)
+        if unwrapped is not None:
+            unwrapped_signals.append((key, unwrapped[0]))
 
     metadata = {
         "event_time_ns": event_time_ns,
         "vehicle": vehicle,
         "is_resend": is_resend,
-        "vin": vin
+        "vin": str(vin_raw).strip()
     }
-    return metadata, raw_signals
+    return metadata, unwrapped_signals
 
 
 def sql_escape(value):
@@ -660,24 +688,23 @@ def open_outbox(path):
 
 
 def store_signal_update(conn, row, max_rows=50000):
-    """Insert one row into outbox with deduplication and bounding.
+    """Insert one row into outbox with deduplication and strict disk bounding.
 
-    Returns:
-      1 if a new row was inserted into outbox
-      0 if deduped (already seen)
-      -1 if dropped due to max_rows overflow (disk protection)
+    Overflow policy (disk safety):
+      - When count >= max_rows, NEW arrivals are rejected (return -1).
+      - Existing unacked rows are NEVER deleted.
+      - Rejected rows are NOT recorded in seen_ids, allowing retry upon drain.
     """
     key = row["event_id"]
     seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?", (key,)).fetchone()
     if seen is not None:
         return 0
 
-    # Check bounded queue capacity
+    # Guard queue capacity
     cur = conn.execute("SELECT COUNT(*) FROM outbox")
     count = cur.fetchone()[0]
     if count >= max_rows:
-        # Bounded outbox overflow protection: drop oldest unacked row (FIFO)
-        conn.execute("DELETE FROM outbox WHERE rowid IN (SELECT rowid FROM outbox ORDER BY event_time ASC LIMIT 1)")
+        return -1  # Capacity overflow: reject new arrival to prevent disk filling
 
     cur = conn.execute(
         "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
@@ -691,13 +718,16 @@ def store_signal_update(conn, row, max_rows=50000):
     return 1 if inserted else 0
 
 
-def prune_seen(conn, older_than_ns, limit=5000):
-    """Prune seen_ids table to prevent unbounded disk growth."""
-    cur = conn.execute(
-        "DELETE FROM seen_ids WHERE rowid IN (SELECT rowid FROM seen_ids"
-        " WHERE seen_at < ? LIMIT ?)", (older_than_ns, limit))
+def prune_seen(conn, older_than_ns, max_seen_limit=MAX_SEEN_IDS):
+    """Bound seen_ids table by age and absolute row limit to prevent unbounded disk growth."""
+    # 1. Prune entries older than retention window
+    conn.execute("DELETE FROM seen_ids WHERE seen_at < ?", (older_than_ns,))
+    # 2. Hard count bounding: retain at most max_seen_limit newest entries
+    conn.execute(
+        "DELETE FROM seen_ids WHERE rowid NOT IN ("
+        " SELECT rowid FROM seen_ids ORDER BY seen_at DESC LIMIT ?"
+        ")", (max_seen_limit,))
     conn.commit()
-    return cur.rowcount if cur.rowcount is not None else 0
 
 
 def greptime_insert(base_url, db, user, password, sql, timeout=15):
@@ -747,13 +777,18 @@ def greptime_insert(base_url, db, user, password, sql, timeout=15):
 def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
     """Parse payload and store allowlisted signals into outbox."""
     try:
-        metadata, raw_signals = extract_signals_and_metadata(
+        metadata, raw_signals = extract_protojson_records(
             payload_bytes,
-            default_vehicle=meta_env["vehicle"],
+            target_vin=meta_env["target_vin"],
+            configured_vehicle_id=meta_env["vehicle_id"],
             salt=meta_env["vehicle_salt"]
         )
     except Exception as ex:
         stats["invalid_messages"] += 1
+        return 0
+
+    if metadata is None:
+        # Non-matching VIN filtered out
         return 0
 
     stats["messages_received"] += 1
@@ -768,7 +803,7 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
         classified = validate_field_value(spec, raw_val)
         if classified is None:
             stats["invalid_fields"] += 1
-            continue  # Value invalid: fail-closed for this signal
+            continue  # Value invalid or out of range: fail-closed for this signal
 
         num, text, boolean = classified
         path = spec["path"]
@@ -820,6 +855,7 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
             stats["deduped"] += 1
         elif res == -1:
             stats["dropped_signals"] += 1
+            stats["outbox_overflow_drops"] += 1
 
     return stored_count
 
@@ -880,6 +916,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
             f"fleet_invalid_messages_total {self.stats.get('invalid_messages', 0)}",
             f"fleet_invalid_fields_total {self.stats.get('invalid_fields', 0)}",
             f"fleet_dropped_signals_total {self.stats.get('dropped_signals', 0)}",
+            f"fleet_outbox_overflow_drops_total {self.stats.get('outbox_overflow_drops', 0)}",
         ]
         body = "\n".join(lines).encode("utf-8") + b"\n"
         self.send_response(200)
@@ -893,20 +930,18 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
 
 
 def run_subscriber(endpoint, topic, on_msg, stop_event):
-    """ZMQ subscriber loop (lazy import zmq for stdlib testing isolation)."""
+    """ZMQ subscriber loop strictly enforcing 2-frame topic protocol."""
     import zmq
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(endpoint)
     sock.setsockopt_string(zmq.SUBSCRIBE, topic)
-    sock.RCVTIMEO = 1000  # 1 second timeout
+    sock.RCVTIMEO = 1000  # 1 second poll timeout
 
     while not stop_event.is_set():
         try:
             parts = sock.recv_multipart()
-            if not parts:
-                continue
-            payload = parts[-1]
+            payload = parse_zmq_frames(parts, expected_topic=topic)
             on_msg(payload)
         except zmq.Again:
             continue
@@ -925,8 +960,8 @@ def run():
     max_outbox_rows = int(env("MAX_OUTBOX_ROWS", "50000"))
     batch_n = int(env("FLEET_BATCH_N", "500"))
     flush_sec = float(env("FLEET_FLUSH_SEC", "5"))
-    endpoint = env("FLEET_ZMQ_ENDPOINT", "tcp://tesla-helper:5555")
-    topic = env("FLEET_ZMQ_TOPIC", "")
+    endpoint = env("FLEET_ZMQ_ENDPOINT", DEFAULT_ENDPOINT)
+    topic = env("FLEET_ZMQ_TOPIC", DEFAULT_TOPIC)
     metrics_port = int(env("FLEET_METRICS_PORT", "9105"))
 
     greptime_url = env("GREPTIME_HTTP_URL", "http://greptimedb:4000")
@@ -935,7 +970,8 @@ def run():
     greptime_pw = env("GREPTIME_PASSWORD", "")
 
     meta_env = {
-        "vehicle": env("VEHICLE_ID", ""),
+        "target_vin": env("TARGET_VIN", ""),
+        "vehicle_id": env("VEHICLE_ID", ""),
         "vehicle_salt": env("VEHICLE_ID_SALT", ""),
         "decode_epoch": env("DECODE_EPOCH", "fleet-v1"),
         "vss_version": env("VSS_VERSION", "4.0"),
@@ -954,6 +990,7 @@ def run():
         "invalid_messages": 0,
         "invalid_fields": 0,
         "dropped_signals": 0,
+        "outbox_overflow_drops": 0,
     }
 
     stop_event = threading.Event()
@@ -964,7 +1001,7 @@ def run():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
-    # Initialize main outbox
+    # Initialize main outbox schema
     main_conn = open_outbox(outbox_path)
     main_conn.close()
 
@@ -998,14 +1035,13 @@ def run():
                 stats["upload_failures"] += 1
                 sys.stderr.write(f"uploader tick error: {e}\n")
 
-            # Periodic prune seen_ids every 10 minutes (keep 24 hours)
+            # Periodic prune seen_ids every 5 minutes (keep 24h, max MAX_SEEN_IDS rows)
             now_mono = time.monotonic()
-            if now_mono - last_prune > 600:
+            if now_mono - last_prune > 300:
                 retention_ns = now_ns() - 86400 * 1_000_000_000
-                prune_seen(conn, retention_ns)
+                prune_seen(conn, retention_ns, max_seen_limit=MAX_SEEN_IDS)
                 last_prune = now_mono
 
-            # Wait flush interval
             stop_event.wait(flush_sec)
 
         conn.close()
@@ -1023,10 +1059,9 @@ def run():
     except Exception as e:
         sys.stderr.write(f"metrics server failed on {metrics_port}: {e}\n")
 
-    sys.stdout.write(f"tesla-fleet-recorder started: zmq={endpoint} greptime={greptime_url}\n")
+    sys.stdout.write(f"tesla-fleet-recorder started: zmq={endpoint} topic={topic} greptime={greptime_url}\n")
     sys.stdout.flush()
 
-    # Main thread blocks until signal
     while not stop_event.is_set():
         time.sleep(1)
 
