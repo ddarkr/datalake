@@ -29,7 +29,8 @@ Config JSON shape (plain JSON object, no secrets):
   {"conditions": {}, "energy": {}, "electrical": {}, "rul": {},
    "alerts": {}} -- only these five keys, each value a dict passed
   opaquely to that analyzer under its suffix. Absent/empty dict runs
-  uncalibrated (unavailable rows, never guessed numbers). Unknown
+  uncalibrated (never guessed numbers). New unavailable identities are
+  omitted from storage; only prior results get NULL invalidations. Unknown
   top-level keys, non-dict top level, or non-dict suffix values are
   malformed and yield per-scope/window error rows (status error), never
   silent zeros. Per-analyzer thresholds/calibration/model content are
@@ -130,7 +131,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
-RUNTIME_VERSION = "1.0.1"
+RUNTIME_VERSION = "1.0.2"
 ANALYSIS_TABLE = "vehicle_analysis"
 SIGNAL_TABLE = "vehicle_signal"
 EVENT_TABLE = "vehicle_event"
@@ -1204,7 +1205,21 @@ def run_battery(ctx, cfg, now_ns=None):
     if config_error is not None and not all_rows:
         raise BatteryConfigError(config_error)
     disambiguate_rows(all_rows)
-    checked = validate_no_duplicate_pks(all_rows)
+    writable = []
+    omitted = {}
+    for row in all_rows:
+        scope = (row.get("vehicle"), row.get("source"), row.get("decode_epoch"))
+        identity = (row.get("metric"), row.get("analysis_id"),
+                    row.get("window_start_ns"), row.get("decode_epoch"))
+        # Absence is not a measurement. Keep NULL revisions only where
+        # dropping one would leave a previously stored result authoritative.
+        if (row.get("status") == "unavailable"
+                and identity not in previous.get(scope, ())):
+            reason = (row.get("reason") or "unspecified").split(":", 1)[0]
+            omitted[reason] = omitted.get(reason, 0) + 1
+        else:
+            writable.append(row)
+    checked = validate_no_duplicate_pks(writable)
     written, skipped = insert_analysis_rows(base_url, auth, db, checked)
     oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE,
                                  vehicle)
@@ -1224,6 +1239,10 @@ def run_battery(ctx, cfg, now_ns=None):
     if skipped:
         sys.stdout.write("battery: skipped %d rows missing NOT NULL "
                          "identity (no vehicle/metric/revision)\n" % skipped)
+    if omitted:
+        sys.stdout.write("battery: unavailable_not_stored (%d rows; %s)\n"
+                         % (sum(omitted.values()),
+                            json.dumps(omitted, sort_keys=True)))
     error_rows = sum(1 for r in checked if r.get("status") == "error")
     if error_rows and error_rows >= len(checked):
         sys.stdout.write("battery: all_error (%d rows, %d scopes x %d "

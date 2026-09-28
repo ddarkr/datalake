@@ -13644,7 +13644,8 @@ configs:
         {"conditions": {}, "energy": {}, "electrical": {}, "rul": {},
          "alerts": {}} -- only these five keys, each value a dict passed
         opaquely to that analyzer under its suffix. Absent/empty dict runs
-        uncalibrated (unavailable rows, never guessed numbers). Unknown
+        uncalibrated (never guessed numbers). New unavailable identities are
+        omitted from storage; only prior results get NULL invalidations. Unknown
         top-level keys, non-dict top level, or non-dict suffix values are
         malformed and yield per-scope/window error rows (status error), never
         silent zeros. Per-analyzer thresholds/calibration/model content are
@@ -13745,7 +13746,7 @@ configs:
       sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
       import battery_common as bc
 
-      RUNTIME_VERSION = "1.0.1"
+      RUNTIME_VERSION = "1.0.2"
       ANALYSIS_TABLE = "vehicle_analysis"
       SIGNAL_TABLE = "vehicle_signal"
       EVENT_TABLE = "vehicle_event"
@@ -14819,7 +14820,21 @@ configs:
           if config_error is not None and not all_rows:
               raise BatteryConfigError(config_error)
           disambiguate_rows(all_rows)
-          checked = validate_no_duplicate_pks(all_rows)
+          writable = []
+          omitted = {}
+          for row in all_rows:
+              scope = (row.get("vehicle"), row.get("source"), row.get("decode_epoch"))
+              identity = (row.get("metric"), row.get("analysis_id"),
+                          row.get("window_start_ns"), row.get("decode_epoch"))
+              # Absence is not a measurement. Keep NULL revisions only where
+              # dropping one would leave a previously stored result authoritative.
+              if (row.get("status") == "unavailable"
+                      and identity not in previous.get(scope, ())):
+                  reason = (row.get("reason") or "unspecified").split(":", 1)[0]
+                  omitted[reason] = omitted.get(reason, 0) + 1
+              else:
+                  writable.append(row)
+          checked = validate_no_duplicate_pks(writable)
           written, skipped = insert_analysis_rows(base_url, auth, db, checked)
           oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE,
                                        vehicle)
@@ -14839,6 +14854,10 @@ configs:
           if skipped:
               sys.stdout.write("battery: skipped %d rows missing NOT NULL "
                                "identity (no vehicle/metric/revision)\n" % skipped)
+          if omitted:
+              sys.stdout.write("battery: unavailable_not_stored (%d rows; %s)\n"
+                               % (sum(omitted.values()),
+                                  json.dumps(omitted, sort_keys=True)))
           error_rows = sum(1 for r in checked if r.get("status") == "error")
           if error_rows and error_rows >= len(checked):
               sys.stdout.write("battery: all_error (%d rows, %d scopes x %d "
@@ -15664,7 +15683,7 @@ configs:
   grafana-dash-battery:
     content: |
       {"uid":"datalake-vehicle-battery","title":"Battery","tags":["datalake","vehicle"],"timezone":"Asia/Seoul","schemaVersion":39,"version":5,"time":{"from":"now-30d","to":"now"},"description":"Battery health, energy, warnings and RUL from vehicle_analysis (latest revision wins) plus vehicle_event lifecycle. No data is unknown, never healthy zero.","links":[{"title":"Vehicle Overview","type":"link","url":"/d/datalake-vehicle-overview","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Charging","type":"link","url":"/d/datalake-vehicle-charging","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"Drives","type":"link","url":"/d/datalake-vehicle-drives","includeVars":false,"keepTime":true,"targetBlank":false},{"title":"CAN / VSS","type":"link","url":"/d/datalake-vehicle-can-vss","includeVars":false,"keepTime":true,"targetBlank":false}],"templating":{"list":[{"name":"vehicle","type":"textbox","label":"Vehicle (exact)","query":"","current":{"text":"","value":""},"description":"Exact match; blank includes all scopes, never averaged."},{"name":"source","type":"textbox","label":"Source (exact)","query":"","current":{"text":"","value":""},"description":"Exact match; can and fleet are never merged."},{"name":"epoch","type":"textbox","label":"Decode epoch (exact)","query":"","current":{"text":"","value":""},"description":"Exact match; blank includes all epochs as separate scopes."},{"name":"metric","type":"textbox","label":"Metric (exact)","query":"battery.electrical.soc_ekf_pct","current":{"text":"battery.electrical.soc_ekf_pct","value":"battery.electrical.soc_ekf_pct"},"description":"Exact metric name for the selected-metric history panel."},{"name":"status","type":"textbox","label":"Status (exact)","query":"","current":{"text":"","value":""},"description":"Exact match on reported, derived, estimated, unavailable, error; blank shows the true latest whatever its status."}]},"panels":[
-      {"id":1,"type":"text","title":"Reading guide — sparsity and limits","fieldConfig":{"defaults":{},"overrides":[]},"options":{"mode":"markdown","content":"**No data means unknown, never healthy zero.** Latest revision wins per (vehicle, source, epoch, analysis, metric, window) ordered by computed_at then revision: a fresh unavailable or error row replaces any stale good value, so check status, reason and computed_at before trusting a number. Blank vehicle, source or epoch filters show every scope side by side, never averaged. Warning episodes use [started_at, ended_at-or-open] overlap, so episodes that started before the range but stay open remain visible. Limits: min and max (+IDs) cannot recover the full cell vector or physical resistance; unknown units stay raw with no chemistry or capacity guesses; delta-E over delta-SOC is interval-equivalent energy, not full usable kWh; lab-cell RUL models cannot be applied to Tesla packs (CB-R stays blocked); Fleet Soc is the BMS usable report, while Coulomb/OCV/EKF values are separate calibrated estimates; apparent DC resistance is not EIS or true cell resistance; warning absence or disconnect never closes an episode, conflicting ends give no authoritative duration, and context association is not causation."},"gridPos":{"h":5,"w":24,"x":0,"y":0}},
+      {"id":1,"type":"text","title":"Reading guide — sparsity and limits","fieldConfig":{"defaults":{},"overrides":[]},"options":{"mode":"markdown","content":"**No data means unknown, never healthy zero.** Missing inputs, calibration or models do not create placeholder rows. Their omission counts appear in aggregate logs as unavailable_not_stored; absence here does not mean all methods ran successfully. Stored unavailable rows invalidate a previously recorded result. Latest revision wins per (vehicle, source, epoch, analysis, metric, window) ordered by computed_at then revision, so check the observation window, status, reason and computed_at before trusting a number. Blank vehicle, source or epoch filters show every scope side by side, never averaged. Warning episodes use [started_at, ended_at-or-open] overlap, so episodes that started before the range but stay open remain visible. Limits: min and max (+IDs) cannot recover the full cell vector or physical resistance; unknown units stay raw with no chemistry or capacity guesses; delta-E over delta-SOC is interval-equivalent energy, not full usable kWh; lab-cell RUL models cannot be applied to Tesla packs (CB-R stays blocked); Fleet Soc is the BMS usable report, while Coulomb/OCV/EKF values are separate calibrated estimates; apparent DC resistance is not EIS or true cell resistance; warning absence or disconnect never closes an episode, conflicting ends give no authoritative duration, and context association is not causation."},"gridPos":{"h":5,"w":24,"x":0,"y":0}},
       {"id":2,"type":"stat","title":"Scopes with analysis (range)","description":"Distinct (vehicle, source, epoch) scopes with analysis rows in range. No data means no analyses, not zero vehicles.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT NULLIF(COUNT(*), 0) AS scopes FROM (SELECT DISTINCT vehicle, source, decode_epoch FROM vehicle_analysis WHERE $$__timeFilter(window_start) AND ($${vehicle:sqlstring} = '' OR vehicle = $${vehicle:sqlstring}) AND ($${source:sqlstring} = '' OR source = $${source:sqlstring}) AND ($${epoch:sqlstring} = '' OR COALESCE(decode_epoch, '') = $${epoch:sqlstring})) AS s","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"No data","mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":7,"w":6,"x":0,"y":5}},
       {"id":3,"type":"stat","title":"Latest metrics unavailable / error","description":"Latest-per-metric rows whose newest revision is unavailable or error. Status is filtered only after the latest revision wins; see the authoritative table. Zero means no current analysis rows carry either status, not a vehicle health judgment. No data means no analysis rows.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"WITH ranked AS (SELECT vehicle, source, decode_epoch, analysis_id, `metric`, window_start, window_end, `value`, value_text, unit, status, reason, revision, evidence_count, sample_count, coverage_ratio, algorithm_version, calibration_version, model_version, uncertainty, uncertainty_lower, uncertainty_upper, computed_at, quality, config_version, connectivity, episode_id, ROW_NUMBER() OVER (PARTITION BY vehicle, source, decode_epoch, analysis_id, `metric`, window_start ORDER BY computed_at DESC, revision DESC) AS rn FROM vehicle_analysis WHERE $$__timeFilter(window_start) AND ($${vehicle:sqlstring} = '' OR vehicle = $${vehicle:sqlstring}) AND ($${source:sqlstring} = '' OR source = $${source:sqlstring}) AND ($${epoch:sqlstring} = '' OR COALESCE(decode_epoch, '') = $${epoch:sqlstring})) SELECT SUM(CASE WHEN status IN ('unavailable', 'error') THEN 1 ELSE 0 END) AS degraded FROM ranked WHERE rn = 1","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"No data","mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":7,"w":6,"x":6,"y":5}},
       {"id":4,"type":"stat","title":"Latest analysis window","description":"Newest window_start in scope; event time, not ingest time. Older than expected marks a stale pipeline, not current health.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CAST(MAX(window_start) AS BIGINT) / 1000000 AS latest_window FROM vehicle_analysis WHERE $$__timeFilter(window_start) AND ($${vehicle:sqlstring} = '' OR vehicle = $${vehicle:sqlstring}) AND ($${source:sqlstring} = '' OR source = $${source:sqlstring}) AND ($${epoch:sqlstring} = '' OR COALESCE(decode_epoch, '') = $${epoch:sqlstring})","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"noValue":"No data","mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}],"unit":"dateTimeAsIso"},"overrides":[]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":7,"w":6,"x":12,"y":5}},

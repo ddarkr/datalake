@@ -471,6 +471,66 @@ def test_sql_values_preserve_identity_and_nanoseconds():
     assert "2026-09-27 07:11:06.062145840" in decoded
 
 
+def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+
+    hour = br.HOUR_NS
+    signals = []
+    with sqlite3.connect(":memory:") as db, ExitStack() as stack:
+        db.execute("CREATE TABLE vehicle_analysis ("
+                   + ", ".join(br.ANALYSIS_COLS) + ")")
+
+        def sql_request(base_url, auth, database, statement, timeout=60):
+            cursor = db.execute(statement)
+            if cursor.description is None:
+                return {}
+            return {"output": [{"records": {
+                "schema": {"column_schemas": [
+                    {"name": column[0], "data_type": "String"}
+                    for column in cursor.description]},
+                "rows": cursor.fetchall()}}]}
+
+        stack.enter_context(patch.object(br, "request_sql", sql_request))
+        stack.enter_context(patch.object(
+            br, "fetch_signals", lambda *args: list(signals)))
+        stack.enter_context(patch.object(br, "fetch_events", lambda *args: []))
+        stack.enter_context(patch.object(br, "coverage_min", lambda *args: None))
+        cfg = {"vehicle": "v", "battery_config": "", "battery_lookback_h": 2}
+        assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
+        assert db.execute("SELECT COUNT(*) FROM vehicle_analysis").fetchone() == (0,)
+
+        signals.append(_sig("v", "fleet", "e1", 8 * hour + 1,
+                            field="BrickVoltageMax", value=4.1, unit=None,
+                            quality="unit_unverified"))
+        br.run_battery(("", "", ""), cfg, now_ns=10 * hour + 1)
+        metric = "battery.conditions.brick_max_raw"
+        assert db.execute(
+            'SELECT "value", status FROM vehicle_analysis WHERE metric=?',
+            (metric,)).fetchall() == [(4.1, "reported")]
+        assert db.execute(
+            "SELECT COUNT(*) FROM vehicle_analysis WHERE status='unavailable'"
+        ).fetchone() == (0,)
+
+        # A late invalid sample must clear the old value, but cannot create
+        # empty results for a different epoch or the adjacent empty hour.
+        for epoch in ("e1", "e2"):
+            signals.append(_sig("v", "fleet", epoch, 8 * hour + 2,
+                                field="BrickVoltageMax", value=None,
+                                unit=None, quality="invalid"))
+        br.run_battery(("", "", ""), cfg, now_ns=10 * hour + 2)
+        assert db.execute(
+            'SELECT "value", status FROM vehicle_analysis WHERE metric=? '
+            "AND decode_epoch='e1' ORDER BY computed_at DESC LIMIT 1",
+            (metric,)).fetchone() == (None, "unavailable")
+        assert db.execute(
+            "SELECT metric, decode_epoch FROM vehicle_analysis "
+            "WHERE status='unavailable'").fetchall() == [(metric, "e1")]
+        assert db.execute(
+            "SELECT COUNT(*) FROM vehicle_analysis WHERE window_start=?",
+            (br.ns_to_sql_ts(9 * hour),)).fetchone() == (0,)
+
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:
