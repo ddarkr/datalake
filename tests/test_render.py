@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 import render  # noqa: E402
 
-
 def base_env(tmp_path):
     return dict(os.environ, GREPTIME_PASSWORD="t3st-pw without equals",
                 GF_ADMIN_PASSWORD="grafana-admin-pw",
@@ -176,10 +175,36 @@ def test_preflight_identity_change_fails_closed(tmp_path):
     assert r2.returncode != 0
     assert "storage backend identity changed" in r2.stderr
 
+def test_fleet_fragment_renders_runtime_bundle():
+    # Rendered runtime behavior only: fleet recorder stays bundled as a
+    # single-file stdlib config with no second script, fleet opt-in profile,
+    # private ZMQ endpoint, persisted volumes, and no vehicle_data polling.
+    frag = render.load_fragment(str(ROOT / "compose" / "tesla-fleet.yaml"))
+    svc = frag["services"]["tesla-fleet-recorder"]
+    assert svc["profiles"] == ["fleet"]
+    assert svc["command"] == ["/opt/venv/bin/python", "-u", "/app/fleet_recorder.py"]
+    names = [c["source"] for c in svc.get("configs", [])]
+    assert names == ["fleet_recorder_py"]
+    env = dict(svc.get("environment") or {})
+    assert "FLEET_ZMQ_TOPICS" in env and "CONFIG_VERSION" in env
+    assert "tesla_alerts" in env["FLEET_ZMQ_TOPICS"]
+    assert "tesla-helper-net" in (svc.get("networks") or [])
+    vols = svc.get("volumes") or []
+    assert any(str(v).startswith("fleet-data:") for v in vols)
+    assert any(str(v).startswith("fleet-venv:") for v in vols)
+    assert not any("POLL" in k or "VEHICLE_DATA" in k for k in env)
+    merged = render.merge_docs(
+        [frag, render.load_fragment(str(ROOT / "compose" / "core.yaml"))])
+    assert set(merged["configs"]) != set()
+    assert "fleet_battery_common_py" not in merged["configs"]
+    rendered = render.render_to_text(merged)
+    assert "/app/fleet_recorder.py" in rendered
+
 
 if __name__ == "__main__":
     test_xsource_roundtrip()
     test_final_forbids_remote_mounts()
+    test_fleet_fragment_renders_runtime_bundle()
     for check in (
         test_duplicate_service_fails, test_xsource_escape_fails,
         test_preflight_fails_fast_without_password,
@@ -192,4 +217,4 @@ if __name__ == "__main__":
     ):
         with tempfile.TemporaryDirectory() as directory:
             check(Path(directory))
-    print("test_render: ok (11 checks)")
+    print("test_render: ok (12 checks)")

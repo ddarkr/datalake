@@ -6,6 +6,17 @@
 #
 # Backup (service/config/volume) lives in BackupCorrectness's fragment;
 # this fragment declares none of those names.
+#
+# Battery analytics ride on the existing aggregate service (profile: server,
+# no new service/volumes). All battery Python modules mount read-only via
+# x-source configs; the aggregate image stays stdlib-only (no scipy:
+# battery_reference .mat loading needs scipy and is unavailable in aggregate,
+# its stdlib record/JSON helpers stay importable). The analysis JSON mounts
+# read-only from config/battery-analysis.example.json; uncalibrated defaults
+# yield unavailable rows, never guessed Tesla chemistry or fake models.
+# Optional operator calibration/model files, whenever needed, arrive as
+# further read-only x-source configs pointing at repo-tracked files only;
+# host bind mounts, file: refs, and absolute host paths stay banned.
 
 services:
   db-schema:
@@ -38,7 +49,7 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.aggregate-revision: "1"
+      datalake.aggregate-revision: "2"
     depends_on:
       greptimedb:
         condition: service_started
@@ -52,6 +63,11 @@ services:
       AGG_INTERVAL_SECONDS: ${AGG_INTERVAL_SECONDS:-300}
       AGG_LOOKBACK_HOURS: ${AGG_LOOKBACK_HOURS:-30}
       AGG_MAX_ROWS: ${AGG_MAX_ROWS:-200000}
+      BATTERY_ANALYSIS_CONFIG: ${BATTERY_ANALYSIS_CONFIG:-/app/battery-analysis.json}
+      BATTERY_LOOKBACK_HOURS: ${BATTERY_LOOKBACK_HOURS:-}
+      BATTERY_MAX_ROWS: ${BATTERY_MAX_ROWS:-}
+      BATTERY_BACKFILL_START: ${BATTERY_BACKFILL_START:-}
+      BATTERY_BACKFILL_END: ${BATTERY_BACKFILL_END:-}
       OTEL_TTL: ${OTEL_TTL:-}
       HOME_RAW_TTL: ${HOME_RAW_TTL:-90d}
       VEHICLE_SPEED_PATH: ${VEHICLE_SPEED_PATH:-}
@@ -73,6 +89,33 @@ services:
       - source: activity_py
         target: /app/activity.py
         mode: 0444
+      - source: battery_common_py
+        target: /app/battery_common.py
+        mode: 0444
+      - source: battery_reference_py
+        target: /app/battery_reference.py
+        mode: 0444
+      - source: battery_conditions_py
+        target: /app/battery_conditions.py
+        mode: 0444
+      - source: battery_energy_py
+        target: /app/battery_energy.py
+        mode: 0444
+      - source: battery_electrical_py
+        target: /app/battery_electrical.py
+        mode: 0444
+      - source: battery_rul_py
+        target: /app/battery_rul.py
+        mode: 0444
+      - source: battery_alerts_py
+        target: /app/battery_alerts.py
+        mode: 0444
+      - source: battery_runtime_py
+        target: /app/battery_runtime.py
+        mode: 0444
+      - source: battery_analysis_json
+        target: /app/battery-analysis.json
+        mode: 0444
     command: ["python", "/app/aggregate.py"]
     restart: unless-stopped
     stop_grace_period: 30s
@@ -84,3 +127,21 @@ configs:
     x-source: scripts/aggregate.py
   activity_py:
     x-source: scripts/activity.py
+  battery_common_py:
+    x-source: scripts/battery_common.py
+  battery_reference_py:
+    x-source: scripts/battery_reference.py
+  battery_conditions_py:
+    x-source: scripts/battery_conditions.py
+  battery_energy_py:
+    x-source: scripts/battery_energy.py
+  battery_electrical_py:
+    x-source: scripts/battery_electrical.py
+  battery_rul_py:
+    x-source: scripts/battery_rul.py
+  battery_alerts_py:
+    x-source: scripts/battery_alerts.py
+  battery_runtime_py:
+    x-source: scripts/battery_runtime.py
+  battery_analysis_json:
+    x-source: config/battery-analysis.example.json

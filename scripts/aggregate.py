@@ -8,17 +8,11 @@ Stdlib only. Reads GREPTIME_* connection env plus:
     and the SQL-pushdownagg windows (vehicle 1m/1h, home 5m/1h/1d).
   AGG_MAX_ROWS (default 200000): per-section raw-row cap. A section over the
   cap fails closed (error, no partial writes) instead of OOMing.
-  OTEL_TTL (default empty): raw OTel retention, same Ns/Nm/Nh/Nd contract
-  as db_init; empty means unbounded. Windows starting before now - TTL
-  keep their existing summary rows instead of rewriting from partial raw.
-  HOME_RAW_TTL (default 90d): passthrough for the Home raw TTL owner;
-  aggregate applies no Home retention logic itself.
-  VEHICLE_SPEED_PATH / VEHICLE_SOC_PATH / VEHICLE_ENERGY_PATH /
-  VEHICLE_POWER_PATH / VEHICLE_CHARGING_PATH: VSS paths. A section whose
-  required path has no rows stays empty (never zero-filled).
-  HOME_SOURCE_TABLE / HOME_TIME_COL / HOME_ENTITY_COL / HOME_VALUE_COL:
-    raw home table. Empty table name = home section skipped (exit 0).
-  AGG_RUN_ONCE=1: single pass (debug only; compose runs the scheduler).
+  BATTERY_ANALYSIS_CONFIG (default /app/battery-analysis.json): plain JSON
+  config for the battery section (explicit missing path is an error); plus
+  BATTERY_LOOKBACK_HOURS/BATTERY_MAX_ROWS (empty = fall back to the AGG
+  values) and BATTERY_BACKFILL_START/END (both-or-neither explicit older
+  recompute range). Battery rides AGG_INTERVAL_SECONDS; no new schedule.
 
 Retention policy (fail-closed; DELETE only drops obsolete same-session starts):
   AI summaries rebuild from the full retained raw range each pass, so there
@@ -1743,6 +1737,9 @@ def load_cfg():
     otel_ttl = env("OTEL_TTL", "").strip()
     if otel_ttl and not TTL_RE.match(otel_ttl):
         raise SqlError("OTEL_TTL must look like 90d/12h (or empty for no TTL)")
+    # Battery-only validation belongs to its isolated section, not startup.
+    battery_lookback_h = env("BATTERY_LOOKBACK_HOURS", "").strip() or lookback_h
+    battery_max_rows = env("BATTERY_MAX_ROWS", "").strip() or max_rows
     return {
         "base_url": env("GREPTIME_HTTP_URL", "http://greptimedb:4000"),
         "db": env("GREPTIME_DB", "datalake"),
@@ -1753,6 +1750,12 @@ def load_cfg():
         "max_rows": max_rows,
         "otel_ttl": otel_ttl,
         "home_raw_ttl": home_raw_ttl,
+        "battery_lookback_h": battery_lookback_h,
+        "battery_max_rows": battery_max_rows,
+        "battery_config": env("BATTERY_ANALYSIS_CONFIG", "/app/battery-analysis.json"),
+        "battery_config_explicit": bool(env("BATTERY_ANALYSIS_CONFIG", "")),
+        "battery_backfill_start": env("BATTERY_BACKFILL_START", ""),
+        "battery_backfill_end": env("BATTERY_BACKFILL_END", ""),
         **tuning,
         "vehicle": env("VEHICLE_ID", ""),
         "paths": {
@@ -2260,6 +2263,15 @@ def home_section(ctx, cfg):
     return total
 
 
+def battery_section(ctx, cfg):
+    """Run pure battery analyzers into vehicle_analysis. Import is lazy so
+    unit tests importing aggregate never require sibling analyzer files;
+    missing battery_runtime fails the section (loud), never silent zeros."""
+    import importlib
+    runtime = importlib.import_module("battery_runtime")
+    return runtime.run_battery(ctx, cfg)
+
+
 def run_all(ctx, cfg):
     """One pass over every section. Returns (rows, failed)."""
     base_url, auth, db = ctx
@@ -2271,7 +2283,8 @@ def run_all(ctx, cfg):
         try:
             n = fn()
             counts[name] = n
-            sys.stdout.write("aggregate: " + name + ": ok (" + str(n) + " rows)\n")
+            if name != "battery":  # battery reports ok/partial_errors/all_error itself
+                sys.stdout.write("aggregate: " + name + ": ok (" + str(n) + " rows)\n")
         except SqlError as e:
             if is_missing_table(e):
                 sys.stdout.write("aggregate: " + name + ": skipped (no source table yet)\n")
@@ -2288,6 +2301,7 @@ def run_all(ctx, cfg):
     run_section("vehicle", lambda: vehicle_section(ctx, cfg))
     run_section("trip_charge", lambda: trip_section(ctx, cfg))
     run_section("home", lambda: home_section(ctx, cfg))
+    run_section("battery", lambda: battery_section(ctx, cfg))
     return counts, failed
 
 
