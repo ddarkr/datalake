@@ -1,129 +1,44 @@
 #!/usr/bin/env python3
-"""Charge/discharge energy, throughput, equivalent cycles and capacity. Stdlib only.
+"""Battery energy, charge/discharge sessions and conditional capacity. Stdlib only.
 
-Config contract (config is a plain dict):
-  config["window_start_ns"] / ["window_end_ns"] / ["decision_time_ns"]:
-    optional integer ns echoed on rows. A present-but-malformed bound, or
-    end < start, yields per-metric error rows. Signals with event_time
-    before window_start are RETAINED as session context (sessions may
-    start before the hourly window); only event_time > window_end is
-    dropped. decision_time_ns admits only rows with event_time and
-    ingest_time <= decision (online filtering; unknown ingest admitted
-    when decision is None).
-  config["energy"]: plain dict, all optional. Absent/not-a-dict runs
-    uncalibrated (counters and sessions still work; physical integrals,
-    EFC, trend and SOH report unavailable, never guessed numbers).
-    "max_skew_ns": non-negative int, default 300000000000 (5 min).
-      Bounded alignment for joins and session/SOC boundary matching.
-    "max_gap_ns": non-negative int, default 600000000000 (10 min).
-      Every integration leg and every session continuity step wider than
-      this is rejected, never filled.
-    "min_soc_span_pct": finite > 0, default 10.0. Minimum SOC span for
-      any delta-E / delta-SOC capacity.
-    Field selection (exact Fleet source_field names, never VSS path
-      guesses). Defaults read the official PackCurrent/PackVoltage raw
-      fields (unit NULL, quality unit_unverified) plus the aligned
-      official BMSState/DetailedChargeState text fields:
-      "voltage_field" default "PackVoltage",
-      "current_field" default "PackCurrent",
-      "soc_field" default "Soc" (BatteryLevel is displayed SOC and is
-      never equated; only the configured soc field is read),
-      "energy_remaining_field" default "EnergyRemaining",
-      "dc_counter_field" default "DCChargingEnergyIn",
-      "ac_counter_field" default "ACChargingEnergyIn",
-      "discharge_counter_field" default "LifetimeEnergyUsed",
-      "session_energy_field" default "ChargeEnergyAdded",
-      "charging_state_field" default "ChargingState",
-      "detailed_charge_field" default "DetailedChargeState",
-      "bms_state_field" default "BMSState",
-      "power_field" default "ChargerPower".
-    PackCurrent/PackVoltage math requires explicit scoped field
-    calibration (see below); without it they are evidence only.
-    "current_sign": "positive_charge" (+1: positive calibrated current
-      means charging) or "positive_discharge" (-1), ints 1/-1 accepted.
-      Required for every V*I and Ah split. Missing leaves those metrics
-      unavailable; present-but-wrong errors the sign-dependent metrics.
-    "field_calibration": optional dict keyed by source_field, each entry
-      {"vehicle": str non-empty, "source": str non-empty,
-       "decode_epoch": str non-empty, "declared_domain": str non-empty,
-       "version": str non-empty, "unit_scale": finite nonzero,
-       "unit_offset": finite (default 0.0), "unit": "V" for the
-       configured voltage field, "A" for the configured current field}.
-      A PackCurrent/PackVoltage sample joins physical V*I/Ah math only
-      when its exact (vehicle, source, decode_epoch) scope matches a
-      calibration entry, the entry unit matches the expected physical
-      unit, and current_sign is present. Calibrated value =
-      raw * unit_scale + unit_offset. Entries never apply across scopes;
-      scope mismatch reports scope_mismatch (never a cross-scope value).
-      A present-but-malformed entry errors the V*I/Ah metrics
-      (malformed:*); malformed entries never silently fall back.
-      Unknown keys "voltage_calibration"/"current_calibration" are
-      rejected as malformed field selection (canonical path only).
-    "soc_uncertainty_pct" / "energy_uncertainty_kwh": optional finite
-      >= 0 single-reading standard deviations. Interval/circular capacity
-      uncertainty is propagated from these only; otherwise no uncertainty
-      is emitted (never fabricated). Malformed values error only the two
-      capacity metrics.
-    "reference": optional dict {version (non-empty str), domain
-      (non-empty str), energy_kwh (finite > 0) and/or charge_ah
-      (finite > 0, at least one required), conditions (optional str)}.
-      A fixed like-for-like new-pack reference supplied by the operator.
-      Present-but-malformed errors the reference-dependent metrics
-      (EFC pair, trend, SOH). Absent leaves them unavailable.
-    "domain" / "conditions": optional strings describing the current
-      window. Trend and SOH additionally require domain equality with
-      the reference, and conditions equality when the reference states
-      conditions; otherwise incomparable_* (never a like-for-like claim).
+analyze(signals, events, config) retains pre-window session context, while
+window counters and integrals use only in-window samples. Optional integer-ns
+window_start_ns/window_end_ns bound inclusive windows. decision_time_ns admits
+only observations with known event and ingest times at or before the decision.
 
-Sessions: charge sessions reduce meter/power/current evidence plus
-  charging/BMS text *changes* (any change is a boundary; text values are
-  never interpreted). A session opens on meter gain, observed power > 0,
-  or charge-direction current; current evidence is sign-independent
-  (any nonzero calibrated current opens: charge direction extends,
-  discharge direction closes). Sessions close on gaps, text changes,
-  meter resets, observed power returning to 0, or discharge-direction
-  current. Sessions may start before the hourly window: runtime passes
-  retained context, so boundary sessions keep their rows with
-  incomplete_boundary (never silently dropped, never credited energy).
-  Discharge segmentation stays in aggregate trip logic; this module
-  reports the discharge window delta only. Each logical session gets a
-  stable persisted identity: analysis_id
-  "battery_energy:session:<episode_id>" where episode_id =
-  bc.episode_key(vehicle, "energy", "charge_session", start_ns, epoch),
-  so hourly runtime windows never collide on one constant PK.
+config["energy"]:
+  max_skew_ns=300000000000; max_gap_ns=600000000000; min_soc_span_pct=10.
+  Exact source_field overrides use FIELD_DEFAULTS below, never path aliases.
+  current_sign: positive_charge/+1 or positive_discharge/-1.
+  field_calibration: {field: entry or [entries]} for PackCurrent/PackVoltage.
+    Each entry requires exact vehicle/source/decode_epoch, declared_domain,
+    version, unit A/V, unit_scale (finite nonzero, default1), unit_offset
+    (finite, default0). Conflicting scopes error. Native A/V is already usable.
+  reference: version, domain, energy_kwh and/or charge_ah (>0), optional
+    conditions. domain/conditions identify the comparable measurement regime.
+  soc_uncertainty_pct/energy_uncertainty_kwh: optional nonnegative independent
+    single-reading standard deviations; absent means unknown, not zero.
 
-Semantics:
-  DCChargingEnergyIn is the battery-side meter (AC+DC into the pack);
-  ACChargingEnergyIn is the charger-side meter (AC only). They are
-  reported as distinct window deltas, never summed. LifetimeEnergyUsed
-  is the discharging counter. Counter deltas reject resets and
-  ambiguous same-stamp conflicts; sparse counters stay unavailable.
-  Counter deltas are computed over the retained window span only;
-  unmatched boundaries (fewer than two in-window counter samples)
-  refuse false deltas even when retained context exists.
-  V*I and Ah integrals need explicit scoped calibration plus sign,
-  bounded skew/gap, and valid quality; any rejected leg makes the
-  window metric unavailable (partial integrals are never presented as
-  window energy). Integration covers only in-window samples; retained
-  pre-window context bounds sessions, never extends the energy totals.
-  Ah and kWh are separate metrics, never converted into each other.
-  EFC uses exactly one throughput domain per run (Ah, then counters,
-  then V*I) so the counter and the integral are never counted twice:
-  oneway = discharge / ref, bidirectional = (charge + discharge) /
-  (2 * ref). Interval capacity is session-meter energy over SOC span;
-  EnergyRemaining/SOC is reported separately as BMS-circular, never as
-  independent capacity. No initial-baseline 100% trick: SOH and trend
-  exist only against the supplied reference.
+Invalid, unknown-unit and same-time contradictory values are barriers.
+V*I/Ah reject a window containing a rejected leg; linear endpoint power/current
+is split at zero crossings instead of cancelling gross charge and discharge.
+Coverage describes observed time, not proof that a whole hour was sampled.
+DCChargingEnergyIn is battery-side AC+DC; ACChargingEnergyIn is charger-side AC.
+They are never added. LifetimeEnergyUsed is the independent discharge counter.
+EFC selects exactly one domain (Ah, counters, V*I), never adds redundant sources.
 
-Metrics (namespace battery.energy.*), all status derived when valued:
-  charge_session_energy_kwh (kWh, per session, episode_id + value_text),
-  dc_charging_energy_in_kwh, ac_charging_energy_in_kwh,
-  discharge_energy_kwh (kWh window deltas),
-  vi_charge_energy_kwh, vi_discharge_energy_kwh (kWh),
-  charge_throughput_ah, discharge_throughput_ah (Ah),
-  efc_oneway_cycles, efc_bidirectional_cycles (cycles),
-  interval_capacity_kwh, bms_circular_capacity_kwh, capacity_trend_kwh
-  (kWh), soh_pct (%).
+Signed current, charger power or counter changes bound directional sessions.
+Unknown state, text changes, gaps and invalid values cannot prove completion.
+Observed idle on both sides plus exact, gap-bounded meter endpoints is required
+for complete energy. Retained cross-hour sessions are credited only on closure.
+episode_id is folded into analysis_id for persistence without PK collisions.
+
+Partial delta-energy/delta-SOC is interval-equivalent capacity, not absolute
+SOH. Full usable capacity needs a complete monotonic 100->0 SOC discharge with
+independent LifetimeEnergyUsed endpoints. Latest eligible retained session is
+labelled with its asof_ns; trend/SOH additionally require comparable reference.
+EnergyRemaining/SOC is separately labelled BMS-circular, never independent.
+Supplied endpoint uncertainty propagates against a fixed reference only.
 """
 
 import math
@@ -134,11 +49,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
 CODE_VERSION = "1.0.0"
-ALGORITHM_VERSION = "1.0.0"
+ALGORITHM_VERSION = "1.1.0"
 ANALYSIS_ID = "battery_energy"
 
 SUPPORTED_METRICS = (
     "battery.energy.charge_session_energy_kwh",
+    "battery.energy.discharge_session_energy_kwh",
+    "battery.energy.full_usable_capacity_kwh",
     "battery.energy.dc_charging_energy_in_kwh",
     "battery.energy.ac_charging_energy_in_kwh",
     "battery.energy.discharge_energy_kwh",
@@ -156,6 +73,8 @@ SUPPORTED_METRICS = (
 
 METRIC_UNITS = {
     "battery.energy.charge_session_energy_kwh": "kWh",
+    "battery.energy.discharge_session_energy_kwh": "kWh",
+    "battery.energy.full_usable_capacity_kwh": "kWh",
     "battery.energy.dc_charging_energy_in_kwh": "kWh",
     "battery.energy.ac_charging_energy_in_kwh": "kWh",
     "battery.energy.discharge_energy_kwh": "kWh",
@@ -183,7 +102,7 @@ FIELD_DEFAULTS = {
     "dc_counter_field": "DCChargingEnergyIn",
     "ac_counter_field": "ACChargingEnergyIn",
     "discharge_counter_field": "LifetimeEnergyUsed",
-    "session_energy_field": "ChargeEnergyAdded",
+    "session_energy_field": "DCChargingEnergyIn",
     "charging_state_field": "ChargingState",
     "detailed_charge_field": "DetailedChargeState",
     "bms_state_field": "BMSState",
@@ -289,6 +208,10 @@ def _parse_field_calibrations(ecfg, fields):
                     raise EnergyError(
                         "malformed: field_calibration[%s] not a V/A field"
                         % field)
+                if any((c["vehicle"], c["source"], c["decode_epoch"]) ==
+                       (parsed["vehicle"], parsed["source"], parsed["decode_epoch"])
+                       for c in out.get(field, [])):
+                    raise EnergyError("malformed: overlapping field_calibration scope")
                 out.setdefault(field, []).append(parsed)
     for key in ("voltage_calibration", "current_calibration"):
         if ecfg.get(key) is not None:
@@ -450,15 +373,19 @@ def split_power_legs(steps, max_gap_ns):
                 or w0 <= 0.0 or w1 <= 0.0:
             rejected += 1
             continue
-        energy = (w0 * c0 + w1 * c1) / 2.0 * (t1 - t0) / 3.6e15
-        if not bc.is_finite_number(energy):
-            rejected += 1
-            continue
-        avg = (c0 + c1) / 2.0
-        if avg > 0.0:
-            charge += energy
-        elif avg < 0.0:
-            dis -= energy
+        # Integrate linear endpoint power, splitting its zero crossing.
+        p0, p1 = w0 * c0, w1 * c1
+        duration = (t1 - t0) / 3.6e15
+        if p0 * p1 < 0:
+            fraction = abs(p0) / (abs(p0) + abs(p1))
+            charge += (max(p0, 0) * fraction
+                       + max(p1, 0) * (1 - fraction)) * duration / 2
+            dis += (max(-p0, 0) * fraction
+                    + max(-p1, 0) * (1 - fraction)) * duration / 2
+        else:
+            energy = (p0 + p1) * duration / 2
+            charge += max(energy, 0)
+            dis += max(-energy, 0)
         used += 1
         used_dt += t1 - t0
     if used and not bc.is_finite_number(charge + dis):
@@ -502,14 +429,17 @@ def split_current_legs(pairs, max_gap_ns):
         if c0 is None or c1 is None:
             rejected += 1
             continue
-        ahs = (c0 + c1) / 2.0 * (t1 - t0) / 3.6e12
-        if not bc.is_finite_number(ahs):
-            rejected += 1
-            continue
-        if ahs > 0.0:
-            charge += ahs
-        elif ahs < 0.0:
-            dis -= ahs
+        duration = (t1 - t0) / 3.6e12
+        if c0 * c1 < 0:
+            fraction = abs(c0) / (abs(c0) + abs(c1))
+            charge += (max(c0, 0) * fraction
+                       + max(c1, 0) * (1 - fraction)) * duration / 2
+            dis += (max(-c0, 0) * fraction
+                    + max(-c1, 0) * (1 - fraction)) * duration / 2
+        else:
+            ahs = (c0 + c1) * duration / 2
+            charge += max(ahs, 0)
+            dis += max(-ahs, 0)
         used += 1
         used_dt += t1 - t0
     if not used:
@@ -573,170 +503,37 @@ def capacity_uncertainty_kwh(cap_kwh, delta_e_kwh, energy_std_kwh,
 
 
 def segment_sessions(points, max_gap_ns):
-    """Reduce a merged charge-evidence timeline into charge sessions.
+    """Reduce observed signed directions; gaps/barriers never close a full session."""
+    _check_ns("max_gap_ns", max_gap_ns)
+    sessions, current, previous = [], None, None
 
-    points: list of dicts {t (ns), powers [...], meters [...],
-      icharges [...] (raw calibrated amps, sign-independent),
-      ctext/dtext/btext (deterministic joined strings or None)}.
-    Same-timestamp conflicts stay visible: straddling meter values mark
-    the point ambiguous, joined text changes mark boundaries. Current
-    opens on any nonzero sample; discharge direction closes.
-    Returns session dicts {start_ns, end_ns, close_reason,
-      evidence (sorted kinds), incomplete_start, incomplete_end,
-      end_inclusive}. Evidence kinds: meter_gain, power, current.
-    """
-    if isinstance(max_gap_ns, bool) or not isinstance(max_gap_ns, int) \
-            or max_gap_ns < 0:
-        raise EnergyError("max_gap_ns must be a non-negative int")
-    merged = {}
-    for point in points or []:
-        if not isinstance(point, dict):
+    def close(end, reason, complete):
+        sessions.append(dict(current, end_ns=end, close_reason=reason,
+                             incomplete_end=not complete, end_inclusive=True))
+
+    for point in sorted(points, key=lambda p: p["t"]):
+        stamp, direction = point["t"], point.get("direction")
+        gap = previous is not None and stamp - previous["t"] > max_gap_ns
+        if gap or direction is None:
+            if current:
+                close(previous["t"], "gap" if gap else "quality_barrier", False)
+                current = None
+            previous = None
+        if direction is None:
             continue
-        tst = bc.to_ns(point.get("t"))
-        if tst is None:
-            continue
-        slot = merged.setdefault(tst, {"t": tst, "powers": [],
-                                       "meters": [], "icharges": [],
-                                       "ctext": [], "dtext": [],
-                                       "btext": []})
-        for key in ("powers", "meters", "icharges"):
-            for val in point.get(key) or []:
-                conv = _finite(val)
-                if conv is not None:
-                    slot[key].append(conv)
-        for key in ("ctext", "dtext", "btext"):
-            val = point.get(key)
-            if isinstance(val, str) and val:
-                slot[key].append(val)
-    ordered = [merged[tst] for tst in sorted(merged)]
-    if not ordered:
-        return []
-    first_t = ordered[0]["t"]
-    last_t = ordered[-1]["t"]
-    out = []
-    cur = None
-    prev_t = None
-    prev_meter = None
-    prev_meter_t = None
-    last_text = {"ctext": None, "dtext": None, "btext": None}
-
-    def _close(reason, end_ns, inclusive):
-        sess = dict(cur)
-        sess["close_reason"] = reason
-        sess["end_ns"] = end_ns
-        sess["end_inclusive"] = inclusive
-        if reason == "open_at_end":
-            sess["incomplete_end"] = True
-        elif reason == "gap":
-            sess["incomplete_end"] = end_ns >= last_t
-        else:
-            sess["incomplete_end"] = False
-        out.append(sess)
-
-    for point in ordered:
-        tst = point["t"]
-        powers = point["powers"]
-        meters = point["meters"]
-        currents = point["icharges"]
-        gain = False
-        reset = False
-        ambiguous = False
-        if meters and prev_meter is not None:
-            ups = [v for v in meters if v > prev_meter]
-            downs = [v for v in meters if v < prev_meter]
-            if ups and downs:
-                ambiguous = True
-            elif ups:
-                gain = True
-            elif downs:
-                reset = True
-        changed = False
-        for key in ("ctext", "dtext", "btext"):
-            joined = "\x1f".join(sorted(set(point[key]))) \
-                if point[key] else None
-            if joined is not None and last_text[key] is not None \
-                    and joined != last_text[key]:
-                changed = True
-            point[key] = joined
-        power_ev = any(v > 0.0 for v in powers)
-        power_stop = bool(powers) and all(v == 0.0 for v in powers)
-        nonzero = [v for v in currents if v != 0.0]
-        charge_ev = bool(nonzero)
-        dis_ev = any(v < 0.0 for v in currents)
-        if cur is not None and prev_t is not None \
-                and tst - prev_t > max_gap_ns:
-            _close("gap", cur["last_evidence_ns"], True)
-            cur = None
-        if cur is not None and changed:
-            _close("text_boundary", cur["last_evidence_ns"], True)
-            cur = None
-        if reset and cur is not None:
-            _close("meter_reset", cur["last_evidence_ns"], True)
-            cur = None
-        if cur is not None and power_stop:
-            _close("power_stop", tst, True)
-            cur = None
-            skip_open = True
-        elif cur is not None and dis_ev:
-            _close("discharge_current", cur["last_evidence_ns"], True)
-            cur = None
-            skip_open = False
-        else:
-            skip_open = ambiguous
-            if ambiguous and cur is not None:
-                _close("ambiguous_meter", cur["last_evidence_ns"], True)
-                cur = None
-        evidence = set()
-        if gain:
-            evidence.add("meter_gain")
-        if power_ev:
-            evidence.add("power")
-        if charge_ev:
-            evidence.add("current")
-        if cur is None:
-            if evidence and not skip_open:
-                # Meter gain credits the observed baseline: the session
-                # spans [prev_meter_t, tst] when that step itself is
-                # gap-bounded, never across a rejected gap.
-                start_ns = tst
-                if "meter_gain" in evidence \
-                        and prev_meter_t is not None \
-                        and prev_t is not None \
-                        and tst - prev_t <= max_gap_ns:
-                    start_ns = prev_meter_t
-                cur = {"start_ns": start_ns, "last_evidence_ns": tst,
-                       "evidence": set(evidence),
-                       "incomplete_start": start_ns == first_t}
-        elif evidence:
-            # Sessions never bridge a rejected gap: a far-apart gain
-            # point starts a new session instead of extending this one.
-            if "meter_gain" in evidence and prev_t is not None \
-                    and tst - prev_t > max_gap_ns:
-                _close("gap", cur["last_evidence_ns"], True)
-                cur = {"start_ns": tst, "last_evidence_ns": tst,
-                       "evidence": set(evidence),
-                       "incomplete_start": tst == first_t}
-            else:
-                cur["last_evidence_ns"] = tst
-                cur["evidence"] |= evidence
-        prev_t = tst
-        if meters:
-            prev_meter = max(meters)
-            prev_meter_t = tst
-        for key in ("ctext", "dtext", "btext"):
-            if point[key] is not None:
-                last_text[key] = point[key]
-    if cur is not None:
-        _close("open_at_end", cur["last_evidence_ns"], True)
-    sessions = []
-    for sess in out:
-        sessions.append({
-            "start_ns": sess["start_ns"], "end_ns": sess["end_ns"],
-            "close_reason": sess["close_reason"],
-            "evidence": sorted(sess["evidence"]),
-            "incomplete_start": sess["incomplete_start"],
-            "incomplete_end": sess["incomplete_end"],
-            "end_inclusive": sess["end_inclusive"]})
+        if current and direction != current["direction"]:
+            close(stamp if direction == 0 else previous["t"],
+                  "observed_idle" if direction == 0 else "direction_change",
+                  direction == 0)
+            current = None
+        if direction and current is None:
+            observed_start = previous is not None and previous["direction"] == 0
+            current = {"start_ns": previous["t"] if observed_start else stamp,
+                       "direction": direction, "incomplete_start": not observed_start,
+                       "evidence": ["signed_current_or_counter"]}
+        previous = point
+    if current:
+        close(previous["t"], "open_at_end", False)
     return sessions
 
 
@@ -761,108 +558,67 @@ def _scope_rows(signals):
 
 
 def _num_pairs(rows, field, unit):
-    return sorted((r["event_time_ns"], r["value_num"]) for r in rows
-                  if r.get("source_field") == field
-                  and r.get("value_num") is not None
-                  and bc.is_valid_quality(r.get("quality"))
-                  and r.get("unit") == unit)
+    """Retain invalid/unit/conflict barriers instead of joining across them."""
+    grouped = {}
+    for row in rows:
+        if row.get("source_field") != field:
+            continue
+        value = _finite(row.get("value_num"))
+        if not bc.is_valid_quality(row.get("quality")) or row.get("unit") != unit:
+            value = None
+        grouped.setdefault(row["event_time_ns"], set()).add(value)
+    return [(t, next(iter(values)) if len(values) == 1 else None)
+            for t, values in sorted(grouped.items())]
 
 
 def _text_series(rows, field):
-    by_ts = {}
-    for r in rows:
-        if r.get("source_field") != field:
+    grouped = {}
+    for row in rows:
+        if row.get("source_field") != field:
             continue
-        if r.get("value_num") is None \
-                and r.get("value_text") is None \
-                and r.get("value_bool") is None:
+        value = row.get("value_text")
+        if not bc.is_valid_quality(row.get("quality")) or not isinstance(value, str):
+            value = None
+        grouped.setdefault(row["event_time_ns"], set()).add(value)
+    return [(t, next(iter(values)) if len(values) == 1 else None)
+            for t, values in sorted(grouped.items())]
+
+
+def _calibrated_values(rows, field, entries, unit):
+    grouped, raw = {}, 0
+    for row in rows:
+        if row.get("source_field") != field:
             continue
-        if not bc.is_valid_quality(r.get("quality")):
-            continue
-        text = r.get("value_text")
-        if isinstance(text, bool) or text is None:
-            text = "" if r.get("value_bool") is None \
-                else ("true" if r.get("value_bool") else "false")
-        if not isinstance(text, str):
-            continue
-        by_ts.setdefault(r["event_time_ns"], {})[repr(
-            (r.get("value_num"), text, r.get("value_bool")))] = text
-    out = []
-    for tst in sorted(by_ts):
-        vals = sorted(set(by_ts[tst].values()))
-        out.append((tst, "\x1f".join(v for v in vals if v) or "present"))
-    return out
+        value = _finite(row.get("value_num"))
+        if not bc.is_valid_quality(row.get("quality")):
+            value = None
+        elif row.get("unit") != unit:
+            matches = [c for c in entries if
+                       (c["vehicle"], c["source"], c["decode_epoch"]) ==
+                       (row["vehicle"], row["source"], row["decode_epoch"])]
+            if value is not None and row.get("unit") is None and len(matches) == 1:
+                value = _finite(value * matches[0]["unit_scale"]
+                                + matches[0]["unit_offset"])
+            else:
+                value = None
+                raw += 1
+        grouped.setdefault(row["event_time_ns"], []).append((row, value))
+    result = []
+    for stamp, samples in sorted(grouped.items()):
+        values = {value for _, value in samples}
+        value = next(iter(values)) if len(values) == 1 else None
+        result.append(dict(samples[0][0], value_num=value, unit=unit,
+                           quality="valid" if value is not None else "invalid"))
+    return result, raw
 
 
 def _calibrated_current(rows, field, entries):
-    """Calibrated [(ns, amps)] for the configured current field.
-
-    Unit "A" rows pass through; unit-NULL rows scale only under an
-    exactly scope-matched field_calibration entry
-    (raw * unit_scale + unit_offset). Anything else counts as
-    uncalibrated evidence (never silently integrated).
-    """
-    pairs = []
-    raw = 0
-    for r in rows:
-        if r.get("source_field") != field:
-            continue
-        if r.get("value_num") is None \
-                or not bc.is_valid_quality(r.get("quality")):
-            continue
-        if r.get("unit") == "A":
-            pairs.append((r["event_time_ns"], r["value_num"]))
-        elif r.get("unit") is None and entries:
-            scope = (r["vehicle"], r["source"], r["decode_epoch"])
-            match = [c for c in entries
-                     if (c["vehicle"], c["source"],
-                         c["decode_epoch"]) == scope]
-            if not match:
-                raw += 1
-                continue
-            cal = match[0]
-            val = _finite(r["value_num"] * cal["unit_scale"]
-                          + cal["unit_offset"])
-            if val is None:
-                raw += 1
-                continue
-            pairs.append((r["event_time_ns"], val))
-        else:
-            raw += 1
-    return sorted(pairs), raw
+    converted, raw = _calibrated_values(rows, field, entries, "A")
+    return [(r["event_time_ns"], r["value_num"]) for r in converted], raw
 
 
 def _calibrated_voltage_rows(rows, field, entries):
-    """Calibrated voltage rows; same scope/scale rules as current."""
-    usable = []
-    raw = 0
-    for r in rows:
-        if r.get("source_field") != field:
-            continue
-        if r.get("value_num") is None \
-                or not bc.is_valid_quality(r.get("quality")):
-            continue
-        if r.get("unit") == "V":
-            usable.append(r)
-        elif r.get("unit") is None and entries:
-            scope = (r["vehicle"], r["source"], r["decode_epoch"])
-            match = [c for c in entries
-                     if (c["vehicle"], c["source"],
-                         c["decode_epoch"]) == scope]
-            if not match:
-                raw += 1
-                continue
-            scaled = dict(r)
-            val = _finite(r["value_num"] * match[0]["unit_scale"]
-                          + match[0]["unit_offset"])
-            if val is None:
-                raw += 1
-                continue
-            scaled["value_num"] = val
-            usable.append(scaled)
-        else:
-            raw += 1
-    return usable, raw
+    return _calibrated_values(rows, field, entries, "V")
 
 
 def _calibration_scope_note(scope, field_cals, field):
@@ -955,8 +711,8 @@ def analyze(signals, events, config):
     if decision is not None:
         rows_all = [r for r in rows_all
                     if r["event_time_ns"] <= decision
-                    and (r.get("ingest_time_ns") is None
-                         or r["ingest_time_ns"] <= decision)]
+                    and r.get("ingest_time_ns") is not None
+                    and r["ingest_time_ns"] <= decision]
     # Retained context: keep pre-window history for session continuity,
     # drop only samples past window_end. Window-scoped metrics below
     # filter to the in-window span explicitly.
@@ -971,7 +727,7 @@ def analyze(signals, events, config):
             revision=bc.revision_id(m, "empty", ecfg, ALGORITHM_VERSION))
             for m in SUPPORTED_METRICS]
     out = []
-    for scope in sorted(bc.group_by_scope(context_all).items()):
+    for scope in sorted(bc.group_by_scope(context_all).items(), key=lambda item: repr(item[0])):
         key, srows = scope
         ordered = bc.sort_dedup(srows)
         out.extend(_analyze_scope(
@@ -1045,9 +801,6 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     # refuse deltas even when retained context exists elsewhere.
     win_rows = [r for r in ordered if _in_window(r["event_time_ns"],
                                                  window)]
-    meter_field = fields["session_energy_field"]
-    meter_pairs = _num_pairs(win_rows, meter_field, "kWh")
-    power_pairs = _num_pairs(win_rows, fields["power_field"], "kW")
     soc_pairs = _num_pairs(win_rows, fields["soc_field"], "%")
     remain_pairs = _num_pairs(win_rows, fields["energy_remaining_field"],
                               "kWh")
@@ -1055,13 +808,6 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     ac_pairs = _num_pairs(win_rows, fields["ac_counter_field"], "kWh")
     dis_pairs = _num_pairs(win_rows, fields["discharge_counter_field"],
                            "kWh")
-    # Session evidence spans retained context (pre-window history may
-    # open the session); text joins read the full ordered scope. Power
-    # pairs are window-scoped (hourly totals); current evidence spans
-    # retained context so pre-window sessions stay visible.
-    ctext = _text_series(ordered, fields["charging_state_field"])
-    dtext = _text_series(ordered, fields["detailed_charge_field"])
-    btext = _text_series(ordered, fields["bms_state_field"])
     cur_entries = field_cals.get(fields["current_field"], [])
     vol_entries = field_cals.get(fields["voltage_field"], [])
     cur_pairs_all, cur_raw_all = _calibrated_current(
@@ -1083,15 +829,11 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
                        and bc.is_valid_quality(r.get("quality"))
                        and r.get("unit") != "V"
                        and not (r.get("unit") is None and vol_entries))
-    # Sessions are sign-independent: any nonzero calibrated current is
-    # evidence (retained context included); the sign only orients V*I/Ah
-    # splits below. Meter/power/SOC anchors stay window-scoped so the
-    # hourly totals never leak pre-window energy.
-    raw_current = [(t, v) for t, v in cur_pairs_all]
+    # Retained context bounds both directions; window integrals stay separate.
+    raw_current = [(t, sign * v if v is not None else None)
+                   for t, v in cur_pairs_all] if sign is not None else []
     sessions, session_rows = _session_results(
-        scope, window, ordered, meter_pairs, power_pairs,
-        raw_current, ctext, dtext, btext, soc_pairs, meter_field,
-        gap, ecfg)
+        scope, window, ordered, raw_current, fields, gap, ecfg)
     out.extend(session_rows)
     counter_rows = _counter_results(scope, window, dc_pairs, ac_pairs,
                                     dis_pairs, fields, ecfg)
@@ -1099,12 +841,13 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     counter_deltas = _counter_deltas_for_efc(counter_rows)
     cal_ver_vi = _cal_version(vol_entries, cur_entries)
     cal_ver_i = _cal_version(cur_entries)
-    signed_current = [(tst, sign * val) for tst, val in cur_pairs] \
+    signed_current = [(tst, sign * val if val is not None else None) for tst, val in cur_pairs] \
         if sign is not None else []
     vi_steps = []
     vi_note = None
     if sign_error is not None or sign is None or cal_error is not None \
-            or not volt_rows or not cur_pairs:
+            or not any(r["value_num"] is not None for r in volt_rows) \
+            or not any(v is not None for _, v in cur_pairs):
         if sign_error is not None:
             vi_note = sign_error
         elif sign is None:
@@ -1121,9 +864,9 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
             vi_note = "scope_mismatch:field_calibration_%s" % (
                 _calibration_scope_note(
                     scope, field_cals, fields["voltage_field"]),)
-        elif not volt_rows and volt_raw_win:
+        elif not any(r["value_num"] is not None for r in volt_rows) and volt_raw_win:
             vi_note = "missing_calibration:voltage_units"
-        elif not cur_pairs and cur_raw_win:
+        elif not any(v is not None for _, v in cur_pairs) and cur_raw_win:
             vi_note = "missing_calibration:current_units"
         else:
             vi_note = "sparse:no_voltage_current"
@@ -1155,11 +898,11 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
             sorted(volt_rows, key=lambda r: r["event_time_ns"]),
             irows, skew)
         for vrow, irow in joined:
-            if irow is None:
-                continue
             vi_steps.append((vrow["event_time_ns"],
                              vrow["value_num"],
-                             sign * irow["value_num"]))
+                             sign * irow["value_num"] if irow is not None else None))
+        # Current-only barriers must also interrupt the voltage sampling grid.
+        vi_steps.extend((t, None, None) for t, v in cur_pairs if v is None)
         vi_steps.sort(key=lambda p: p[0])
     if vi_note is not None:
         for metric in ("battery.energy.vi_charge_energy_kwh",
@@ -1203,7 +946,7 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
                 % (vi_res["legs_used"], cov), len(vi_steps), ecfg,
                 cal_ver_vi, vi_res["legs_used"], cov))
     if sign_error is not None or sign is None or cal_error is not None \
-            or not cur_pairs:
+            or not any(v is not None for _, v in cur_pairs):
         if sign_error is not None:
             ah_note = sign_error
         elif sign is None:
@@ -1274,10 +1017,13 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     interval = _interval_result(scope, window, sessions, soc_pairs,
                                 parsed, uncertainties, unc_error, ecfg)
     out.append(interval["row"])
+    full_capacity = _interval_result(scope, window, sessions, soc_pairs,
+                                    parsed, uncertainties, unc_error, ecfg, full=True)
+    out.append(full_capacity["row"])
     out.extend(_circular_results(scope, window, remain_pairs, soc_pairs,
                                  parsed, uncertainties, unc_error,
                                  fields, ecfg))
-    out.extend(_trend_soh_results(scope, window, interval, reference,
+    out.extend(_trend_soh_results(scope, window, full_capacity, reference,
                                   ref_error, parsed, ecfg))
     if sign_error is not None:
         out = [_promote_sign_error(r, sign_error) for r in out]
@@ -1287,8 +1033,7 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
 
 
 def _promote_sign_error(row, sign_error):
-    if row["metric"] in SIGN_METRICS and row["status"] == "unavailable" \
-            and row.get("reason") != sign_error:
+    if row["metric"] in SIGN_METRICS and row["status"] == "unavailable":
         fixed = dict(row)
         fixed["status"] = "error"
         fixed["reason"] = sign_error
@@ -1298,8 +1043,7 @@ def _promote_sign_error(row, sign_error):
 
 
 def _promote_cal_error(row, cal_error):
-    if row["metric"] in CAL_METRICS and row["status"] == "unavailable" \
-            and row.get("reason") != cal_error:
+    if row["metric"] in CAL_METRICS and row["status"] == "unavailable":
         fixed = dict(row)
         fixed["status"] = "error"
         fixed["reason"] = cal_error
@@ -1308,142 +1052,101 @@ def _promote_cal_error(row, cal_error):
     return row
 
 
-def _session_results(scope, window, ordered, meter_pairs, power_pairs,
-                     raw_current, ctext, dtext, btext, soc_pairs,
-                     meter_field, gap, ecfg):
+def _bounded_meter(pairs, start, end, gap):
+    span = [(t, value) for t, value in pairs if start <= t <= end]
+    if len(span) < 2 or span[0][0] != start or span[-1][0] != end:
+        return None, "unmatched_boundary", span
+    if any(b[0] - a[0] > gap for a, b in zip(span, span[1:])):
+        return None, "gap", span
+    value, reason = meter_delta(span)
+    return value, reason, span
+
+
+def _session_results(scope, window, ordered, signed_current, fields, gap, ecfg):
+    charge = _num_pairs(ordered, fields["session_energy_field"], "kWh")
+    discharge = _num_pairs(ordered, fields["discharge_counter_field"], "kWh")
+    soc = _num_pairs(ordered, fields["soc_field"], "%")
+    current = dict(signed_current)
+    power = dict(_num_pairs(ordered, fields["power_field"], "kW"))
+    texts = [dict(_text_series(ordered, fields[key])) for key in
+             ("charging_state_field", "detailed_charge_field", "bms_state_field")]
+    stamps = sorted(set(current) | set(power) | {t for t, _ in charge + discharge}
+                    | {t for series in texts for t in series})
+    previous_text = [None] * len(texts)
+    points, previous = [], None
+    previous_direction = None
     skew = ecfg.get("max_skew_ns", DEFAULT_MAX_SKEW_NS)
-    grouped = {}
-
-    def _bucket(pairs, key):
-        for tst, val in pairs:
-            grouped.setdefault(tst, {"t": tst}).setdefault(key, []).append(
-                val)
-
-    _bucket(power_pairs, "powers")
-    _bucket(meter_pairs, "meters")
-    _bucket(raw_current, "icharges")
-    for pairs, key in ((ctext, "ctext"), (dtext, "dtext"),
-                       (btext, "btext")):
-        for tst, val in pairs:
-            grouped.setdefault(tst, {"t": tst})[key] = val
-    # Retained pre-window meter anchor bounds the first in-window point:
-    # sessions may start before the hourly window. The latest pre-window
-    # meter sample joins the timeline as a real meter point (never an
-    # energy span by itself).
-    pre_meter = [(t, v) for t, v in _session_meter_context(
-        ordered, meter_field) if not _in_window(t, window)]
-    if pre_meter:
-        anchor_t, anchor_v = pre_meter[-1]
-        grouped.setdefault(anchor_t, {"t": anchor_t}).setdefault(
-            "meters", []).append(anchor_v)
-    points = sorted(grouped.values(), key=lambda p: p["t"])
+    for stamp in stamps:
+        direction = None
+        c, d = _asof(charge, stamp, skew), _asof(discharge, stamp, skew)
+        if stamp in current:
+            value = current[stamp]
+            if value is not None:
+                direction = 1 if value > 0 else -1 if value < 0 else 0
+        elif stamp in power:
+            value = power[stamp]
+            if value is not None and value >= 0:
+                direction = 1 if value > 0 else 0
+        elif previous is not None and stamp - previous[0] <= gap:
+            dc = c - previous[1] if c is not None and previous[1] is not None else None
+            dd = d - previous[2] if d is not None and previous[2] is not None else None
+            if (dc is None or dc >= 0) and (dd is None or dd >= 0):
+                if dc is not None and dc > 0 and (dd is None or dd == 0):
+                    direction = 1
+                elif dd is not None and dd > 0 and (dc is None or dc == 0):
+                    direction = -1
+                elif dc == 0 and dd == 0:
+                    direction = 0
+        for index, series in enumerate(texts):
+            if stamp not in series:
+                continue
+            value = series[stamp]
+            if value is None or (previous_text[index] is not None
+                                 and value != previous_text[index] and direction != 0
+                                 and previous_direction not in (None, 0)):
+                direction = None
+            previous_text[index] = value
+        points.append({"t": stamp, "direction": direction})
+        previous = (stamp, c, d)
+        previous_direction = direction
     sessions = segment_sessions(points, gap)
-    rows = []
-    enriched = []
-    metric = "battery.energy.charge_session_energy_kwh"
-    if not sessions:
-        rows.append(_unavailable(scope, window, metric, "no_sessions",
-                                 len(points), ecfg))
-        return [], rows
-    for sess in sessions:
-        start, end = sess["start_ns"], sess["end_ns"]
-        if sess["end_inclusive"]:
-            span_pairs = [(tst, val) for tst, val in meter_pairs
-                          if start <= tst <= end]
+    rows, enriched = [], []
+    for session in sessions:
+        start, end = session["start_ns"], session["end_ns"]
+        direction = "charge" if session["direction"] > 0 else "discharge"
+        metric = "battery.energy.%s_session_energy_kwh" % direction
+        meter = charge if session["direction"] > 0 else discharge
+        value, reason, span = _bounded_meter(meter, start, end, gap)
+        if session["incomplete_start"] or session["incomplete_end"]:
+            value, reason = None, "incomplete_boundary:" + session["close_reason"]
+        soc_span = [(t, v) for t, v in soc if start <= t <= end]
+        soc0, soc1 = _asof(soc, start, skew), _asof(soc, end, skew)
+        if any(v is None or not 0 <= v <= 100 for _, v in soc_span) or any(
+                b[0] - a[0] > gap for a, b in zip(soc_span, soc_span[1:])):
+            soc0 = soc1 = None
+        enriched.append({"session": session, "meter_pairs": span,
+                         "energy_kwh": value, "soc0_pct": soc0, "soc1_pct": soc1,
+                         "soc_pairs": soc_span})
+        # Complete sessions are credited once, in their closure window.
+        if not _in_window(end, window):
+            continue
+        episode = bc.episode_key(scope[0], "energy", direction + "_session", start, scope[2])
+        text = "%s start_ns=%d end_ns=%d close=%s" % (
+            direction, start, end, session["close_reason"])
+        if value is None:
+            row = _unavailable(scope, window, metric, reason, len(span), ecfg)
         else:
-            span_pairs = [(tst, val) for tst, val in meter_pairs
-                          if start <= tst < end]
-        edge = sess["incomplete_start"] or sess["incomplete_end"]
-        # Retained-context sessions keep incomplete_boundary rows but
-        # never credit energy: only fully in-window closed sessions
-        # value a delta.
-        at_edge = edge or not _in_window(start, window) \
-            or not _in_window(end, window)
-        delta, info = meter_delta(span_pairs)
-        first_ts = min((tst for tst, _ in span_pairs), default=None)
-        last_ts = max((tst for tst, _ in span_pairs), default=None)
-        if info == "reset":
-            status = ("unavailable", "reset:%s" % meter_field)
-            value = None
-        elif info == "ambiguous":
-            status = ("unavailable", "ambiguous:%s" % meter_field)
-            value = None
-        elif info == "sparse":
-            if edge or at_edge:
-                status = ("unavailable", "incomplete_boundary:"
-                          "session_open_at_window_edge")
-            else:
-                status = ("unavailable", "unmatched_boundary:"
-                          "session_meter_single_or_missing")
-            value = None
-        elif edge or at_edge:
-            status = ("unavailable", "incomplete_boundary:"
-                      "session_open_at_window_edge")
-            value = None
-        elif first_ts - start > skew or end - last_ts > skew:
-            status = ("unavailable", "unmatched_boundary:"
-                      "session_meter_unaligned")
-            value = None
-        else:
-            status = ("derived", None)
-            value = delta
-        soc0 = _asof(soc_pairs, start, skew)
-        soc1 = _asof(soc_pairs, end, skew)
-        enriched.append({"session": sess, "meter_pairs": span_pairs,
-                         "energy_kwh": value, "soc0_pct": soc0,
-                         "soc1_pct": soc1})
-        episode = bc.episode_key(scope[0], "energy", "charge_session",
-                                 start, scope[2])
-        text = "charge start_ns=%d end_ns=%d evidence=%s close=%s" % (
-            start, end, "+".join(sess["evidence"]) or "none",
-            sess["close_reason"])
-        aid = _session_analysis_id(episode)
-        if status[0] == "derived":
-            rows.append(_derived(
-                scope, window, metric, value, "kWh",
-                "charge_session meter_delta_kwh evidence=%s close=%s"
-                % ("+".join(sess["evidence"]) or "none",
-                   sess["close_reason"]), len(span_pairs), ecfg,
-                None, None, None, None, None, None, text, episode, aid))
-        else:
-            row = _unavailable(scope, window, metric, status[1],
-                               len(span_pairs), ecfg)
-            row["value_text"] = text
-            row["episode_id"] = episode
-            row["analysis_id"] = aid
-            row["revision"] = bc.revision_id(
-                metric, scope, status[1], span_pairs, sess, ecfg,
-                ALGORITHM_VERSION)
-            rows.append(row)
-    # Sessions fully outside the window are context only: keep rows for
-    kept_rows, kept_enriched = [], []
-    for row, entry in zip(rows, enriched):
-        start, end = entry["session"]["start_ns"], entry["session"]["end_ns"]
-        before = window[0] is not None and end < window[0]
-        after = window[1] is not None and start > window[1]
-        if before or after:
-            continue
-        kept_rows.append(row)
-        kept_enriched.append(entry)
-    if not kept_rows:
-        return [], [_unavailable(scope, window, metric,
-                                 "no_sessions:no_session_overlaps_window",
-                                 len(points), ecfg)]
-    return kept_enriched, kept_rows
-
-
-def _session_meter_context(ordered, meter_field):
-    vals = []
-    for r in ordered:
-        if r.get("source_field") != meter_field:
-            continue
-        if r.get("value_num") is None \
-                or not bc.is_valid_quality(r.get("quality")):
-            continue
-        if r.get("unit") != "kWh":
-            continue
-        vals.append((r["event_time_ns"], r["value_num"]))
-    return sorted(vals)
+            row = _derived(scope, window, metric, value, "kWh",
+                           "completed_session:independent_counter", len(span), ecfg)
+        row.update(value_text=text, episode_id=episode,
+                   analysis_id=_session_analysis_id(episode))
+        row["revision"] = bc.revision_id(metric, scope, session, span, ecfg, ALGORITHM_VERSION)
+        rows.append(row)
+    for direction in ("charge", "discharge"):
+        metric = "battery.energy.%s_session_energy_kwh" % direction
+        if not any(row["metric"] == metric for row in rows):
+            rows.append(_unavailable(scope, window, metric, "no_sessions", len(points), ecfg))
+    return enriched, rows
 
 
 def _counter_results(scope, window, dc_pairs, ac_pairs, dis_pairs, fields,
@@ -1460,6 +1163,9 @@ def _counter_results(scope, window, dc_pairs, ac_pairs, dis_pairs, fields,
              fields["discharge_counter_field"],
              "counter_delta discharging_meter")):
         delta, info = meter_delta(pairs)
+        if any(b[0] - a[0] > ecfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
+               for a, b in zip(pairs, pairs[1:])):
+            delta, info = None, "gap"
         if info == "ok":
             out.append(_derived(scope, window, metric, delta, "kWh",
                                 note, len(pairs), ecfg))
@@ -1550,69 +1256,46 @@ def _efc_results(scope, window, ah_res, vi_res, counter_deltas, ecfg,
 
 
 def _interval_result(scope, window, sessions, soc_pairs, parsed,
-                     uncertainties, unc_error, ecfg):
-    metric = "battery.energy.interval_capacity_kwh"
+                     uncertainties, unc_error, ecfg, full=False):
+    metric = "battery.energy.%s_capacity_kwh" % ("full_usable" if full else "interval")
+    empty = {"capacity_kwh": None, "energy_kwh": None,
+             "soc_span01": None, "session": None}
     if unc_error is not None:
-        return {"row": _error_row(scope, window, metric, unc_error, ecfg),
-                "capacity_kwh": None, "energy_kwh": None,
-                "soc_span01": None, "session": None}
-    min_span = parsed["min_soc_span_pct"] / 100.0
-    for entry in sessions:
-        energy = entry.get("energy_kwh")
-        soc0, soc1 = entry.get("soc0_pct"), entry.get("soc1_pct")
-        if energy is None or soc0 is None or soc1 is None:
+        return dict(empty, row=_error_row(scope, window, metric, unc_error, ecfg))
+    for entry in reversed(sessions):
+        energy = entry["energy_kwh"]
+        soc0, soc1 = entry["soc0_pct"], entry["soc1_pct"]
+        session = entry["session"]
+        if energy is None or energy <= 0 or soc0 is None or soc1 is None:
             continue
-        span = (soc1 - soc0) / 100.0
-        cap = interval_capacity_kwh(energy, span)
-        if cap is None:
+        direction = session["direction"]
+        span = direction * (soc1 - soc0) / 100
+        samples = entry["soc_pairs"]
+        if span < parsed["min_soc_span_pct"] / 100 or not samples:
             continue
-        if span < min_span:
-            return {"row": _unavailable(
-                        scope, window, metric,
-                        "soc_span_too_small:min_%r_pct"
-                        % parsed["min_soc_span_pct"], 2, ecfg),
-                    "capacity_kwh": None, "energy_kwh": None,
-                    "soc_span01": None, "session": None}
-        sigma = None
-        lo = hi = None
-        soc_std = uncertainties.get("soc_uncertainty_pct")
-        energy_std = uncertainties.get("energy_uncertainty_kwh")
-        if soc_std is not None and energy_std is not None:
-            sigma = capacity_uncertainty_kwh(
-                cap, energy, energy_std, span, soc_std / 100.0)
-            if sigma is not None:
-                lo, hi = cap - sigma, cap + sigma
-        reason = ("interval_capacity session start_ns=%d span_soc=%r "
-                  "energy=%r" % (entry["session"]["start_ns"], span,
-                                 energy))
+        if any(direction * (b[1] - a[1]) < 0 for a, b in zip(samples, samples[1:])):
+            continue
+        if full and (direction != -1 or soc0 != 100 or soc1 != 0
+                     or parsed["fields"]["discharge_counter_field"] == "EnergyRemaining"
+                     or samples[0][0] != session["start_ns"]
+                     or samples[-1][0] != session["end_ns"]):
+            continue
+        cap = energy if full else interval_capacity_kwh(energy, span)
+        sigma = capacity_uncertainty_kwh(
+            cap, energy, uncertainties.get("energy_uncertainty_kwh"), span,
+            uncertainties["soc_uncertainty_pct"] / 100
+            if uncertainties.get("soc_uncertainty_pct") is not None else None)
+        reason = "%s asof_ns=%d start_ns=%d span_soc=%r" % (
+            "full_usable:independent_discharge" if full else "interval_equivalent:not_absolute_soh",
+            session["end_ns"], session["start_ns"], span)
         return {"row": _derived(
-                    scope, window, metric, cap, "kWh", reason, 2, ecfg,
-                    None, 2, None, sigma, lo, hi),
-                "capacity_kwh": cap, "energy_kwh": energy,
-                "soc_span01": span, "session": entry["session"]}
-    reason = "sparse:no_valued_session_with_soc_span"
-    if not sessions:
-        reason = "sparse:no_sessions_for_capacity"
-    else:
-        spans = []
-        for entry in sessions:
-            soc0, soc1 = entry.get("soc0_pct"), entry.get("soc1_pct")
-            if soc0 is None or soc1 is None:
-                continue
-            spans.append((soc1 - soc0) / 100.0)
-        if any(s == 0.0 for s in spans):
-            reason = "zero:soc_span_zero"
-        elif spans and all(s < 0.0 for s in spans):
-            reason = "inconsistent:soc_span_non_positive"
-        elif spans and any(s < 0.0 for s in spans):
-            reason = "inconsistent:soc_span_non_positive"
-        elif spans and max(spans) < min_span:
-            reason = ("soc_span_too_small:min_%r_pct"
-                      % parsed["min_soc_span_pct"])
-    return {"row": _unavailable(scope, window, metric, reason,
-                                len(sessions), ecfg),
-            "capacity_kwh": None, "energy_kwh": None,
-            "soc_span01": None, "session": None}
+            scope, window, metric, cap, "kWh", reason, len(samples), ecfg,
+            uncertainty=sigma, uncertainty_lower=cap-sigma if sigma is not None else None,
+            uncertainty_upper=cap+sigma if sigma is not None else None),
+            "capacity_kwh": cap, "energy_kwh": energy, "soc_span01": span, "session": session}
+    return dict(empty, row=_unavailable(
+        scope, window, metric, "sparse:no_complete_full_discharge" if full
+        else "sparse:no_complete_session_with_soc_span", len(sessions), ecfg))
 
 
 def _circular_results(scope, window, remain_pairs, soc_pairs, parsed,
@@ -1623,6 +1306,11 @@ def _circular_results(scope, window, remain_pairs, soc_pairs, parsed,
     if len(remain_pairs) < 2 or len(soc_pairs) < 2:
         return [_unavailable(scope, window, metric,
                              "sparse:bms_needs_energy_and_soc_span",
+                             len(remain_pairs) + len(soc_pairs), ecfg)]
+    if any(v is None for _, v in remain_pairs + soc_pairs) or any(
+            b[0] - a[0] > parsed["max_gap_ns"]
+            for pairs in (remain_pairs, soc_pairs) for a, b in zip(pairs, pairs[1:])):
+        return [_unavailable(scope, window, metric, "quality_or_gap_barrier",
                              len(remain_pairs) + len(soc_pairs), ecfg)]
     (t0, e0), (t1, e1) = remain_pairs[0], remain_pairs[-1]
     soc0 = _asof(soc_pairs, t0, parsed["max_skew_ns"])
@@ -1717,9 +1405,16 @@ def _trend_soh_results(scope, window, interval, reference, ref_error,
                              1, ecfg, reference["version"]),
                 _unavailable(scope, window, soh_m, "non_finite_result",
                              1, ecfg, reference["version"])]
+    sigma = interval["row"]["uncertainty"]
+    soh_sigma = sigma / reference["energy_kwh"] * 100 if sigma is not None else None
+    provenance = interval["row"]["reason"]
     return [_derived(scope, window, trend_m, trend, "kWh",
-                     "capacity_trend like_for_like_vs_reference", 1, ecfg,
-                     reference["version"]),
+                     "capacity_trend like_for_like_vs_fixed_reference;" + provenance, 1, ecfg,
+                     reference["version"], uncertainty=sigma,
+                     uncertainty_lower=trend-sigma if sigma is not None else None,
+                     uncertainty_upper=trend+sigma if sigma is not None else None),
             _derived(scope, window, soh_m, soh, "%",
-                     "absolute_soh like_for_like_vs_reference", 1, ecfg,
-                     reference["version"])]
+                     "absolute_soh like_for_like_vs_fixed_reference;" + provenance, 1, ecfg,
+                     reference["version"], uncertainty=soh_sigma,
+                     uncertainty_lower=soh-soh_sigma if soh_sigma is not None else None,
+                     uncertainty_upper=soh+soh_sigma if soh_sigma is not None else None)]
