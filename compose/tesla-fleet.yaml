@@ -39,7 +39,7 @@ services:
     command: ["/opt/venv/bin/python", "-u", "/app/fleet_recorder.py"]
     environment:
       FLEET_ZMQ_ENDPOINT: ${FLEET_ZMQ_ENDPOINT:-tcp://fleet-telemetry:5555}
-      FLEET_ZMQ_TOPIC: ${FLEET_ZMQ_TOPIC:-tesla_V}
+      FLEET_ZMQ_TOPICS: ${FLEET_ZMQ_TOPICS:-tesla_V,tesla_alerts,tesla_errors,tesla_connectivity}
       TARGET_VIN: ${TARGET_VIN:-}
       VEHICLE_ID: ${VEHICLE_ID:-}
       VEHICLE_ID_SALT: ${VEHICLE_ID_SALT:-}
@@ -49,6 +49,7 @@ services:
       MAPPING_REVISION: ${MAPPING_REVISION:-fleet-v1}
       COLLECTOR_VERSION: ${COLLECTOR_VERSION:-tesla-fleet-recorder-1}
       COLLECTOR_ID: ${COLLECTOR_ID:-fleet-collector-1}
+      CONFIG_VERSION: ${CONFIG_VERSION:-}
       OUTBOX_PATH: ${FLEET_OUTBOX_PATH:-/data/outbox.sqlite}
       MAX_OUTBOX_ROWS: ${MAX_OUTBOX_ROWS:-50000}
       FLEET_BATCH_N: ${FLEET_BATCH_N:-500}

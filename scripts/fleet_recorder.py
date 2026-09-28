@@ -1,42 +1,50 @@
 #!/usr/bin/env python3
 """Tesla Fleet Telemetry ZMQ subscriber -> SQLite outbox -> Greptime HTTP SQL uploader.
 
-Official Contract Compliance (crates/tesla-api/src/telemetry.rs):
-  1. Two-frame ZMQ messages: frame[0] == topic (b"tesla_V"), frame[1] == protojson payload.
-     Any other framing or arbitrary flat fallback payloads are strictly rejected.
-  2. Protojson data[{key, value: {oneof}}] unwrapping:
-     - floatValue, doubleValue, intValue, longValue (quoted integer), booleanValue,
-       stringValue, shiftStateValue (e.g. "ShiftStateP" -> "P"),
-       hvacAutoMode / hvacAutoModeValue ("HvacAutoModeStateOn" -> true).
-     - kind == "invalid" is dropped.
-  3. Original createdAt preserved to exact nanosecond precision (9 digits).
-     Timestamps without an explicit timezone offset (Z or +/-HH:MM) or boolean types are rejected.
-  4. Strict VIN & pseudonymization policy:
-     - Non-empty VIN is required on every record (no unknown-vehicle fallback).
-     - When TARGET_VIN is set, non-matching VINs are dropped to prevent multi-vehicle mixing.
-     - When TARGET_VIN is not set, VEHICLE_ID_SALT is mandatory for deterministic SHA-256 hashing.
-  5. Official unit handling & conversion:
-     - VehicleSpeed (raw mph) converted to VSS km/h (* 1.609344).
-     - Odometer / EstRange / IdealBatteryRange (raw miles) converted to VSS km (* 1.609344).
-     - Tire pressure (raw bar from Tesla TpmsPressure*/TirePressure*) converted to VSS kPa (* 100.0).
-     - Distinct canonical paths for related fields:
-       * Soc -> Vehicle.Powertrain.TractionBattery.StateOfCharge.Current (%)
-       * BatteryLevel -> Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed (%)
-       * EstRange -> Vehicle.Powertrain.TractionBattery.Range (km)
-       * IdealBatteryRange -> Vehicle.Powertrain.TractionBattery.IdealRange (km)
-     - InsideTemp / OutsideTemp (already Celsius) verified and preserved.
-     - Sparse unreceived fields are NEVER padded with 0 or false.
-  6. Provenance & event_id deduplication:
-     - deterministic_event_id hashes (vehicle, path, source='fleet', source_system,
-       source_field, event_time_ns, decode_epoch, value).
-     - Distinct fields arriving at identical timestamps keep separate event_ids (no data loss).
-     - Only redeliveries of the same logical field sample (isResend variation) are deduplicated.
-  7. Unverified VSS_VERSION and VEHICLE_FIRMWARE are left NULL (empty string).
-  8. Bounded SQLite outbox (PRAGMA WAL) guarded by MAX_OUTBOX_ROWS.
-     Existing unacked rows are NEVER deleted on overflow; new arrivals are rejected
-     with explicit counter increments to ensure remaining disk (~2.5 GiB) safety.
-  9. Seen table bounded by 24h prune and MAX_SEEN_IDS=50000 limit.
- 10. Greptime HTTP SQL batch INSERT with fail-closed ack verification (affectedrows == batch size).
+Official dispatch across four namespaced topics (FLEET_ZMQ_TOPICS, default all four):
+  tesla_V -> vehicle_signal rows from protojson data[{key, value:{oneof}}].
+  tesla_alerts -> vehicle_event rows (protos/vehicle_alert.proto envelope
+    {vin, createdAt, alerts:[{name, audiences?, startedAt?, endedAt?}]}).
+  tesla_errors -> vehicle_event rows (protos/vehicle_error.proto envelope
+    {vin, createdAt, errors:[{createdAt?, name, tags?, body?}]}).
+  tesla_connectivity -> vehicle_event rows (protos/vehicle_connectivity.proto
+    {vin, createdAt, status, connection_id?, network_interface?}).
+Any other framing or non-allowlisted topic is strictly rejected.
+
+Signal contract (crates/tesla-api/src/telemetry.rs oneof mapping):
+  floatValue/doubleValue/int*/long*/booleanValue/stringValue unwrapped;
+  shiftStateValue prefix stripped; hvacAutoMode* On -> true.
+  Undecodable, explicit-invalid, or non-finite samples are stored as tombstones
+  (values NULL, quality 'invalid'), never zero-filled. Type-ok but out-of-range
+  samples are tombstones with quality 'range_rejected'. Undocumented-unit
+  battery fields are stored raw with quality 'unit_unverified', never rescaled.
+  Sparse unreceived fields are NEVER padded. Original createdAt keeps exact
+  nanosecond precision; timezone-less or boolean timestamps are rejected.
+
+Event contract:
+  Active alert iff endedAt absent; invalid endedAt yields quality 'error' with
+  ended NULL and is_active NULL (parse failure never implies active). Missing
+  or unparseable startedAt retains the warning with quality 'unknown_start'
+  (no duration/episode). Conflicting ends (end < start) keep both stamps with
+  no duration. Connectivity DISCONNECTED/CONNECTED rows stay separate and never
+  close alert episodes. Body/tags/connection_id/network_interface are never
+  stored (body presence recorded as body_redacted only); raw VIN never stored.
+
+Identity and provenance:
+  Signal event_id hashes (vehicle, path, source, source_system, source_field,
+  event_time_ns, decode_epoch, value); isResend/envelope excluded so redelivery
+  dedups. Event event_id hashes (vehicle, event_type, name, source,
+  source_system, started, ended, event_time, decode_epoch, audience, is_active).
+  episode_id = sha256(vehicle|event_type|name|started_ns|decode_epoch), NULL
+  without a valid start. envelope_id = sha256(topic + payload) rides every row.
+  CONFIG_VERSION provenance is operator-supplied only, never invented.
+
+Durability:
+  Bounded SQLite outbox (PRAGMA WAL); MAX_OUTBOX_ROWS bounds TOTAL pending
+  signal + event rows. Overflow rejects new arrivals (never deletes unacked
+  rows); rejected rows skip seen_ids so redelivery can land after drain.
+  Seen table bounded by 24h prune and MAX_SEEN_IDS limit. Upload acks only on
+  affectedrows == batch size, then deletes exactly the acked batch.
 
 Tesla API / vehicle command transmission is strictly prohibited (receive-only).
 """
@@ -72,7 +80,12 @@ ISO_STRICT_RE = re.compile(
 
 SOURCE = "fleet"
 SOURCE_SYSTEM = "tesla_fleet_telemetry"
-DEFAULT_TOPIC = "tesla_V"
+TOPIC_V = "tesla_V"
+TOPIC_ALERTS = "tesla_alerts"
+TOPIC_ERRORS = "tesla_errors"
+TOPIC_CONNECTIVITY = "tesla_connectivity"
+DEFAULT_TOPICS = (TOPIC_V, TOPIC_ALERTS, TOPIC_ERRORS, TOPIC_CONNECTIVITY)
+EVENT_TOPICS = frozenset({TOPIC_ALERTS, TOPIC_ERRORS, TOPIC_CONNECTIVITY})
 DEFAULT_ENDPOINT = "tcp://fleet-telemetry:5555"
 MAX_SEEN_IDS = 50000
 MPH_TO_KPH = 1.609344
@@ -86,8 +99,20 @@ COLUMNS = [
     "dbc_supplemental_commit", "dbc_override_version",
     "dbc_override_commit", "mapping_revision", "collector_version",
     "ingest_time", "source_system", "source_field", "collector_id",
-    "source_is_resend"
+    "source_is_resend", "quality", "envelope_id", "config_version",
+    "connectivity"
 ]
+
+EVENT_COLUMNS = [
+    "event_time", "vehicle", "event_type", "name", "source", "event_id",
+    "ingest_time", "envelope_id", "started_at", "ended_at", "duration_s",
+    "audience", "is_active", "body_redacted", "source_system",
+    "decode_epoch", "collector_id", "episode_id", "quality",
+    "config_version", "connectivity"
+]
+
+BOOL_COLUMNS = frozenset({"value_bool", "source_is_resend", "is_active",
+                          "body_redacted"})
 
 DDL = """CREATE TABLE IF NOT EXISTS outbox(
   event_id TEXT PRIMARY KEY,
@@ -112,13 +137,48 @@ DDL = """CREATE TABLE IF NOT EXISTS outbox(
   source_system TEXT,
   source_field TEXT,
   collector_id TEXT,
-  source_is_resend INTEGER
+  source_is_resend INTEGER,
+  quality TEXT,
+  envelope_id TEXT,
+  config_version TEXT,
+  connectivity TEXT
+)"""
+
+EVENT_DDL = """CREATE TABLE IF NOT EXISTS outbox_events(
+  event_id TEXT PRIMARY KEY,
+  event_time INTEGER NOT NULL,
+  vehicle TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  name TEXT NOT NULL,
+  source TEXT NOT NULL,
+  ingest_time INTEGER NOT NULL,
+  envelope_id TEXT,
+  started_at INTEGER,
+  ended_at INTEGER,
+  duration_s REAL,
+  audience TEXT,
+  is_active INTEGER,
+  body_redacted INTEGER,
+  source_system TEXT,
+  decode_epoch TEXT,
+  collector_id TEXT,
+  episode_id TEXT,
+  quality TEXT,
+  config_version TEXT,
+  connectivity TEXT
 )"""
 
 SEEN_DDL = """CREATE TABLE IF NOT EXISTS seen_ids(
   event_id TEXT PRIMARY KEY,
   seen_at INTEGER NOT NULL
 )"""
+
+OUTBOX_MIGRATIONS = (
+    "ALTER TABLE outbox ADD COLUMN quality TEXT",
+    "ALTER TABLE outbox ADD COLUMN envelope_id TEXT",
+    "ALTER TABLE outbox ADD COLUMN config_version TEXT",
+    "ALTER TABLE outbox ADD COLUMN connectivity TEXT",
+)
 
 # Field Allowlist with official Tesla telemetry field names, target VSS paths,
 # conversion multipliers, expected units, and physical range validation limits.
@@ -182,10 +242,9 @@ FIELD_ALLOWLIST = {
     },
     "PackCurrent": {
         "path": "Vehicle.Powertrain.TractionBattery.Current",
-        "unit": "A",
+        "unit": None,
         "type": "num",
-        "min": -1000.0,
-        "max": 2500.0,
+        "unverified": True,
     },
     "BatteryVoltage": {
         "path": "Vehicle.Powertrain.TractionBattery.Voltage",
@@ -196,10 +255,9 @@ FIELD_ALLOWLIST = {
     },
     "PackVoltage": {
         "path": "Vehicle.Powertrain.TractionBattery.Voltage",
-        "unit": "V",
+        "unit": None,
         "type": "num",
-        "min": 0.0,
-        "max": 1000.0,
+        "unverified": True,
     },
     "Gear": {
         "path": "Vehicle.Powertrain.Transmission.CurrentGear",
@@ -390,6 +448,119 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 500.0,
     },
+    # Battery energy counters (authoritative kWh per available-data docs:
+    # DCChargingEnergyIn = battery meter AC+DC, ACChargingEnergyIn = charger
+    # meter AC only, EnergyRemaining = nominal pack kWh, LifetimeEnergyUsed =
+    # discharge-lost kWh). No circular readings: stored verbatim for analysis.
+    "DCChargingEnergyIn": {
+        "path": "Vehicle.Powertrain.TractionBattery.Charging.DCEnergyIn",
+        "unit": "kWh",
+        "type": "num",
+        "min": 0.0,
+        "max": 500.0,
+    },
+    "ACChargingEnergyIn": {
+        "path": "Vehicle.Powertrain.TractionBattery.Charging.ACEnergyIn",
+        "unit": "kWh",
+        "type": "num",
+        "min": 0.0,
+        "max": 500.0,
+    },
+    "EnergyRemaining": {
+        "path": "Vehicle.Powertrain.TractionBattery.EnergyRemaining",
+        "unit": "kWh",
+        "type": "num",
+        "min": 0.0,
+        "max": 500.0,
+    },
+    "LifetimeEnergyUsed": {
+        "path": "Vehicle.Powertrain.TractionBattery.LifetimeEnergyUsed",
+        "unit": "kWh",
+        "type": "num",
+        "min": 0.0,
+        "max": 1000000.0,
+    },
+    # Brick voltages / module temps / isolation: docs give no authoritative
+    # unit or scale, so stored raw (unit None) with quality 'unit_unverified'
+    # for downstream calibration; never rescaled or range-clamped here.
+    "BrickVoltageMin": {
+        "path": "Vehicle.Powertrain.TractionBattery.BrickVoltageMin",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "BrickVoltageMax": {
+        "path": "Vehicle.Powertrain.TractionBattery.BrickVoltageMax",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "NumBrickVoltageMin": {
+        "path": "Vehicle.Powertrain.TractionBattery.NumBrickVoltageMin",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "NumBrickVoltageMax": {
+        "path": "Vehicle.Powertrain.TractionBattery.NumBrickVoltageMax",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "ModuleTempMin": {
+        "path": "Vehicle.Powertrain.TractionBattery.ModuleTempMin",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "ModuleTempMax": {
+        "path": "Vehicle.Powertrain.TractionBattery.ModuleTempMax",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "NumModuleTempMin": {
+        "path": "Vehicle.Powertrain.TractionBattery.NumModuleTempMin",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "NumModuleTempMax": {
+        "path": "Vehicle.Powertrain.TractionBattery.NumModuleTempMax",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    "IsolationResistance": {
+        "path": "Vehicle.Powertrain.TractionBattery.IsolationResistance",
+        "unit": None,
+        "type": "num",
+        "unverified": True,
+    },
+    # BMS / charge state enums: stored as opaque text, never reinterpreted.
+    "BMSState": {
+        "path": "Vehicle.Powertrain.TractionBattery.BMSState",
+        "unit": None,
+        "type": "text",
+    },
+    "DetailedChargeState": {
+        "path": "Vehicle.Powertrain.TractionBattery.Charging.DetailedState",
+        "unit": None,
+        "type": "text",
+    },
+    "BatteryHeaterOn": {
+        "path": "Vehicle.Powertrain.TractionBattery.BatteryHeaterOn",
+        "unit": None,
+        "type": "bool",
+    },
+    # Official charge-limit SOC (% of capacity at which charging terminates).
+    "ChargeLimitSoc": {
+        "path": "Vehicle.Powertrain.TractionBattery.Charging.ChargeLimitSoc",
+        "unit": "%",
+        "type": "num",
+        "min": 0.0,
+        "max": 100.0,
+    },
 }
 
 
@@ -519,7 +690,9 @@ def unwrap_protojson_value(field, value_obj):
       - stringValue -> str
       - shiftStateValue -> strip 'ShiftState' prefix (e.g. 'ShiftStateP' -> 'P')
       - hvacAutoMode / hvacAutoModeValue -> 'HvacAutoModeStateOn' -> true
-      - kind == 'invalid' -> None (dropped)
+      - kind == 'invalid' -> None (tombstone downstream, never zero-filled)
+      - other scalar kinds (enum states such as BMSStateValue) -> preserved
+        verbatim so text/bool specs can store them without reinterpretation.
     """
     if not isinstance(value_obj, dict) or not value_obj:
         return None
@@ -570,25 +743,35 @@ def unwrap_protojson_value(field, value_obj):
     if kind == "stringValue":
         return (str(raw_val), kind)
 
+    if isinstance(raw_val, (str, bool, int, float)):
+        return (raw_val, kind)
+
     return None
 
 
 def validate_field_value(spec, unwrapped_value):
-    """Validate and convert unwrapped value according to spec (scale + range).
+    """Validate and convert unwrapped value according to spec.
 
-    Returns (num, text, boolean) tuple, or None if invalid.
+    Returns (num, text, boolean, quality): quality None means verified-valid;
+    'invalid' means undecodable/non-finite (tombstone, values NULL);
+    'range_rejected' means type-ok but outside min/max (tombstone);
+    'unit_unverified' means spec has unverified=True (raw numeric kept, no
+    scale or range applied). Enum-typed text/bool carry quality None.
     """
-    if unwrapped_value is None:
-        return None
-
     ftype = spec["type"]
     if ftype == "num":
+        val = None
         try:
+            if isinstance(unwrapped_value, bool):
+                raise ValueError("bool is not numeric")
             val = float(unwrapped_value)
         except (ValueError, TypeError):
-            return None
+            return (None, None, None, "invalid")
         if math.isnan(val) or math.isinf(val):
-            return None
+            return (None, None, None, "invalid")
+        if spec.get("unverified"):
+            # No scale, no clamp: raw value persists for downstream calibration.
+            return (val, None, None, "unit_unverified")
 
         # Unit scaling (e.g. mph -> km/h, miles -> km, bar -> kPa)
         scale = spec.get("scale")
@@ -598,32 +781,34 @@ def validate_field_value(spec, unwrapped_value):
         min_v = spec.get("min")
         max_v = spec.get("max")
         if min_v is not None and val < min_v:
-            return None
+            return (None, None, None, "range_rejected")
         if max_v is not None and val > max_v:
-            return None
-        return (val, None, None)
+            return (None, None, None, "range_rejected")
+        return (val, None, None, None)
 
     if ftype == "bool":
         if isinstance(unwrapped_value, bool):
-            return (None, None, 1 if unwrapped_value else 0)
+            return (None, None, 1 if unwrapped_value else 0, None)
         if isinstance(unwrapped_value, (int, float)):
             if unwrapped_value in (0, 1):
-                return (None, None, int(unwrapped_value))
-            return None
+                return (None, None, int(unwrapped_value), None)
+            return (None, None, None, "range_rejected")
         if isinstance(unwrapped_value, str):
             s = unwrapped_value.strip().lower()
             if s in ("true", "1"):
-                return (None, None, 1)
+                return (None, None, 1, None)
             if s in ("false", "0"):
-                return (None, None, 0)
-        return None
+                return (None, None, 0, None)
+        return (None, None, None, "invalid")
 
     if ftype == "text":
         if isinstance(unwrapped_value, (dict, list, set, tuple)):
-            return None
-        return (None, str(unwrapped_value), None)
+            return (None, None, None, "invalid")
+        if unwrapped_value is None or (isinstance(unwrapped_value, bool)):
+            return (None, None, None, "invalid")
+        return (None, str(unwrapped_value), None, None)
 
-    return None
+    return (None, None, None, "invalid")
 
 
 def deterministic_event_id(vehicle, path, source_system, source_field,
@@ -644,18 +829,253 @@ def deterministic_event_id(vehicle, path, source_system, source_field,
     return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
 
 
-def parse_zmq_frames(frames, expected_topic=DEFAULT_TOPIC):
-    """Validate 2-frame ZMQ message and return payload bytes.
+def deterministic_event_row_id(vehicle, event_type, name, event_time_ns,
+                               decode_epoch, started_ns, ended_ns,
+                               audience, is_active):
+    """Stable id for one observed alert/error/connectivity episode sample.
 
-    Strict contract: frame[0] must equal expected_topic (e.g. b"tesla_V").
-    Frame[1] must contain the protojson payload.
+    Includes decode_epoch (re-decode keeps history); excludes isResend,
+    envelope, body, connection, and config (metadata never moves identity).
     """
+    parts = [
+        vehicle, event_type, name, SOURCE, SOURCE_SYSTEM,
+        "" if started_ns is None else str(started_ns),
+        "" if ended_ns is None else str(ended_ns),
+        str(event_time_ns), str(decode_epoch),
+        "" if audience is None else audience,
+        "" if is_active is None else ("1" if is_active else "0"),
+    ]
+    return hashlib.sha256("\x1f".join(parts).encode("utf-8")).hexdigest()
+
+
+def episode_id(vehicle, event_type, name, started_ns, decode_epoch):
+    """Pragmatic episode linkage; None without a valid start (no invention)."""
+    if not vehicle or not event_type or not name or started_ns is None:
+        return None
+    try:
+        started = int(started_ns)
+    except (ValueError, TypeError):
+        return None
+    if started <= 0 or started > _INT64_MAX:
+        return None
+    tail = "|" + str(decode_epoch) if decode_epoch else ""
+    return hashlib.sha256(
+        f"{vehicle}|{event_type}|{name}|{started}{tail}".encode("utf-8")).hexdigest()
+
+
+def _opt_nonempty_str(value):
+    return value if isinstance(value, str) and value else None
+
+
+def _parse_optional_time(raw):
+    """Optional envelope/element time: (ns|None, status).
+
+    Status True only when the raw value is absent (None/"") or a valid
+    timestamp. A present-but-unparseable value returns False so callers can
+    retain the warning with quality 'unknown_start'/'error' instead of
+    treating it as valid, and never infer activity from the failure.
+    """
+    if raw is None or raw == "":
+        return (None, True)
+    try:
+        return (parse_created_at(raw), True)
+    except (ValueError, TypeError, OverflowError):
+        return (None, False)
+
+
+def _resolve_envelope_identity(data, target_vin, configured_vehicle_id, salt):
+    vin_raw = data.get("vin")
+    vehicle = resolve_vehicle_identity(vin_raw, target_vin, configured_vehicle_id, salt)
+    if vehicle is None:
+        return None, None
+    return vehicle, str(vin_raw).strip()
+
+
+def extract_alert_records(data, vehicle, event_time_ns):
+    """Official VehicleAlerts envelope -> per-alert dicts (no invention).
+
+    createdAt is the envelope event time. Each alerts[] element needs name;
+    audiences join to one string or None; startedAt/endedAt parse optionally.
+    No top-level name/status fallback and no events[] probing: non-envelope
+    shapes raise ValueError.
+    """
+    alerts = data.get("alerts")
+    if not isinstance(alerts, list):
+        raise ValueError("alerts envelope missing 'alerts' array")
+    out = []
+    for elem in alerts:
+        if not isinstance(elem, dict):
+            continue
+        name = elem.get("name")
+        if not name or not isinstance(name, str):
+            continue
+        audiences = elem.get("audiences")
+        audience = None
+        if isinstance(audiences, list):
+            parts = [a for a in audiences if isinstance(a, str) and a]
+            audience = ",".join(parts) if parts else None
+        elif isinstance(audiences, str) and audiences:
+            audience = audiences
+        started_ns, start_ok = _parse_optional_time(elem.get("startedAt"))
+        ended_ns, end_ok = _parse_optional_time(elem.get("endedAt"))
+        has_start_raw = elem.get("startedAt") not in (None, "")
+        has_end_raw = elem.get("endedAt") not in (None, "")
+        if ended_ns is not None and started_ns is not None and ended_ns >= started_ns:
+            duration_s = (ended_ns - started_ns) / 1e9
+        else:
+            duration_s = None
+        if ended_ns is not None:
+            is_active = False
+        elif has_end_raw and not end_ok:
+            # Invalid endedAt: parse failure never implies active.
+            is_active = None
+        elif not has_start_raw or not start_ok:
+            # Missing/unparseable start retains the warning without activity.
+            is_active = None
+        else:
+            is_active = True
+        if not has_start_raw or not start_ok:
+            quality = "unknown_start"
+        elif has_end_raw and not end_ok:
+            quality = "error"
+        else:
+            quality = None
+        out.append({
+            "name": name, "audience": audience, "started_ns": started_ns,
+            "ended_ns": ended_ns if end_ok else None, "duration_s": duration_s,
+            "is_active": is_active, "quality": quality,
+            "body_redacted": None, "connectivity": None,
+            "event_time_ns": event_time_ns, "vehicle": vehicle,
+        })
+    return out
+
+
+def extract_error_records(data, vehicle, event_time_ns):
+    """Official VehicleErrors envelope -> per-error dicts (no invention).
+
+    Each errors[] element needs name; per-element createdAt overrides the
+    envelope time when valid; tags/body are never stored (body presence only).
+    """
+    errors = data.get("errors")
+    if not isinstance(errors, list):
+        raise ValueError("errors envelope missing 'errors' array")
+    out = []
+    for elem in errors:
+        if not isinstance(elem, dict):
+            continue
+        name = elem.get("name")
+        if not name or not isinstance(name, str):
+            continue
+        elem_time, elem_ok = _parse_optional_time(elem.get("createdAt"))
+        row_time = elem_time if elem_ok and elem_time is not None else event_time_ns
+        body = elem.get("body")
+        out.append({
+            "name": name, "audience": None, "started_ns": None,
+            "ended_ns": None, "duration_s": None, "is_active": None,
+            "quality": None if elem_ok else "error",
+            "body_redacted": True if body not in (None, "") and "body" in elem else None,
+            "connectivity": None, "event_time_ns": row_time,
+            "vehicle": vehicle,
+        })
+    return out
+
+
+def extract_connectivity_record(data, vehicle, event_time_ns):
+    """Official VehicleConnectivity envelope -> single state row.
+
+    status maps CONNECTED/DISCONNECTED/UNKNOWN (case-insensitive); anything
+    else keeps the raw string as connectivity with quality 'error'. Rows stay
+    separate and never close alert episodes downstream.
+    """
+    raw_status = data.get("status")
+    status = raw_status.strip().upper() if isinstance(raw_status, str) and raw_status.strip() else None
+    if status in ("CONNECTED", "DISCONNECTED", "UNKNOWN"):
+        connectivity, quality = status, None
+    elif status is None:
+        connectivity, quality = None, "error"
+    else:
+        connectivity, quality = raw_status, "error"
+    return {
+        "name": "connectivity", "audience": None, "started_ns": None,
+        "ended_ns": None, "duration_s": None,
+        "is_active": True if status == "CONNECTED" else (False if status == "DISCONNECTED" else None),
+        "quality": quality, "body_redacted": None, "connectivity": connectivity,
+        "event_time_ns": event_time_ns, "vehicle": vehicle,
+    }
+
+
+def extract_event_envelope(topic, payload_bytes, target_vin="",
+                           configured_vehicle_id="", salt=""):
+    """Parse one alerts/errors/connectivity envelope.
+
+    Returns (metadata, event_dicts) on event topics, else (None, None).
+    VIN/target filter, exact-ns createdAt, and camelCase protojson field
+    names follow the official protos; unknown shapes fail closed.
+    """
+    if topic not in EVENT_TOPICS:
+        return None, None
+    try:
+        data = json.loads(payload_bytes.decode("utf-8"))
+    except Exception as e:
+        raise ValueError(f"malformed JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("top-level payload must be a JSON object")
+    vehicle, _vin = _resolve_envelope_identity(data, target_vin, configured_vehicle_id, salt)
+    if vehicle is None:
+        return None, []
+    event_time_ns = parse_created_at(data.get("createdAt"))
+    if topic == TOPIC_ALERTS:
+        events = extract_alert_records(data, vehicle, event_time_ns)
+        event_type = "alerts"
+    elif topic == TOPIC_ERRORS:
+        events = extract_error_records(data, vehicle, event_time_ns)
+        event_type = "errors"
+    else:
+        events = [extract_connectivity_record(data, vehicle, event_time_ns)]
+        event_type = "connectivity"
+    metadata = {"event_time_ns": event_time_ns, "vehicle": vehicle, "event_type": event_type}
+    return metadata, events
+
+
+def resolve_topics(raw=""):
+    """Parse FLEET_ZMQ_TOPICS allowlist; empty -> default full four.
+
+    Unknown names are dropped; the clean cutover reads only FLEET_ZMQ_TOPICS.
+    """
+    names = [t.strip() for t in str(raw or "").split(",") if t.strip()]
+    if not names:
+        return list(DEFAULT_TOPICS)
+    known = [t for t in names if t in DEFAULT_TOPICS]
+    return known or list(DEFAULT_TOPICS)
+
+
+def envelope_id(topic, payload_bytes):
+    """Stable envelope over the exact received bytes (topic + payload)."""
+    return hashlib.sha256(topic.encode("utf-8") + b"\x1f" + bytes(payload_bytes)).hexdigest()
+
+
+def parse_zmq_frames(frames, topics=DEFAULT_TOPICS):
+    """Validate 2-frame ZMQ message and return (topic, payload bytes).
+
+    topics: allowlist (tuple/list/set); frame[0] must match one entry.
+    A single string topic is accepted as a one-entry allowlist.
+    """
+    if isinstance(topics, str):
+        topics = (topics,)
+    allowed = set(topics) if topics else set(DEFAULT_TOPICS)
     if len(frames) != 2:
         raise ValueError(f"expected exactly 2 frames, got {len(frames)}")
-    topic_bytes = frames[0]
-    if topic_bytes != expected_topic.encode("utf-8"):
-        raise ValueError(f"unexpected topic frame: {topic_bytes!r}, expected {expected_topic!r}")
-    return frames[1]
+    raw0 = frames[0]
+    topic = raw0.decode("utf-8") if isinstance(raw0, (bytes, bytearray)) else raw0
+    if topic not in allowed:
+        raise ValueError(f"unexpected topic frame: {raw0!r}")
+    return topic, frames[1]
+
+
+def parse_zmq_payload(frames, topics=DEFAULT_TOPICS):
+    """Legacy helper: return payload bytes of a 2-frame message."""
+    _, payload = parse_zmq_frames(frames, topics)
+    return payload
 
 
 def extract_protojson_records(payload_bytes, target_vin="", configured_vehicle_id="", salt=""):
@@ -699,9 +1119,13 @@ def extract_protojson_records(payload_bytes, target_vin="", configured_vehicle_i
         val_obj = datum.get("value")
         if not key or not isinstance(key, str) or not isinstance(val_obj, dict):
             continue
+        if key not in FIELD_ALLOWLIST:
+            continue  # Not allowlisted: ignore silently
+        # Every allowlisted datum keeps a slot: undecodable/invalid -> raw
+        # None tombstone (classified downstream as quality 'invalid').
         unwrapped = unwrap_protojson_value(key, val_obj)
-        if unwrapped is not None:
-            unwrapped_signals.append((key, unwrapped[0]))
+        raw = unwrapped[0] if unwrapped is not None else None
+        unwrapped_signals.append((key, raw))
 
     metadata = {
         "event_time_ns": event_time_ns,
@@ -728,60 +1152,86 @@ def sql_bool(value):
     return "TRUE" if value else "FALSE"
 
 
-def render_insert(table, rows):
+def render_insert(table, rows, columns=None):
     """Render batch INSERT statement for GreptimeDB HTTP SQL."""
     if not TABLE_RE.fullmatch(table):
         raise ValueError(f"bad table name: {table}")
+    cols = list(columns) if columns is not None else list(COLUMNS)
+    for col in cols:
+        if not TABLE_RE.fullmatch(col):
+            raise ValueError(f"bad column name: {col}")
     cells = []
     for r in rows:
         cells.append(",".join(
-            sql_bool(r.get(c)) if c in ("value_bool", "source_is_resend")
+            sql_bool(r.get(c)) if c in BOOL_COLUMNS
             else sql_escape(r.get(c))
-            for c in COLUMNS))
-    return f"INSERT INTO {table} ({','.join(COLUMNS)}) VALUES {', '.join(f'({c})' for c in cells)}"
+            for c in cols))
+    return f"INSERT INTO {table} ({','.join(cols)}) VALUES {', '.join(f'({c})' for c in cells)}"
 
 
-def open_outbox(path):
-    """Open and initialize SQLite outbox database."""
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    conn = sqlite3.connect(path, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(DDL)
-    conn.execute(SEEN_DDL)
-    conn.commit()
-    return conn
+def _existing_columns(conn, table):
+    try:
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    except Exception:
+        return set()
 
 
-def store_signal_update(conn, row, max_rows=50000):
-    """Insert one row into outbox with deduplication and strict disk bounding.
+def outbox_pending_total(conn):
+    """TOTAL pending rows across signal + event queues (single bound)."""
+    total = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    try:
+        total += conn.execute("SELECT COUNT(*) FROM outbox_events").fetchone()[0]
+    except Exception:
+        pass
+    return total
 
-    Overflow policy (disk safety):
-      - When count >= max_rows, NEW arrivals are rejected (return -1).
-      - Existing unacked rows are NEVER deleted.
-      - Rejected rows are NOT recorded in seen_ids, allowing retry upon drain.
-    """
+
+def _store_row(conn, table, columns, row, max_rows):
     key = row["event_id"]
     seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?", (key,)).fetchone()
     if seen is not None:
         return 0
-
-    # Guard queue capacity
-    cur = conn.execute("SELECT COUNT(*) FROM outbox")
-    count = cur.fetchone()[0]
-    if count >= max_rows:
-        return -1  # Capacity overflow: reject new arrival to prevent disk filling
-
+    if outbox_pending_total(conn) >= max_rows:
+        return -1  # Capacity overflow: reject new arrival, keep unacked rows
+    existing = _existing_columns(conn, table)
+    write_cols = [c for c in columns if c in existing] if existing else list(columns)
     cur = conn.execute(
-        "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
-        " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
-        [row[c] for c in COLUMNS])
-
+        "INSERT OR IGNORE INTO " + table + "(" + ",".join(write_cols) + ")"
+        " VALUES(" + ",".join("?" * len(write_cols)) + ")",
+        [row[c] for c in write_cols])
     inserted = cur.rowcount > 0
     conn.execute("INSERT OR IGNORE INTO seen_ids(event_id, seen_at) VALUES(?,?)",
                  (key, now_ns()))
     conn.commit()
     return 1 if inserted else 0
+
+
+def open_outbox(path):
+    """Open and initialize SQLite outbox database (migrates old rows)."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    conn = sqlite3.connect(path, timeout=30)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute(DDL)
+    conn.execute(EVENT_DDL)
+    conn.execute(SEEN_DDL)
+    existing = _existing_columns(conn, "outbox")
+    for stmt in OUTBOX_MIGRATIONS:
+        col = stmt.split()[-2]
+        if col not in existing:
+            conn.execute(stmt)
+    conn.commit()
+    return conn
+
+
+def store_signal_update(conn, row, max_rows=50000):
+    """Insert one signal row; overflow rejects new, keeps unacked, skips seen."""
+    return _store_row(conn, "outbox", COLUMNS, row, max_rows)
+
+
+def store_event_update(conn, row, max_rows=50000):
+    """Insert one event row; same non-destructive TOTAL-bound semantics."""
+    return _store_row(conn, "outbox_events", EVENT_COLUMNS, row, max_rows)
 
 
 def prune_seen(conn, older_than_ns, max_seen_limit=MAX_SEEN_IDS):
@@ -838,8 +1288,120 @@ def greptime_insert(base_url, db, user, password, sql, timeout=15):
     return first["affectedrows"]
 
 
-def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
-    """Parse payload and store allowlisted signals into outbox."""
+def _stats_bump(stats, key, delta=1):
+    try:
+        stats[key] = stats.get(key, 0) + delta
+    except Exception:
+        pass
+
+
+def _store_signal_row(conn, meta_env, stats, source_field, raw_val, metadata,
+                      ingest_time_ns, envelope, max_rows):
+    spec = FIELD_ALLOWLIST.get(source_field)
+    if not spec:
+        return 0  # Unreachable: extractor already filters non-allowlisted.
+    num, text, boolean, quality = validate_field_value(spec, raw_val)
+    if quality in ("invalid", "range_rejected"):
+        _stats_bump(stats, "invalid_fields")
+    path = spec["path"]
+    event_id = deterministic_event_id(
+        vehicle=metadata["vehicle"], path=path, source_system=SOURCE_SYSTEM,
+        source_field=source_field, event_time_ns=metadata["event_time_ns"],
+        decode_epoch=meta_env["decode_epoch"], num=num, text=text,
+        boolean=boolean)
+    row = {
+        "event_time": metadata["event_time_ns"],
+        "vehicle": metadata["vehicle"],
+        "path": path,
+        "source": SOURCE,
+        "event_id": event_id,
+        "decode_epoch": meta_env["decode_epoch"],
+        "value_num": num,
+        "value_text": text,
+        "value_bool": boolean,
+        "unit": spec.get("unit"),
+        "vss_version": meta_env["vss_version"] or None,
+        "vehicle_firmware": meta_env["vehicle_firmware"] or None,
+        "dbc_primary_commit": None,
+        "dbc_supplemental_commit": None,
+        "dbc_override_version": None,
+        "dbc_override_commit": None,
+        "mapping_revision": meta_env["mapping_revision"],
+        "collector_version": meta_env["collector_version"],
+        "ingest_time": ingest_time_ns,
+        "source_system": SOURCE_SYSTEM,
+        "source_field": source_field,
+        "collector_id": meta_env["collector_id"],
+        "source_is_resend": 1 if metadata.get("is_resend") else 0,
+        "quality": quality,
+        "envelope_id": envelope,
+        "config_version": meta_env.get("config_version") or None,
+        "connectivity": None,
+    }
+    res = store_signal_update(conn, row, max_rows=max_rows)
+    if res == 1:
+        _stats_bump(stats, "signals_stored")
+        return 1
+    if res == 0:
+        _stats_bump(stats, "deduped")
+    elif res == -1:
+        _stats_bump(stats, "dropped_signals")
+        _stats_bump(stats, "outbox_overflow_drops")
+    return 0
+
+
+def _store_event_row(conn, meta_env, stats, topic, event_type, item,
+                     metadata, ingest_time_ns, envelope, max_rows):
+    audience = _opt_nonempty_str(item.get("audience"))
+    is_active = item.get("is_active")
+    is_active = is_active if isinstance(is_active, bool) else None
+    event_id = deterministic_event_row_id(
+        vehicle=item["vehicle"], event_type=event_type, name=item["name"],
+        event_time_ns=item["event_time_ns"],
+        decode_epoch=meta_env["decode_epoch"],
+        started_ns=item.get("started_ns"), ended_ns=item.get("ended_ns"),
+        audience=audience, is_active=is_active)
+    row = {
+        "event_time": item["event_time_ns"],
+        "vehicle": item["vehicle"],
+        "event_type": event_type,
+        "name": item["name"],
+        "source": SOURCE,
+        "event_id": event_id,
+        "ingest_time": ingest_time_ns,
+        "envelope_id": envelope,
+        "started_at": item.get("started_ns"),
+        "ended_at": item.get("ended_ns"),
+        "duration_s": item.get("duration_s"),
+        "audience": audience,
+        "is_active": 1 if is_active is True else (0 if is_active is False else None),
+        "body_redacted": 1 if item.get("body_redacted") is True else None,
+        "source_system": SOURCE_SYSTEM,
+        "decode_epoch": meta_env["decode_epoch"],
+        "collector_id": meta_env["collector_id"],
+        "episode_id": episode_id(item["vehicle"], event_type, item["name"],
+                                 item.get("started_ns"), meta_env["decode_epoch"]),
+        "quality": item.get("quality"),
+        "config_version": meta_env.get("config_version") or None,
+        "connectivity": _opt_nonempty_str(item.get("connectivity")),
+    }
+    res = store_event_update(conn, row, max_rows=max_rows)
+    if res == 1:
+        _stats_bump(stats, "events_stored")
+        return 1
+    if res == 0:
+        _stats_bump(stats, "deduped")
+    elif res == -1:
+        _stats_bump(stats, "dropped_events")
+        _stats_bump(stats, "event_overflow_drops")
+        _stats_bump(stats, "dropped_signals")
+        _stats_bump(stats, "outbox_overflow_drops")
+    return 0
+
+
+def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
+                    topic=TOPIC_V):
+    """Parse one V payload and store allowlisted signals (with tombstones)."""
     try:
         metadata, raw_signals = extract_protojson_records(
             payload_bytes,
@@ -847,106 +1409,96 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000):
             configured_vehicle_id=meta_env["vehicle_id"],
             salt=meta_env["vehicle_salt"]
         )
-    except Exception as ex:
-        stats["invalid_messages"] += 1
+    except Exception:
+        _stats_bump(stats, "invalid_messages")
         return 0
-
     if metadata is None:
-        # Non-matching VIN filtered out
-        return 0
-
-    stats["messages_received"] += 1
-    stored_count = 0
+        return 0  # Non-matching VIN filtered out
+    _stats_bump(stats, "messages_received")
     ingest_time_ns = now_ns()
-
+    envelope = envelope_id(topic, payload_bytes)
+    stored = 0
     for source_field, raw_val in raw_signals:
-        spec = FIELD_ALLOWLIST.get(source_field)
-        if not spec:
-            continue  # Not allowlisted: ignore
-
-        classified = validate_field_value(spec, raw_val)
-        if classified is None:
-            stats["invalid_fields"] += 1
-            continue  # Value invalid or out of range: fail-closed for this signal
-
-        num, text, boolean = classified
-        path = spec["path"]
-        unit = spec.get("unit")
-        event_time_ns = metadata["event_time_ns"]
-        vehicle = metadata["vehicle"]
-
-        event_id = deterministic_event_id(
-            vehicle=vehicle,
-            path=path,
-            source_system=SOURCE_SYSTEM,
-            source_field=source_field,
-            event_time_ns=event_time_ns,
-            decode_epoch=meta_env["decode_epoch"],
-            num=num,
-            text=text,
-            boolean=boolean
-        )
-
-        row = {
-            "event_time": event_time_ns,
-            "vehicle": vehicle,
-            "path": path,
-            "source": SOURCE,
-            "event_id": event_id,
-            "decode_epoch": meta_env["decode_epoch"],
-            "value_num": num,
-            "value_text": text,
-            "value_bool": boolean,
-            "unit": unit,
-            "vss_version": meta_env["vss_version"] or None,
-            "vehicle_firmware": meta_env["vehicle_firmware"] or None,
-            "dbc_primary_commit": None,
-            "dbc_supplemental_commit": None,
-            "dbc_override_version": None,
-            "dbc_override_commit": None,
-            "mapping_revision": meta_env["mapping_revision"],
-            "collector_version": meta_env["collector_version"],
-            "ingest_time": ingest_time_ns,
-            "source_system": SOURCE_SYSTEM,
-            "source_field": source_field,
-            "collector_id": meta_env["collector_id"],
-            "source_is_resend": 1 if metadata["is_resend"] else 0
-        }
-
-        res = store_signal_update(conn, row, max_rows=max_rows)
-        if res == 1:
-            stored_count += 1
-            stats["signals_stored"] += 1
-        elif res == 0:
-            stats["deduped"] += 1
-        elif res == -1:
-            stats["dropped_signals"] += 1
-            stats["outbox_overflow_drops"] += 1
-
-    return stored_count
+        stored += _store_signal_row(conn, meta_env, stats, source_field,
+                                    raw_val, metadata, ingest_time_ns,
+                                    envelope, max_rows)
+    return stored
 
 
-def upload_tick(conn, base_url, db, user, password, batch_size=500):
-    """Execute one batch upload tick from outbox to GreptimeDB."""
+def process_envelope(conn, topic, payload_bytes, meta_env, stats,
+                     max_rows=50000):
+    """Parse one alerts/errors/connectivity envelope into event rows."""
+    try:
+        metadata, items = extract_event_envelope(
+            topic, payload_bytes,
+            target_vin=meta_env["target_vin"],
+            configured_vehicle_id=meta_env["vehicle_id"],
+            salt=meta_env["vehicle_salt"])
+    except Exception:
+        _stats_bump(stats, "invalid_events")
+        return 0
+    if metadata is None:
+        return 0  # Non-matching VIN filtered out
+    _stats_bump(stats, "messages_received")
+    ingest_time_ns = now_ns()
+    envelope = envelope_id(topic, payload_bytes)
+    stored = 0
+    for item in items:
+        stored += _store_event_row(conn, meta_env, stats, topic,
+                                   metadata["event_type"], item, metadata,
+                                   ingest_time_ns, envelope, max_rows)
+    return stored
+
+
+def process_frame(conn, topic, payload_bytes, meta_env, stats,
+                  max_rows=50000):
+    """Dispatch one (topic, payload) pair to the signal or event path."""
+    if topic in EVENT_TOPICS:
+        return process_envelope(conn, topic, payload_bytes, meta_env, stats,
+                                max_rows=max_rows)
+    if topic == TOPIC_V:
+        return process_message(conn, payload_bytes, meta_env, stats,
+                               max_rows=max_rows, topic=topic)
+    _stats_bump(stats, "invalid_messages")
+    return 0
+
+
+def _upload_table(conn, table, columns, dest_table, base_url, db, user,
+                  password, batch_size):
+    existing = _existing_columns(conn, table)
+    if existing and table == "outbox":
+        missing = [c for c in COLUMNS if c not in existing]
+        if missing:
+            return 0  # Old DB mid-migration: next open_outbox migrates.
     cur = conn.execute(
-        "SELECT " + ",".join(COLUMNS) + " FROM outbox ORDER BY event_time ASC LIMIT ?",
+        "SELECT " + ",".join(columns) + " FROM " + table
+        + " ORDER BY event_time ASC LIMIT ?",
         (batch_size,))
-    rows = [dict(zip(COLUMNS, r)) for r in cur.fetchall()]
+    rows = [dict(zip(columns, r)) for r in cur.fetchall()]
     if not rows:
         return 0
-
-    sql = render_insert("vehicle_signal", rows)
+    sql = render_insert(dest_table, rows, columns=columns)
     affected = greptime_insert(base_url, db, user, password, sql, timeout=20)
     if affected != len(rows):
         raise SqlError(f"partial affected rows: expected {len(rows)}, got {affected}")
-
-    # Single-transaction delete of acked rows
     event_ids = [r["event_id"] for r in rows]
     conn.execute(
-        "DELETE FROM outbox WHERE event_id IN (" + ",".join("?" * len(event_ids)) + ")",
+        "DELETE FROM " + table + " WHERE event_id IN ("
+        + ",".join("?" * len(event_ids)) + ")",
         event_ids)
     conn.commit()
     return len(rows)
+
+
+def upload_tick(conn, base_url, db, user, password, batch_size=500):
+    """Upload one tick: signal batch then event batch (fail-closed each)."""
+    total = _upload_table(conn, "outbox", COLUMNS, "vehicle_signal",
+                          base_url, db, user, password, batch_size)
+    if total < batch_size:
+        total += _upload_table(conn, "outbox_events", EVENT_COLUMNS,
+                               "vehicle_event", base_url, db, user,
+                               password, batch_size - total)
+    return total
 
 
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
@@ -961,12 +1513,24 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
 
         pending = 0
         oldest_ns = 0
+        ev_pending = 0
+        ev_oldest = 0
         try:
             conn = sqlite3.connect(self.db_path, timeout=5)
-            row = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
+            try:
+                row = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
+            except Exception:
+                row = None
             if row:
                 pending = row[0] or 0
                 oldest_ns = row[1] or 0
+            try:
+                erow = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox_events").fetchone()
+            except Exception:
+                erow = None
+            if erow:
+                ev_pending = erow[0] or 0
+                ev_oldest = erow[1] or 0
             conn.close()
         except Exception:
             pass
@@ -974,15 +1538,22 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
         lines = [
             f"fleet_outbox_pending_rows {pending}",
             f"fleet_outbox_oldest_event_time_ns {oldest_ns}",
+            f"fleet_outbox_events_pending_rows {ev_pending}",
+            f"fleet_outbox_events_oldest_event_time_ns {ev_oldest}",
             f"fleet_messages_received_total {self.stats.get('messages_received', 0)}",
             f"fleet_signals_stored_total {self.stats.get('signals_stored', 0)}",
+            f"fleet_events_stored_total {self.stats.get('events_stored', 0)}",
             f"fleet_uploaded_total {self.stats.get('uploaded', 0)}",
+            f"fleet_events_uploaded_total {self.stats.get('events_uploaded', 0)}",
             f"fleet_upload_failures_total {self.stats.get('upload_failures', 0)}",
             f"fleet_deduped_total {self.stats.get('deduped', 0)}",
             f"fleet_invalid_messages_total {self.stats.get('invalid_messages', 0)}",
             f"fleet_invalid_fields_total {self.stats.get('invalid_fields', 0)}",
+            f"fleet_invalid_events_total {self.stats.get('invalid_events', 0)}",
             f"fleet_dropped_signals_total {self.stats.get('dropped_signals', 0)}",
+            f"fleet_dropped_events_total {self.stats.get('dropped_events', 0)}",
             f"fleet_outbox_overflow_drops_total {self.stats.get('outbox_overflow_drops', 0)}",
+            f"fleet_event_overflow_drops_total {self.stats.get('event_overflow_drops', 0)}",
         ]
         body = "\n".join(lines).encode("utf-8") + b"\n"
         self.send_response(200)
@@ -995,20 +1566,21 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def run_subscriber(endpoint, topic, on_msg, stop_event):
-    """ZMQ subscriber loop strictly enforcing 2-frame topic protocol."""
+def run_subscriber(endpoint, topics, on_frame, stop_event):
+    """ZMQ subscriber loop over the allowlisted topics (strict 2-frame)."""
     import zmq
     ctx = zmq.Context()
     sock = ctx.socket(zmq.SUB)
     sock.connect(endpoint)
-    sock.setsockopt_string(zmq.SUBSCRIBE, topic)
+    for topic in topics:
+        sock.setsockopt_string(zmq.SUBSCRIBE, topic)
     sock.RCVTIMEO = 1000  # 1 second poll timeout
 
     while not stop_event.is_set():
         try:
             parts = sock.recv_multipart()
-            payload = parse_zmq_frames(parts, expected_topic=topic)
-            on_msg(payload)
+            topic, payload = parse_zmq_frames(parts, topics)
+            on_frame(topic, payload)
         except zmq.Again:
             continue
         except Exception as e:
@@ -1021,13 +1593,32 @@ def run_subscriber(endpoint, topic, on_msg, stop_event):
     ctx.term()
 
 
+def default_stats():
+    return {
+        "messages_received": 0,
+        "signals_stored": 0,
+        "events_stored": 0,
+        "uploaded": 0,
+        "events_uploaded": 0,
+        "upload_failures": 0,
+        "deduped": 0,
+        "invalid_messages": 0,
+        "invalid_fields": 0,
+        "invalid_events": 0,
+        "dropped_signals": 0,
+        "dropped_events": 0,
+        "outbox_overflow_drops": 0,
+        "event_overflow_drops": 0,
+    }
+
+
 def run():
     outbox_path = env("OUTBOX_PATH", "/data/outbox.sqlite")
     max_outbox_rows = int(env("MAX_OUTBOX_ROWS", "50000"))
     batch_n = int(env("FLEET_BATCH_N", "500"))
     flush_sec = float(env("FLEET_FLUSH_SEC", "5"))
     endpoint = env("FLEET_ZMQ_ENDPOINT", DEFAULT_ENDPOINT)
-    topic = env("FLEET_ZMQ_TOPIC", DEFAULT_TOPIC)
+    topics = resolve_topics(env("FLEET_ZMQ_TOPICS", ""))
     metrics_port = int(env("FLEET_METRICS_PORT", "9105"))
 
     greptime_url = env("GREPTIME_HTTP_URL", "http://greptimedb:4000")
@@ -1045,19 +1636,10 @@ def run():
         "mapping_revision": env("MAPPING_REVISION", "fleet-v1"),
         "collector_version": env("COLLECTOR_VERSION", "tesla-fleet-recorder-1"),
         "collector_id": env("COLLECTOR_ID", "fleet-collector-1"),
+        "config_version": env("CONFIG_VERSION", ""),
     }
 
-    stats = {
-        "messages_received": 0,
-        "signals_stored": 0,
-        "uploaded": 0,
-        "upload_failures": 0,
-        "deduped": 0,
-        "invalid_messages": 0,
-        "invalid_fields": 0,
-        "dropped_signals": 0,
-        "outbox_overflow_drops": 0,
-    }
+    stats = default_stats()
 
     stop_event = threading.Event()
 
@@ -1074,10 +1656,10 @@ def run():
     # Subscriber worker thread
     def sub_worker():
         conn = open_outbox(outbox_path)
-        def on_msg(payload):
-            process_message(conn, payload, meta_env, stats, max_rows=max_outbox_rows)
+        def on_frame(topic, payload):
+            process_frame(conn, topic, payload, meta_env, stats, max_rows=max_outbox_rows)
         try:
-            run_subscriber(endpoint, topic, on_msg, stop_event)
+            run_subscriber(endpoint, topics, on_frame, stop_event)
         finally:
             conn.close()
 
@@ -1125,7 +1707,7 @@ def run():
     except Exception as e:
         sys.stderr.write(f"metrics server failed on {metrics_port}: {e}\n")
 
-    sys.stdout.write(f"tesla-fleet-recorder started: zmq={endpoint} topic={topic} greptime={greptime_url}\n")
+    sys.stdout.write(f"tesla-fleet-recorder started: zmq={endpoint} topics={','.join(topics)} greptime={greptime_url}\n")
     sys.stdout.flush()
 
     while not stop_event.is_set():
