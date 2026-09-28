@@ -74,6 +74,7 @@ export async function handleHook(input, { telemetry, stateDir, now = Date.now } 
       const tool = label(input.tool_name);
       if (tool) attributes['gen_ai.tool.name'] = tool;
       attributes['gen_ai.tool.call.id'] = callId;
+      if (started !== undefined) attributes['duration_ms'] = Math.max(0, clock - started);
       event = { kind: 'tool.call', sessionId, eventId: key, startTimeMs: started ?? clock, endTimeMs: Math.max(started ?? clock, clock), attributes };
     }
   } else if ((eventName === 'SubagentStart' || eventName === 'SubagentStop') && agentId && turnId) {

@@ -1,0 +1,35 @@
+{
+  "datalake-telemetry": {
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hook.mjs --pre-tool",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node hook.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node hook.mjs --stop",
+        "timeout": 15
+      }
+    ]
+  }
+}

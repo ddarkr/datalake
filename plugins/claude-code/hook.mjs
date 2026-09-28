@@ -143,16 +143,20 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
       const observedStart = event !== undefined;
       // No pre-hook means no observed start: completion is still a real zero-duration event.
       if (!event) event = { kind: isTool ? 'tool.call' : 'subagent', sessionId, eventId, startTimeMs: now, parentEventId: session?.eventId, attributes: isTool ? { 'gen_ai.tool.name': builtins.has(input.tool_name) ? input.tool_name : 'custom', 'gen_ai.tool.call.id': toolId } : { 'coding_agent.agent.id': agentId, 'coding_agent.subagent.type': agentTypes.has(input.agent_type) ? input.agent_type : 'custom' } };
+      if (isTool && hook === 'PostToolUseFailure') event.error = true;
       if (event.endTimeMs === undefined) {
         event.endTimeMs = Math.max(event.startTimeMs, now);
-        event.error = hook === 'PostToolUseFailure';
-        if (!isTool && observedStart) event.attributes['coding_agent.subagent.duration_ms'] = event.endTimeMs - event.startTimeMs;
+        if (observedStart) {
+          const duration = Math.max(0, event.endTimeMs - event.startTimeMs);
+          if (isTool) event.attributes['duration_ms'] = duration;
+          else event.attributes['coding_agent.subagent.duration_ms'] = duration;
+        }
         await save(eventPath, event);
       }
       completed.push(event);
     }
   }
-  if (session && ['Stop', 'StopFailure', 'SessionEnd', 'SubagentStop'].includes(hook)) {
+  if (session && ['Stop', 'StopFailure', 'SessionEnd', 'SubagentStop', 'PostToolUse', 'PostToolUseFailure'].includes(hook)) {
     const agent = hook === 'SubagentStop' && agentFile ? await json(agentFile) : undefined;
     const transcript = hook === 'SubagentStop' ? input.agent_transcript_path : input.transcript_path;
     // Missing SubagentStart cannot distinguish a new run from historical resumed content.

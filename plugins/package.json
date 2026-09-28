@@ -3,12 +3,13 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Metadata-only OTLP adapters for Codex, OMP, opencode2, and Claude Code",
+  "description": "Metadata-only OTLP adapters for Codex, OMP, opencode2, Claude Code, and AGY",
   "engines": { "node": ">=22" },
   "exports": {
     "./otel": "./otel.mjs",
     "./omp": "./omp/index.mjs",
-    "./opencode2": "./opencode2/index.js"
+    "./opencode2": "./opencode2/index.js",
+    "./agy": "./agy/hook.mjs"
   },
   "bin": {
     "datalake-otel-install": "./install.mjs",

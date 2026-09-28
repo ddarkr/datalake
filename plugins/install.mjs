@@ -2,7 +2,7 @@
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
-const clients = ['codex', 'omp', 'opencode2', 'claude-code'];
+const clients = ['codex', 'omp', 'opencode2', 'claude-code', 'agy'];
 const [client, ...args] = process.argv.slice(2);
 if (!client || client === '--help' || client === '-h') {
   console.log(`Usage: node plugins/install.mjs <${clients.join('|')}> [options]
@@ -22,7 +22,7 @@ Then inspect and apply one adapter:
 Restart the client after installing. Native hook trust still applies.
 Never commit the private telemetry configuration or deployment .env.`);
 } else if (!clients.includes(client)) {
-  console.error('Unknown client; use codex, omp, opencode2, or claude-code');
+  console.error('Unknown client; use codex, omp, opencode2, claude-code, or agy');
   process.exitCode = 2;
 } else {
   const result = spawnSync(process.execPath, [fileURLToPath(new URL(`./${client}/install.mjs`, import.meta.url)), ...args], { stdio: 'inherit' });
