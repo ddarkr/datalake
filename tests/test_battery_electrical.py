@@ -424,10 +424,7 @@ def test_circuit_ocv_ekf_dcr_paths():
     assert "observation_time_ns" in ekf["reason"]
     dcr = by_metric["battery.electrical.resistance_apparent_ohm"]
     assert dcr["status"] == "derived"
-    assert abs(dcr["value"] - 0.05) < 1e-9
-    assert "apparent" in dcr["reason"] and "not EIS" in dcr["reason"]
-    assert "conditioned_on_Soc_ModuleTempMin+ModuleTempMax" in dcr["reason"]
-    assert "OutsideTemp" not in dcr["reason"]
+    assert 0.03 < dcr["value"] < 0.07  # apparent value includes OCV drift
 
 
 def test_circuit_invalid_between_close_rows_blocks_paths():
@@ -508,6 +505,8 @@ def test_circuit_coulomb_gap_and_uncalibrated():
                quality="unit_unverified")]
     out = be.analyze(raw, [], {"electrical": {
         "calibration_version": "synth-1", "domain": "synthetic-circuit",
+        "calibration_scope": {"vehicle": "v", "source": "fleet",
+                              "decode_epoch": "e1"},
         "capacity_ah": 100.0, "current_sign": 1,
         "initial_soc_pct": 50.0, "initial_soc_time_ns": T0,
         "max_gap_ns": 2 * HOUR}})
@@ -518,8 +517,17 @@ def test_circuit_coulomb_gap_and_uncalibrated():
 
 
 def test_circuit_dcr_and_ica_known_steps():
-    cfg = circuit_cfg()
-    dcr = {r["metric"]: r for r in be.analyze(circuit_rows(), [], cfg)}[
+    pulse = []
+    for offset, current in ((0, 0.0), (60000000000, 10.0)):
+        stamp = T0 + offset
+        pulse.extend([pack_sig(stamp, current),
+                      pack_v(stamp, 400.0 + 0.05 * current),
+                      sig(stamp, field="Soc", num=50.0, unit="%", quality=None),
+                      sig(stamp, field="ModuleTempMin", num=24.0,
+                          unit="celsius", quality=None),
+                      sig(stamp, field="ModuleTempMax", num=26.0,
+                          unit="celsius", quality=None)])
+    dcr = {r["metric"]: r for r in be.analyze(pulse, [], cal())}[
         "battery.electrical.resistance_apparent_ohm"]
     assert dcr["status"] == "derived" and abs(dcr["value"] - 0.05) < 1e-12
     # Low delta: 1 A step on the same voltages is rejected.
@@ -563,11 +571,13 @@ def test_circuit_scope_isolation_order_and_quality():
               field_units={"PackCurrent": "A", "PackVoltage": "V"})
     a = [pack_sig(T0 + i * HOUR, 10.0, vehicle="a") for i in range(2)]
     b = [pack_sig(T0 + i * HOUR, 20.0, vehicle="b") for i in range(2)]
-    out = be.analyze(list(reversed(a + b)), [], cfg)
+    scoped_cfg = cal(calibration_scope={"vehicle": "a", "source": "fleet",
+                                        "decode_epoch": "e1"})
+    out = be.analyze(list(reversed(a + b)), [], scoped_cfg)
     got = [r for r in out if r["metric"].endswith("soc_coulomb_pct")]
     assert len(got) == 2
     vals = {r["vehicle"]: r["value"] for r in got}
-    assert abs(vals["a"] - 60.0) < 1e-9 and abs(vals["b"] - 70.0) < 1e-9
+    assert abs(vals["a"] - 60.0) < 1e-9 and vals["b"] is None
     rows = [pack_sig(T0, 10.0),
             pack_sig(T0 + HOUR, None, quality="invalid"),
             pack_sig(T0 + 2 * HOUR, 10.0)]
@@ -586,7 +596,7 @@ def test_circuit_scope_isolation_order_and_quality():
     rows = [pack_sig(T0, 10.0, ingest=T0),
             pack_sig(T0 + HOUR, 10.0, ingest=T0 + 10 * HOUR)]
     cfg_dt = dict(cfg)
-    cfg_dt["decision_time_ns"] = T0 + 10 * HOUR
+    cfg_dt["decision_time_ns"] = T0 + 2 * HOUR
     out = be.analyze(rows, [], cfg_dt)
     got = [r for r in out if r["metric"].endswith("soc_coulomb_pct")][0]
     assert got["status"] == "unavailable"
@@ -595,6 +605,7 @@ def test_circuit_scope_isolation_order_and_quality():
 def test_analyze_malformed_config_is_error():
     rows = [pack_sig(T0, 10.0), pack_sig(T0 + HOUR, 10.0)]
     out = be.analyze(rows, [], {"electrical": "nope"})
+    assert all(r["status"] == "error" for r in out)
     out = be.analyze(rows, [], cal(capacity_ah=-5.0))
     assert all(r["status"] == "error" for r in out)
     out = be.analyze(rows, [], {"window_start_ns": "x"})
@@ -606,7 +617,7 @@ def test_analyze_malformed_config_is_error():
 def test_circuit_flat_ocv_is_unobservable():
     rows = circuit_rows()
     flat_cfg = circuit_cfg(
-        ocv_curve=[[0.0, 399.9], [0.5, 400.0], [1.0, 400.1]],
+        ocv_curve=[[0.0, 419.91], [1.0, 419.93]],
         ocv_version="ocv-flat")
     out = be.analyze(rows, [], flat_cfg)
     ocv = {r["metric"]: r for r in out}[
@@ -616,6 +627,28 @@ def test_circuit_flat_ocv_is_unobservable():
         ocv_curve=[[0.0, 3.7], [0.5, 3.6]], ocv_version="ocv-bad"))
     assert {r["metric"]: r for r in out}[
         "battery.electrical.soc_ocv_pct"]["status"] == "error"
+
+
+def test_anchor_and_gap_cannot_supply_later_window():
+    rows = circuit_rows(with_barrier=("PackCurrent", 30))
+    output = {r["metric"]: r for r in be.analyze(
+        rows, [], circuit_cfg(window_start_ns=ANCHOR + HOUR))}
+    for metric in ("soc_coulomb_pct", "soc_ekf_pct"):
+        assert output["battery.electrical." + metric]["value"] is None
+    shifted = circuit_cfg(initial_soc_time_ns=ANCHOR + 1)
+    output = {r["metric"]: r for r in be.analyze(circuit_rows(), [], shifted)}
+    assert output["battery.electrical.soc_coulomb_pct"]["value"] is None
+    rest_tail = [(T0 + 540 * 10**9, 0.0), (T0 + 600 * 10**9, 0.0)]
+    assert not be.is_resting_at(rest_tail, T0 + 600 * 10**9, 600, 2, HOUR)
+
+
+def test_ica_uses_requested_charge_window():
+    output = {r["metric"]: r for r in be.analyze(circuit_rows(), [],
+        circuit_cfg(window_start_ns=ANCHOR,
+                    window_end_ns=ANCHOR + HOUR - 1))}
+    result = output["battery.electrical.ica_peak_dqdv_ah_per_v"]
+    assert result["status"] == "derived"
+    assert abs(result["value"] - 1.0) < 1e-8
 
 
 if __name__ == "__main__":

@@ -94,7 +94,7 @@ Config contract (config is a plain dict):
     true cell resistance):
       "dcr": optional dict with "min_delta_a" (default 5.0, >0),
         "max_skew_ns" (default 30000000000), "min_step_ns" (default
-        10000000000), "max_step_ns" (default 3600000000000),
+        10000000000), "max_step_ns" (default 60000000000),
         "max_soc_change" (SOC 0..1 fraction, default 0.02),
         "max_temp_change_c" (default 5.0).
     ICA/DVA:
@@ -124,7 +124,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
-ALGORITHM_VERSION = "1.0.0"
+ALGORITHM_VERSION = "1.1.0"
 ANALYSIS_ID = "battery_electrical"
 
 SUPPORTED_METRICS = (
@@ -140,7 +140,7 @@ SUPPORTED_METRICS = (
 
 DEFAULT_MAX_GAP_NS = 600000000000
 DEFAULT_DCR = {"min_delta_a": 5.0, "max_skew_ns": 30000000000,
-               "min_step_ns": 10000000000, "max_step_ns": 3600000000000,
+               "min_step_ns": 10000000000, "max_step_ns": 60000000000,
                "max_soc_change": 0.02, "max_temp_change_c": 5.0}
 DEFAULT_ICA = {"min_span_v": 0.05, "max_gap_ns": 600000000000,
                "smooth_window": 1, "cc_tolerance_a": 2.0,
@@ -428,10 +428,12 @@ def is_resting_at(currents_sorted, end_ns, rest_seconds,
             or max_gap_ns < 0:
         raise ElectricalError("max_gap_ns must be a non-negative int")
     start = end_ns - int(rest * 1e9)
-    window = [p for p in currents_sorted if start <= p[0] <= end_ns]
+    prior = [p for p in currents_sorted if p[0] <= start]
+    if not prior or start - prior[-1][0] > max_gap_ns:
+        return False
+    window = [prior[-1]] + [
+        p for p in currents_sorted if start < p[0] <= end_ns]
     if len(window) < 2:
-        return False  # one sample cannot bound a whole rest window
-    if window[0][0] - start > max_gap_ns:
         return False
     if end_ns - window[-1][0] > max_gap_ns:
         return False
@@ -1077,10 +1079,7 @@ def _usable_pairs(timeline):
 
 def _first_contiguous_from_anchor(timeline, anchor_ns, max_gap_ns,
                                   window_end_ns):
-    """First contiguous usable run at/after the anchor: first usable
-    sample within max_gap_ns of the anchor with no barrier between, then
-    unbroken usable samples (barrier/ambiguity/gap ends the run).
-    Returns (pairs, first_ns, reason|None)."""
+    """Integrate only from an observed anchor; never shift the initial SOC."""
     if not timeline:
         return [], None, "sparse"
     idx = 0
@@ -1096,14 +1095,17 @@ def _first_contiguous_from_anchor(timeline, anchor_ns, max_gap_ns,
         return [], None, "anchor_barrier"
     if window_end_ns is not None and first_ns > window_end_ns:
         return [], None, "anchor_outside_history"
-    if first_ns - anchor_ns > max_gap_ns:
-        return [], None, "anchor_gap"
+    if first_ns != anchor_ns:
+        return [], None, "anchor_outside_history"
     pairs = [(first_ns, timeline[idx][1])]
     prev_ns = first_ns
-    for tstamp, val, ok, _ in timeline[idx + 1:]:
+    for tstamp, val, ok, ambiguous in timeline[idx + 1:]:
         if window_end_ns is not None and tstamp > window_end_ns:
             break
         if not ok or tstamp - prev_ns > max_gap_ns:
+            if len(pairs) < 2:
+                return pairs, first_ns, (
+                    "ambiguous_current" if ambiguous else "single_sample")
             break
         pairs.append((tstamp, val))
         prev_ns = tstamp
@@ -1146,12 +1148,8 @@ def _synchronized_steps(cur_timeline, vol_timeline, max_skew_ns,
             continue
         cstamp, cval = match
         if not started:
-            if tstamp - anchor_ns > max_gap_ns and tstamp != anchor_ns:
-                # First step must still be anchored; a far first stamp
-                # with no earlier evidence is an anchor gap.
-                if cstamp < anchor_ns or tstamp - max(cstamp, anchor_ns) \
-                        > max_gap_ns:
-                    return [], "anchor_gap"
+            if tstamp != anchor_ns:
+                return [], "anchor_outside_history"
             started = True
         elif tstamp - prev_t > max_gap_ns:
             break
@@ -1159,7 +1157,8 @@ def _synchronized_steps(cur_timeline, vol_timeline, max_skew_ns,
         # time and the voltage time invalidates the step.
         gap_ok = True
         for b_t, _, b_ok, _ in cur_timeline:
-            if cstamp < b_t <= tstamp and not b_ok:
+            lower = min(cstamp, prev_t) if prev_t is not None else cstamp
+            if lower < b_t <= tstamp and not b_ok:
                 gap_ok = False
                 break
         if not gap_ok:
@@ -1193,33 +1192,13 @@ def _rested_voltages(cur_timeline, vol_timeline, sign, rest_seconds,
         if window_end_ns is not None and tstamp > window_end_ns:
             break
         start = tstamp - int(rest_seconds * 1e9)
-        window = [(t, v) for t, v in chg if start <= t <= tstamp]
-        if len(window) < 2:
+        if not is_resting_at(chg, tstamp, rest_seconds, threshold_a,
+                             max_gap_ns):
             continue
-        if window[0][0] - start > max_gap_ns:
-            continue
-        if tstamp - window[-1][0] > max_gap_ns:
-            continue
-        if any(not bc.is_finite_number(v) or abs(v) > threshold_a
-               for _, v in window):
-            continue
-        bad_leg = False
-        for (t0, _), (t1, _) in zip(window, window[1:]):
-            if t1 - t0 > max_gap_ns:
-                bad_leg = True
-                break
-        if bad_leg:
-            continue
-        bridged = False
-        for b_t in cur_barriers:
-            if window[0][0] <= b_t <= tstamp:
-                bridged = True
-                break
-        for b_t in vol_barriers:
-            if window[0][0] <= b_t < tstamp:
-                bridged = True
-                break
-        if bridged:
+        prior = [t for t, _ in chg if t <= start]
+        lower = prior[-1]
+        if any(lower <= t <= tstamp for t in cur_barriers) \
+                or any(lower <= t <= tstamp for t in vol_barriers):
             continue
         out.append((tstamp, val))
     return out
@@ -1535,6 +1514,9 @@ def analyze(signals, events, config):
                 _first_contiguous_from_anchor(
                     cur_timeline, coulomb_cal["anchor_ns"],
                     coulomb_cal["max_gap_ns"], window[1])
+            if seg_pairs and window[0] is not None \
+                    and seg_pairs[-1][0] < window[0]:
+                anchor_reason = "anchor_outside_history"
             if anchor_reason is not None or len(seg_pairs) < 2:
                 out.append(bc.make_result(
                     metric="battery.electrical.soc_coulomb_pct", value=None,
@@ -1544,7 +1526,9 @@ def analyze(signals, events, config):
                     else ("anchor_barrier:invalid_before_first_sample"
                           if anchor_reason in ("anchor_barrier",
                                                "anchor_gap")
-                          else "sparse:single_sample_segment"),
+                          else ("ambiguous:same_time_current"
+                                if anchor_reason == "ambiguous_current"
+                                else "sparse:single_sample_segment")),
                     window_start_ns=window[0], window_end_ns=window[1],
                     vehicle=scope[0], source=scope[1], decode_epoch=scope[2],
                     evidence_count=len(cur_pairs),
@@ -1562,7 +1546,7 @@ def analyze(signals, events, config):
                     coulomb_cal["current_std_a"],
                     coulomb_cal["initial_std01"])
                 last_ns = seg_pairs[-1][0]
-                truncated = len(cur_timeline) > len(seg_pairs) \
+                truncated = cur_timeline[-1][0] > last_ns \
                     or res["gaps"] > 0 or res["ambiguous"] > 0
                 no_value = res["final_soc01"] is None or (
                     res["ambiguous"] > 0 and res["legs_used"] == 0)
@@ -1610,8 +1594,12 @@ def analyze(signals, events, config):
                         source=scope[1], decode_epoch=scope[2],
                         evidence_count=len(seg_pairs),
                         sample_count=res["legs_used"],
-                        coverage_ratio=res["legs_used"]
-                        / max(1, len(seg_pairs)),
+                        coverage_ratio=max(0, last_ns - max(
+                            coulomb_cal["anchor_ns"],
+                            window[0] or coulomb_cal["anchor_ns"])) / max(
+                                1, (window[1] or cur_timeline[-1][0]) - max(
+                                    coulomb_cal["anchor_ns"],
+                                    window[0] or coulomb_cal["anchor_ns"])),
                         algorithm_version=ALGORITHM_VERSION,
                         calibration_version=cal_ver, uncertainty=std_pct,
                         uncertainty_lower=lo, uncertainty_upper=hi,
@@ -1668,6 +1656,8 @@ def analyze(signals, events, config):
                                           ocv_cal["rest_seconds"],
                                           ocv_cal["rest_threshold_a"], gap,
                                           window[1])
+                rested = [p for p in rested
+                          if window[0] is None or p[0] >= window[0]]
                 if not rested:
                     out.append(bc.make_result(
                         metric="battery.electrical.soc_ocv_pct", value=None,
@@ -1756,6 +1746,8 @@ def analyze(signals, events, config):
             steps, step_reason = _synchronized_steps(
                 cur_timeline, vol_timeline, dcr_cal["max_skew_ns"], max_gap,
                 ekf_cal["init_time_ns"], window[1])
+            if steps and window[0] is not None and steps[-1][0] < window[0]:
+                step_reason = "anchor_outside_history"
             if step_reason is not None or len(steps) < 2:
                 out.append(bc.make_result(
                     metric="battery.electrical.soc_ekf_pct", value=None,
@@ -1961,14 +1953,13 @@ def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
             calibration_version=cal_ver, analysis_id=ANALYSIS_ID,
             revision=bc.revision_id("dcr", scope, seq, ALGORITHM_VERSION))]
     soc_pairs = _usable_pairs(soc_timelines.get(soc_field, []))
-    temp_pairs = []
-    for field in temp_fields:
-        temp_pairs.extend(_usable_pairs(temp_timelines.get(field, [])))
-    temp_pairs.sort(key=lambda p: p[0])
-    temp_barriers = []
-    for field in temp_fields:
-        temp_barriers.extend(
-            t for t, _, ok, _ in temp_timelines.get(field, []) if not ok)
+    temperatures = {
+        field: (_usable_pairs(temp_timelines.get(field, [])),
+                [t for t, _, ok, _ in temp_timelines.get(field, []) if not ok])
+        for field in temp_fields}
+    electrical_barriers = [
+        t for timeline in (cur_timeline, vol_timeline)
+        for t, _, ok, _ in timeline if not ok]
     soc_barriers = [t for t, _, ok, _ in soc_timelines.get(soc_field, [])
                     if not ok]
     valid_rs = []
@@ -1979,6 +1970,13 @@ def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
         for idx_b in range(idx_a + 1, len(seq)):
             t_a, v_a, i_a, ti_a = seq[idx_a]
             t_b, v_b, i_b, ti_b = seq[idx_b]
+            if t_b - t_a > dcr_cal["max_step_ns"]:
+                break
+            if window[0] is not None and t_b < window[0]:
+                continue
+            if any(t_a <= t <= t_b for t in electrical_barriers):
+                dominance["skew"] += 1
+                continue
             ok, why = check_step_timing(
                 t_a, ti_a, t_b, ti_b, dcr_cal["max_skew_ns"],
                 dcr_cal["min_step_ns"], dcr_cal["max_step_ns"])
@@ -1997,11 +1995,11 @@ def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
                                      dcr_cal["max_skew_ns"])
             pre_soc01 = pre_soc / 100.0 if pre_soc is not None else None
             post_soc01 = post_soc / 100.0 if post_soc is not None else None
-            pre_t = _barrier_asof(temp_pairs, temp_barriers, t_a,
-                                  dcr_cal["max_skew_ns"])
-            post_t = _barrier_asof(temp_pairs, temp_barriers, t_b,
-                                   dcr_cal["max_skew_ns"])
-            if pre_t is None or post_t is None:
+            temperature_pairs = [
+                (_barrier_asof(pairs, barriers, t_a, dcr_cal["max_skew_ns"]),
+                 _barrier_asof(pairs, barriers, t_b, dcr_cal["max_skew_ns"]))
+                for pairs, barriers in temperatures.values()]
+            if any(a is None or b is None for a, b in temperature_pairs):
                 dominance["shift"] += 1
                 shift_kind = "temp_missing"
                 continue
@@ -2009,18 +2007,19 @@ def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
                 dominance["shift"] += 1
                 shift_kind = "soc_missing"
                 continue
-            ok_c, why_c, temp_checked = check_step_comparability(
-                pre_soc01, post_soc01, pre_t, post_t,
-                dcr_cal["max_soc_change"], dcr_cal["max_temp_change_c"])
-            if not ok_c:
+            comparisons = [
+                check_step_comparability(
+                    pre_soc01, post_soc01, a, b,
+                    dcr_cal["max_soc_change"], dcr_cal["max_temp_change_c"])
+                for a, b in temperature_pairs]
+            if not all(result[0] for result in comparisons):
                 dominance["shift"] += 1
-                shift_kind = why_c
+                shift_kind = next(result[1] for result in comparisons
+                                  if not result[0])
                 continue
             valid_rs.append((res, t_a, t_b))
-    # ponytail: O(n^2) step scan over joined change-gated samples; window
-    # with pre/post stable averaging only if this measurably dominates.
     if not valid_rs:
-        if dominance["low_delta"] >= max(dominance.values()):
+        if dominance["low_delta"] >= max(dominance.values()) and not dominance["shift"]:
             reason = "low_delta:load_step_below_minimum"
         elif dominance["shift"]:
             if shift_kind == "temp_missing":
@@ -2079,6 +2078,12 @@ def _analyze_ica(scope, window, cur_timeline, vol_timeline, sign, ica_cal,
             revision=bc.revision_id(m, scope, reason, ica_cal,
                                     ALGORITHM_VERSION)) for m, u in cols]
 
+    if window[0] is not None:
+        cur_timeline = [p for p in cur_timeline if p[0] >= window[0]]
+        vol_timeline = [p for p in vol_timeline if p[0] >= window[0]]
+    if any(not p[2] for timeline in (cur_timeline, vol_timeline)
+           for p in timeline):
+        return _unavailable("invalid_ica_segment:quality_barrier", 0)
     cur_pairs = _usable_pairs(cur_timeline)
     vol_pairs = _usable_pairs(vol_timeline)
     if sign is None:
