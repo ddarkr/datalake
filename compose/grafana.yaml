@@ -4,7 +4,7 @@ services:
     profiles: [server]
     # Bump with dashboard changes: inline configs alone do not trigger recreation.
     labels:
-      datalake.dashboard-revision: "6"
+      datalake.dashboard-revision: "7"
     depends_on:
       db-schema:
         condition: service_completed_successfully

@@ -85,7 +85,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '2'
+      datalake.aggregate-revision: '3'
     depends_on:
       greptimedb:
         condition: service_started
@@ -262,7 +262,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.dashboard-revision: '6'
+      datalake.dashboard-revision: '7'
     depends_on:
       db-schema:
         condition: service_completed_successfully
