@@ -223,13 +223,13 @@ python -m pip install PyYAML==6.0.2
 python tools/render.py \
   compose/core.yaml compose/database.yaml compose/ingest.yaml \
   compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml \
-  compose/vehicle-vss.yaml compose/redecode.yaml \
+  compose/vehicle-vss.yaml compose/tesla-fleet.yaml compose/redecode.yaml \
   --out compose.yaml
 
 python tools/check_env.py
 python tests/test_render.py
 
-for profile in server home mqtt vehicle backup redecode '*'; do
+for profile in server home mqtt vehicle fleet backup redecode '*'; do
   docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
 done
 ```
