@@ -85,7 +85,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '7'
+      datalake.aggregate-revision: '8'
     depends_on:
       greptimedb:
         condition: service_started
@@ -8095,8 +8095,11 @@ configs:
           (finite, default0). Conflicting scopes error. Native A/V is already usable.
         reference: version, domain, energy_kwh and/or charge_ah (>0), optional
           conditions. domain/conditions identify the comparable measurement regime.
-          Absent: the latest valid NominalFullPackEnergyKwh reading (BMS-reported,
-          version bms_nominal_full_pack) is the energy reference.
+          reference_source: "configured" (default) or "bms_first". bms_first uses
+          the latest valid NominalFullPackEnergyKwh reading (BMS-reported, version
+          bms_nominal_full_pack) when the vehicle sends one and falls back to the
+          configured reference otherwise; with no reference configured the BMS
+          reading is used whenever present.
         soh_min_soc_span_pct=30: SOC span a complete session needs before its
           interval capacity yields soh_estimated_pct (partial-window estimate
           with uncertainty; soh_pct still needs a full 100->0 discharge).
@@ -8396,10 +8399,14 @@ configs:
           if conditions is not None and (not isinstance(conditions, str)
                                          or not conditions):
               raise EnergyError("malformed: conditions string")
+          source = ecfg.get("reference_source", "configured")
+          if source not in ("configured", "bms_first"):
+              raise EnergyError("malformed: reference_source configured|bms_first")
           return {"max_skew_ns": skew, "max_gap_ns": gap,
                   "max_offline_gap_ns": offline,
                   "min_soc_span_pct": span, "soh_min_soc_span_pct": soh_span,
-                  "fields": fields, "domain": domain, "conditions": conditions}
+                  "fields": fields, "domain": domain, "conditions": conditions,
+                  "reference_source": source}
 
 
       def _parse_uncertainties(ecfg):
@@ -8901,9 +8908,10 @@ configs:
           skew = parsed["max_skew_ns"]
           gap = parsed["max_gap_ns"]
           out = []
-          if reference is None and ref_error is None:
+          if ref_error is None and (reference is None
+                                    or parsed["reference_source"] == "bms_first"):
               reference = _bms_reference(ordered, fields["nominal_pack_field"],
-                                         parsed)
+                                         parsed) or reference
           # Window-scoped pairs for counters/SOC/energy: unmatched boundaries
           # refuse deltas even when retained context exists elsewhere.
           win_rows = [r for r in ordered if _in_window(r["event_time_ns"],

@@ -150,6 +150,12 @@ def test_estimated_soh_uses_partial_session_and_bms_nominal_reference():
     short = full_discharge(span=20, energy=10)
     assert one(en.analyze(short + nominal, [], no_ref), 'soh_estimated_pct')['value'] is None
     assert one(en.analyze(rows, [], no_ref), 'soh_estimated_pct')['value'] is None
+    # bms_first: a vehicle reading beats the configured community fallback,
+    # which still applies while the vehicle never reports one.
+    first = cal(reference_source='bms_first')
+    assert abs(one(en.analyze(rows + nominal, [], first), 'soh_estimated_pct')['value'] - 80.0) < 1e-9
+    fallback = one(en.analyze(rows, [], first), 'soh_estimated_pct')
+    assert abs(fallback['value'] - 100.0) < 1e-9 and 'ref=new-pack-1' in fallback['reason']
 
 
 def test_cross_hour_session_credited_only_at_closure():
