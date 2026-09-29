@@ -147,13 +147,14 @@ COMPOSE_PROFILES=redecode docker compose --env-file .env run --rm redecode
 
 ## Grafana와 데이터 해석
 
-11개 대시보드를 자동 provisioning합니다.
+12개 대시보드를 자동 provisioning합니다.
 
 | 영역 | 대시보드 |
 | --- | --- |
 | 전체 / 운영 | Overview, Datalake Health |
 | AI | AI Usage, AI Tools, AI Sessions |
-| 차량 | Vehicle Overview, CAN / VSS, Drives, Charging, DBC Health |
+| 차량 (차주용) | 차량 개요, 배터리 모니터, 충전, 주행 |
+| 차량 (수집 진단) | 수집 진단 · CAN / VSS, 수집 진단 · DBC |
 | 홈 | Home |
 
 - `No data`는 정상이나 0을 의미하지 않습니다. 수집 미설정·누락·조회 범위를 먼저 확인하세요.
