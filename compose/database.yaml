@@ -49,7 +49,7 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.aggregate-revision: "5"
+      datalake.aggregate-revision: "6"
     depends_on:
       greptimedb:
         condition: service_started
