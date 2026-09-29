@@ -11,6 +11,8 @@ only observations with known event and ingest times at or before the decision.
 
 config["energy"]:
   max_skew_ns=300000000000; max_gap_ns=600000000000; min_soc_span_pct=10.
+  max_offline_gap_ns=86400000000000: longest reporting gap whose
+  LifetimeEnergyUsed increase is credited as parked_discharge_kwh.
   Exact source_field overrides use FIELD_DEFAULTS below, never path aliases.
   current_sign: positive_charge/+1 or positive_discharge/-1.
   field_calibration: {field: entry or [entries]} for PackCurrent/PackVoltage.
@@ -62,6 +64,7 @@ SUPPORTED_METRICS = (
     "battery.energy.dc_charging_energy_in_kwh",
     "battery.energy.ac_charging_energy_in_kwh",
     "battery.energy.discharge_energy_kwh",
+    "battery.energy.parked_discharge_kwh",
     "battery.energy.vi_charge_energy_kwh",
     "battery.energy.vi_discharge_energy_kwh",
     "battery.energy.charge_throughput_ah",
@@ -81,6 +84,7 @@ METRIC_UNITS = {
     "battery.energy.dc_charging_energy_in_kwh": "kWh",
     "battery.energy.ac_charging_energy_in_kwh": "kWh",
     "battery.energy.discharge_energy_kwh": "kWh",
+    "battery.energy.parked_discharge_kwh": "kWh",
     "battery.energy.vi_charge_energy_kwh": "kWh",
     "battery.energy.vi_discharge_energy_kwh": "kWh",
     "battery.energy.charge_throughput_ah": "Ah",
@@ -96,6 +100,7 @@ METRIC_UNITS = {
 DEFAULT_MAX_SKEW_NS = 300000000000
 DEFAULT_MAX_GAP_NS = 600000000000
 DEFAULT_MIN_SOC_SPAN_PCT = 10.0
+DEFAULT_MAX_OFFLINE_GAP_NS = 86400000000000
 
 FIELD_DEFAULTS = {
     "voltage_field": "PackVoltage",
@@ -280,6 +285,8 @@ def _parse_config(ecfg):
     gap = ecfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
     _check_ns("max_skew_ns", skew)
     _check_ns("max_gap_ns", gap)
+    offline = ecfg.get("max_offline_gap_ns", DEFAULT_MAX_OFFLINE_GAP_NS)
+    _check_ns("max_offline_gap_ns", offline)
     span = _finite(ecfg.get("min_soc_span_pct", DEFAULT_MIN_SOC_SPAN_PCT))
     if span is None or span <= 0.0:
         raise EnergyError("malformed: min_soc_span_pct finite > 0")
@@ -297,6 +304,7 @@ def _parse_config(ecfg):
                                    or not conditions):
         raise EnergyError("malformed: conditions string")
     return {"max_skew_ns": skew, "max_gap_ns": gap,
+            "max_offline_gap_ns": offline,
             "min_soc_span_pct": span, "fields": fields,
             "domain": domain, "conditions": conditions}
 
@@ -841,6 +849,9 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     counter_rows = _counter_results(scope, window, ordered, dc_pairs,
                                     ac_pairs, dis_pairs, fields, gap, ecfg)
     out.extend(counter_rows)
+    out.append(_parked_discharge(scope, window, ordered, dis_pairs,
+                                 fields["discharge_counter_field"], gap,
+                                 parsed["max_offline_gap_ns"], ecfg))
     counter_deltas = _counter_deltas_for_efc(counter_rows)
     cal_ver_vi = _cal_version(vol_entries, cur_entries)
     cal_ver_i = _cal_version(cur_entries)
@@ -1207,6 +1218,44 @@ def _counter_results(scope, window, ordered, dc_pairs, ac_pairs, dis_pairs,
                                     "sparse:no_%s_span" % field,
                                     len(pairs), ecfg))
     return out
+
+
+def _parked_discharge(scope, window, ordered, win_pairs, field, gap,
+                      max_offline, ecfg):
+    """Discharge-meter increase across a reporting gap (vehicle offline).
+
+    Hourly counter deltas stop at gaps wider than max_gap_ns, so energy used
+    while parked/asleep lands in no window. This credits that single leg
+    (last valid reading before the gap -> first in-window reading after it)
+    to the window where reporting resumes, so window deltas plus parked legs
+    partition the meter. Invalid/conflicting endpoints, decreases and gaps
+    beyond max_offline stay unavailable.
+    """
+    metric = "battery.energy.parked_discharge_kwh"
+    if window[0] is None or not win_pairs:
+        return _unavailable(scope, window, metric, "sparse:no_resume_reading",
+                            len(win_pairs), ecfg)
+    t1, v1 = win_pairs[0]
+    prior = _num_pairs([r for r in ordered if r["event_time_ns"] < t1],
+                       field, "kWh")
+    if not prior or v1 is None or prior[-1][1] is None:
+        return _unavailable(scope, window, metric,
+                            "sparse:no_valid_gap_endpoints", len(win_pairs),
+                            ecfg)
+    t0, v0 = prior[-1]
+    if t1 - t0 <= gap:
+        return _unavailable(scope, window, metric, "no_offline_gap",
+                            len(win_pairs), ecfg)
+    if t1 - t0 > max_offline:
+        return _unavailable(scope, window, metric,
+                            "gap_exceeded:max_offline_gap_ns", 2, ecfg)
+    delta, info = meter_delta([(t0, v0), (t1, v1)])
+    if info != "ok":
+        return _unavailable(scope, window, metric, "%s:%s" % (info, field),
+                            2, ecfg)
+    return _derived(scope, window, metric, delta, "kWh",
+                    "counter_delta offline_gap_s=%d" % ((t1 - t0) // 10**9),
+                    2, ecfg)
 
 
 def _counter_deltas_for_efc(counter_rows):

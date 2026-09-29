@@ -163,6 +163,30 @@ def test_counter_delta_anchors_prior_window_reading_only_when_bounded():
     assert one(en.analyze(reset, [], dict(cal(), **win)), 'discharge_energy_kwh')['value'] is None
 
 
+def test_parked_discharge_credits_offline_gap_once_in_resume_window():
+    def meter(t, value, **kwargs):
+        return sig(t, 'LifetimeEnergyUsed', value, 'kWh', **kwargs)
+    # Production shape: drive ends 19:31, next reading 07:24 after the night.
+    rows = [meter(T0, 100), meter(T0+STEP, 100.5),
+            meter(T0+12*HOUR, 100.516), meter(T0+12*HOUR+STEP, 101.0)]
+    resume = dict(window_start_ns=T0+12*HOUR, window_end_ns=T0+13*HOUR-1)
+    before = dict(window_start_ns=T0, window_end_ns=T0+HOUR-1)
+    got = one(en.analyze(rows, [], dict(cal(), **resume)), 'parked_discharge_kwh')
+    assert abs(got['value'] - 0.016) < 1e-9 and 'offline_gap_s=43140' in got['reason']
+    # Resume-window counter excludes the gap leg; together they partition 1.0.
+    counter = one(en.analyze(rows, [], dict(cal(), **resume)), 'discharge_energy_kwh')
+    first = one(en.analyze(rows, [], dict(cal(), **before)), 'discharge_energy_kwh')
+    assert abs(first['value'] + got['value'] + counter['value'] - 1.0) < 1e-9
+    assert one(en.analyze(rows, [], dict(cal(), **before)), 'parked_discharge_kwh')['value'] is None
+    # Beyond max_offline_gap_ns, invalid endpoint, or meter decrease: unavailable.
+    short = cal(max_offline_gap_ns=HOUR)
+    assert one(en.analyze(rows, [], dict(short, **resume)), 'parked_discharge_kwh')['value'] is None
+    invalid = rows + [meter(T0+2*STEP, None, quality='invalid')]
+    assert one(en.analyze(invalid, [], dict(cal(), **resume)), 'parked_discharge_kwh')['value'] is None
+    reset = rows[:2] + [meter(T0+12*HOUR, 50.0)] + rows[3:]
+    assert one(en.analyze(reset, [], dict(cal(), **resume)), 'parked_discharge_kwh')['value'] is None
+
+
 def test_incomplete_or_invalid_full_cycle_is_never_healthy():
     rows = full_discharge()
     variants = [[r for r in rows if r['event_time_ns'] > T0],

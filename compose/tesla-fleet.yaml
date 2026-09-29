@@ -18,6 +18,9 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [fleet]
     restart: unless-stopped
+    # Inline script changes need a service revision to trigger recreation.
+    labels:
+      datalake.recorder-revision: "2"
     stop_grace_period: 30s
     depends_on:
       fleet-deps:

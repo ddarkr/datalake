@@ -684,21 +684,39 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
                 conn, "tesla_connectivity", disc_payload, self.META,
                 stats), 1)
         crows = conn.execute(
-            "SELECT connectivity, is_active FROM outbox_events"
+            "SELECT connectivity, is_active, episode_id FROM outbox_events"
             " WHERE event_type='connectivity' ORDER BY event_time").fetchall()
         self.assertEqual([r[0] for r in crows], ["CONNECTED", "DISCONNECTED"])
         self.assertEqual([r[1] for r in crows], [1, 0])
+        # Same socket -> same episode; a concurrent socket gets its own, so a
+        # wifi DISCONNECTED never reads as the cellular socket going away.
+        self.assertIsNotNone(crows[0][2])
+        self.assertEqual(crows[0][2], crows[1][2])
+        other = json.dumps({
+            "vin": "5YJ3E1EB1NF123456", "createdAt": "2026-09-26T13:06:00Z",
+            "connectionId": "second-socket", "status": "CONNECTED",
+        }).encode()
+        self.assertEqual(fr.process_frame(
+            conn, "tesla_connectivity", other, self.META, stats), 1)
+        second = conn.execute(
+            "SELECT episode_id FROM outbox_events WHERE event_type='connectivity'"
+            " AND event_time=?", (fr.parse_created_at("2026-09-26T13:06:00Z"),)).fetchone()[0]
+        self.assertNotIn(second, (None, crows[0][2]))
         leak = conn.execute(
             "SELECT COUNT(*) FROM outbox_events WHERE connectivity LIKE '%opaque%'"
-            " OR connectivity LIKE '%cellular%'").fetchone()[0]
+            " OR connectivity LIKE '%cellular%' OR episode_id LIKE '%opaque%'"
+            " OR episode_id LIKE '%second-socket%'").fetchone()[0]
         self.assertEqual(leak, 0)
         # Earlier alert rows untouched by connectivity arrivals.
         self.assertEqual(conn.execute(
             "SELECT COUNT(*) FROM outbox_events WHERE event_type='alerts'").fetchone()[0], 2)
 
         # Upload routes events to vehicle_event (only table with rows here).
-        uploaded = fr.upload_tick(conn, self.base_url, "datalake", "user", "pw", batch_size=100)
-        self.assertEqual(uploaded, 5)
+        uploaded = fr.upload_tick(conn, self.base_url, "datalake", "user", "pw",
+                                  batch_size=100, stats=stats)
+        self.assertEqual(uploaded, 6)
+        self.assertEqual(stats["events_uploaded"], 6)
+        self.assertEqual(stats["uploaded"], 6)
         stmts = FakeGreptimeServer.received_stmts
         self.assertEqual(len(stmts), 1)
         self.assertIn("INSERT INTO vehicle_event", stmts[0])

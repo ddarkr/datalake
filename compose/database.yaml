@@ -49,13 +49,16 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.aggregate-revision: "4"
+      datalake.aggregate-revision: "5"
     depends_on:
       greptimedb:
         condition: service_started
       db-schema:
         condition: service_completed_successfully
     environment:
+      # Pass progress must reach docker logs immediately; block-buffered
+      # stdout hid a 17-minute backfill pass behind an empty log.
+      PYTHONUNBUFFERED: "1"
       GREPTIME_HTTP_URL: http://greptimedb:4000
       GREPTIME_DB: ${GREPTIME_DB:-datalake}
       GREPTIME_USER: ${GREPTIME_USER:-datalake}

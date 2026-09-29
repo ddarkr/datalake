@@ -150,6 +150,7 @@ MODULE_FILES = (
 MISSING_TABLE_HINTS = ("not found", "not exist", "does not exist",
                        "unknown table")
 HOUR_NS = 3_600_000_000_000
+SIGNAL_CONTEXT_NS = 24 * HOUR_NS
 EPOCH = dt.datetime(1970, 1, 1)
 
 
@@ -1056,10 +1057,12 @@ def run_battery(ctx, cfg, now_ns=None):
         return 0
     fetch_start = min(ws for ws, _ in windows)
     fetch_end = max(we for _, we in windows)
-    # One hour of pre-window signal context lets the earliest lookback
-    # window anchor cumulative-meter deltas like every later window does,
-    # so a sliding lookback never flips its first window's value.
-    signals = fetch_signals(base_url, auth, db, fetch_start - HOUR_NS,
+    # Pre-window signal context covering the energy analyzer's longest
+    # credited offline gap (max_offline_gap_ns, 24 h) lets the earliest
+    # lookback window anchor meter deltas and parked legs exactly like later
+    # windows, so a sliding lookback never flips its first window's value.
+    signals = fetch_signals(base_url, auth, db,
+                            fetch_start - SIGNAL_CONTEXT_NS,
                             fetch_end, vehicle, max_rows)
     events = fetch_events(base_url, auth, db, fetch_start, fetch_end,
                           vehicle, max_rows)

@@ -85,13 +85,14 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '4'
+      datalake.aggregate-revision: '5'
     depends_on:
       greptimedb:
         condition: service_started
       db-schema:
         condition: service_completed_successfully
     environment:
+      PYTHONUNBUFFERED: '1'
       GREPTIME_HTTP_URL: http://greptimedb:4000
       GREPTIME_DB: ${GREPTIME_DB:-datalake}
       GREPTIME_USER: ${GREPTIME_USER:-datalake}
@@ -625,6 +626,8 @@ services:
     profiles:
     - fleet
     restart: unless-stopped
+    labels:
+      datalake.recorder-revision: '2'
     stop_grace_period: 30s
     depends_on:
       fleet-deps:
@@ -8082,6 +8085,8 @@ configs:
 
       config["energy"]:
         max_skew_ns=300000000000; max_gap_ns=600000000000; min_soc_span_pct=10.
+        max_offline_gap_ns=86400000000000: longest reporting gap whose
+        LifetimeEnergyUsed increase is credited as parked_discharge_kwh.
         Exact source_field overrides use FIELD_DEFAULTS below, never path aliases.
         current_sign: positive_charge/+1 or positive_discharge/-1.
         field_calibration: {field: entry or [entries]} for PackCurrent/PackVoltage.
@@ -8133,6 +8138,7 @@ configs:
           "battery.energy.dc_charging_energy_in_kwh",
           "battery.energy.ac_charging_energy_in_kwh",
           "battery.energy.discharge_energy_kwh",
+          "battery.energy.parked_discharge_kwh",
           "battery.energy.vi_charge_energy_kwh",
           "battery.energy.vi_discharge_energy_kwh",
           "battery.energy.charge_throughput_ah",
@@ -8152,6 +8158,7 @@ configs:
           "battery.energy.dc_charging_energy_in_kwh": "kWh",
           "battery.energy.ac_charging_energy_in_kwh": "kWh",
           "battery.energy.discharge_energy_kwh": "kWh",
+          "battery.energy.parked_discharge_kwh": "kWh",
           "battery.energy.vi_charge_energy_kwh": "kWh",
           "battery.energy.vi_discharge_energy_kwh": "kWh",
           "battery.energy.charge_throughput_ah": "Ah",
@@ -8167,6 +8174,7 @@ configs:
       DEFAULT_MAX_SKEW_NS = 300000000000
       DEFAULT_MAX_GAP_NS = 600000000000
       DEFAULT_MIN_SOC_SPAN_PCT = 10.0
+      DEFAULT_MAX_OFFLINE_GAP_NS = 86400000000000
 
       FIELD_DEFAULTS = {
           "voltage_field": "PackVoltage",
@@ -8351,6 +8359,8 @@ configs:
           gap = ecfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
           _check_ns("max_skew_ns", skew)
           _check_ns("max_gap_ns", gap)
+          offline = ecfg.get("max_offline_gap_ns", DEFAULT_MAX_OFFLINE_GAP_NS)
+          _check_ns("max_offline_gap_ns", offline)
           span = _finite(ecfg.get("min_soc_span_pct", DEFAULT_MIN_SOC_SPAN_PCT))
           if span is None or span <= 0.0:
               raise EnergyError("malformed: min_soc_span_pct finite > 0")
@@ -8368,6 +8378,7 @@ configs:
                                          or not conditions):
               raise EnergyError("malformed: conditions string")
           return {"max_skew_ns": skew, "max_gap_ns": gap,
+                  "max_offline_gap_ns": offline,
                   "min_soc_span_pct": span, "fields": fields,
                   "domain": domain, "conditions": conditions}
 
@@ -8912,6 +8923,9 @@ configs:
           counter_rows = _counter_results(scope, window, ordered, dc_pairs,
                                           ac_pairs, dis_pairs, fields, gap, ecfg)
           out.extend(counter_rows)
+          out.append(_parked_discharge(scope, window, ordered, dis_pairs,
+                                       fields["discharge_counter_field"], gap,
+                                       parsed["max_offline_gap_ns"], ecfg))
           counter_deltas = _counter_deltas_for_efc(counter_rows)
           cal_ver_vi = _cal_version(vol_entries, cur_entries)
           cal_ver_i = _cal_version(cur_entries)
@@ -9278,6 +9292,44 @@ configs:
                                           "sparse:no_%s_span" % field,
                                           len(pairs), ecfg))
           return out
+
+
+      def _parked_discharge(scope, window, ordered, win_pairs, field, gap,
+                            max_offline, ecfg):
+          """Discharge-meter increase across a reporting gap (vehicle offline).
+
+          Hourly counter deltas stop at gaps wider than max_gap_ns, so energy used
+          while parked/asleep lands in no window. This credits that single leg
+          (last valid reading before the gap -> first in-window reading after it)
+          to the window where reporting resumes, so window deltas plus parked legs
+          partition the meter. Invalid/conflicting endpoints, decreases and gaps
+          beyond max_offline stay unavailable.
+          """
+          metric = "battery.energy.parked_discharge_kwh"
+          if window[0] is None or not win_pairs:
+              return _unavailable(scope, window, metric, "sparse:no_resume_reading",
+                                  len(win_pairs), ecfg)
+          t1, v1 = win_pairs[0]
+          prior = _num_pairs([r for r in ordered if r["event_time_ns"] < t1],
+                             field, "kWh")
+          if not prior or v1 is None or prior[-1][1] is None:
+              return _unavailable(scope, window, metric,
+                                  "sparse:no_valid_gap_endpoints", len(win_pairs),
+                                  ecfg)
+          t0, v0 = prior[-1]
+          if t1 - t0 <= gap:
+              return _unavailable(scope, window, metric, "no_offline_gap",
+                                  len(win_pairs), ecfg)
+          if t1 - t0 > max_offline:
+              return _unavailable(scope, window, metric,
+                                  "gap_exceeded:max_offline_gap_ns", 2, ecfg)
+          delta, info = meter_delta([(t0, v0), (t1, v1)])
+          if info != "ok":
+              return _unavailable(scope, window, metric, "%s:%s" % (info, field),
+                                  2, ecfg)
+          return _derived(scope, window, metric, delta, "kWh",
+                          "counter_delta offline_gap_s=%d" % ((t1 - t0) // 10**9),
+                          2, ecfg)
 
 
       def _counter_deltas_for_efc(counter_rows):
@@ -13810,6 +13862,7 @@ configs:
       MISSING_TABLE_HINTS = ("not found", "not exist", "does not exist",
                              "unknown table")
       HOUR_NS = 3_600_000_000_000
+      SIGNAL_CONTEXT_NS = 24 * HOUR_NS
       EPOCH = dt.datetime(1970, 1, 1)
 
 
@@ -14716,10 +14769,12 @@ configs:
               return 0
           fetch_start = min(ws for ws, _ in windows)
           fetch_end = max(we for _, we in windows)
-          # One hour of pre-window signal context lets the earliest lookback
-          # window anchor cumulative-meter deltas like every later window does,
-          # so a sliding lookback never flips its first window's value.
-          signals = fetch_signals(base_url, auth, db, fetch_start - HOUR_NS,
+          # Pre-window signal context covering the energy analyzer's longest
+          # credited offline gap (max_offline_gap_ns, 24 h) lets the earliest
+          # lookback window anchor meter deltas and parked legs exactly like later
+          # windows, so a sliding lookback never flips its first window's value.
+          signals = fetch_signals(base_url, auth, db,
+                                  fetch_start - SIGNAL_CONTEXT_NS,
                                   fetch_end, vehicle, max_rows)
           events = fetch_events(base_url, auth, db, fetch_start, fetch_end,
                                 vehicle, max_rows)
@@ -20405,7 +20460,8 @@ configs:
         (no duration/episode). Conflicting ends (end < start) keep both stamps with
         no duration. Connectivity DISCONNECTED/CONNECTED rows stay separate and never
         close alert episodes. Body/tags/connection_id/network_interface are never
-        stored (body presence recorded as body_redacted only); raw VIN never stored.
+        stored raw (body presence recorded as body_redacted only; connection_id only
+        as a hash in connectivity episode_id); raw VIN never stored.
 
       Identity and provenance:
         Signal event_id hashes (vehicle, path, source, source_system, source_field,
@@ -20413,7 +20469,10 @@ configs:
         dedups. Event event_id hashes (vehicle, event_type, name, source,
         source_system, started, ended, event_time, decode_epoch, audience, is_active).
         episode_id = sha256(vehicle|event_type|name|started_ns|decode_epoch), NULL
-        without a valid start. envelope_id = sha256(topic + payload) rides every row.
+        without a valid start. Connectivity episode_id =
+        sha256(vehicle|connectivity|connection_id|decode_epoch): one per vehicle
+        socket, so concurrent wifi/cellular sockets are tracked independently.
+        envelope_id = sha256(topic + payload) rides every row.
         CONFIG_VERSION provenance is operator-supplied only, never invented.
 
       Durability:
@@ -21240,6 +21299,15 @@ configs:
               f"{vehicle}|{event_type}|{name}|{started}{tail}".encode("utf-8")).hexdigest()
 
 
+      def connection_episode_id(vehicle, connection, decode_epoch):
+          """Hash of one vehicle socket; None without an id (no invention)."""
+          if not vehicle or not connection:
+              return None
+          tail = "|" + str(decode_epoch) if decode_epoch else ""
+          return hashlib.sha256(
+              f"{vehicle}|connectivity|{connection}{tail}".encode("utf-8")).hexdigest()
+
+
       def _opt_nonempty_str(value):
           return value if isinstance(value, str) and value else None
 
@@ -21362,7 +21430,10 @@ configs:
 
           status maps CONNECTED/DISCONNECTED/UNKNOWN (case-insensitive); anything
           else keeps the raw string as connectivity with quality 'error'. Rows stay
-          separate and never close alert episodes downstream.
+          separate and never close alert episodes downstream. The raw connection
+          id is never stored; its hash becomes episode_id so a DISCONNECTED row
+          closes only its own connection (a vehicle may hold wifi and cellular
+          sockets at once).
           """
           raw_status = data.get("status")
           status = raw_status.strip().upper() if isinstance(raw_status, str) and raw_status.strip() else None
@@ -21372,12 +21443,18 @@ configs:
               connectivity, quality = None, "error"
           else:
               connectivity, quality = raw_status, "error"
+          connection = None
+          for key in ("connectionId", "connection_id", "ConnectionID"):
+              connection = _opt_nonempty_str(data.get(key))
+              if connection:
+                  break
           return {
               "name": "connectivity", "audience": None, "started_ns": None,
               "ended_ns": None, "duration_s": None,
               "is_active": True if status == "CONNECTED" else (False if status == "DISCONNECTED" else None),
               "quality": quality, "body_redacted": None, "connectivity": connectivity,
               "event_time_ns": event_time_ns, "vehicle": vehicle,
+              "connection": connection,
           }
 
 
@@ -21756,8 +21833,11 @@ configs:
               "source_system": SOURCE_SYSTEM,
               "decode_epoch": meta_env["decode_epoch"],
               "collector_id": meta_env["collector_id"],
-              "episode_id": episode_id(item["vehicle"], event_type, item["name"],
-                                       item.get("started_ns"), meta_env["decode_epoch"]),
+              "episode_id": connection_episode_id(item["vehicle"], item.get("connection"),
+                                                  meta_env["decode_epoch"])
+              if event_type == "connectivity" else
+              episode_id(item["vehicle"], event_type, item["name"],
+                         item.get("started_ns"), meta_env["decode_epoch"]),
               "quality": item.get("quality"),
               "config_version": meta_env.get("config_version") or None,
               "connectivity": _opt_nonempty_str(item.get("connectivity")),
@@ -21867,14 +21947,24 @@ configs:
           return len(rows)
 
 
-      def upload_tick(conn, base_url, db, user, password, batch_size=500):
-          """Upload one tick: signal batch then event batch (fail-closed each)."""
+      def upload_tick(conn, base_url, db, user, password, batch_size=500, stats=None):
+          """Upload one tick: signal batch then event batch (fail-closed each).
+
+          Returns total rows; with stats, bumps uploaded (all rows) and
+          events_uploaded (vehicle_event rows) as each table batch lands.
+          """
           total = _upload_table(conn, "outbox", COLUMNS, "vehicle_signal",
                                 base_url, db, user, password, batch_size)
+          if stats is not None and total:
+              _stats_bump(stats, "uploaded", total)
           if total < batch_size:
-              total += _upload_table(conn, "outbox_events", EVENT_COLUMNS,
+              events = _upload_table(conn, "outbox_events", EVENT_COLUMNS,
                                      "vehicle_event", base_url, db, user,
                                      password, batch_size - total)
+              if stats is not None and events:
+                  _stats_bump(stats, "uploaded", events)
+                  _stats_bump(stats, "events_uploaded", events)
+              total += events
           return total
 
 
@@ -22051,9 +22141,8 @@ configs:
                   try:
                       # Catch-up drain loop
                       while not stop_event.is_set():
-                          n = upload_tick(conn, greptime_url, greptime_db, greptime_user, greptime_pw, batch_size=batch_n)
-                          if n > 0:
-                              stats["uploaded"] += n
+                          n = upload_tick(conn, greptime_url, greptime_db, greptime_user, greptime_pw,
+                                          batch_size=batch_n, stats=stats)
                           if n < batch_n:
                               break
                   except Exception as e:
@@ -22100,9 +22189,8 @@ configs:
               final_conn = open_outbox(outbox_path)
               deadline = time.monotonic() + 15
               while time.monotonic() < deadline:
-                  n = upload_tick(final_conn, greptime_url, greptime_db, greptime_user, greptime_pw, batch_size=batch_n)
-                  if n > 0:
-                      stats["uploaded"] += n
+                  n = upload_tick(final_conn, greptime_url, greptime_db, greptime_user, greptime_pw,
+                                  batch_size=batch_n, stats=stats)
                   if n < batch_n:
                       break
               final_conn.close()

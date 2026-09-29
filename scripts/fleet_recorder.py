@@ -28,7 +28,8 @@ Event contract:
   (no duration/episode). Conflicting ends (end < start) keep both stamps with
   no duration. Connectivity DISCONNECTED/CONNECTED rows stay separate and never
   close alert episodes. Body/tags/connection_id/network_interface are never
-  stored (body presence recorded as body_redacted only); raw VIN never stored.
+  stored raw (body presence recorded as body_redacted only; connection_id only
+  as a hash in connectivity episode_id); raw VIN never stored.
 
 Identity and provenance:
   Signal event_id hashes (vehicle, path, source, source_system, source_field,
@@ -36,7 +37,10 @@ Identity and provenance:
   dedups. Event event_id hashes (vehicle, event_type, name, source,
   source_system, started, ended, event_time, decode_epoch, audience, is_active).
   episode_id = sha256(vehicle|event_type|name|started_ns|decode_epoch), NULL
-  without a valid start. envelope_id = sha256(topic + payload) rides every row.
+  without a valid start. Connectivity episode_id =
+  sha256(vehicle|connectivity|connection_id|decode_epoch): one per vehicle
+  socket, so concurrent wifi/cellular sockets are tracked independently.
+  envelope_id = sha256(topic + payload) rides every row.
   CONFIG_VERSION provenance is operator-supplied only, never invented.
 
 Durability:
@@ -863,6 +867,15 @@ def episode_id(vehicle, event_type, name, started_ns, decode_epoch):
         f"{vehicle}|{event_type}|{name}|{started}{tail}".encode("utf-8")).hexdigest()
 
 
+def connection_episode_id(vehicle, connection, decode_epoch):
+    """Hash of one vehicle socket; None without an id (no invention)."""
+    if not vehicle or not connection:
+        return None
+    tail = "|" + str(decode_epoch) if decode_epoch else ""
+    return hashlib.sha256(
+        f"{vehicle}|connectivity|{connection}{tail}".encode("utf-8")).hexdigest()
+
+
 def _opt_nonempty_str(value):
     return value if isinstance(value, str) and value else None
 
@@ -985,7 +998,10 @@ def extract_connectivity_record(data, vehicle, event_time_ns):
 
     status maps CONNECTED/DISCONNECTED/UNKNOWN (case-insensitive); anything
     else keeps the raw string as connectivity with quality 'error'. Rows stay
-    separate and never close alert episodes downstream.
+    separate and never close alert episodes downstream. The raw connection
+    id is never stored; its hash becomes episode_id so a DISCONNECTED row
+    closes only its own connection (a vehicle may hold wifi and cellular
+    sockets at once).
     """
     raw_status = data.get("status")
     status = raw_status.strip().upper() if isinstance(raw_status, str) and raw_status.strip() else None
@@ -995,12 +1011,18 @@ def extract_connectivity_record(data, vehicle, event_time_ns):
         connectivity, quality = None, "error"
     else:
         connectivity, quality = raw_status, "error"
+    connection = None
+    for key in ("connectionId", "connection_id", "ConnectionID"):
+        connection = _opt_nonempty_str(data.get(key))
+        if connection:
+            break
     return {
         "name": "connectivity", "audience": None, "started_ns": None,
         "ended_ns": None, "duration_s": None,
         "is_active": True if status == "CONNECTED" else (False if status == "DISCONNECTED" else None),
         "quality": quality, "body_redacted": None, "connectivity": connectivity,
         "event_time_ns": event_time_ns, "vehicle": vehicle,
+        "connection": connection,
     }
 
 
@@ -1379,8 +1401,11 @@ def _store_event_row(conn, meta_env, stats, topic, event_type, item,
         "source_system": SOURCE_SYSTEM,
         "decode_epoch": meta_env["decode_epoch"],
         "collector_id": meta_env["collector_id"],
-        "episode_id": episode_id(item["vehicle"], event_type, item["name"],
-                                 item.get("started_ns"), meta_env["decode_epoch"]),
+        "episode_id": connection_episode_id(item["vehicle"], item.get("connection"),
+                                            meta_env["decode_epoch"])
+        if event_type == "connectivity" else
+        episode_id(item["vehicle"], event_type, item["name"],
+                   item.get("started_ns"), meta_env["decode_epoch"]),
         "quality": item.get("quality"),
         "config_version": meta_env.get("config_version") or None,
         "connectivity": _opt_nonempty_str(item.get("connectivity")),
@@ -1490,14 +1515,24 @@ def _upload_table(conn, table, columns, dest_table, base_url, db, user,
     return len(rows)
 
 
-def upload_tick(conn, base_url, db, user, password, batch_size=500):
-    """Upload one tick: signal batch then event batch (fail-closed each)."""
+def upload_tick(conn, base_url, db, user, password, batch_size=500, stats=None):
+    """Upload one tick: signal batch then event batch (fail-closed each).
+
+    Returns total rows; with stats, bumps uploaded (all rows) and
+    events_uploaded (vehicle_event rows) as each table batch lands.
+    """
     total = _upload_table(conn, "outbox", COLUMNS, "vehicle_signal",
                           base_url, db, user, password, batch_size)
+    if stats is not None and total:
+        _stats_bump(stats, "uploaded", total)
     if total < batch_size:
-        total += _upload_table(conn, "outbox_events", EVENT_COLUMNS,
+        events = _upload_table(conn, "outbox_events", EVENT_COLUMNS,
                                "vehicle_event", base_url, db, user,
                                password, batch_size - total)
+        if stats is not None and events:
+            _stats_bump(stats, "uploaded", events)
+            _stats_bump(stats, "events_uploaded", events)
+        total += events
     return total
 
 
@@ -1674,9 +1709,8 @@ def run():
             try:
                 # Catch-up drain loop
                 while not stop_event.is_set():
-                    n = upload_tick(conn, greptime_url, greptime_db, greptime_user, greptime_pw, batch_size=batch_n)
-                    if n > 0:
-                        stats["uploaded"] += n
+                    n = upload_tick(conn, greptime_url, greptime_db, greptime_user, greptime_pw,
+                                    batch_size=batch_n, stats=stats)
                     if n < batch_n:
                         break
             except Exception as e:
@@ -1723,9 +1757,8 @@ def run():
         final_conn = open_outbox(outbox_path)
         deadline = time.monotonic() + 15
         while time.monotonic() < deadline:
-            n = upload_tick(final_conn, greptime_url, greptime_db, greptime_user, greptime_pw, batch_size=batch_n)
-            if n > 0:
-                stats["uploaded"] += n
+            n = upload_tick(final_conn, greptime_url, greptime_db, greptime_user, greptime_pw,
+                            batch_size=batch_n, stats=stats)
             if n < batch_n:
                 break
         final_conn.close()
