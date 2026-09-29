@@ -67,9 +67,15 @@ def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
             only.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, 0.015, 0)")
             assert only.execute(query).fetchone() == (0.015, None, 0.015, 0)
 
+def _all_battery_panels(panels):
+    for panel in panels:
+        yield panel
+        yield from _all_battery_panels(panel.get("panels") or [])
+
+
 def _battery_query(configs, panel_id):
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
-    panel = next(p for p in dashboard["panels"] if p["id"] == panel_id)
+    panel = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == panel_id)
     query = panel["targets"][0]["rawSql"].replace("$$", "$")
     return (query.replace("$__timeFilter(window_start)", "window_start BETWEEN 1000 AND 2000")
             .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
@@ -99,6 +105,11 @@ def _battery_db():
         source_system TEXT, decode_epoch TEXT, collector_id TEXT,
         episode_id TEXT, quality TEXT, config_version TEXT,
         connectivity TEXT)''')
+    db.execute('''CREATE TABLE vehicle_signal (
+        event_time TIMESTAMP, vehicle TEXT, source TEXT,
+        decode_epoch TEXT, source_field TEXT, value_num REAL,
+        unit TEXT, quality TEXT, ingest_time TIMESTAMP,
+        envelope_id TEXT)''')
     return db
 
 
@@ -143,8 +154,7 @@ def test_battery_dashboard_warning_overlap_keeps_started_before_range():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     assert dashboard["uid"] == "datalake-vehicle-battery"
-    panels = {p["id"]: p for p in dashboard["panels"]}
-    assert panels[5]["title"].startswith("Warning")
+    panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
     # Warning panels read alerts only; errors/connectivity never leak in.
     for pid in (5, 18, 19):
         assert "event_type = 'alerts'" in panels[pid]["targets"][0]["rawSql"]
@@ -193,9 +203,83 @@ def test_battery_dashboard_warning_overlap_keeps_started_before_range():
         assert rows["ep-closed"][12] is None and rows["ep-closed"][13] is None
 
 
+def test_battery_cards_raw_display_latest_valid_only():
+    """Panel 25 shows the newest BatteryLevel report; a bad newest stays NULL."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _battery_query(configs, 25)
+    with _battery_db() as db:
+        # No reports: no rows (unknown), never a zero fill.
+        assert db.execute(query).fetchall() == []
+        db.execute("""INSERT INTO vehicle_signal VALUES
+            (1500, 'v', 'fleet', 'e1', 'BatteryLevel', 62.5, '%', NULL, 1500, 'env-a')""")
+        row = db.execute(query).fetchone()
+        assert row[:3] == ('v', 'fleet', 'e1')
+        assert row[3] == 1500 and row[4] == 62.5
+        # A newer invalid tombstone blocks the stale good value: row stays, reading NULL.
+        db.execute("""INSERT INTO vehicle_signal VALUES
+            (1600, 'v', 'fleet', 'e1', 'BatteryLevel', NULL, '%', 'invalid', 1600, 'env-b')""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1 and rows[0][4] is None
+        # A newer wrong-unit report is not a percent either: still NULL.
+        db.execute("""INSERT INTO vehicle_signal VALUES
+            (1700, 'v', 'fleet', 'e1', 'BatteryLevel', 62.5, 'count', NULL, 1700, 'env-c')""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1 and rows[0][4] is None
+        # Other scopes stay separate; the BMS Soc field never leaks into this card.
+        db.execute("""INSERT INTO vehicle_signal VALUES
+            (1700, 'v', 'fleet', 'e2', 'BatteryLevel', 70.0, '%', 'ok', 1700, 'env-d')""")
+        db.execute("""INSERT INTO vehicle_signal VALUES
+            (1700, 'v', 'fleet', 'e1', 'Soc', 68.0, '%', NULL, 1700, 'env-e')""")
+        rows = {r[2]: r for r in db.execute(query).fetchall()}
+        assert set(rows) == {'e1', 'e2'}
+        assert rows['e1'][4] is None and rows['e2'][4] == 70.0
+
+
+def test_battery_cards_latest_window_energy_not_lifetime():
+    """Panel 30 shows the newest window's energy; a bad newest never resurrects older goods."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _battery_query(configs, 30)
+    metric = 'battery.energy.discharge_energy_kwh'
+    with _battery_db() as db:
+        assert db.execute(query).fetchall() == []
+        db.execute(f"""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', '{metric}', 'fleet', 'battery_energy',
+             'r1', 3.0, NULL, 'kWh', 'derived', 'ok', 'e1',
+             5, 5, 0.9, 'a', 'c', 'm', NULL, NULL, NULL, 10,
+             NULL, NULL, NULL, NULL)""")
+        db.execute(f"""INSERT INTO vehicle_analysis VALUES
+            (1500, 1600, 'v', '{metric}', 'fleet', 'battery_energy',
+             'r2', 5.0, NULL, 'kWh', 'derived', 'ok', 'e1',
+             5, 5, 0.9, 'a', 'c', 'm', NULL, NULL, NULL, 20,
+             NULL, NULL, NULL, NULL)""")
+        # Latest window wins: its value and window, not a lifetime sum.
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1
+        assert rows[0][3] == 1500 and rows[0][4] == 5.0
+        # A newer unavailable revision on the latest window blocks it; older goods stay buried.
+        db.execute(f"""INSERT INTO vehicle_analysis VALUES
+            (1500, 1600, 'v', '{metric}', 'fleet', 'battery_energy',
+             'r3', NULL, NULL, NULL, 'unavailable', 'sparse', 'e1',
+             0, 5, 0.1, 'a', NULL, NULL, NULL, NULL, NULL, 30,
+             NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1 and rows[0][4] is None
+        # Another epoch stays a separate current row.
+        db.execute(f"""INSERT INTO vehicle_analysis VALUES
+            (1500, 1600, 'v', '{metric}', 'fleet', 'battery_energy',
+             'r4', 7.0, NULL, 'kWh', 'derived', 'ok', 'e2',
+             5, 5, 0.9, 'a', 'c', 'm', NULL, NULL, NULL, 40,
+             NULL, NULL, NULL, NULL)""")
+        rows = {r[2]: r for r in db.execute(query).fetchall()}
+        assert set(rows) == {'e1', 'e2'}
+        assert rows['e1'][4] is None and rows['e2'][4] == 7.0
+
+
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
     test_battery_dashboard_latest_revision_wins_before_status_filter()
     test_battery_dashboard_warning_overlap_keeps_started_before_range()
-    print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap)")
+    test_battery_cards_raw_display_latest_valid_only()
+    test_battery_cards_latest_window_energy_not_lifetime()
+    print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")
