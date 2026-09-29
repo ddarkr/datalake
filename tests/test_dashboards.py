@@ -275,6 +275,66 @@ def test_battery_cards_latest_window_energy_not_lifetime():
         assert rows['e1'][4] is None and rows['e2'][4] == 7.0
 
 
+def test_battery_soh_card_prefers_absolute_then_estimate_with_error():
+    """Panel 33: full-discharge SOH wins; else the estimate carries its ±range."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = (_battery_query(configs, 33)
+             .replace("CAST(ROUND(uncertainty, 1) AS STRING)", "ROUND(uncertainty, 1)")
+             .replace("CAST(window_start AS TIMESTAMP(6))", "window_start"))
+    with _battery_db() as db:
+        db.create_function("CONCAT", 3, lambda a, b, c: f"{a}{b}{c}")
+        assert db.execute(query).fetchall() == []
+        est = 'battery.energy.soh_estimated_pct'
+        db.execute(f"""INSERT INTO vehicle_analysis VALUES
+            (1500, 1600, 'v', '{est}', 'fleet', 'battery_energy', 'r1', 91.5,
+             NULL, '%', 'derived', 'ok', 'e1', 1, 1, NULL, 'a', 'c', NULL,
+             1.24, 90.26, 92.74, 10, NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1 and rows[0][5] == 91.5 and '±1.2%p' in rows[0][4]
+        # An older absolute measurement still outranks a newer estimate.
+        db.execute("""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', 'battery.energy.soh_pct', 'fleet', 'battery_energy',
+             'r2', 88.0, NULL, '%', 'derived', 'ok', 'e1', 1, 1, NULL, 'a', 'c',
+             NULL, NULL, NULL, NULL, 20, NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1 and rows[0][5] == 88.0 and rows[0][4] == '완전 방전 기준'
+        # A newer unavailable absolute revision drops back to the estimate.
+        db.execute("""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', 'battery.energy.soh_pct', 'fleet', 'battery_energy',
+             'r3', NULL, NULL, NULL, 'unavailable', 'sparse', 'e1', 0, 0, NULL,
+             'a', NULL, NULL, NULL, NULL, NULL, 30, NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1 and rows[0][5] == 91.5
+
+
+def test_battery_period_totals_sum_latest_revision_per_window():
+    """Panels 37-40: period totals add each window's newest derived kWh once."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for panel, metrics in ((37, ("battery.energy.discharge_energy_kwh",
+                                 "battery.energy.parked_discharge_kwh")),
+                           (39, ("battery.energy.dc_charging_energy_in_kwh",))):
+        query = _battery_query(configs, panel)
+        bound = query.split("window_start >= ", 1)[1].split(" AND ", 1)[0]
+        query = query.replace(bound, "1000")
+        with _battery_db() as db:
+            assert db.execute(query).fetchall() == []
+            for ts, metric, rev, value, computed in (
+                    (1200, metrics[0], "r1", 2.0, 10),
+                    (1200, metrics[0], "r2", 3.0, 20),   # newer revision replaces r1
+                    (1500, metrics[-1], "r3", 0.5, 10),
+                    (500, metrics[0], "r4", 9.0, 10),    # before the period
+                    (1800, "battery.energy.soh_pct", "r5", 99.0, 10)):
+                db.execute(f"""INSERT INTO vehicle_analysis VALUES
+                    ({ts}, {ts + 100}, 'v', '{metric}', 'fleet', 'battery_energy',
+                     '{rev}', {value}, NULL, 'kWh', 'derived', 'ok', 'e1', 1, 1,
+                     NULL, 'a', NULL, NULL, NULL, NULL, NULL, {computed}, NULL,
+                     NULL, NULL, NULL)""")
+            rows = db.execute(query).fetchall()
+            # Newest r2 (3.0) replaces r1; r3 (0.5) is a different window.
+            assert len(rows) == 1 and abs(rows[0][4] - 3.5) < 1e-9, (panel, rows)
+            assert rows[0][3] == 2
+
+
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()

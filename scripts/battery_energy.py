@@ -21,6 +21,11 @@ config["energy"]:
     (finite, default0). Conflicting scopes error. Native A/V is already usable.
   reference: version, domain, energy_kwh and/or charge_ah (>0), optional
     conditions. domain/conditions identify the comparable measurement regime.
+    Absent: the latest valid NominalFullPackEnergyKwh reading (BMS-reported,
+    version bms_nominal_full_pack) is the energy reference.
+  soh_min_soc_span_pct=30: SOC span a complete session needs before its
+    interval capacity yields soh_estimated_pct (partial-window estimate
+    with uncertainty; soh_pct still needs a full 100->0 discharge).
   soc_uncertainty_pct/energy_uncertainty_kwh: optional nonnegative independent
     single-reading standard deviations; absent means unknown, not zero.
 
@@ -75,6 +80,7 @@ SUPPORTED_METRICS = (
     "battery.energy.bms_circular_capacity_kwh",
     "battery.energy.capacity_trend_kwh",
     "battery.energy.soh_pct",
+    "battery.energy.soh_estimated_pct",
 )
 
 METRIC_UNITS = {
@@ -95,12 +101,19 @@ METRIC_UNITS = {
     "battery.energy.bms_circular_capacity_kwh": "kWh",
     "battery.energy.capacity_trend_kwh": "kWh",
     "battery.energy.soh_pct": "%",
+    "battery.energy.soh_estimated_pct": "%",
 }
 
 DEFAULT_MAX_SKEW_NS = 300000000000
 DEFAULT_MAX_GAP_NS = 600000000000
 DEFAULT_MIN_SOC_SPAN_PCT = 10.0
 DEFAULT_MAX_OFFLINE_GAP_NS = 86400000000000
+DEFAULT_SOH_MIN_SOC_SPAN_PCT = 30.0
+# Estimate-only reading noise when soc/energy uncertainty is not configured:
+# Fleet Soc and kWh counters report ~0.01 resolution; 0.5 %p and 0.1 kWh per
+# endpoint also cover sample-time skew at session boundaries.
+DEFAULT_ESTIMATE_SOC_STD_PCT = 0.5
+DEFAULT_ESTIMATE_ENERGY_STD_KWH = 0.1
 
 FIELD_DEFAULTS = {
     "voltage_field": "PackVoltage",
@@ -115,6 +128,7 @@ FIELD_DEFAULTS = {
     "detailed_charge_field": "DetailedChargeState",
     "bms_state_field": "BMSState",
     "power_field": "ChargerPower",
+    "nominal_pack_field": "NominalFullPackEnergyKwh",
 }
 
 SIGN_METRICS = (
@@ -290,6 +304,11 @@ def _parse_config(ecfg):
     span = _finite(ecfg.get("min_soc_span_pct", DEFAULT_MIN_SOC_SPAN_PCT))
     if span is None or span <= 0.0:
         raise EnergyError("malformed: min_soc_span_pct finite > 0")
+    soh_span = _finite(ecfg.get("soh_min_soc_span_pct",
+                                DEFAULT_SOH_MIN_SOC_SPAN_PCT))
+    if soh_span is None or not span <= soh_span <= 100.0:
+        raise EnergyError(
+            "malformed: soh_min_soc_span_pct finite in [min_soc_span_pct, 100]")
     fields = {}
     for key, default in FIELD_DEFAULTS.items():
         raw = ecfg.get(key, default)
@@ -305,8 +324,8 @@ def _parse_config(ecfg):
         raise EnergyError("malformed: conditions string")
     return {"max_skew_ns": skew, "max_gap_ns": gap,
             "max_offline_gap_ns": offline,
-            "min_soc_span_pct": span, "fields": fields,
-            "domain": domain, "conditions": conditions}
+            "min_soc_span_pct": span, "soh_min_soc_span_pct": soh_span,
+            "fields": fields, "domain": domain, "conditions": conditions}
 
 
 def _parse_uncertainties(ecfg):
@@ -808,6 +827,9 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     skew = parsed["max_skew_ns"]
     gap = parsed["max_gap_ns"]
     out = []
+    if reference is None and ref_error is None:
+        reference = _bms_reference(ordered, fields["nominal_pack_field"],
+                                   parsed)
     # Window-scoped pairs for counters/SOC/energy: unmatched boundaries
     # refuse deltas even when retained context exists elsewhere.
     win_rows = [r for r in ordered if _in_window(r["event_time_ns"],
@@ -1039,11 +1061,78 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
                                  fields, ecfg))
     out.extend(_trend_soh_results(scope, window, full_capacity, reference,
                                   ref_error, parsed, ecfg))
+    out.append(_estimated_soh(scope, window, interval, reference, ref_error,
+                              parsed, uncertainties, unc_error, ecfg))
     if sign_error is not None:
         out = [_promote_sign_error(r, sign_error) for r in out]
     if cal_error is not None:
         out = [_promote_cal_error(r, cal_error) for r in out]
     return out
+
+
+def _bms_reference(ordered, field, parsed):
+    """Latest valid BMS nominal full-pack energy as a fixed reference.
+
+    Reported by the vehicle, so SOH against it is relative to the BMS's
+    own nominal, not an independent new-pack measurement. The reference
+    domain is the analysis domain (same pack), with no conditions.
+    """
+    pairs = [(t, v) for t, v in _num_pairs(ordered, field, "kWh")
+             if v is not None and v > 0.0]
+    if not pairs:
+        return None
+    return {"version": "bms_nominal_full_pack", "domain": parsed.get("domain"),
+            "energy_kwh": pairs[-1][1], "charge_ah": None, "conditions": None,
+            "asof_ns": pairs[-1][0]}
+
+
+def _estimated_soh(scope, window, interval, reference, ref_error, parsed,
+                   uncertainties, unc_error, ecfg):
+    """Partial-window SOH estimate: interval capacity / reference energy.
+
+    Needs a complete monotonic session spanning soh_min_soc_span_pct. The
+    interval uncertainty uses configured stds, else the documented
+    estimate defaults; the result is always labelled an estimate.
+    """
+    metric = "battery.energy.soh_estimated_pct"
+    if ref_error is not None:
+        return _error_row(scope, window, metric, ref_error, ecfg)
+    if unc_error is not None:
+        return _error_row(scope, window, metric, unc_error, ecfg)
+    if reference is None or reference.get("energy_kwh") is None:
+        return _unavailable(scope, window, metric,
+                            "reference_absent:soh_needs_reference_energy", 0,
+                            ecfg)
+    cap, energy, span = (interval.get("capacity_kwh"),
+                         interval.get("energy_kwh"), interval.get("soc_span01"))
+    if cap is None or span is None:
+        return _unavailable(scope, window, metric,
+                            "sparse:no_complete_session_with_soc_span", 0,
+                            ecfg, reference["version"])
+    if span < parsed["soh_min_soc_span_pct"] / 100.0:
+        return _unavailable(scope, window, metric,
+                            "soc_span_too_small:min_%r_pct"
+                            % parsed["soh_min_soc_span_pct"], 1, ecfg,
+                            reference["version"])
+    soc_std = uncertainties.get("soc_uncertainty_pct")
+    energy_std = uncertainties.get("energy_uncertainty_kwh")
+    source = "configured"
+    if soc_std is None or energy_std is None:
+        soc_std, energy_std = (DEFAULT_ESTIMATE_SOC_STD_PCT,
+                               DEFAULT_ESTIMATE_ENERGY_STD_KWH)
+        source = "default"
+    sigma = capacity_uncertainty_kwh(cap, energy, energy_std, span,
+                                     soc_std / 100.0)
+    ref = reference["energy_kwh"]
+    soh = cap / ref * 100.0
+    soh_sigma = sigma / ref * 100.0 if sigma is not None else None
+    return _derived(
+        scope, window, metric, soh, "%",
+        "estimated_partial_window ref=%s:%r uncertainty=%s;%s" % (
+            reference["version"], ref, source, interval["row"]["reason"]),
+        1, ecfg, reference["version"], uncertainty=soh_sigma,
+        uncertainty_lower=soh - soh_sigma if soh_sigma is not None else None,
+        uncertainty_upper=soh + soh_sigma if soh_sigma is not None else None)
 
 
 def _promote_sign_error(row, sign_error):

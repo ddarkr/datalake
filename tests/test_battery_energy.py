@@ -131,6 +131,27 @@ def test_partial_capacity_is_not_absolute_soh():
         assert one(en.analyze(full_discharge(span=span), [], cal()), 'interval_capacity_kwh')['value'] is None
 
 
+def test_estimated_soh_uses_partial_session_and_bms_nominal_reference():
+    # 40 %p discharge of 20 kWh -> 50 kWh interval capacity.
+    rows = full_discharge(span=40, energy=20)
+    nominal = [sig(T0, 'NominalFullPackEnergyKwh', 62.5, 'kWh')]
+    no_ref = cal(reference=None)
+    got = one(en.analyze(rows + nominal, [], no_ref), 'soh_estimated_pct')
+    assert abs(got['value'] - 80.0) < 1e-9 and 'ref=bms_nominal_full_pack:62.5' in got['reason']
+    # Default estimate noise always yields a bounded interval, never a bare point.
+    assert got['uncertainty'] > 0
+    assert got['uncertainty_lower'] < got['value'] < got['uncertainty_upper']
+    # Absolute soh_pct still refuses a partial window.
+    assert one(en.analyze(rows + nominal, [], no_ref), 'soh_pct')['value'] is None
+    # Configured reference wins over the BMS nominal.
+    configured = one(en.analyze(rows + nominal, [], cal()), 'soh_estimated_pct')
+    assert abs(configured['value'] - 100.0) < 1e-9
+    # Span below soh_min_soc_span_pct, or no reference at all: unavailable.
+    short = full_discharge(span=20, energy=10)
+    assert one(en.analyze(short + nominal, [], no_ref), 'soh_estimated_pct')['value'] is None
+    assert one(en.analyze(rows, [], no_ref), 'soh_estimated_pct')['value'] is None
+
+
 def test_cross_hour_session_credited_only_at_closure():
     rows = full_discharge(T0+55*STEP)
     early = en.analyze(rows, [], dict(cal(), window_start_ns=T0, window_end_ns=T0+HOUR-1))

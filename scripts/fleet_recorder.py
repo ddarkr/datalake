@@ -484,6 +484,15 @@ FIELD_ALLOWLIST = {
         "min": 0.0,
         "max": 1000000.0,
     },
+    # BMS-reported nominal full-pack energy: the vehicle's own capacity
+    # reference for EFC/SOH (reported, not an independent measurement).
+    "NominalFullPackEnergyKwh": {
+        "path": "Vehicle.Powertrain.TractionBattery.NominalFullPackEnergy",
+        "unit": "kWh",
+        "type": "num",
+        "min": 0.0,
+        "max": 500.0,
+    },
     # Brick voltages / module temps / isolation: docs give no authoritative
     # unit or scale, so stored raw (unit None) with quality 'unit_unverified'
     # for downstream calibration; never rescaled or range-clamped here.
