@@ -140,7 +140,27 @@ def test_cross_hour_session_credited_only_at_closure():
     assert one(late, 'discharge_session_energy_kwh')['value'] == 40
     assert one(after, 'discharge_session_energy_kwh')['value'] is None
     assert one(after, 'soh_pct')['value'] == 80  # retained measurement, as-of in reason
-    assert one(late, 'discharge_energy_kwh')['value'] == 24  # only in-window counter span
+    # Counter deltas partition the meter across hours: 12 + 28 = the full 40.
+    assert one(early, 'discharge_energy_kwh')['value'] == 12
+    assert one(late, 'discharge_energy_kwh')['value'] == 28
+
+
+def test_counter_delta_anchors_prior_window_reading_only_when_bounded():
+    def meter(t, value, **kwargs):
+        return sig(t, 'LifetimeEnergyUsed', value, 'kWh', **kwargs)
+    win = dict(window_start_ns=T0+HOUR, window_end_ns=T0+2*HOUR-1)
+    rows = [meter(T0+HOUR-STEP, 100), meter(T0+HOUR+STEP, 101), meter(T0+HOUR+2*STEP, 103)]
+    out = one(en.analyze(rows, [], dict(cal(), **win)), 'discharge_energy_kwh')
+    assert out['value'] == 3 and 'anchor=prior_window' in out['reason']
+    # Prior reading beyond max_gap_ns (2 steps here) is not a baseline.
+    far = [meter(T0+HOUR-2*STEP, 100)] + rows[1:]
+    assert one(en.analyze(far, [], dict(cal(), **win)), 'discharge_energy_kwh')['value'] == 2
+    # An invalid latest prior reading is a barrier, not skipped over.
+    barrier = rows + [meter(T0+HOUR-STEP//2, None, quality='invalid')]
+    assert one(en.analyze(barrier, [], dict(cal(), **win)), 'discharge_energy_kwh')['value'] == 2
+    # A meter decrease across the boundary is a reset, never negative energy.
+    reset = [meter(T0+HOUR-STEP, 200)] + rows[1:]
+    assert one(en.analyze(reset, [], dict(cal(), **win)), 'discharge_energy_kwh')['value'] is None
 
 
 def test_incomplete_or_invalid_full_cycle_is_never_healthy():

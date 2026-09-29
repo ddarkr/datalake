@@ -131,7 +131,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
-RUNTIME_VERSION = "1.0.2"
+RUNTIME_VERSION = "1.0.3"
 ANALYSIS_TABLE = "vehicle_analysis"
 SIGNAL_TABLE = "vehicle_signal"
 EVENT_TABLE = "vehicle_event"
@@ -1056,8 +1056,11 @@ def run_battery(ctx, cfg, now_ns=None):
         return 0
     fetch_start = min(ws for ws, _ in windows)
     fetch_end = max(we for _, we in windows)
-    signals = fetch_signals(base_url, auth, db, fetch_start, fetch_end,
-                            vehicle, max_rows)
+    # One hour of pre-window signal context lets the earliest lookback
+    # window anchor cumulative-meter deltas like every later window does,
+    # so a sliding lookback never flips its first window's value.
+    signals = fetch_signals(base_url, auth, db, fetch_start - HOUR_NS,
+                            fetch_end, vehicle, max_rows)
     events = fetch_events(base_url, auth, db, fetch_start, fetch_end,
                           vehicle, max_rows)
     scopes = set()

@@ -12,6 +12,10 @@ Config contract (config is a plain dict):
       Any slope/exposure leg wider than this is rejected, never
       interpolated. Invalid or ambiguous timestamps are barriers even
       when the leg is otherwise within the gap.
+    ``min_slope_span_ns``: non-negative int, default 600000000000 (10 min).
+      Thermal/isolation slopes need a same-ID run spanning at least this
+      long; shorter runs report unavailable instead of extrapolating a
+      few seconds of change to a per-hour rate.
     ``min_peers``: int >= 3, default 5. Minimum conditioned peers for
       the robust baseline (median needs >= 3 to mean anything).
     ``domain``: non-empty string or None (default None). Declared target
@@ -100,7 +104,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
-ALGORITHM_VERSION = "1.1.2"
+ALGORITHM_VERSION = "1.2.0"
 ANALYSIS_ID = "battery_conditions"
 
 BRICK_MAX_FIELD = "BrickVoltageMax"
@@ -119,6 +123,7 @@ CURR_UNIT = "A"
 
 DEFAULT_MAX_SKEW_NS = 30000000000
 DEFAULT_MAX_GAP_NS = 600000000000
+DEFAULT_MIN_SLOPE_SPAN_NS = 600000000000
 DEFAULT_MIN_PEERS = 5
 DEFAULT_SOC_WINDOW = 5.0
 DEFAULT_TEMP_WINDOW = 5.0
@@ -636,6 +641,10 @@ def _parse_params(ccfg):
     gap = ccfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
     if isinstance(gap, bool) or not isinstance(gap, int) or gap < 0:
         raise ConditionsError("malformed: max_gap_ns non-negative int")
+    min_span = ccfg.get("min_slope_span_ns", DEFAULT_MIN_SLOPE_SPAN_NS)
+    if isinstance(min_span, bool) or not isinstance(min_span, int) \
+            or min_span < 0:
+        raise ConditionsError("malformed: min_slope_span_ns non-negative int")
     peers = ccfg.get("min_peers", DEFAULT_MIN_PEERS)
     if isinstance(peers, bool) or not isinstance(peers, int) or peers < 3:
         raise ConditionsError("malformed: min_peers int >= 3")
@@ -652,7 +661,8 @@ def _parse_params(ccfg):
     if curr_w is None or curr_w <= 0.0:
         raise ConditionsError("malformed: current_window_a finite > 0")
     fields = _parse_current_fields(ccfg)
-    return {"max_skew_ns": skew, "max_gap_ns": gap, "min_peers": peers,
+    return {"max_skew_ns": skew, "max_gap_ns": gap,
+            "min_slope_span_ns": min_span, "min_peers": peers,
             "domain": dom, "soc_window_pct": soc_w, "temp_window_c": temp_w,
             "current_window_a": curr_w, "current_fields": fields}
 
@@ -1171,6 +1181,7 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
                    cals, cal_errors, ccfg, pre_dedup_count, after_decision):
     skew = params["max_skew_ns"]
     gap = params["max_gap_ns"]
+    min_span = params["min_slope_span_ns"]
     rows = []
     rev = lambda *parts: bc.revision_id(
         scope, params, ccfg, ALGORITHM_VERSION, *parts)
@@ -1490,10 +1501,13 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
                     break
                 run.append(before)
             run = sorted(run, key=lambda p: p["t"])
-            if len(run) < 2:
-                reason = "id_changed:same_module_run_too_short" \
-                    if stop == "id_changed" else \
-                    "gap_exceeded:trailing_run_too_short"
+            if len(run) < 2 or run[-1]["t"] - run[0]["t"] < min_span:
+                if len(run) >= 2:
+                    reason = "sparse:same_id_run_shorter_than_min_span"
+                elif stop == "id_changed":
+                    reason = "id_changed:same_module_run_too_short"
+                else:
+                    reason = "gap_exceeded:trailing_run_too_short"
                 rows.append(_row(raw_metric, None, None, "unavailable",
                                  reason, scope, window,
                                  evidence=len(therm_pts),
@@ -1678,6 +1692,12 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
                              "gap_exceeded:trailing_run_too_short", scope,
                              window, evidence=len(iso_pts),
                              revision=rev("iso_trend", "gap")))
+        elif run[-1][0] - run[0][0] < min_span:
+            rows.append(_row("battery.conditions.isolation_trend_ohm_per_h",
+                             None, tscal["unit"] + "/h", "unavailable",
+                             "sparse:run_shorter_than_min_span", scope,
+                             window, evidence=len(iso_pts),
+                             revision=rev("iso_trend", "min_span")))
         else:
             raw_slope = slope_per_h(run)
             if raw_slope is None:

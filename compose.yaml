@@ -85,7 +85,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '3'
+      datalake.aggregate-revision: '4'
     depends_on:
       greptimedb:
         condition: service_started
@@ -6143,6 +6143,10 @@ configs:
             Any slope/exposure leg wider than this is rejected, never
             interpolated. Invalid or ambiguous timestamps are barriers even
             when the leg is otherwise within the gap.
+          ``min_slope_span_ns``: non-negative int, default 600000000000 (10 min).
+            Thermal/isolation slopes need a same-ID run spanning at least this
+            long; shorter runs report unavailable instead of extrapolating a
+            few seconds of change to a per-hour rate.
           ``min_peers``: int >= 3, default 5. Minimum conditioned peers for
             the robust baseline (median needs >= 3 to mean anything).
           ``domain``: non-empty string or None (default None). Declared target
@@ -6231,7 +6235,7 @@ configs:
       sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
       import battery_common as bc
 
-      ALGORITHM_VERSION = "1.1.2"
+      ALGORITHM_VERSION = "1.2.0"
       ANALYSIS_ID = "battery_conditions"
 
       BRICK_MAX_FIELD = "BrickVoltageMax"
@@ -6250,6 +6254,7 @@ configs:
 
       DEFAULT_MAX_SKEW_NS = 30000000000
       DEFAULT_MAX_GAP_NS = 600000000000
+      DEFAULT_MIN_SLOPE_SPAN_NS = 600000000000
       DEFAULT_MIN_PEERS = 5
       DEFAULT_SOC_WINDOW = 5.0
       DEFAULT_TEMP_WINDOW = 5.0
@@ -6767,6 +6772,10 @@ configs:
           gap = ccfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
           if isinstance(gap, bool) or not isinstance(gap, int) or gap < 0:
               raise ConditionsError("malformed: max_gap_ns non-negative int")
+          min_span = ccfg.get("min_slope_span_ns", DEFAULT_MIN_SLOPE_SPAN_NS)
+          if isinstance(min_span, bool) or not isinstance(min_span, int) \
+                  or min_span < 0:
+              raise ConditionsError("malformed: min_slope_span_ns non-negative int")
           peers = ccfg.get("min_peers", DEFAULT_MIN_PEERS)
           if isinstance(peers, bool) or not isinstance(peers, int) or peers < 3:
               raise ConditionsError("malformed: min_peers int >= 3")
@@ -6783,7 +6792,8 @@ configs:
           if curr_w is None or curr_w <= 0.0:
               raise ConditionsError("malformed: current_window_a finite > 0")
           fields = _parse_current_fields(ccfg)
-          return {"max_skew_ns": skew, "max_gap_ns": gap, "min_peers": peers,
+          return {"max_skew_ns": skew, "max_gap_ns": gap,
+                  "min_slope_span_ns": min_span, "min_peers": peers,
                   "domain": dom, "soc_window_pct": soc_w, "temp_window_c": temp_w,
                   "current_window_a": curr_w, "current_fields": fields}
 
@@ -7302,6 +7312,7 @@ configs:
                          cals, cal_errors, ccfg, pre_dedup_count, after_decision):
           skew = params["max_skew_ns"]
           gap = params["max_gap_ns"]
+          min_span = params["min_slope_span_ns"]
           rows = []
           rev = lambda *parts: bc.revision_id(
               scope, params, ccfg, ALGORITHM_VERSION, *parts)
@@ -7621,10 +7632,13 @@ configs:
                           break
                       run.append(before)
                   run = sorted(run, key=lambda p: p["t"])
-                  if len(run) < 2:
-                      reason = "id_changed:same_module_run_too_short" \
-                          if stop == "id_changed" else \
-                          "gap_exceeded:trailing_run_too_short"
+                  if len(run) < 2 or run[-1]["t"] - run[0]["t"] < min_span:
+                      if len(run) >= 2:
+                          reason = "sparse:same_id_run_shorter_than_min_span"
+                      elif stop == "id_changed":
+                          reason = "id_changed:same_module_run_too_short"
+                      else:
+                          reason = "gap_exceeded:trailing_run_too_short"
                       rows.append(_row(raw_metric, None, None, "unavailable",
                                        reason, scope, window,
                                        evidence=len(therm_pts),
@@ -7809,6 +7823,12 @@ configs:
                                    "gap_exceeded:trailing_run_too_short", scope,
                                    window, evidence=len(iso_pts),
                                    revision=rev("iso_trend", "gap")))
+              elif run[-1][0] - run[0][0] < min_span:
+                  rows.append(_row("battery.conditions.isolation_trend_ohm_per_h",
+                                   None, tscal["unit"] + "/h", "unavailable",
+                                   "sparse:run_shorter_than_min_span", scope,
+                                   window, evidence=len(iso_pts),
+                                   revision=rev("iso_trend", "min_span")))
               else:
                   raw_slope = slope_per_h(run)
                   if raw_slope is None:
@@ -8052,8 +8072,11 @@ configs:
       #!/usr/bin/env python3
       """Battery energy, charge/discharge sessions and conditional capacity. Stdlib only.
 
-      analyze(signals, events, config) retains pre-window session context, while
-      window counters and integrals use only in-window samples. Optional integer-ns
+      analyze(signals, events, config) retains pre-window session context. Window
+      integrals use only in-window samples; cumulative-meter deltas additionally
+      anchor on the last valid pre-window reading within max_gap_ns, so adjacent
+      windows partition the meter increase instead of dropping boundary legs.
+      Optional integer-ns
       window_start_ns/window_end_ns bound inclusive windows. decision_time_ns admits
       only observations with known event and ingest times at or before the decision.
 
@@ -8100,7 +8123,7 @@ configs:
       import battery_common as bc
 
       CODE_VERSION = "1.0.0"
-      ALGORITHM_VERSION = "1.1.0"
+      ALGORITHM_VERSION = "1.2.0"
       ANALYSIS_ID = "battery_energy"
 
       SUPPORTED_METRICS = (
@@ -8886,8 +8909,8 @@ configs:
           sessions, session_rows = _session_results(
               scope, window, ordered, raw_current, fields, gap, ecfg)
           out.extend(session_rows)
-          counter_rows = _counter_results(scope, window, dc_pairs, ac_pairs,
-                                          dis_pairs, fields, ecfg)
+          counter_rows = _counter_results(scope, window, ordered, dc_pairs,
+                                          ac_pairs, dis_pairs, fields, gap, ecfg)
           out.extend(counter_rows)
           counter_deltas = _counter_deltas_for_efc(counter_rows)
           cal_ver_vi = _cal_version(vol_entries, cur_entries)
@@ -9200,10 +9223,29 @@ configs:
           return enriched, rows
 
 
-      def _counter_results(scope, window, dc_pairs, ac_pairs, dis_pairs, fields,
-                           ecfg):
+      def _with_prior_baseline(ordered, field, window, pairs, gap):
+          """Prepend the last pre-window reading as the delta anchor.
+
+          Only a valid, unambiguous reading within gap of the first in-window
+          sample anchors; an invalid/conflicting latest prior reading is a
+          barrier, so the window falls back to its own span.
+          """
+          if window[0] is None or not pairs:
+              return pairs, False
+          prior = _num_pairs([r for r in ordered
+                              if r["event_time_ns"] < window[0]], field, "kWh")
+          if not prior:
+              return pairs, False
+          tst, value = prior[-1]
+          if value is None or pairs[0][0] - tst > gap:
+              return pairs, False
+          return [(tst, value)] + pairs, True
+
+
+      def _counter_results(scope, window, ordered, dc_pairs, ac_pairs, dis_pairs,
+                           fields, gap, ecfg):
           out = []
-          for metric, pairs, field, note in (
+          for metric, win_pairs, field, note in (
                   ("battery.energy.dc_charging_energy_in_kwh", dc_pairs,
                    fields["dc_counter_field"],
                    "counter_delta battery_side_ac_and_dc_meter"),
@@ -9213,9 +9255,12 @@ configs:
                   ("battery.energy.discharge_energy_kwh", dis_pairs,
                    fields["discharge_counter_field"],
                    "counter_delta discharging_meter")):
+              pairs, anchored = _with_prior_baseline(ordered, field, window,
+                                                     win_pairs, gap)
+              if anchored:
+                  note += " anchor=prior_window"
               delta, info = meter_delta(pairs)
-              if any(b[0] - a[0] > ecfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
-                     for a, b in zip(pairs, pairs[1:])):
+              if any(b[0] - a[0] > gap for a, b in zip(pairs, pairs[1:])):
                   delta, info = None, "gap"
               if info == "ok":
                   out.append(_derived(scope, window, metric, delta, "kWh",
@@ -13746,7 +13791,7 @@ configs:
       sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
       import battery_common as bc
 
-      RUNTIME_VERSION = "1.0.2"
+      RUNTIME_VERSION = "1.0.3"
       ANALYSIS_TABLE = "vehicle_analysis"
       SIGNAL_TABLE = "vehicle_signal"
       EVENT_TABLE = "vehicle_event"
@@ -14671,8 +14716,11 @@ configs:
               return 0
           fetch_start = min(ws for ws, _ in windows)
           fetch_end = max(we for _, we in windows)
-          signals = fetch_signals(base_url, auth, db, fetch_start, fetch_end,
-                                  vehicle, max_rows)
+          # One hour of pre-window signal context lets the earliest lookback
+          # window anchor cumulative-meter deltas like every later window does,
+          # so a sliding lookback never flips its first window's value.
+          signals = fetch_signals(base_url, auth, db, fetch_start - HOUR_NS,
+                                  fetch_end, vehicle, max_rows)
           events = fetch_events(base_url, auth, db, fetch_start, fetch_end,
                                 vehicle, max_rows)
           scopes = set()

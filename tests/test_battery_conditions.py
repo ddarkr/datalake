@@ -210,6 +210,28 @@ def test_slope_barrier_invalid_timestamp_stops_interpolation():
     assert bad["status"] == "unavailable" and "gap_exceeded" in bad["reason"]
 
 
+def test_short_same_id_run_is_not_extrapolated_to_hourly_slope():
+    # Production case: 0.5 spread change over 30 s must not become 60/h.
+    rows = therm_pair(T0, 35.0, 30.0) + therm_pair(T0 + 5 * 10**9, 35.0, 30.0)
+    rows += therm_pair(T0 + 30 * 10**9, 34.5, 30.0)
+    out = co.analyze(rows, [], cfg(module_temp_calibration=mod_cal()))
+    bad = by(out, "battery.conditions.thermal_slope_raw_per_h")
+    assert bad["status"] == "unavailable" and bad["value"] is None
+    assert "min_span" in bad["reason"]
+    assert by(out, "battery.conditions.thermal_slope_c_per_h")["value"] is None
+    # The span boundary is inclusive; an isolation run obeys the same rule.
+    span = 10 * 60 * 10**9
+    ok = therm_pair(T0, 22.0, 20.0) + therm_pair(T0 + span, 23.0, 20.0)
+    got = by(co.analyze(ok, [], cfg(min_slope_span_ns=span)),
+             "battery.conditions.thermal_slope_raw_per_h")
+    assert got["status"] == "derived" and abs(got["value"] - 6.0) < 1e-9
+    iso = [raw(T0, "IsolationResistance", 1000.0),
+           raw(T0 + 60 * 10**9, "IsolationResistance", 900.0)]
+    trend = by(co.analyze(iso, [], cfg(isolation_calibration=cal("ohm", 1.0))),
+               "battery.conditions.isolation_trend_ohm_per_h")
+    assert trend["value"] is None and "min_span" in trend["reason"]
+
+
 def test_conditioned_baseline_known_answer():
     spreads = [(0.10, 50.0, 20.0, 5.0), (0.12, 50.0, 20.0, 5.0),
                (0.11, 50.0, 20.0, 5.0), (0.20, 50.0, 20.0, 5.0)]

@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """Battery energy, charge/discharge sessions and conditional capacity. Stdlib only.
 
-analyze(signals, events, config) retains pre-window session context, while
-window counters and integrals use only in-window samples. Optional integer-ns
+analyze(signals, events, config) retains pre-window session context. Window
+integrals use only in-window samples; cumulative-meter deltas additionally
+anchor on the last valid pre-window reading within max_gap_ns, so adjacent
+windows partition the meter increase instead of dropping boundary legs.
+Optional integer-ns
 window_start_ns/window_end_ns bound inclusive windows. decision_time_ns admits
 only observations with known event and ingest times at or before the decision.
 
@@ -49,7 +52,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
 CODE_VERSION = "1.0.0"
-ALGORITHM_VERSION = "1.1.0"
+ALGORITHM_VERSION = "1.2.0"
 ANALYSIS_ID = "battery_energy"
 
 SUPPORTED_METRICS = (
@@ -835,8 +838,8 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     sessions, session_rows = _session_results(
         scope, window, ordered, raw_current, fields, gap, ecfg)
     out.extend(session_rows)
-    counter_rows = _counter_results(scope, window, dc_pairs, ac_pairs,
-                                    dis_pairs, fields, ecfg)
+    counter_rows = _counter_results(scope, window, ordered, dc_pairs,
+                                    ac_pairs, dis_pairs, fields, gap, ecfg)
     out.extend(counter_rows)
     counter_deltas = _counter_deltas_for_efc(counter_rows)
     cal_ver_vi = _cal_version(vol_entries, cur_entries)
@@ -1149,10 +1152,29 @@ def _session_results(scope, window, ordered, signed_current, fields, gap, ecfg):
     return enriched, rows
 
 
-def _counter_results(scope, window, dc_pairs, ac_pairs, dis_pairs, fields,
-                     ecfg):
+def _with_prior_baseline(ordered, field, window, pairs, gap):
+    """Prepend the last pre-window reading as the delta anchor.
+
+    Only a valid, unambiguous reading within gap of the first in-window
+    sample anchors; an invalid/conflicting latest prior reading is a
+    barrier, so the window falls back to its own span.
+    """
+    if window[0] is None or not pairs:
+        return pairs, False
+    prior = _num_pairs([r for r in ordered
+                        if r["event_time_ns"] < window[0]], field, "kWh")
+    if not prior:
+        return pairs, False
+    tst, value = prior[-1]
+    if value is None or pairs[0][0] - tst > gap:
+        return pairs, False
+    return [(tst, value)] + pairs, True
+
+
+def _counter_results(scope, window, ordered, dc_pairs, ac_pairs, dis_pairs,
+                     fields, gap, ecfg):
     out = []
-    for metric, pairs, field, note in (
+    for metric, win_pairs, field, note in (
             ("battery.energy.dc_charging_energy_in_kwh", dc_pairs,
              fields["dc_counter_field"],
              "counter_delta battery_side_ac_and_dc_meter"),
@@ -1162,9 +1184,12 @@ def _counter_results(scope, window, dc_pairs, ac_pairs, dis_pairs, fields,
             ("battery.energy.discharge_energy_kwh", dis_pairs,
              fields["discharge_counter_field"],
              "counter_delta discharging_meter")):
+        pairs, anchored = _with_prior_baseline(ordered, field, window,
+                                               win_pairs, gap)
+        if anchored:
+            note += " anchor=prior_window"
         delta, info = meter_delta(pairs)
-        if any(b[0] - a[0] > ecfg.get("max_gap_ns", DEFAULT_MAX_GAP_NS)
-               for a, b in zip(pairs, pairs[1:])):
+        if any(b[0] - a[0] > gap for a, b in zip(pairs, pairs[1:])):
             delta, info = None, "gap"
         if info == "ok":
             out.append(_derived(scope, window, metric, delta, "kWh",
