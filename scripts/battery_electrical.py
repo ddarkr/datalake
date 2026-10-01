@@ -117,6 +117,7 @@ Metrics (namespace battery.electrical.*):
   helper ica_dva_curve, not from Grafana rows).
 """
 
+import bisect
 import math
 import os
 import sys
@@ -1859,6 +1860,8 @@ def _step_sequence(cur_timeline, vol_timeline, sign, max_skew_ns,
     between consecutive steps ends that region (never bridged)."""
     cur_by_t = {t: v for t, v in _usable_pairs(cur_timeline)}
     cur_usable = sorted(cur_by_t)
+    cur_barriers = sorted(t for t, _, ok, _ in cur_timeline if not ok)
+    vol_barriers = sorted(t for t, _, ok, _ in vol_timeline if not ok)
     seq = []
     prev_t = None
     for tstamp, val, ok, _ in vol_timeline:
@@ -1866,28 +1869,19 @@ def _step_sequence(cur_timeline, vol_timeline, sign, max_skew_ns,
             break
         if not ok:
             continue
-        match = None
-        for cstamp in reversed(cur_usable):
-            if cstamp > tstamp:
-                continue
-            if tstamp - cstamp > max_skew_ns:
-                break
-            match = (cstamp, cur_by_t[cstamp])
-            break
-        if match is None:
+        idx = bisect.bisect_right(cur_usable, tstamp) - 1
+        if idx < 0:
             continue
-        cstamp, cval = match
-        bridged = False
-        for b_t, _, b_ok, _ in cur_timeline:
-            if cstamp < b_t <= tstamp and not b_ok:
-                bridged = True
-                break
-        if not bridged and prev_t is not None:
-            for b_t, _, b_ok, _ in vol_timeline:
-                if prev_t < b_t < tstamp and not b_ok:
-                    bridged = True
-                    break
-        if bridged:
+        cstamp = cur_usable[idx]
+        if tstamp - cstamp > max_skew_ns:
+            continue
+        cval = cur_by_t[cstamp]
+        bidx = bisect.bisect_right(cur_barriers, cstamp)
+        if bidx < len(cur_barriers) and cur_barriers[bidx] <= tstamp:
+            continue
+        if prev_t is not None and bisect.bisect_right(
+                vol_barriers, prev_t) < bisect.bisect_left(
+                vol_barriers, tstamp):
             continue
         seq.append((tstamp, val, sign * cval, cstamp))
         prev_t = tstamp

@@ -120,6 +120,23 @@ def test_dedup_identical_retransmit_keeps_earliest_ingest():
         assert got[0]["ingest_time_ns"] == 50  # order-independent
 
 
+def test_dedup_cheap_collision_keeps_provenance_picks_earliest_ingest():
+    early = sig(100, num=1.0, envelope="e", ingest=50)
+    late = dict(early, ingest_time_ns=90)
+    unknown = dict(early, ingest_time_ns=None)
+    tombstone = dict(early, quality="invalid", ingest_time_ns=10)
+    other_unit = dict(early, unit="mph", ingest_time_ns=20)
+    other_env = dict(early, ingest_time_ns=30)
+    other_env["envelope_id"] = "env-9"
+    rows = [unknown, other_env, late, tombstone, other_unit, early]
+    got = bc.sort_dedup(rows)
+    assert len(got) == 4  # quality/unit/envelope variants stay distinct
+    kept = [r for r in got if r["quality"] is None and r["unit"] == "km/h"
+            and r["envelope_id"] == "e"]
+    assert len(kept) == 1 and kept[0]["ingest_time_ns"] == 50
+    assert got == bc.sort_dedup(list(reversed(rows)))  # order-independent
+
+
 def test_dedup_stable_observation_set_stable_result():
     rows = [sig(100, num=1.0), sig(100, num=2.0), sig(90, num=0.5)]
     assert bc.sort_dedup(rows) == bc.sort_dedup(list(reversed(rows)))

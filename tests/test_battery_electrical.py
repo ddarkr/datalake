@@ -651,6 +651,57 @@ def test_ica_uses_requested_charge_window():
     assert abs(result["value"] - 1.0) < 1e-8
 
 
+def test_step_sequence_barriers_skew_clip_and_duplicates():
+    # Numerical contract for the DCR V/I join; entries are
+    # (ns, value, usable, ambiguous). A current barrier strictly inside
+    # (c, v] skips that voltage stamp; a voltage barrier strictly between
+    # consecutive accepted stamps skips the later one (strict endpoints).
+    cur = [(T0, 10.0, True, False), (T0 + 30 * 10**9, None, False, False)]
+    vol = [(T0 + 60 * 10**9, 400.0, True, False)]
+    seq, why = be._step_sequence(cur, vol, 1, HOUR, None)
+    assert why is None
+    assert seq == []  # barrier strictly inside (c, v]
+    cur = [(T0, 10.0, True, False), (T0 + 60 * 10**9, 20.0, True, False)]
+    vol = [(T0 + 60 * 10**9, 400.0, True, False),
+           (T0 + 90 * 10**9, 401.0, True, False)]
+    seq, why = be._step_sequence(cur, vol, 1, HOUR, None)
+    assert why is None
+    assert seq == [(T0 + 60 * 10**9, 400.0, 20.0, T0 + 60 * 10**9),
+                   (T0 + 90 * 10**9, 401.0, 20.0, T0 + 60 * 10**9)]
+    # Voltage barrier strictly between accepted stamps skips the later
+    # stamp; a barrier exactly at the previous stamp does not.
+    cur = [(T0, 10.0, True, False), (T0 + 60 * 10**9, 10.0, True, False)]
+    vol = [(T0, 400.0, True, False), (T0 + 30 * 10**9, None, False, False),
+           (T0 + 60 * 10**9, 401.0, True, False)]
+    seq, _ = be._step_sequence(cur, vol, 1, HOUR, None)
+    assert seq == [(T0, 400.0, 10.0, T0)]
+    vol = [(T0, 400.0, True, False), (T0, None, False, False),
+           (T0 + 60 * 10**9, 401.0, True, False)]
+    seq, _ = be._step_sequence(cur, vol, 1, HOUR, None)
+    assert seq == [(T0, 400.0, 10.0, T0),
+                   (T0 + 60 * 10**9, 401.0, 10.0, T0 + 60 * 10**9)]
+    # Skew cutoff drops the stamp; zero skew needs an exact timestamp.
+    seq, _ = be._step_sequence([(T0, 10.0, True, False)],
+                               [(T0 + 2 * HOUR, 400.0, True, False)],
+                               1, HOUR, None)
+    assert seq == []
+    seq, _ = be._step_sequence([(T0, 10.0, True, False)],
+                               [(T0, 400.0, True, False),
+                                (T0 + 1, 401.0, True, False)], 1, 0, None)
+    assert seq == [(T0, 400.0, 10.0, T0)]
+    # window_end clips voltage stamps only.
+    seq, _ = be._step_sequence([(T0, 10.0, True, False)],
+                               [(T0, 400.0, True, False),
+                                (T0 + 60 * 10**9, 401.0, True, False)],
+                               1, HOUR, T0)
+    assert seq == [(T0, 400.0, 10.0, T0)]
+    # Duplicate usable current stamps: last value wins.
+    seq, _ = be._step_sequence([(T0, 10.0, True, False),
+                                (T0, 20.0, True, False)],
+                               [(T0, 400.0, True, False)], 1, HOUR, None)
+    assert seq == [(T0, 400.0, 20.0, T0)]
+
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:

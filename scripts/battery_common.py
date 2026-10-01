@@ -26,6 +26,7 @@ no default confidence live here; modules report status explicitly.
 
 import hashlib
 from bisect import bisect_right
+from itertools import groupby
 
 SCHEMA_VERSION = "1"
 CODE_VERSION = "1.0.0"
@@ -241,6 +242,13 @@ def _sig_key(sig):
             sig.get("config_version"), sig.get("connectivity"))
 
 
+def _sort_prefix(sig):
+    return (sig["event_time_ns"],
+            sig.get("source_field") or sig.get("path") or "",
+            repr((sig.get("value_num"), sig.get("value_text"),
+                  sig.get("value_bool"))))
+
+
 def sort_dedup(signals):
     """Sort by (time, field, payload, canonical row); collapse exact key
     matches only.
@@ -251,10 +259,13 @@ def sort_dedup(signals):
     ingest regardless of arrival order (unknown ingest loses to any real
     stamp). The same observation set always yields the same rows.
     """
-    ordered = sorted(signals, key=lambda s: (
-        s["event_time_ns"], s.get("source_field") or s.get("path") or "",
-        repr((s.get("value_num"), s.get("value_text"), s.get("value_bool"))),
-        _canonical(s)))
+    cheap = sorted(signals, key=_sort_prefix)
+    ordered = []
+    for _, tied in groupby(cheap, key=_sort_prefix):
+        tied = list(tied)
+        if len(tied) > 1:
+            tied.sort(key=_canonical)
+        ordered.extend(tied)
     out, index = [], {}
     for sig in ordered:
         key = _sig_key(sig)
