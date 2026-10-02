@@ -159,8 +159,23 @@ class Exporter:
         try:
             request = urllib.request.Request(self.endpoint, data=claim[2].encode(), method='POST',
                                              headers={**self.headers, 'Content-Type': 'application/json'})
+            deadline = time.monotonic() + self.timeout
             with self.opener.open(request, timeout=self.timeout) as response:
-                raw = response.read(65537)
+                chunks = []
+                size = 0
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('response deadline')
+                    chunk = response.read1(min(8192, 65537 - size))
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('response deadline')
+                    if not chunk:
+                        break
+                    chunks.append(chunk)
+                    size += len(chunk)
+                    if size > 65536:
+                        raise ValueError('oversized response')
+                raw = b''.join(chunks)
                 if len(raw) > 65536:
                     raise ValueError('oversized response')
                 result = json.loads(raw) if raw else {}
