@@ -762,6 +762,89 @@ def test_zero_brick_id_is_not_used_for_persistence():
     assert persistence["value"] is None
 
 
+def test_prepared_and_raw_analyses_agree():
+    rows = brick_pair(T0, 4.2, 4.0) + brick_pair(T0 + HOUR, 4.3, 4.0)
+    expected = co.analyze(list(rows), [], cfg(**GAP2H))
+    assert co.analyze(bc.prepare_signals(rows), [], cfg(**GAP2H)) == expected
+    assert co.analyze(
+        bc.prepare_signals(list(reversed(rows))), [], cfg(**GAP2H)) == expected
+
+
+def test_raw_malformed_inputs_dropped_in_both_paths():
+    good = brick_pair(T0, 4.2, 4.0)
+    bad = [None, "x", 42, {}, dict(good[0], event_time_ns="bad"),
+           dict(good[0], vehicle="")]
+    rows = good + bad
+    expected = co.analyze(list(good), [], cfg())
+    assert co.analyze(list(rows), [], cfg()) == expected
+    assert co.analyze(bc.prepare_signals(rows), [], cfg()) == expected
+
+
+def test_invalid_and_conflicting_duplicates_stay_barriers_across_paths():
+    rows = [raw(T0, "BrickVoltageMax", 4.2), raw(T0, "BrickVoltageMax", 4.3),
+            raw(T0, "BrickVoltageMin", 4.0),
+            raw(T0, "NumBrickVoltageMax", 7),
+            raw(T0, "NumBrickVoltageMin", 3)]
+    expected = co.analyze(list(rows), [], cfg())
+    assert co.analyze(bc.prepare_signals(rows), [], cfg()) == expected
+    bad = by(expected, "battery.conditions.brick_spread_raw")
+    assert bad["status"] == "unavailable" and bad["value"] is None
+    inv = [sig(T0, field="BrickVoltageMax", num=None, unit=None,
+               quality="invalid"),
+           raw(T0, "BrickVoltageMin", 4.0)]
+    out = co.analyze(list(inv), [], cfg())
+    assert co.analyze(bc.prepare_signals(inv), [], cfg()) == out
+    assert by(out, "battery.conditions.brick_spread_raw")["status"] == \
+        "unavailable"
+
+
+def test_late_ingest_decision_preserved_across_paths():
+    rows = [sig(T0, field="Soc", num=90.0, unit="%", ingest=T0),
+            sig(T0 + HOUR, field="Soc", num=90.0, unit="%",
+                ingest=T0 + 2 * HOUR)]
+    config = {"conditions": {"soc_high_pct": 80.0, **GAP2H},
+              "decision_time_ns": T0 + HOUR}
+    expected = co.analyze(list(rows), [], config)
+    assert co.analyze(bc.prepare_signals(rows), [], config) == expected
+    got = by(expected, "battery.conditions.exposure_high_soc_s")
+    assert got["status"] == "unavailable"
+
+
+def test_terminal_equivalence_across_paths():
+    t0, t1 = T0, T0 + 1000000000
+    rows = [raw(t0, "BrickVoltageMax", 3.72),
+            raw(t0, "BrickVoltageMin", 3.6999),
+            raw(t0, "NumBrickVoltageMax", 7),
+            raw(t0, "NumBrickVoltageMin", 2),
+            raw(t1, "BrickVoltageMax", 3.72),
+            sig(t1, field="BrickVoltageMin", num=None, unit=None,
+                quality="invalid"),
+            raw(t1, "NumBrickVoltageMax", 7),
+            raw(t1, "NumBrickVoltageMin", 2)]
+    config = cfg(brick_voltage_calibration=cal("V", 1.0), **GAP2H)
+    expected = co.analyze(list(rows), [], config)
+    assert co.analyze(bc.prepare_signals(rows), [], config) == expected
+    assert "terminal_invalid" in by(
+        expected, "battery.conditions.brick_spread_raw")["reason"]
+
+
+def test_skew_and_wrong_unit_barriers_across_paths():
+    skew_rows = [raw(T0 + HOUR, "BrickVoltageMax", 4.2),
+                 raw(T0, "BrickVoltageMin", 4.0),
+                 raw(T0 + HOUR, "NumBrickVoltageMax", 7),
+                 raw(T0, "NumBrickVoltageMin", 3)]
+    out = co.analyze(list(skew_rows), [], cfg())
+    assert co.analyze(bc.prepare_signals(skew_rows), [], cfg()) == out
+    assert "unsynchronized" in by(
+        out, "battery.conditions.brick_spread_raw")["reason"]
+    rows = [dict(r, unit="V") if r.get("source_field") == "Soc" else r
+            for r in brick_pair(T0, 4.2, 4.0)]
+    out = co.analyze(list(rows), [], cfg())
+    assert co.analyze(bc.prepare_signals(rows), [], cfg()) == out
+    assert by(out, "battery.conditions.brick_spread_raw")["status"] == \
+        "derived"
+
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:

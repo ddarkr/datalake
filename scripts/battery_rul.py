@@ -765,11 +765,10 @@ def analyze(signals, events, config):
             for m in SUPPORTED_METRICS]
     _ = events
     scoped = set()
-    for raw in signals if isinstance(signals, list) else []:
-        sig = bc.normalize_signal(raw)
-        if sig is not None:
-            scoped.add((sig["vehicle"], sig["source"],
-                        sig["decode_epoch"]))
+    for sig in bc.normalize_signals(
+            signals if isinstance(signals, list) else []):
+        scoped.add((sig["vehicle"], sig["source"],
+                    sig["decode_epoch"]))
     scopes = sorted(scoped, key=repr) if scoped else [(None, None, None)]
     single = len(scopes) == 1
 

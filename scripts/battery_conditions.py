@@ -974,8 +974,6 @@ def _sync_pair(ordered, max_field, min_field, max_id_field, min_id_field,
     spread as current and callers report unavailable instead of an
     older matched point.
     """
-    # ponytail: per-point join_asof re-sorts secondaries; change-gated
-    # windows keep n small, pre-group only if profiles show it matters.
     max_all = _field_rows(ordered, max_field)
     min_all = _field_rows(ordered, min_field)
     maxid_all = _field_rows(ordered, max_id_field)
@@ -994,7 +992,8 @@ def _sync_pair(ordered, max_field, min_field, max_id_field, min_id_field,
     groups = {}
     for row in max_all:
         groups.setdefault(row["event_time_ns"], []).append(row)
-    points, unsync, ambiguous = [], 0, 0
+    cands = []
+    ambiguous = 0
     for tstamp in sorted(groups):
         members = groups[tstamp]
         if len({_payload(r) for r in members}) != 1:
@@ -1005,7 +1004,27 @@ def _sync_pair(ordered, max_field, min_field, max_id_field, min_id_field,
                 or not bc.is_valid_quality(rep.get("quality")) \
                 or _finite(rep.get("value_num")) is None:
             continue  # invalid barrier, already in barriers
-        got = bc.join_asof([rep], min_all, skew_ns)[0][1]
+        cands.append((tstamp, rep))
+    reps = [rep for _, rep in cands]
+    if reps:
+        min_hit = [m for _, m in bc.join_asof(reps, min_all, skew_ns)]
+        maxid_hit = [m for _, m in bc.join_asof(reps, maxid_all, skew_ns)]
+        minid_hit = [m for _, m in bc.join_asof(reps, minid_all, skew_ns)]
+        soc_hit = [m for _, m in bc.join_asof(reps, soc_all, skew_ns)]
+    else:
+        min_hit = maxid_hit = minid_hit = soc_hit = []
+
+    def _row_value(match, unit=None):
+        if match is None or match.get("value_num") is None \
+                or not bc.is_valid_quality(match.get("quality")):
+            return None
+        if unit is not None and match.get("unit") != unit:
+            return None
+        return _finite(match.get("value_num"))
+
+    points, unsync = [], 0
+    for (tstamp, rep), got, maxid_raw, minid_raw, soc_raw in \
+            zip(cands, min_hit, maxid_hit, minid_hit, soc_hit):
         if got is None or got.get("value_num") is None \
                 or not bc.is_valid_quality(got.get("quality")) \
                 or _finite(got.get("value_num")) is None:
@@ -1015,20 +1034,8 @@ def _sync_pair(ordered, max_field, min_field, max_id_field, min_id_field,
         if not bc.is_finite_number(spread):
             unsync += 1
             continue
-
-        def _asof(rows, unit=None):
-            match = bc.join_asof([rep], rows, skew_ns)[0][1]
-            if match is None or match.get("value_num") is None \
-                    or not bc.is_valid_quality(match.get("quality")):
-                return None
-            if unit is not None and match.get("unit") != unit:
-                return None
-            return _finite(match.get("value_num"))
-
-        max_id = _asof(maxid_all)
-        min_id = _asof(minid_all)
-        max_id = _valid_id(max_id, max_id_field)
-        min_id = _valid_id(min_id, min_id_field)
+        max_id = _valid_id(_row_value(maxid_raw), max_id_field)
+        min_id = _valid_id(_row_value(minid_raw), min_id_field)
         if max_id is None or min_id is None:
             barriers = set(barriers) | {tstamp}
         points.append({
@@ -1038,7 +1045,7 @@ def _sync_pair(ordered, max_field, min_field, max_id_field, min_id_field,
             "min_v": float(got["value_num"]),
             "max_id": max_id,
             "min_id": min_id,
-            "soc": _asof(soc_all, SOC_UNIT),
+            "soc": _row_value(soc_raw, SOC_UNIT),
             "temp": _asof_points(temp_points, tstamp, skew_ns),
             "curr": _asof_points(curr_points, tstamp, skew_ns),
         })
@@ -1131,10 +1138,7 @@ def analyze(signals, events, config):
 
     rows_all = []
     after_decision = 0
-    for raw in signals if isinstance(signals, list) else []:
-        sig = bc.normalize_signal(raw)
-        if sig is None:
-            continue
+    for sig in bc.normalize_signals(signals if isinstance(signals, list) else []):
         if decision is not None:
             if sig["event_time_ns"] > decision:
                 after_decision += 1

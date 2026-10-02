@@ -163,6 +163,7 @@ COMPOSE_PROFILES=redecode docker compose --env-file .env run --rm redecode
 - Overview의 raw trace 조사는 선택 범위의 마지막 48시간에 제한됩니다. 관측된 span 수는 사용자 HTTP 요청 수가 아니며, 허용 목록 밖의 HTTP route·SQL 본문·span event를 복원할 수 없습니다.
 - 기본 `OTEL_TTL`은 빈 값으로 **raw OTel 무기한 보존**입니다. 30~90일이 자동 적용되는 것이 아닙니다. 보존 기간을 줄이면 기존 데이터도 만료될 수 있습니다.
 - AI 집계는 장기 보존합니다. Home raw는 설정된 대상에 기본 `HOME_RAW_TTL=90d`를 사용하며 `0s`로 만료를 끌 수 있습니다. raw CAN의 S3 보존 정책은 별도로 관리하세요.
+- AI 요약 INSERT는 최대 500행씩 묶어 전송합니다. 세션의 새 시작점 저장이 모두 성공한 뒤에만 같은 `(client, session_id)`의 이전 시작점 행을 삭제합니다. 배치 실패 시 이전 행은 남으며 재실행이 성공하면 다시 정리합니다. 집계 주기·조회 한도·보존 정책은 바꾸지 않습니다.
 
 ## 백업과 복구
 

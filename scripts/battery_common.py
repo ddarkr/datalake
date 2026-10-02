@@ -156,6 +156,28 @@ def normalize_signal(raw):
     }
 
 
+class _PreparedSignals(list):
+    """Private marker for once-canonicalized signal collections."""
+    pass
+
+
+def prepare_signals(signals):
+    """Validate/canonicalize raw rows once; order, duplicates, barriers kept."""
+    return _PreparedSignals(normalize_signals(signals))
+
+
+def normalize_signals(signals):
+    """Fresh normalized rows; prepared input skips revalidation with copies."""
+    if isinstance(signals, _PreparedSignals):
+        return [dict(row) for row in signals]
+    normed = []
+    for raw in signals or []:
+        sig = normalize_signal(raw)
+        if sig is not None:
+            normed.append(sig)
+    return normed
+
+
 def normalize_event(raw):
     """Canonical event dict, or None when envelope time/identity is missing.
 

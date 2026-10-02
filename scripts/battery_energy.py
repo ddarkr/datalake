@@ -585,15 +585,6 @@ def _session_analysis_id(episode_id):
     return "battery_energy:session:%s" % (episode_id,)
 
 
-def _scope_rows(signals):
-    normed = []
-    for raw in signals or []:
-        sig = bc.normalize_signal(raw)
-        if sig is not None:
-            normed.append(sig)
-    return normed
-
-
 def _num_pairs(rows, field, unit):
     """Retain invalid/unit/conflict barriers instead of joining across them."""
     grouped = {}
@@ -744,7 +735,7 @@ def analyze(signals, events, config):
         uncertainties = {"soc_uncertainty_pct": None,
                          "energy_uncertainty_kwh": None}
         unc_error = str(exc)
-    rows_all = _scope_rows(signals)
+    rows_all = bc.normalize_signals(signals)
     if decision is not None:
         rows_all = [r for r in rows_all
                     if r["event_time_ns"] <= decision

@@ -59,8 +59,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cols, rows, types = Handler.cols, Handler.rows, Handler.types
             if "information_schema.tables" in stmt:
                 cols, rows, types = ["table_name", "create_options"], [], None
-            elif "FROM ai_session_summary" in stmt:
-                cols, rows, types = ["client", "session_id", "session_start"], [], None
             elif "FROM raw_retention_watermark" in stmt:
                 cols, rows, types = ["deleted_before"], Handler.retention_rows, None
             elif "opentelemetry_traces" in stmt and Handler.span_cols is not None:
@@ -945,6 +943,256 @@ def test_price_loader_caches_refresh_failure_and_rejects_bad_payload():
                                     "x": {"mode": "chat"}}) == {}
     assert agg._parse_price_table(["nope"]) is None
 
+@patch.object(agg, "load_price_table", lambda: None)
+def test_session_batch_replacement_isolation_and_failure_keeps_anchor():
+    # Persisted-state regression over a local SQLite-backed HTTP store:
+    # earlier session start replaces the stale anchor, client identity stays
+    # isolated, an expired stored anchor is untouched, a faulted session
+    # INSERT batch keeps old anchors, and a clean restart converges to one
+    # current start per (client, session_id).
+    import datetime as dt
+    import sqlite3
+    now = dt.datetime(2026, 9, 21, 12, 0, 0)
+    db = sqlite3.connect(":memory:", check_same_thread=False)
+    db.execute("CREATE TABLE store (client TEXT, session_id TEXT,"
+               " session_start TEXT, input_tokens INTEGER,"
+               " output_tokens INTEGER, cost_usd REAL)")
+    db.executemany(
+        "INSERT INTO store VALUES (?, ?, ?, ?, ?, ?)",
+        [("codex", "move", "2026-09-21 10:00:00", 5, 5, 0.001),
+         ("oh-my-pi", "move", "2026-09-21 10:00:00", 7, 3, 0.002),
+         ("codex", "old", "2026-09-10 10:00:00", 5, 5, 0.001)])
+    lock = threading.Lock()
+    source = {"cols": [], "rows": []}
+    faults = {"session_inserts": 0, "fail_at": None}
+
+    class SessionStoreHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", 0))
+            stmt = urllib.parse.parse_qs(
+                self.rfile.read(length).decode()).get("sql", [""])[0]
+            payload = self.route(stmt)
+            data = json.dumps(payload).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def route(self, stmt):
+            if stmt.startswith("SELECT"):
+                if "FROM opentelemetry_traces" in stmt:
+                    return _records(source["cols"], source["rows"])
+                if "FROM opentelemetry_logs" in stmt:
+                    return _records(list(agg.LOG_COLS), [])
+                if "FROM ai_session_summary" in stmt:
+                    with lock:
+                        rows = db.execute(
+                            "SELECT client, session_id, session_start"
+                            " FROM store").fetchall()
+                    return _records(["client", "session_id", "session_start"],
+                                    [list(r) for r in rows])
+                if "FROM raw_retention_watermark" in stmt:
+                    return _records(["deleted_before"], [[None]])
+                return _records(["table_name", "create_options"], [])
+            if stmt.startswith("INSERT INTO ai_session_summary"):
+                faults["session_inserts"] += 1
+                if faults["fail_at"] == faults["session_inserts"]:
+                    return {"error": "boom"}
+                with lock:
+                    for client, sid, start, inp, outp, cost in _lit_rows(stmt):
+                        # Same (client, session, start) overwrites, mirroring
+                        # the production upsert; a new start adds a row the
+                        # scoped delete below then reconciles.
+                        db.execute("DELETE FROM store WHERE client = ?"
+                                   " AND session_id = ? AND session_start = ?",
+                                   (client, sid, start))
+                        db.execute("INSERT INTO store VALUES (?, ?, ?, ?, ?, ?)",
+                                   (client, sid, start, inp, outp, cost))
+                    db.commit()
+                return {"output": [{"affectedrows": 1}]}
+            if stmt.startswith("INSERT INTO"):
+                return {"output": [{"affectedrows": 1}]}
+            if stmt.startswith("DELETE FROM ai_session_summary"):
+                sid = _lit(stmt.split("session_id = ", 1)[1])
+                client = _lit(stmt.split("client = ", 1)[1])
+                start = _lit(stmt.split("session_start != ", 1)[1])
+                with lock:
+                    db.execute("DELETE FROM store WHERE session_id = ?"
+                               " AND client = ? AND session_start != ?",
+                               (sid, client, start))
+                    db.commit()
+                return {"output": [{"affectedrows": 1}]}
+            return {"output": [{"affectedrows": 1}]}
+
+    def _s(ts, span, session, client):
+        return span_row(ts, "t-%s-%s" % (session, span), span, None,
+                        "chat", session, None, client, "svc",
+                        5, 5, 0.001, "estimated")
+    rows = [_s("2026-09-21 10:00:00", "late", "move", "codex"),
+            _s("2026-09-21 09:00:00", "early", "move", "codex"),
+            _s("2026-09-21 10:30:00", "other1", "move", "oh-my-pi"),
+            _s("2026-09-10 10:00:00", "old1", "old", "codex")]
+    source["cols"] = list(rows[0])
+    source["rows"] = [[r[c] for c in source["cols"]] for r in rows]
+    srv = http.server.HTTPServer(("127.0.0.1", 0), SessionStoreHandler)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    ctx = ("http://127.0.0.1:%d" % srv.server_port, "YXV0aA==", "db")
+    cfg = _ai_cfg()
+    cfg["otel_ttl"] = "7d"
+    real_utcnow = agg.utcnow
+    agg.utcnow = lambda: now
+    try:
+        agg.ai_section(ctx, cfg)
+        got = {(c, s): (ts, i, o, m)
+               for c, s, ts, i, o, m in db.execute(
+                   "SELECT client, session_id, session_start, input_tokens,"
+                   " output_tokens, cost_usd FROM store").fetchall()}
+        assert got[("codex", "move")][0].startswith("2026-09-21 09:00:00"), got
+        assert got[("codex", "move")][1:] == (10, 10, 0.002), got
+        assert got[("oh-my-pi", "move")][0].startswith("2026-09-21 10:30:00"), got
+        assert got[("oh-my-pi", "move")][1:] == (5, 5, 0.001), got
+        assert got[("codex", "old")] == ("2026-09-10 10:00:00", 5, 5, 0.001), got
+        # 501 input sessions reach the second INSERT batch; the injected
+        # fault fails it after the first batch landed, so old anchors stay.
+        bulk = [_s("2026-09-21 11:%02d:00" % (i % 60), "sp-%d" % i,
+                    "bulk-%d" % i, "codex") for i in range(501)]
+        source["cols"] = list(bulk[0])
+        source["rows"] = [[r[c] for c in source["cols"]] for r in bulk]
+        before = set(db.execute(
+            "SELECT client, session_id, session_start FROM store").fetchall())
+        faults["session_inserts"] = 0
+        faults["fail_at"] = 2
+        try:
+            agg.ai_section(ctx, cfg)
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("expected SqlError on session batch failure")
+        assert before <= set(db.execute(
+            "SELECT client, session_id, session_start FROM store").fetchall())
+        # Clean restart converges to one current start per affected session.
+        faults["session_inserts"] = 0
+        faults["fail_at"] = None
+        source["cols"] = list(rows[0])
+        source["rows"] = [[r[c] for c in source["cols"]] for r in rows]
+        agg.ai_section(ctx, cfg)
+        final = db.execute(
+            "SELECT client, session_id, session_start FROM store").fetchall()
+        assert sum(1 for c, s, ts in final
+                   if (c, s) == ("codex", "move")
+                   and str(ts).startswith("2026-09-21 09:00:00")) == 1, final
+        assert sum(1 for c, s, ts in final
+                   if (c, s) == ("oh-my-pi", "move")
+                   and str(ts).startswith("2026-09-21 10:30:00")) == 1, final
+        assert ("codex", "old", "2026-09-10 10:00:00") in [
+            (c, s, str(ts)) for c, s, ts in final], final
+    finally:
+        agg.utcnow = real_utcnow
+        _reset_table_fixtures()
+        srv.shutdown()
+        srv.server_close()
+        db.close()
+
+
+def _records(cols, rows):
+    return {"output": [{"records": {
+        "schema": {"column_schemas": [{"name": c} for c in cols]},
+        "rows": rows}}], "execution_time_ms": 1}
+
+
+def _lit(text):
+    # Leading single-quoted literal ('' unescapes to ').
+    text = text.lstrip()
+    assert text.startswith("'"), text
+    out, i = [], 1
+    while i < len(text):
+        if text[i] == "'" and text[i:i + 2] == "''":
+            out.append("'")
+            i += 2
+        elif text[i] == "'":
+            return "".join(out)
+        else:
+            out.append(text[i])
+            i += 1
+    raise AssertionError("unterminated literal: " + text)
+
+
+def _split_cells(tup):
+    parts, cur, quoted, i = [], "", False, 0
+    while i < len(tup):
+        ch = tup[i]
+        if quoted:
+            if ch == "'" and tup[i:i + 2] == "''":
+                cur += "''"
+                i += 2
+                continue
+            if ch == "'":
+                quoted = False
+            cur += ch
+        elif ch == "'":
+            quoted = True
+            cur += ch
+        elif ch == ",":
+            parts.append(cur.strip())
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    parts.append(cur.strip())
+    return parts
+
+
+def _lit_rows(stmt):
+    # Session INSERT tuples in column order: session_start, session_id,
+    # client, ..., input_tokens, output_tokens, ... cost_usd. Only the
+    # persisted-state cells below are extracted; the rest ride along.
+    vals = stmt.split("VALUES", 1)[1]
+    tuples, depth, quoted, buf = [], 0, False, ""
+    i, n = 0, len(vals)
+    while i < n:
+        ch = vals[i]
+        if quoted:
+            if ch == "'" and vals[i:i + 2] == "''":
+                buf += "''"
+                i += 2
+                continue
+            if ch == "'":
+                quoted = False
+            if depth:
+                buf += ch
+        elif ch == "'":
+            quoted = True
+            if depth:
+                buf += ch
+        elif ch == "(":
+            if depth:
+                buf += ch
+            else:
+                buf = ""
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth:
+                buf += ch
+            else:
+                tuples.append(buf)
+        elif depth:
+            buf += ch
+        i += 1
+    out = []
+    for tup in tuples:
+        parts = _split_cells(tup)
+        def _num(text):
+            return None if text == "NULL" else float(text)
+        out.append((_lit(parts[2]), _lit(parts[1]), _lit(parts[0]),
+                    _num(parts[8]), _num(parts[9]), _num(parts[14])))
+    return out
+
 if __name__ == "__main__":
     test_sql_error_raises()
     test_per_call_billing_excludes_rollups_and_cumulative_parents()
@@ -979,4 +1227,5 @@ if __name__ == "__main__":
     test_supplemental_never_runs_without_prices_or_unverified_semantics()
     test_supplemental_cache_math_invalid_data_and_receipt_suppression()
     test_price_loader_caches_refresh_failure_and_rejects_bad_payload()
-    print("test_database: ok (33 tests)")
+    test_session_batch_replacement_isolation_and_failure_keeps_anchor()
+    print("test_database: ok (34 tests)")

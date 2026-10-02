@@ -1087,9 +1087,10 @@ def run_battery(ctx, cfg, now_ns=None):
             base_url, auth, db, scope, windows, max_rows)
     all_rows = []
     for scope in sorted(scopes, key=repr):
-        sig_scope = [s for s in signals
-                     if (s["vehicle"], s["source"], s["decode_epoch"])
-                     == scope]
+        sig_scope = bc.prepare_signals(
+            [s for s in signals
+             if (s["vehicle"], s["source"], s["decode_epoch"])
+             == scope])
         ev_scope = [e for e in events
                     if (e["vehicle"], e["source"], e.get("decode_epoch"))
                     == scope]

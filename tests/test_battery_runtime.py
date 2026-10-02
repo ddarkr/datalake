@@ -530,6 +530,25 @@ def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
             "SELECT COUNT(*) FROM vehicle_analysis WHERE window_start=?",
             (br.ns_to_sql_ts(9 * hour),)).fetchone() == (0,)
 
+def test_prepared_scope_rows_do_not_mutate_across_windows():
+    hour = br.HOUR_NS
+    first = _sig("v", "fleet", "e1", 8 * hour + 1, field="Soc", value=60.0,
+                 unit="%", quality="valid")
+    second = _sig("v", "fleet", "e1", 9 * hour + 1, field="Soc", value=61.0,
+                  unit="%", quality="valid")
+    prepared = bc.prepare_signals([first, second])
+    snapshot = [dict(r) for r in prepared]
+    import battery_conditions as co
+    one = {"window_start_ns": 8 * hour, "window_end_ns": 9 * hour - 1}
+    two = {"window_start_ns": 9 * hour, "window_end_ns": 10 * hour - 1}
+    first_out = co.analyze(prepared, [], one)
+    assert prepared == snapshot
+    second_out = co.analyze(prepared, [], two)
+    assert prepared == snapshot
+    fresh = co.analyze([first, second], [], two)
+    assert second_out == fresh
+    assert first_out != second_out
+
 
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))

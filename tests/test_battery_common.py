@@ -383,6 +383,34 @@ def test_revision_canonical_over_dict_order():
     assert bc.revision_id({"a": 1}) != bc.revision_id({"a": 2})
 
 
+def test_normalize_signals_detaches_prepared_rows():
+    rows = bc.prepare_signals([sig(100, num=1.0), sig(200, num=2.0)])
+    got = bc.normalize_signals(rows)
+    assert got == list(rows) and all(g is not r for g, r in zip(got, rows))
+    got[0]["value_num"] = 9.0
+    assert rows[0]["value_num"] == 1.0
+    assert bc.normalize_signals(rows)[0]["value_num"] == 1.0
+
+
+def test_normalize_signals_raw_preserves_dup_and_invalid_order():
+    bad_time = dict(sig(100, num=1.0), event_time_ns="bad")
+    rows = [bad_time, sig(100, num=1.0), sig(100, num=2.0),
+            sig(200, num=None, quality="invalid")]
+    got = bc.normalize_signals(rows)
+    assert [r["value_num"] for r in got] == [1.0, 2.0, None]
+    assert bc.normalize_signals(None) == [] and bc.normalize_signals([]) == []
+
+
+def test_join_batched_matches_sequential_probes():
+    primaries = [sig(t, num=1.0) for t in (100, 200, 300)]
+    secondaries = [sig(90, num=5.0), sig(190, num=6.0),
+                   sig(290, num=7.0)]
+    batched = bc.join_asof(primaries, secondaries, 50)
+    sequential = [bc.join_asof([p], secondaries, 50)[0][1]
+                  for p in primaries]
+    assert [m for _, m in batched] == sequential
+    assert [m["value_num"] for m in sequential] == [5.0, 6.0, 7.0]
+
 def _ddls():
     return dict(db_init.ddl_statements(""))
 def test_signal_schema_extends_safely():

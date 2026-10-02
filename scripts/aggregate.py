@@ -1955,18 +1955,18 @@ def ai_section(ctx, cfg):
         "SELECT client, session_id, session_start FROM ai_session_summary", cfg["max_rows"])
     expired = {(client, sid) for client, sid, start in old_rows
                if not fully_retained(parse_ts(start), ttl, now, bound)}
+    session_cols = ["session_start", "session_id", "client", "provider", "models",
+                    "model_count", "session_end", "duration_s", "input_tokens",
+                    "output_tokens", "cache_read_tokens", "cache_write_tokens",
+                    "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
+                    "cost_estimated_usd", "cost_unpriced_calls",
+                    "llm_spans", "tool_calls", "error_count"] + list(ACTIVITY_FIELDS) + [
+                    "repo", "branch", "outcome", "activity_sources"]
+    pending = []
     for key, s in sessions.items():
         if key in expired or not fully_retained(s.get("session_start"), ttl, now, bound):
             continue  # Stored anchors also detect an already-expired raw head.
-        insert_rows(base_url, auth, db, "ai_session_summary",
-                    ["session_start", "session_id", "client", "provider", "models",
-                     "model_count", "session_end", "duration_s", "input_tokens",
-                     "output_tokens", "cache_read_tokens", "cache_write_tokens",
-                     "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
-                     "cost_estimated_usd", "cost_unpriced_calls",
-                     "llm_spans", "tool_calls", "error_count"] + list(ACTIVITY_FIELDS) +
-                    ["repo", "branch", "outcome", "activity_sources"],
-                    [[ts_lit(s["session_start"]), str_lit(s["session_id"]),
+        pending.append((s, [ts_lit(s["session_start"]), str_lit(s["session_id"]),
                       str_lit(s["client"]), str_lit(s.get("provider")),
                       str_lit(json.dumps(s["models"])) if s.get("models") else "NULL",
                       num_lit(s.get("model_count")), ts_lit(s.get("session_end")),
@@ -1979,47 +1979,62 @@ def ai_section(ctx, cfg):
                       num_lit(s.get("tool_calls")), num_lit(s.get("errors"))] +
                      [num_lit(s.get(field)) for field in ACTIVITY_FIELDS] +
                      [str_lit(s.get(field)) for field in ("repo", "branch", "outcome")] +
-                     [str_lit(json.dumps(s.get("activity_sources") or {}, sort_keys=True))]])
-        request_sql(base_url, auth, db,
-                    "DELETE FROM ai_session_summary WHERE session_id = " +
-                    str_lit(s["session_id"]) + " AND client = " +
-                    str_lit(s["client"]) + " AND session_start != " + ts_lit(s["session_start"]))
-        total += 1
+                     [str_lit(json.dumps(s.get("activity_sources") or {}, sort_keys=True))]))
+    if pending:
+        # All eligible session batches land before any scoped stale-start
+        # delete: a failed batch keeps old anchors (restart converges).
+        insert_rows(base_url, auth, db, "ai_session_summary",
+                    session_cols, [row for _, row in pending])
+        for s, _ in pending:
+            request_sql(base_url, auth, db,
+                        "DELETE FROM ai_session_summary WHERE session_id = " +
+                        str_lit(s["session_id"]) + " AND client = " +
+                        str_lit(s["client"]) + " AND session_start != " + ts_lit(s["session_start"]))
+        total += len(pending)
+    activity_cols = ["day_start", "client"] + list(ACTIVITY_FIELDS) + ["activity_sources"]
+    activity_rows = []
     for day in activity_days:
         if bound and day["day_start"] < bound:
             continue
-        insert_rows(base_url, auth, db, "ai_activity_daily",
-                    ["day_start", "client"] + list(ACTIVITY_FIELDS) + ["activity_sources"],
-                    [[ts_lit(day["day_start"]), str_lit(day["client"])] +
+        activity_rows.append([ts_lit(day["day_start"]), str_lit(day["client"])] +
                      [num_lit(day.get(field)) for field in ACTIVITY_FIELDS] +
-                     [str_lit(json.dumps(day.get("activity_sources") or {}, sort_keys=True))]])
-        total += 1
-    for d in summarize_daily(spans, prices):
-        if bound and d["day"] < bound:
-            continue  # partly expired day: keep the old row
-        insert_rows(base_url, auth, db, "ai_daily_summary",
-                    ["day_start", "client", "provider", "model", "input_tokens",
+                     [str_lit(json.dumps(day.get("activity_sources") or {}, sort_keys=True))])
+    if activity_rows:
+        insert_rows(base_url, auth, db, "ai_activity_daily",
+                    activity_cols, activity_rows)
+        total += len(activity_rows)
+    daily_cols = ["day_start", "client", "provider", "model", "input_tokens",
                      "output_tokens", "cache_read_tokens", "cache_write_tokens",
                      "reasoning_tokens", "total_tokens", "cost_usd", "cost_source",
                      "cost_estimated_usd", "cost_unpriced_calls",
-                     "llm_spans", "tool_calls", "active_sessions", "error_count"],
-                    [[ts_lit(d["day"]), str_lit(d["client"]), str_lit(d["provider"]),
+                     "llm_spans", "tool_calls", "active_sessions", "error_count"]
+    daily_rows = []
+    for d in summarize_daily(spans, prices):
+        if bound and d["day"] < bound:
+            continue  # partly expired day: keep the old row
+        daily_rows.append([ts_lit(d["day"]), str_lit(d["client"]), str_lit(d["provider"]),
                       str_lit(d["model"]), num_lit(d["input"]), num_lit(d["output"]),
                       num_lit(d["cache_read"]), num_lit(d["cache_write"]),
                       num_lit(d["reasoning"]), num_lit(d["total"]), num_lit(d["cost"]),
                       str_lit(d["cost_source"]), num_lit(d.get("cost_estimated_usd")),
                       num_lit(d.get("cost_unpriced_calls")), num_lit(d["llm_spans"]),
                       num_lit(d["tool_calls"]), num_lit(d["sessions"]),
-                      num_lit(d["errors"])]])
-        total += 1
+                      num_lit(d["errors"])])
+    if daily_rows:
+        insert_rows(base_url, auth, db, "ai_daily_summary",
+                    daily_cols, daily_rows)
+        total += len(daily_rows)
+    tool_cols = ["day_start", "tool_name", "client", "calls", "errors", "avg_duration_ms"]
+    tool_rows = []
     for t in summarize_tools(spans):
         if bound and t["day"] < bound:
             continue  # partly expired day: keep the old row
+        tool_rows.append([ts_lit(t["day"]), str_lit(t["tool"]), str_lit(t["client"]),
+                      num_lit(t["calls"]), num_lit(t["errors"]), num_lit(t["avg_ms"])])
+    if tool_rows:
         insert_rows(base_url, auth, db, "ai_tool_daily",
-                    ["day_start", "tool_name", "client", "calls", "errors", "avg_duration_ms"],
-                    [[ts_lit(t["day"]), str_lit(t["tool"]), str_lit(t["client"]),
-                      num_lit(t["calls"]), num_lit(t["errors"]), num_lit(t["avg_ms"])]])
-        total += 1
+                    tool_cols, tool_rows)
+        total += len(tool_rows)
     return total
 
 

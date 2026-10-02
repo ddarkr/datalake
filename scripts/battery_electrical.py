@@ -1218,15 +1218,6 @@ def _battery_temp_timeline(rows, field, temp_units, has_top_calibration):
     return _field_timeline(native_rows, field, "celsius", {}, False)
 
 
-def _scope_rows(signals):
-    normed = []
-    for raw in signals or []:
-        sig = bc.normalize_signal(raw)
-        if sig is not None:
-            normed.append(sig)
-    return normed
-
-
 def _row_usable(row, field, expected_unit, field_units, has_top_calibration):
     """Physical usability: measurable value/quality AND a calibrated unit.
 
@@ -1309,7 +1300,7 @@ def analyze(signals, events, config):
                                         window, ALGORITHM_VERSION)))
         return rows
     decision = bc.to_ns(cfg_all.get("decision_time_ns"))
-    rows_all = _scope_rows(signals)
+    rows_all = bc.normalize_signals(signals)
     excluded_unknown = excluded_late = 0
     if decision is not None:
         kept = []
