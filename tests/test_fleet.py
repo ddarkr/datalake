@@ -824,6 +824,84 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.assertEqual(uploaded, 2)
         conn.close()
 
+    def test_migrated_mixed_outbox_uploads_chronologically_with_ack_replay(self):
+        # Old-schema pending row survives migration next to new signal/event
+        # rows; uploads stay chronological and failed acks retain rows.
+        old_ns = fr.parse_created_at("2026-09-26T13:00:01Z")
+        raw = sqlite3.connect(self.db_path, timeout=30)
+        raw.execute("CREATE TABLE outbox(event_id TEXT PRIMARY KEY,"
+                    " event_time INTEGER NOT NULL, vehicle TEXT NOT NULL,"
+                    " path TEXT NOT NULL, source TEXT NOT NULL,"
+                    " decode_epoch TEXT NOT NULL, value_num REAL,"
+                    " value_text TEXT, value_bool INTEGER, unit TEXT,"
+                    " vss_version TEXT, vehicle_firmware TEXT,"
+                    " dbc_primary_commit TEXT, dbc_supplemental_commit TEXT,"
+                    " dbc_override_version TEXT, dbc_override_commit TEXT,"
+                    " mapping_revision TEXT, collector_version TEXT,"
+                    " ingest_time INTEGER NOT NULL, source_system TEXT,"
+                    " source_field TEXT, collector_id TEXT,"
+                    " source_is_resend INTEGER)")
+        raw.execute("INSERT INTO outbox(event_id, event_time, vehicle, path,"
+                    " source, decode_epoch, value_num, ingest_time)"
+                    " VALUES('old-id', ?, 'my-tesla',"
+                    " 'Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed',"
+                    " 'fleet', 'fleet-v1', 59.0, ?)", (old_ns, old_ns + 1))
+        raw.commit()
+        raw.close()
+        conn = fr.open_outbox(self.db_path)
+        stats = fr.default_stats()
+        for sec in (0, 2):
+            payload = json.dumps({
+                "vin": "5YJ3E1EB1NF123456",
+                "createdAt": f"2026-09-26T13:00:{sec:02d}Z",
+                "data": [{"key": "Soc", "value": {"longValue": "59"}}],
+            }).encode()
+            self.assertEqual(fr.process_frame(conn, "tesla_V", payload, self.META, stats), 1)
+        alert = json.dumps({
+            "vin": "5YJ3E1EB1NF123456",
+            "createdAt": "2026-09-26T13:00:01Z",
+            "alerts": [{"name": "bms_a035",
+                        "startedAt": "2026-09-26T12:00:00Z"}],
+        }).encode()
+        self.assertEqual(fr.process_frame(conn, "tesla_alerts", alert, self.META, stats), 1)
+        # Reopen: old row kept, redelivery deduped.
+        conn.close()
+        conn = fr.open_outbox(self.db_path)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 3)
+        dup = json.dumps({
+            "vin": "5YJ3E1EB1NF123456",
+            "createdAt": "2026-09-26T13:00:00Z",
+            "data": [{"key": "Soc", "value": {"longValue": "59"}}],
+        }).encode()
+        self.assertEqual(fr.process_frame(conn, "tesla_V", dup, self.META, stats), 0)
+        # Chronological signal upload: oldest two first, newest stays queued.
+        t0 = fr.parse_created_at("2026-09-26T13:00:00Z")
+        t2 = fr.parse_created_at("2026-09-26T13:00:02Z")
+        uploaded = fr.upload_tick(conn, self.base_url, "datalake", "user", "pw", batch_size=2)
+        self.assertEqual(uploaded, 2)
+        sql = FakeGreptimeServer.received_stmts[-1]
+        self.assertLess(sql.index(str(t0)), sql.index(str(old_ns)))
+        self.assertNotIn(str(t2), sql)
+        self.assertIn("'old-id'", sql)
+        # Failed ack retains the queued rows for replay.
+        FakeGreptimeServer.mode = "error"
+        try:
+            with self.assertRaises(fr.SqlError):
+                fr.upload_tick(conn, self.base_url, "datalake", "user", "pw", batch_size=2)
+        finally:
+            FakeGreptimeServer.mode = "ok"
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox_events").fetchone()[0], 1)
+        # Replay drains the remaining signal plus the event exactly once.
+        rest = fr.upload_tick(conn, self.base_url, "datalake", "user", "pw", batch_size=2)
+        self.assertEqual(rest, 2)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox_events").fetchone()[0], 0)
+        stmts = [s for s in FakeGreptimeServer.received_stmts if "VALUES" in s]
+        self.assertEqual(sum(s.count("'old-id'") for s in stmts), 1)
+        self.assertIn("'bms_a035'", stmts[-1])
+        conn.close()
+
     def test_can_and_fleet_aggregation_isolation(self):
         base_time = datetime(2026, 9, 26, 13, 0, 0, tzinfo=timezone.utc)
         cols = ["event_time", "vehicle", "path", "source", "decode_epoch",

@@ -1224,12 +1224,10 @@ def _store_row(conn, table, columns, row, max_rows):
         return 0
     if outbox_pending_total(conn) >= max_rows:
         return -1  # Capacity overflow: reject new arrival, keep unacked rows
-    existing = _existing_columns(conn, table)
-    write_cols = [c for c in columns if c in existing] if existing else list(columns)
     cur = conn.execute(
-        "INSERT OR IGNORE INTO " + table + "(" + ",".join(write_cols) + ")"
-        " VALUES(" + ",".join("?" * len(write_cols)) + ")",
-        [row[c] for c in write_cols])
+        "INSERT OR IGNORE INTO " + table + "(" + ",".join(columns) + ")"
+        " VALUES(" + ",".join("?" * len(columns)) + ")",
+        [row[c] for c in columns])
     inserted = cur.rowcount > 0
     conn.execute("INSERT OR IGNORE INTO seen_ids(event_id, seen_at) VALUES(?,?)",
                  (key, now_ns()))
@@ -1251,6 +1249,9 @@ def open_outbox(path):
         col = stmt.split()[-2]
         if col not in existing:
             conn.execute(stmt)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_event_time ON outbox(event_time)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_outbox_events_event_time"
+                 " ON outbox_events(event_time)")
     conn.commit()
     return conn
 
@@ -1499,11 +1500,6 @@ def process_frame(conn, topic, payload_bytes, meta_env, stats,
 
 def _upload_table(conn, table, columns, dest_table, base_url, db, user,
                   password, batch_size):
-    existing = _existing_columns(conn, table)
-    if existing and table == "outbox":
-        missing = [c for c in COLUMNS if c not in existing]
-        if missing:
-            return 0  # Old DB mid-migration: next open_outbox migrates.
     cur = conn.execute(
         "SELECT " + ",".join(columns) + " FROM " + table
         + " ORDER BY event_time ASC LIMIT ?",
