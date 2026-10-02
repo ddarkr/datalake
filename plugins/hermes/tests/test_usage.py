@@ -293,6 +293,56 @@ class TransportTests(unittest.TestCase):
 
 
 class ConfigTests(unittest.TestCase):
+    def test_private_http_transport_requires_exact_endpoint_opt_in(self):
+        import tempfile
+        class Context:
+            def __init__(self, **values):
+                self.values = values
+            def get_config(self, key, default=None):
+                return self.values.get(key, default)
+        approved = 'http://192.168.99.10:14318/v1/traces'
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            with self.assertRaises(ValueError):
+                plugin.settings(Context(endpoint=approved), home, environ={})
+            actual = plugin.settings(Context(endpoint=approved, approved_private_http_endpoint=approved), home, environ={})
+            self.assertEqual(actual['endpoint'], approved)
+            for endpoint in [approved.replace('.214:', '.213:'), approved.replace(':14318/', ':4318/'),
+                             approved.replace('/v1/traces', ''), approved + '/',
+                             'ftp://192.168.99.10:14318/v1/traces']:
+                with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                    plugin.settings(Context(endpoint=endpoint, approved_private_http_endpoint=approved), home, environ={})
+
+    def test_private_http_approval_rejects_nonliteral_or_unsafe_targets(self):
+        import tempfile
+        class Context:
+            def __init__(self, endpoint, approval=None):
+                self.values = {'endpoint': endpoint, 'approved_private_http_endpoint': endpoint if approval is None else approval}
+            def get_config(self, key, default=None):
+                return self.values.get(key, default)
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            invalid = ['http://8.8.8.8:14318/v1/traces', 'http://example.org:14318/v1/traces',
+                       'http://192.168.99.10.nip.io:14318/v1/traces', 'http://192.168.99.10/v1/traces',
+                       'http://192.168.99.10:0/v1/traces', 'http://192.168.99.10:65536/v1/traces',
+                       'http://@192.168.99.10:14318/v1/traces', 'http://user@192.168.99.10:14318/v1/traces',
+                       'http://192.168.99.10:14318/v1/traces?', 'http://192.168.99.10:14318/v1/traces#',
+                       'http://192.168.99.10:14318/v1/traces?x=1', 'http://192.168.99.10:14318/v1/traces#x',
+                       'http://192.168.99.10:14318/other', 'http://192.168.99.10:14318/v1/traces/',
+                       'http://192.168.99.10:14318/a/../v1/traces', 'http://192.168.000.214:14318/v1/traces',
+                       'http://3232235734:14318/v1/traces', 'http://169.254.169.254:14318/v1/traces',
+                       'http://[::ffff:192.168.99.10]:14318/v1/traces', 'http://[fe80::1%en0]:14318/v1/traces',
+                       'ftp://192.168.99.10:14318/v1/traces']
+            for endpoint in invalid:
+                with self.subTest(endpoint=endpoint), self.assertRaises(ValueError):
+                    plugin.settings(Context(endpoint), home, environ={})
+            for approval in (True, [], {}, 1):
+                with self.subTest(approval=approval), self.assertRaises(ValueError):
+                    plugin.settings(Context('https://example.org', approval), home, environ={})
+            for endpoint in ('http://10.0.0.1:4318/v1/traces', 'http://172.16.0.1:4318/v1/traces',
+                             'http://[fd00::1]:4318/v1/traces', 'http://127.0.0.1:4318/v1/traces'):
+                self.assertEqual(plugin.settings(Context(endpoint), home, environ={})['endpoint'], endpoint)
+
     def test_auxiliary_capture_requires_explicit_boolean_opt_in(self):
         import tempfile
         class Context:
