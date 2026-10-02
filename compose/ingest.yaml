@@ -469,7 +469,7 @@ configs:
         topic_tag = "topic"
         qos = 1
         persistent_session = true
-        client_id = "${MQTT_CLIENT_ID:-doda-datalake-telegraf}"
+        client_id = "${MQTT_CLIENT_ID:-datalake-telegraf}"
         username = "$${MQTT_USERNAME}"
         password = "$${MQTT_PASSWORD}"
         max_undelivered_messages = 1000

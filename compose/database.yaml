@@ -11,12 +11,11 @@
 # no new service/volumes). All battery Python modules mount read-only via
 # x-source configs; the aggregate image stays stdlib-only (no scipy:
 # battery_reference .mat loading needs scipy and is unavailable in aggregate,
-# its stdlib record/JSON helpers stay importable). The analysis JSON mounts
-# read-only from config/battery-analysis.example.json; uncalibrated defaults
-# yield unavailable rows, never guessed Tesla chemistry or fake models.
-# Optional operator calibration/model files, whenever needed, arrive as
-# further read-only x-source configs pointing at repo-tracked files only;
-# host bind mounts, file: refs, and absolute host paths stay banned.
+# its stdlib record/JSON helpers stay importable). Analysis JSON mounts
+# read-only from a native Compose config. Public defaults are {}; operator
+# calibration/model JSON comes from the private .env or Compose override.
+# x-source paths are constrained to the repository, not checked against Git;
+# never embed private data in tracked fragments or the generated bundle.
 
 services:
   db-schema:
@@ -147,4 +146,4 @@ configs:
   battery_runtime_py:
     x-source: scripts/battery_runtime.py
   battery_analysis_json:
-    x-source: config/battery-analysis.example.json
+    content: ${BATTERY_ANALYSIS_CONFIG_JSON:-{}}

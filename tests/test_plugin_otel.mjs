@@ -78,7 +78,7 @@ try {
   assert.throws(() => validateConfig({ endpoint, headers: { Authorization: 'line\r\ninjection' } }));
   assert.deepEqual(parseHeaders('Authorization=Basic%20a%3Db%3D'), { Authorization: 'Basic a=b=' });
   assert.equal(validateConfig({ endpoint: endpoint + '/v1/traces' }).endpoint, endpoint + '/v1/traces');
-  const lanEndpoint = 'http://192.168.99.10:14318';
+  const lanEndpoint = 'http://192.168.99.10:4318';
   assert.throws(() => validateConfig({ endpoint: lanEndpoint }));
   assert.throws(() => validateConfig({ endpoint: lanEndpoint, allowInsecureHttp: 'true' }));
   assert.equal(validateConfig({ endpoint: lanEndpoint, allowInsecureHttp: true }).endpoint, lanEndpoint + '/v1/traces');

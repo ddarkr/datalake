@@ -13841,7 +13841,7 @@ configs:
 
       Env (exact names, coordinated with BatteryIntegrationPackaging):
         BATTERY_ANALYSIS_CONFIG default /app/battery-analysis.json (read-only
-          mount of config/battery-analysis.example.json via x-source). Only an
+          native Compose config; private JSON or uncalibrated {}). Only an
           intentionally absent config (empty value or missing default path)
           yields uncalibrated ({}); a missing EXPLICITLY configured path is a
           config_missing error (visible error rows, never silent uncalibrated).
@@ -15208,9 +15208,7 @@ configs:
       if __name__ == "__main__":
           raise SystemExit(main())
   battery_analysis_json:
-    content: |
-      {}
-
+    content: ${BATTERY_ANALYSIS_CONFIG_JSON:-{}}
   trace_privacy_script:
     content: |
       #!/usr/bin/env python3
@@ -15704,7 +15702,7 @@ configs:
         topic_tag = "topic"
         qos = 1
         persistent_session = true
-        client_id = "${MQTT_CLIENT_ID:-doda-datalake-telegraf}"
+        client_id = "${MQTT_CLIENT_ID:-datalake-telegraf}"
         username = "$${MQTT_USERNAME}"
         password = "$${MQTT_PASSWORD}"
         max_undelivered_messages = 1000

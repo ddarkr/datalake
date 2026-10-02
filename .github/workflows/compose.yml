@@ -2,16 +2,39 @@ name: Compose validation
 
 on:
   push:
+  pull_request:
 
 permissions:
   contents: read
 
 jobs:
-  validate:
+  secrets:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Scan working tree and full history with pinned Gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -eu
+          curl --fail --silent --show-error --location -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP"
+          "$RUNNER_TEMP/gitleaks" dir . --redact=100 --ignore-gitleaks-allow
+          "$RUNNER_TEMP/gitleaks" git . --redact=100 --ignore-gitleaks-allow \
+            --log-opts="--all --full-history"
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
@@ -32,6 +55,22 @@ jobs:
         run: |
           python tools/check_env.py
           python tests/test_render.py
+      - name: Check offline Python regressions (no credentials or services)
+        run: |
+          python tests/test_trace_privacy.py
+          python tests/test_backup.py
+          python tests/test_storage.py
+          python tests/test_database.py
+          python tests/test_dashboards.py
+          python tests/test_activity.py
+          python tests/test_vehicle_aggregate.py
+          python tests/test_fleet.py
+          python tests/test_raw.py
+          python tests/test_redecode.py
+          python tests/test_can_validation.py
+          python tests/test_vss.py
+          python tests/test_vss_setup.py
+          for f in tests/test_battery_*.py; do python "$f"; done
       - name: Check generated deployment bundle is current
         run: |
           python tools/render.py \

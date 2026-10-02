@@ -135,6 +135,26 @@ COMPOSE_PROFILES=redecode docker compose --env-file .env run --rm redecode
 
 수집 계약과 배터리 분석의 조건·제한은 [Tesla Fleet Telemetry 문서](tesla_fleet.md)를 참고하세요.
 
+### 배터리 교정과 모델을 비공개로 주입하기
+
+공개 기본 설정은 미교정 `{}`이며, [설정 구조 예제](../config/battery-analysis.example.json)의 각 모듈도 비어 있습니다. 개인 차량 식별자·교정값·학습 모델을 이 예제나 `compose.yaml`에 추가해 커밋하지 마세요.
+
+기존 설정 로더는 `/app/battery-analysis.json`을 읽습니다. Compose가 비공개 `.env`의 `BATTERY_ANALYSIS_CONFIG_JSON` 값을 해당 read-only config 파일로 전달하므로 서버 배포는 계속 `compose.yaml`과 `.env` 두 파일만 사용합니다. 값이 없으면 `{}`가 전달됩니다.
+
+```dotenv
+BATTERY_ANALYSIS_CONFIG_JSON='{"conditions":{},"energy":{},"electrical":{},"rul":{},"alerts":{}}'
+```
+
+위 값은 미교정 예제입니다. 실제 JSON은 확인된 차량·source·epoch·domain·단위에 맞춰 `.env` 안에서만 편집하고 파일 권한을 `600`으로 제한하세요. 작은따옴표로 감싼 dotenv 값은 `$`의 변수 치환을 막습니다. 전체 `docker compose config` 출력에는 교정 정보와 인증값이 포함될 수 있으므로 구조 검사는 `config --quiet`로 수행합니다.
+
+환경변수 대신 비공개 `compose.private.yaml`에서 `configs.battery_analysis_json.content`를 교체할 수도 있습니다. 이 파일도 Git 밖에 보관하며, 아래 명령에는 실제 파일 경로를 사용합니다. 명령은 기본 Compose와 private override를 명시적으로 함께 읽습니다.
+
+```bash
+docker compose --env-file .env -f compose.yaml -f /private/path/compose.private.yaml config --quiet
+```
+
+Compose 관리 도구가 단일 파일만 읽는다면 `.env` 주입 방식을 사용하세요. 교정값이 없는 기본값이나 잘못된 명시적 설정은 정상·0으로 처리하지 않습니다. 적용 전 설정을 보존하고 설정 파일의 존재·파싱·scope와 필요한 분석 결과를 확인하세요.
+
 ## Grafana와 데이터 해석
 
 12개 대시보드를 자동 provisioning합니다.

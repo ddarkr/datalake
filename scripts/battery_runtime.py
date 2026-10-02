@@ -8,7 +8,7 @@ called from aggregate.py battery_section and from its own one-shot CLI.
 
 Env (exact names, coordinated with BatteryIntegrationPackaging):
   BATTERY_ANALYSIS_CONFIG default /app/battery-analysis.json (read-only
-    mount of config/battery-analysis.example.json via x-source). Only an
+    native Compose config; private JSON or uncalibrated {}). Only an
     intentionally absent config (empty value or missing default path)
     yields uncalibrated ({}); a missing EXPLICITLY configured path is a
     config_missing error (visible error rows, never silent uncalibrated).

@@ -485,7 +485,7 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         "vehicle_firmware": "",
         "mapping_revision": "fleet-v1",
         "collector_version": "tesla-fleet-recorder-1",
-        "collector_id": "fleet-collector-1",
+        "collector_id": "collector-under-test",
         "config_version": "",
     }
 
@@ -560,7 +560,7 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.assertIn("'fleet'", sql)
         self.assertIn("'tesla_fleet_telemetry'", sql)
         self.assertIn("'my-tesla'", sql)
-        self.assertIn("'fleet-collector-1'", sql)
+        self.assertIn("'collector-under-test'", sql)
         self.assertIn("FALSE", sql)  # source_is_resend is False
 
         # All 8 telemetry-config.sh fields are verified in output
