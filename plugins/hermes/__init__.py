@@ -1,5 +1,6 @@
 """Native metadata-only Hermes usage observer; no SDK or core patches."""
 import hashlib
+import ipaddress
 import json
 import math
 import re
@@ -96,8 +97,26 @@ def settings(ctx, home, environ=None):
     url = urlsplit(endpoint)
     if url.username or url.password or url.query or url.fragment or not url.hostname:
         raise ValueError('invalid endpoint')
+    approved = ctx.get_config('approved_private_http_endpoint', '')
+    if type(approved) is not str:
+        raise ValueError('private HTTP approval must be an exact URL string')
+    if approved:
+        # Do not use is_private: it also includes link-local/reserved ranges.
+        if len(approved) > 2048 or re.search(r'[\s\x00-\x1f\x7f@?#%]', approved):
+            raise ValueError('invalid private HTTP approval')
+        target = urlsplit(approved)
+        address = ipaddress.ip_address(target.hostname or '')
+        networks = ('10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '127.0.0.0/8', 'fc00::/7', '::1/128')
+        if not any(address in ipaddress.ip_network(net) for net in networks):
+            raise ValueError('private literal IP required')
+        if target.scheme != 'http' or target.path != '/v1/traces' or target.port is None or not 1 <= target.port <= 65535:
+            raise ValueError('exact HTTP OTLP path and explicit port required')
+        host = '[' + str(address) + ']' if address.version == 6 else str(address)
+        if approved != f'http://{host}:{target.port}/v1/traces':
+            raise ValueError('canonical private HTTP URL required')
     if url.scheme != 'https' and not (url.scheme == 'http' and url.hostname in ('localhost', '127.0.0.1', '::1')):
-        raise ValueError('HTTPS required outside loopback')
+        if url.scheme != 'http' or endpoint != approved:
+            raise ValueError('HTTPS required outside loopback unless exact endpoint approved')
     path = url.path.rstrip('/')
     endpoint = urlunsplit((url.scheme, url.netloc, path if path.endswith('/v1/traces') else path + '/v1/traces', '', ''))
     secret = environ.get('DATALAKE_HERMES_OTLP_HEADERS')
