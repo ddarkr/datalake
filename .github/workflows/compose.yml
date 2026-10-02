@@ -26,6 +26,8 @@ jobs:
         run: |
           npm ci --prefix plugins --ignore-scripts --no-audit --no-fund
           node --test tests/test_plugin_*.mjs
+      - name: Check Hermes metadata-only usage exporter
+        run: python -m unittest discover -s plugins/hermes/tests -v
       - name: Check environment contract and renderer regressions
         run: |
           python tools/check_env.py

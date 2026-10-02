@@ -1,0 +1,29 @@
+manifest_version: 2
+name: datalake-usage
+version: "1.0.0"
+description: "Metadata-only request usage to OTLP with a private durable SQLite outbox. Opt-in."
+kind: standalone
+provides_hooks:
+  - post_api_request
+  - post_auxiliary_call
+config_schema:
+  endpoint:
+    type: string
+    description: "OTLP HTTP collector URL; HTTPS except loopback. Empty disables export."
+    default: ""
+  capture_auxiliary:
+    type: boolean
+    default: false
+    description: "Capture auxiliary calls; opt-in can double count nonstreaming main MoA aggregators. Main-only is conservative default."
+  export_paused:
+    type: boolean
+    default: false
+    description: "Spool usage locally without claiming or sending pending events; reload to apply."
+  timeout_seconds:
+    type: number
+    default: 2
+    description: "HTTP socket timeout, 0.1 to 5 seconds."
+  capacity:
+    type: integer
+    default: 100000
+    description: "Maximum ledger identities including delivered tombstones; no silent eviction."
