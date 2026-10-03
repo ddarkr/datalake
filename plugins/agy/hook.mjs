@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { readFile, writeFile, unlink, mkdir, stat, appendFile } from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
+import { readFile, writeFile, unlink, mkdir, stat, appendFile, rename } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { join, isAbsolute } from 'node:path';
-import { createTelemetry, repositoryContext, isMain } from '../otel.mjs';
+import { createTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
 
 async function resolveConfigPath() {
   if (process.env.DATALAKE_OTEL_CONFIG) return process.env.DATALAKE_OTEL_CONFIG;
@@ -26,6 +27,13 @@ function toolStatePath(sessionId, stepIdx) {
 
 function cursorPath(sessionId) {
   return join(stateDir(sessionId), 'cursor.json');
+}
+
+async function save(path, value) {
+  const temporary = `${path}.${randomUUID()}`;
+  await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
+  try { await rename(temporary, path); }
+  finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
 }
 
 // 텍스트 길이 기반 고정밀 토큰 근사치 계산 (Gemini/Claude 표준: ~3.8 글자당 1토큰)
@@ -79,6 +87,16 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
 
   const turns = [];
   const subagents = [];
+  const sent = new Set(cursor.sentEventIds ?? []);
+  async function emitOnce(event, output) {
+    if (sent.has(event.eventId)) return true;
+    if (!await telemetry.emit(event)) return false;
+    sent.add(event.eventId);
+    cursor.sentEventIds = [...sent];
+    await save(cPath, cursor);
+    output.push(event);
+    return true;
+  }
 
   try {
     const raw = await readFile(transcriptPath, 'utf8');
@@ -132,8 +150,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
             },
           };
 
-          await telemetry.emit(turnEvent);
-          turns.push(turnEvent);
+          if (!await emitOnce(turnEvent, turns)) return { turns, subagents };
 
           // 서브에이전트 호출 발견 시 계층 트레이스(subagent span) 생성
           if (step.tool_calls && Array.isArray(step.tool_calls)) {
@@ -158,28 +175,37 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
                       'gen_ai.request.model': String(sa.Model || model).slice(0, 128),
                     },
                   };
-                  await telemetry.emit(subagentEvent);
-                  subagents.push(subagentEvent);
+                  if (!await emitOnce(subagentEvent, subagents)) return { turns, subagents };
                 }
               }
             }
           }
 
           cursor.lastProcessedIndex = stepIndex;
+          // A turn's checkpoint includes every child ACK; preserve partial identities on retry.
+          sent.clear();
+          cursor.sentEventIds = [];
+          await save(cPath, cursor);
         }
 
         accumulatedPromptChars += (thinkingText.length + contentText.length + toolCallsText.length);
       }
     }
 
-    // 커서 상태 저장
-    await writeFile(cPath, JSON.stringify(cursor), { mode: 0o600 });
   } catch {}
 
   return { turns, subagents };
 }
 
-export async function handleHook(payload, { telemetry, now = Date.now, cwd = process.cwd(), isPreTool = false, isPostInvocation = false } = {}) {
+export async function handleHook(payload, options = {}) {
+  const sessionId = payload?.conversationId || payload?.session_id;
+  if (!sessionId) return [];
+  const directory = stateDir(sessionId);
+  await mkdir(directory, { recursive: true, mode: 0o700 });
+  return await withStateLock(directory, () => handleSerialized(payload, options)) ?? [];
+}
+
+async function handleSerialized(payload, { telemetry, now = Date.now, cwd = process.cwd(), isPreTool = false, isPostInvocation = false } = {}) {
   const sessionId = payload?.conversationId || payload?.session_id;
   if (!sessionId) return [];
 
@@ -205,7 +231,7 @@ export async function handleHook(payload, { telemetry, now = Date.now, cwd = pro
 
     try {
       await mkdir(stateDir(sessionId), { recursive: true, mode: 0o700 });
-      await writeFile(filePath, JSON.stringify({ startTimeMs: clock, toolName }), { mode: 0o600 });
+      await writeFile(filePath, JSON.stringify({ startTimeMs: clock, toolName }), { mode: 0o600, flag: 'wx' });
     } catch {}
     return [];
   }
@@ -262,8 +288,7 @@ export async function handleHook(payload, { telemetry, now = Date.now, cwd = pro
       },
     };
 
-    await telemetry.emit(sessionEvent);
-    events.push(sessionEvent);
+    if (await telemetry.emit(sessionEvent)) events.push(sessionEvent);
   } else {
     // 3. PostToolUse: 도구 실행 완료 시 실제 소요시간 계산 및 직전 턴 증분 즉시 전송
     const stepIdx = payload.stepIdx ?? 0;
@@ -272,22 +297,22 @@ export async function handleHook(payload, { telemetry, now = Date.now, cwd = pro
     const filePath = toolStatePath(sessionId, stepIdx);
 
     let startTimeMs = clock - 50;
+    let toolState;
     try {
-      const data = JSON.parse(await readFile(filePath, 'utf8'));
-      if (data?.startTimeMs && Number.isFinite(data.startTimeMs)) {
-        startTimeMs = data.startTimeMs;
+      toolState = JSON.parse(await readFile(filePath, 'utf8'));
+      if (Number.isFinite(toolState?.startTimeMs)) {
+        startTimeMs = toolState.startTimeMs;
       }
-      if (!toolName && data?.toolName) {
-        toolName = data.toolName;
+      if (!toolName && toolState?.toolName) {
+        toolName = toolState.toolName;
       }
-      await unlink(filePath).catch(() => {});
     } catch {}
     if (!toolName) toolName = 'unknown_tool';
 
     const endTimeMs = clock;
     const durationMs = Math.max(1, endTimeMs - startTimeMs);
 
-    const toolEvent = {
+    const toolEvent = toolState?.event ?? {
       kind: 'tool.call',
       sessionId: String(sessionId),
       eventId: `tool:${stepIdx}:${toolName}`,
@@ -298,12 +323,16 @@ export async function handleHook(payload, { telemetry, now = Date.now, cwd = pro
         ...baseAttrs,
         'gen_ai.tool.name': String(toolName).slice(0, 128),
         'duration_ms': durationMs,
-        ...(isError ? { 'error.type': String(payload.error).slice(0, 256) } : {}),
+        ...(isError ? { 'error.type': 'tool_error' } : {}),
       },
     };
 
-    await telemetry.emit(toolEvent);
-    events.push(toolEvent);
+    // Retain the first observed completion and duration until the collector acknowledges it.
+    await save(filePath, { startTimeMs, toolName, event: toolEvent });
+    if (await telemetry.emit(toolEvent)) {
+      await unlink(filePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      events.push(toolEvent);
+    }
 
     // 실시간 증분 턴 전송 (세션 중 강제 종료 방지)
     const { turns, subagents } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock);

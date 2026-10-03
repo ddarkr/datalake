@@ -1,9 +1,9 @@
-import { createHash } from 'node:crypto';
-import { mkdir, open, readFile, stat, unlink, writeFile } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createTelemetry, repositoryContext, isMain } from '../otel.mjs';
+import { createTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(value) ? value : undefined;
@@ -43,19 +43,25 @@ async function json(path) {
   catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
 }
 async function save(path, value, exclusive = false) {
-  try { await writeFile(path, JSON.stringify(value), { mode: 0o600, flag: exclusive ? 'wx' : 'w' }); return true; }
-  catch (error) { if (exclusive && error.code === 'EEXIST') return false; throw error; }
+  if (exclusive) {
+    try { await writeFile(path, JSON.stringify(value), { mode: 0o600, flag: 'wx' }); return true; }
+    catch (error) { if (error.code === 'EEXIST') return false; throw error; }
+  }
+  const temporary = `${path}.${randomUUID()}`;
+  await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
+  try { await rename(temporary, path); return true; }
+  finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
 }
 
 // Only the transcript explicitly supplied by the current hook is opened; never discover sessions.
 // ponytail: scan at most 16 MiB per hook and skip >1 MiB records; native telemetry covers unrecorded usage.
 async function transcriptEvents(path, options, stateDir) {
-  if (typeof path !== 'string' || !path) return [];
+  if (typeof path !== 'string' || !path) return { events: [] };
   let file;
-  try { file = await open(path, 'r'); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  try { file = await open(path, 'r'); } catch (error) { if (error.code === 'ENOENT') return { events: [] }; throw error; }
   try {
     const info = await file.stat();
-    if (!info.isFile()) return [];
+    if (!info.isFile()) return { events: [] };
     const cursorPath = join(stateDir, `cursor-${hash(path)}.json`);
     const cursor = await json(cursorPath);
     let offset = cursor?.ino === info.ino && cursor?.offset <= info.size ? cursor.offset : 0;
@@ -87,8 +93,7 @@ async function transcriptEvents(path, options, stateDir) {
       }
       offset += bytesRead;
     }
-    await save(cursorPath, { ino: info.ino, offset: committed });
-    return [...found.values()];
+    return { events: [...found.values()], checkpoint: { path: cursorPath, value: { ino: info.ino, offset: committed } } };
   } finally { await file.close(); }
 }
 
@@ -98,6 +103,10 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
   if (!sessionId || !events.has(hook)) return;
   const stateDir = join(stateRoot, hash(sessionId));
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
+  return withStateLock(stateDir, () => handleSerialized(input, { telemetry, stateDir, now, context }, sessionId, hook));
+}
+
+async function handleSerialized(input, { telemetry, stateDir, now, context }, sessionId, hook) {
   const sessionPath = join(stateDir, 'session.json');
   let session = await json(sessionPath);
   if (hook === 'SessionStart') {
@@ -131,12 +140,13 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
   }
   async function emitOnce(event) {
     const claim = join(stateDir, `sent-${hash(event.eventId)}.json`);
-    if (!await save(claim, {}, true)) return;
-    try {
-      if (!await telemetry.emit(event)) await unlink(claim);
-    } catch (error) { await unlink(claim).catch(() => {}); throw error; }
+    if (await json(claim)) return true;
+    if (!await telemetry.emit(event)) return false;
+    await save(claim, {});
+    return true;
   }
   const completed = [];
+  let checkpoint;
   if (isTool || hook === 'SubagentStop') {
     if (eventId) {
       let event = await json(eventPath);
@@ -162,7 +172,8 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
     // Missing SubagentStart cannot distinguish a new run from historical resumed content.
     if (hook !== 'SubagentStop' || agent) {
       const usage = await transcriptEvents(transcript, { sessionId, sinceMs: agent?.startTimeMs ?? session.startTimeMs, agentId: hook === 'SubagentStop' ? agentId : undefined }, stateDir);
-      completed.push(...usage.map(event => ({ ...event, parentEventId: event.parentEventId ?? session.eventId })));
+      checkpoint = usage.checkpoint;
+      completed.push(...usage.events.map(event => ({ ...event, parentEventId: event.parentEventId ?? session.eventId })));
     }
   }
   if (session && hook === 'SessionEnd') {
@@ -173,7 +184,13 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
     }
     completed.unshift(session);
   }
-  await Promise.all(completed.map(emitOnce));
+  // Wait for every ACK before releasing serialization, including a mixed false/throw batch.
+  const delivered = await Promise.allSettled(completed.map(emitOnce));
+  if (checkpoint && delivered.every(result => result.status === 'fulfilled' && result.value)) {
+    await save(checkpoint.path, checkpoint.value);
+  }
+  const failure = delivered.find(result => result.status === 'rejected');
+  if (failure) throw failure.reason;
 }
 
 async function main() {

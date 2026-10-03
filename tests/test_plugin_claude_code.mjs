@@ -3,6 +3,7 @@ import { mkdtemp, mkdir, readFile, writeFile, appendFile, rm, stat } from 'node:
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { setTimeout as delay } from 'node:timers/promises';
 import { handleHook, usageEvent } from '../plugins/claude-code/hook.mjs';
 import { install } from '../plugins/claude-code/install.mjs';
 
@@ -70,7 +71,8 @@ test('Claude lifecycle joins stable tool/subagent IDs, records real durations an
 
 test('Claude reads only newly appended current-session records, deduplicates requests and waits for complete lines', async t => {
   const path = await sandbox(t), transcript = join(path, 'active.jsonl'), output = [];
-  await writeFile(transcript, JSON.stringify(record('historical', 500)) + '\n');
+  // Even an old record newer than the hook clock is deliberately excluded by the EOF seed.
+  await writeFile(transcript, JSON.stringify(record('historical', 1500)) + '\n');
   const invoke = hook_event_name => handleHook({ session_id: 'session_1', hook_event_name, transcript_path: transcript }, {
     stateRoot: join(path, 'state'), now: 1000, context: async () => ({}), telemetry: { emit: async event => { output.push(event); return true; } },
   });
@@ -96,6 +98,49 @@ test('Claude reads only newly appended current-session records, deduplicates req
   }
   assert.equal(JSON.stringify(output).includes(secret), false);
 });
+
+for (const failure of ['false', 'throw']) {
+  test(`Claude retries a mixed ${failure} batch across concurrent hooks without skipped or duplicate usage`, async t => {
+    const path = await sandbox(t), transcript = join(path, 'active.jsonl'), acknowledged = [], attempts = [];
+    await writeFile(transcript, '');
+    let release, entered;
+    const blocked = new Promise(resolve => { release = resolve; });
+    const started = new Promise(resolve => { entered = resolve; });
+    let fail = true;
+    const invoke = hook_event_name => handleHook({ session_id: 'session_1', hook_event_name, transcript_path: transcript }, {
+      stateRoot: join(path, 'state'), now: 1000, context: async () => ({}),
+      telemetry: { emit: async event => {
+        attempts.push(event.eventId);
+        if (event.eventId === 'message:retry' && fail) {
+          fail = false;
+          entered();
+          await blocked;
+          if (failure === 'throw') throw new Error('synthetic transport failure');
+          return false;
+        }
+        acknowledged.push(event);
+        return true;
+      } },
+    });
+    await invoke('SessionStart');
+    await appendFile(transcript, [record('accepted'), record('retry')].map(row => JSON.stringify(row)).join('\n') + '\n');
+    const first = invoke('Stop').then(() => undefined, error => error);
+    await started;
+    await appendFile(transcript, JSON.stringify(record('appended')) + '\n');
+    const concurrent = invoke('Stop');
+    await delay(20);
+    release();
+    const result = await first;
+    if (failure === 'throw') assert.match(result.message, /synthetic transport failure/);
+    else assert.equal(result, undefined);
+    await concurrent;
+    await invoke('Stop');
+    assert.deepEqual(acknowledged.map(event => event.eventId), ['message:accepted', 'message:retry', 'message:appended']);
+    assert.deepEqual(attempts.filter(id => id === 'message:accepted'), ['message:accepted']);
+    assert.deepEqual(attempts.filter(id => id === 'message:retry'), ['message:retry', 'message:retry']);
+    assert.equal(acknowledged.reduce((total, event) => total + event.attributes['gen_ai.usage.output_tokens'], 0), 21);
+  });
+}
 
 test('Claude installer is dry-run by default, preserves settings, copies a self-contained native plugin and removes only owned files', async t => {
   const home = await sandbox(t), settings = join(home, '.claude', 'settings.json');

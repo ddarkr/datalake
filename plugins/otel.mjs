@@ -1,13 +1,66 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, realpathSync, statSync } from 'node:fs';
+import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { setTimeout as delay } from 'node:timers/promises';
 
 export function isMain(url) {
   try { return fileURLToPath(url) === realpathSync(process.argv[1]); }
   catch { return false; }
+}
+
+// One native hook per session; never evict a live process just because export is slow.
+export async function withStateLock(directory, action) {
+  const lock = join(directory, 'hook.lock');
+  const candidate = `${lock}.${randomUUID()}`;
+  const ownerPath = path => join(path, 'owner.json');
+  const dead = pid => {
+    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+    try { process.kill(pid, 0); return false; }
+    catch (error) { return error.code === 'ESRCH'; }
+  };
+  const owner = async () => {
+    try { return JSON.parse(await readFile(ownerPath(lock), 'utf8')).pid; }
+    catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
+  };
+  await mkdir(candidate, { mode: 0o700 });
+  let acquired = false;
+  try {
+    await writeFile(ownerPath(candidate), JSON.stringify({ pid: process.pid }), { mode: 0o600, flag: 'wx' });
+    for (let attempt = 0; attempt < 25; attempt++) {
+      try { await rename(candidate, lock); acquired = true; break; }
+      catch (error) { if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error; }
+      if (dead(await owner())) {
+        // Only one contender reaps; recheck after claiming in case another replaced the old lock.
+        const reaping = join(lock, 'reaping');
+        try {
+          await mkdir(reaping, { mode: 0o700 });
+          let retired = false;
+          try {
+            if (dead(await owner())) {
+              const removed = `${lock}.${randomUUID()}`;
+              // Rename before deleting: never expose an empty live lock to a new contender.
+              await rename(lock, removed);
+              retired = true;
+              await rm(removed, { recursive: true, force: true });
+            }
+          } finally { if (!retired) await rm(reaping, { recursive: true, force: true }); }
+        } catch (error) { if (!['EEXIST', 'ENOENT'].includes(error.code)) throw error; }
+      }
+      await delay(10);
+    }
+    if (acquired) return await action();
+    // Contention leaves checkpoints untouched; a later native hook retries the same records.
+  } finally {
+    if (acquired) {
+      const removed = `${lock}.${randomUUID()}`;
+      await rename(lock, removed);
+      await rm(removed, { recursive: true, force: true });
+    } else await rm(candidate, { recursive: true, force: true });
+  }
 }
 
 export const defaultConfigPath = () => process.env.DATALAKE_OTEL_CONFIG || join(homedir(), '.config', 'doda-datalake', 'otel.json');

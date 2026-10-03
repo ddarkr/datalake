@@ -230,6 +230,8 @@ claude plugin list --json
 
 조직 정책, `disableAllHooks`, 명시적인 플러그인 비활성화는 우회하지 않습니다. Claude는 훅 프로세스에서 `OTEL_*` 환경 변수를 제거하므로, 이 가이드처럼 **private 설정 파일과 `--config` 경로**를 사용하세요.
 
+현재 세션 transcript의 cursor는 해당 batch의 전송 ACK를 모두 확인한 뒤 확정합니다. 일부 전송이 실패하거나 예외가 발생하면 다음 훅에서 같은 구간을 다시 읽고, 이미 ACK된 message identity는 다시 보내지 않습니다. 병행 훅은 세션별로 직렬화하며 살아 있는 프로세스의 lock을 시간만으로 빼앗지 않습니다. `SessionStart`는 기존 transcript의 EOF에서 시작하므로 재개한 과거 대화는 수집하지 않습니다.
+
 ### AGY CLI (Antigravity)
 
 ```bash
@@ -238,6 +240,8 @@ node plugins/install.mjs agy --config "$DATALAKE_OTEL_CONFIG" --apply
 
 `~/.gemini/config/plugins/doda-datalake/`에 플러그인과 훅이 등록되며, `~/.gemini/config/config.json`의 플러그인 목록에 활성화됩니다.
 도구 실행(`PostToolUse`) 및 세션 종료(`Stop`) 시 자동으로 OTLP span이 데이터레이크로 전송됩니다.
+
+도구 오류는 원문 대신 고정 분류 `error.type=tool_error`만 전송합니다. 증분 턴과 해당 서브에이전트가 모두 ACK되어야 cursor를 전진시키며, 부분 성공 identity를 보존해 다음 훅의 재시도에서 이미 성공한 사용량을 중복 전송하지 않습니다. 도구 완료 시각과 duration도 ACK 전까지 로컬 상태에 보존합니다.
 
 ## 6. 실제 사용량이 보이는지 확인하기
 
@@ -311,3 +315,5 @@ node plugins/install.mjs agy --uninstall --apply
 추가 Codex·opencode2 설치 검증에서는 Arcane 브라우저 relay 연결이 끊겨 서버 DB를 다시 조회하지 못했습니다. 인증 요청 성공이나 로컬 usage cursor를 DB 저장·집계 확인과 동일하게 취급하지 않습니다. 기존 공유 서버는 중단하지 않았으므로 실행 중이던 클라이언트·서버는 별도 재시작이 필요합니다.
 
 Codex·Claude는 현재 세션의 로컬 transcript에서 숫자 사용량만 추출합니다. 기록이 꺼져 있거나 마지막 기록이 훅보다 늦게 쓰이고 이후 훅이 실행되지 않으면 일부 사용량이 누락될 수 있습니다. 과거 대화 전체를 스캔하지 않습니다. 도구 버전이 달라지면 훅·이벤트 계약을 다시 확인해야 합니다.
+
+Claude·AGY의 ACK checkpoint 재시도는 원본 transcript·로컬 상태가 남아 있고 이후 훅이 실행될 때만 동작합니다. lock 경합으로 처리를 미루거나 실패한 전송을 독립적으로 재시도하는 백그라운드 작업·영속 offline queue는 없습니다. 프로세스가 종료되어 남긴 lock은 소유 PID가 더 이상 살아 있지 않을 때 회수합니다. 수집기가 저장한 뒤 ACK 응답만 유실되는 경우에는 같은 안정적 OTLP span identity가 다시 전송될 수 있으므로 end-to-end exactly-once 보장은 아닙니다.
