@@ -4,8 +4,8 @@
 # services/configs/volumes only. Scripts are embedded by tools/render.py via
 # x-source (no external file refs in the final bundle).
 #
-# Backup (service/config/volume) lives in BackupCorrectness's fragment;
-# this fragment declares none of those names.
+# Backup owns backup-data; aggregate shares it only for operational status.
+# No new service or volume is declared here.
 #
 # Battery analytics ride on the existing aggregate service (profile: server,
 # no new service/volumes). All battery Python modules mount read-only via
@@ -118,6 +118,8 @@ services:
       - source: battery_analysis_json
         target: /app/battery-analysis.json
         mode: 0444
+    volumes:
+      - backup-data:/ops
     command: ["python", "/app/aggregate.py"]
     restart: unless-stopped
     stop_grace_period: 30s

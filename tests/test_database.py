@@ -1193,6 +1193,78 @@ def _lit_rows(stmt):
                     _num(parts[8]), _num(parts[9]), _num(parts[14])))
     return out
 
+def test_operational_status_failure_recovery_and_atomic_replace():
+    import tempfile
+    from pathlib import Path
+    with tempfile.TemporaryDirectory() as directory:
+        path = str(Path(directory, "aggregate-status.json"))
+        real_replace = agg.os.replace
+        replaced = []
+
+        def replace(source, target):
+            # The replacement source is always a complete JSON document.
+            state = agg.json.loads(Path(source).read_text())
+            replaced.append(state)
+            real_replace(source, target)
+
+        def success(ctx, cfg, progress):
+            progress("vehicle")
+            current = agg.read_status(path)
+            assert current["running"] == 1 and current["section"] == "vehicle"
+            return {"vehicle": 2}, []
+
+        with patch.object(agg.time, "time", return_value=100), \
+                patch.object(agg.os, "replace", replace), \
+                patch.object(agg, "run_all", success), \
+                patch.object(agg, "vehicle_window_lag", lambda ctx: {"fleet": 12}):
+            agg.run_pass(("", "", ""), {"interval_s": 300}, path)
+        good = agg.read_status(path)
+        assert good["success"] == 1 and good["running"] == 0
+        last_success = good["last_success_timestamp_seconds"]
+        with patch.object(agg.time, "time", return_value=200), \
+                patch.object(agg, "run_all", lambda *args: ({}, ["vehicle"])), \
+                patch.object(agg, "vehicle_window_lag", side_effect=agg.SqlError("unreachable")):
+            agg.run_pass(("", "", ""), {"interval_s": 300}, path)
+        failed = agg.read_status(path)
+        assert failed["success"] == 0 and failed["running"] == 0
+        assert failed["last_success_timestamp_seconds"] == last_success
+        assert failed["vehicle_window_observation_success"] == 0
+        with patch.object(agg.time, "time", return_value=300):
+            agg.startup_failure(path)
+        assert agg.read_status(path)["last_success_timestamp_seconds"] == last_success
+        with patch.object(agg.time, "time", return_value=400), \
+                patch.object(agg, "run_all", success), \
+                patch.object(agg, "vehicle_window_lag", lambda ctx: {}):
+            agg.run_pass(("", "", ""), {"interval_s": 300}, path)
+        recovered = agg.read_status(path)
+        assert recovered["success"] == 1
+        assert recovered["last_success_timestamp_seconds"] == 400
+        assert recovered["last_failure_timestamp_seconds"] == 300
+        assert not list(Path(directory).glob(".aggregate-status-*"))
+        assert replaced[0]["running"] == 1
+        with patch.object(agg.os, "replace", side_effect=OSError("synthetic interruption")):
+            try:
+                agg.write_status({"timestamp_seconds": 500, "success": 0}, path)
+            except OSError:
+                pass
+            else:
+                raise AssertionError("failed replacement must fail")
+        assert agg.read_status(path) == recovered
+        assert not list(Path(directory).glob(".aggregate-status-*"))
+
+
+def test_vehicle_window_lag_is_observed_data_gap_not_wall_clock_age():
+    import datetime as dt
+    raw = [("fleet", dt.datetime(2026, 10, 1, 12, 5, 30)),
+           ("can", dt.datetime(2026, 10, 1, 12, 0, 20)),
+           ("new", dt.datetime(2026, 10, 1, 12, 0))]
+    summaries = [("fleet", dt.datetime(2026, 10, 1, 12, 3)),
+                 ("can", dt.datetime(2026, 10, 1, 12, 0))]
+    with patch.object(agg, "fetch_rows", side_effect=[([], raw), ([], summaries)]):
+        gaps = agg.vehicle_window_lag(("", "", ""))
+    assert gaps == {"fleet": 90, "can": 0}
+
+
 if __name__ == "__main__":
     test_sql_error_raises()
     test_per_call_billing_excludes_rollups_and_cumulative_parents()
@@ -1228,4 +1300,6 @@ if __name__ == "__main__":
     test_supplemental_cache_math_invalid_data_and_receipt_suppression()
     test_price_loader_caches_refresh_failure_and_rejects_bad_payload()
     test_session_batch_replacement_isolation_and_failure_keeps_anchor()
-    print("test_database: ok (34 tests)")
+    test_operational_status_failure_recovery_and_atomic_replace()
+    test_vehicle_window_lag_is_observed_data_gap_not_wall_clock_age()
+    print("test_database: ok (36 tests)")

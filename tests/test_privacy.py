@@ -73,6 +73,9 @@ class WireProxy(BaseHTTPRequestHandler):
             response = urllib.request.urlopen(request, timeout=30)
         except urllib.error.HTTPError as error:
             response = error
+        except urllib.error.URLError:
+            self.send_error(503, "synthetic backend unavailable")
+            return
         with response:
             result = response.read()
             self.send_response(response.status)
@@ -126,6 +129,7 @@ def build_traces(now_ns, trace_hex, span_hex):
         "gen_ai.usage.input_tokens": IN_TOKENS,
         "gen_ai.usage.output_tokens": OUT_TOKENS,
         "gen_ai.prompt": MARKER,
+        "error.type": MARKER,
         "gen_ai.tool.call.arguments": MARKER,
         "gen_ai.tool.call.result": MARKER,
         "bash_argv0": MARKER,
@@ -176,6 +180,7 @@ def build_logs(now_ns):
         rec.body.string_value = MARKER
         for key, value in {
             **attributes, "private.raw": MARKER,
+            "error.type": MARKER,
             "gen_ai.tool.call.arguments": MARKER,
             "bash_argv0": MARKER,
             "bash_command_class": MARKER,
@@ -201,6 +206,7 @@ def build_metrics(now_ns):
     for key, value in {
         "gen_ai.provider.name": "openai",
         "gen_ai.request.model": f"smoke-model-{now_ns}",
+        "error.type": MARKER,
         "private.raw": MARKER,
     }.items():
         attr(dp.attributes, key, value)

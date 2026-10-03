@@ -12,21 +12,46 @@ import io
 import json
 import socket
 import urllib.error
+import time
 import urllib.request
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MAX_BODY = 16 * 1024 * 1024
 UPSTREAM = "http://alloy:4319/v1/traces"
+CLIENTS = frozenset({"codex", "omp", "opencode2", "claude-code", "agy", "hermes"})
+LAST_RECEIVED = {}
 
 
-def redact(payload):
-    envelope = json.loads(payload)
+def redact(envelope):
     for resource in envelope.get("resourceSpans", []):
         for scope in resource.get("scopeSpans", []):
             for span in scope.get("spans", []):
                 span.pop("events", None)
                 span.pop("links", None)
     return json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()
+
+
+def record_received(envelope):
+    """Accepted by the redacted receiver, not confirmed persisted by the DB."""
+    clients = set()
+    for resource in envelope.get("resourceSpans", []):
+        attrs = {a.get("key"): a.get("value", {}).get("stringValue")
+                 for a in resource.get("resource", {}).get("attributes", [])}
+        fallback = attrs.get("coding_agent.client") or attrs.get("service.name")
+        for scope in resource.get("scopeSpans", []):
+            for span in scope.get("spans", []):
+                label = next((a.get("value", {}).get("stringValue")
+                              for a in span.get("attributes", [])
+                              if a.get("key") == "coding_agent.client"), fallback)
+                clients.add(label if label in CLIENTS else "other")
+    now = time.time()
+    LAST_RECEIVED.update({client: now for client in clients})
+
+
+def receipt_metrics():
+    return "".join(
+        'datalake_trace_last_received_timestamp_seconds{client="%s"} %s\n' % (client, stamp)
+        for client, stamp in sorted(LAST_RECEIVED.items())).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -45,7 +70,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
-        self.respond(200 if self.path == "/health" else 404)
+        if self.path == "/metrics":
+            self.respond(200, receipt_metrics(), "text/plain; version=0.0.4")
+        else:
+            self.respond(200 if self.path == "/health" else 404)
 
     def do_POST(self):
         if self.path != "/v1/traces":
@@ -80,7 +108,8 @@ class Handler(BaseHTTPRequestHandler):
             if len(body) > MAX_BODY:
                 self.respond(413)
                 return
-            body = redact(body)
+            envelope = json.loads(body)
+            body = redact(envelope)
         except (ValueError, TypeError, AttributeError, RecursionError, OSError, EOFError):
             self.respond(400)
             return
@@ -96,6 +125,13 @@ class Handler(BaseHTTPRequestHandler):
             if len(result) > 65536:
                 self.respond(502)
                 return
+            if 200 <= status < 300:
+                try:
+                    rejected = json.loads(result or b"{}").get("partialSuccess", {}).get("rejectedSpans", 0)
+                    if int(rejected) == 0:
+                        record_received(envelope)
+                except (ValueError, TypeError, AttributeError):
+                    pass  # A malformed ACK cannot establish successful reception.
             self.respond(status, result, content_type)
         except urllib.error.HTTPError as error:
             # Preserve retryable status, never reflect upstream diagnostics.

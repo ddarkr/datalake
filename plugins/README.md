@@ -2,6 +2,8 @@
 
 Codex, OMP, opencode2, Claude Code, AGY CLI(Antigravity)에서 관측한 토큰·세션·도구 실행 메타데이터를 데이터레이크로 보냅니다. 프롬프트, 답변·추론 원문, 도구 인자·결과, 파일 내용은 보내지 않습니다.
 
+AGY의 `error.type`은 고정 `tool_error`로 보내며, 서버도 trace·log·datapoint의 나머지 `error.type`을 `reported_error`, trace·log의 `error_class`를 `reported_error`로 제한합니다. 오류 분류에 섞인 원문·비밀 유출을 막기 위해 상세 진단 문자열은 의도적으로 보존하지 않습니다.
+
 **설치와 실제 연결은 별개입니다.** 아래 순서대로 **수집 주소 선택 → 인증 설정 → 연결 확인 → 원하는 도구 설치 → 새 세션 확인**을 진행하세요. 설치기는 기존의 다른 설정을 보존하며, `--apply`가 없으면 미리보기만 합니다.
 
 이 문서의 셸 명령은 macOS/Linux의 bash 또는 zsh 기준입니다. `plugins/` 안이 아니라 **이 저장소의 최상위 디렉터리**에서 실행하세요.

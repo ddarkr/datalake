@@ -22,6 +22,8 @@ Errors never carry bucket/key/credential text: type name only.
 """
 
 import os
+import json
+import math
 import signal
 import shutil
 import sys
@@ -139,6 +141,47 @@ def filesystem_metrics(path="/greptime-data"):
         return {"datalake_local_storage_success": 0}
 
 
+def operational_metrics(path="/ops"):
+    """Missing/corrupt markers are unknown; old timestamps remain visibly old."""
+    values = {}
+    for filename, prefix in (("aggregate-status.json", "datalake_aggregate"),
+                             ("restore-verification.json", "datalake_restore_verification")):
+        try:
+            with open(os.path.join(path, filename)) as handle:
+                state = json.load(handle)
+            stamp = state["timestamp_seconds"]
+            if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                    or not math.isfinite(stamp) or stamp <= 0):
+                raise ValueError("invalid timestamp")
+            if not isinstance(state, dict):
+                raise ValueError("invalid state")
+        except (OSError, ValueError, TypeError, KeyError):
+            values[prefix + ("_status_known" if filename.startswith("aggregate") else "_known")] = 0
+            continue
+        values[prefix + ("_status_known" if filename.startswith("aggregate") else "_known")] = 1
+        if filename.startswith("restore"):
+            values[prefix + "_timestamp_seconds"] = stamp
+            continue
+        values[prefix + "_status_timestamp_seconds"] = stamp
+        for key in ("interval_seconds", "running", "success",
+                    "last_start_timestamp_seconds", "last_success_timestamp_seconds",
+                    "last_failure_timestamp_seconds",
+                    "vehicle_window_observation_timestamp_seconds",
+                    "vehicle_window_observation_success"):
+            value = state.get(key)
+            if (not isinstance(value, bool) and isinstance(value, (int, float))
+                    and math.isfinite(value) and value >= 0):
+                values[prefix + "_" + key] = value
+        if (state.get("vehicle_window_observation_success") == 1
+                and isinstance(state.get("vehicle_window_lag_seconds"), dict)):
+            for source, value in state.get("vehicle_window_lag_seconds", {}).items():
+                if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                        and math.isfinite(value) and value >= 0):
+                    values[prefix + "_vehicle_window_lag_seconds{source="
+                           + json.dumps(source, ensure_ascii=True) + "}"] = value
+    return values
+
+
 
 def render():
     with _SLOCK:
@@ -153,6 +196,7 @@ def render():
         lines.append("datalake_s3_inventory_timestamp_seconds %d"
                      % snap["timestamp"])
     lines.extend("%s %d" % item for item in filesystem_metrics().items())
+    lines.extend("%s %s" % item for item in operational_metrics().items())
     return "".join(l + "\n" for l in lines)
 
 

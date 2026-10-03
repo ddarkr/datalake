@@ -35,6 +35,7 @@ import threading
 import unittest
 import urllib.parse
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO, "scripts"))
@@ -302,6 +303,49 @@ class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):
         return json.dumps({
             "vin": "V1", "createdAt": "2026-09-26T13:00:05Z", "alerts": [alert],
         }).encode()
+
+    def test_receipt_and_queue_residence_ignore_old_event_clock(self):
+        conn = fr.open_outbox(self.db_path)
+        stats = self._stats()
+        payload = self._signal_payload(0, 50)
+        event_ns = fr.parse_created_at("2026-09-26T13:00:00Z")
+        receipt_ns = event_ns + 86400 * 1_000_000_000
+        with patch.object(fr, "now_ns", return_value=receipt_ns):
+            self.assertEqual(fr.process_frame(conn, fr.TOPIC_V, payload, self.META, stats), 1)
+        first = fr.outbox_metrics(self.db_path, receipt_ns + 10 * 1_000_000_000)
+        self.assertEqual(first["fleet_outbox_oldest_enqueue_age_seconds"], 10)
+        self.assertEqual(first["fleet_outbox_oldest_event_age_seconds"], 86410)
+        with patch.object(fr, "now_ns", return_value=receipt_ns + 20 * 1_000_000_000):
+            self.assertEqual(fr.process_frame(conn, fr.TOPIC_V, payload, self.META, stats), 0)
+        self.assertEqual(stats["last_receive_" + fr.TOPIC_V], receipt_ns / 1e9 + 20)
+        self.assertEqual(fr.outbox_metrics(self.db_path, receipt_ns + 30 * 1_000_000_000)
+                         ["fleet_outbox_oldest_enqueue_age_seconds"], 30)
+        conn.execute("DELETE FROM outbox")
+        conn.commit()
+        self.assertEqual(fr.outbox_metrics(self.db_path)["fleet_outbox_oldest_enqueue_age_seconds"], 0)
+        conn.close()
+        missing = fr.outbox_metrics(os.path.join(self.tmp_dir.name, "absent.sqlite"))
+        self.assertEqual(missing, {"fleet_outbox_metrics_success": 0})
+        self.assertFalse(os.path.exists(os.path.join(self.tmp_dir.name, "absent.sqlite")))
+
+    def test_vss_queue_failure_is_unknown_not_empty(self):
+        import vss_recorder as vss
+        path = os.path.join(self.tmp_dir.name, "vss.sqlite")
+        conn = vss.open_outbox(path)
+        conn.execute("INSERT INTO outbox(event_id,event_time,vehicle,path,source,decode_epoch,"
+                     "ingest_time) VALUES('test',1000000000,'synthetic','speed','can','test',9000000000)")
+        conn.commit()
+        conn.close()
+        with patch.object(vss, "now_ns", return_value=12000000000):
+            text = vss.render_metrics({"last_receive_timestamp_seconds": 9}, path)
+        samples = dict(line.split(" ", 1) for line in text.splitlines() if not line.startswith("#"))
+        self.assertEqual(float(samples["vss_outbox_oldest_enqueue_age_seconds"]), 3)
+        self.assertEqual(float(samples["vss_outbox_oldest_event_age_seconds"]), 11)
+        self.assertEqual(float(samples["vss_last_receive_timestamp_seconds"]), 9)
+        missing = vss.render_metrics({}, path + ".absent")
+        self.assertIn("vss_outbox_metrics_success 0", missing)
+        self.assertNotIn("vss_outbox_oldest_enqueue_age_seconds", missing)
+        self.assertNotIn("vss_last_receive_timestamp_seconds", missing)
 
     def test_overflow_rejects_new_and_preserves_unacked(self):
         conn = fr.open_outbox(self.db_path)

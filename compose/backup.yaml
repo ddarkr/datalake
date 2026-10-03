@@ -66,6 +66,8 @@ services:
   storage-metrics:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
+    labels:
+      datalake.storage-metrics-revision: "1"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -80,6 +82,7 @@ services:
     volumes:
       - backup-venv:/opt/venv:ro
       - greptime-data:/greptime-data:ro
+      - backup-data:/ops:ro
     configs:
       - source: storage_metrics_py
         target: /app/storage_metrics.py

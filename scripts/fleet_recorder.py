@@ -1437,6 +1437,7 @@ def _store_event_row(conn, meta_env, stats, topic, event_type, item,
 def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
                     topic=TOPIC_V):
     """Parse one V payload and store allowlisted signals (with tombstones)."""
+    ingest_time_ns = now_ns()
     try:
         metadata, raw_signals = extract_protojson_records(
             payload_bytes,
@@ -1450,7 +1451,7 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
     if metadata is None:
         return 0  # Non-matching VIN filtered out
     _stats_bump(stats, "messages_received")
-    ingest_time_ns = now_ns()
+    stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
     envelope = envelope_id(topic, payload_bytes)
     stored = 0
     for source_field, raw_val in raw_signals:
@@ -1463,6 +1464,7 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
 def process_envelope(conn, topic, payload_bytes, meta_env, stats,
                      max_rows=50000):
     """Parse one alerts/errors/connectivity envelope into event rows."""
+    ingest_time_ns = now_ns()
     try:
         metadata, items = extract_event_envelope(
             topic, payload_bytes,
@@ -1475,7 +1477,7 @@ def process_envelope(conn, topic, payload_bytes, meta_env, stats,
     if metadata is None:
         return 0  # Non-matching VIN filtered out
     _stats_bump(stats, "messages_received")
-    ingest_time_ns = now_ns()
+    stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
     envelope = envelope_id(topic, payload_bytes)
     stored = 0
     for item in items:
@@ -1541,6 +1543,32 @@ def upload_tick(conn, base_url, db, user, password, batch_size=500, stats=None):
     return total
 
 
+def outbox_metrics(path, current_ns=None):
+    """Receipt-based residence and original event age are distinct."""
+    current_ns = now_ns() if current_ns is None else current_ns
+    values = {}
+    try:
+        conn = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(path))
+                               + "?mode=ro", uri=True, timeout=5)
+        try:
+            for table, prefix in (("outbox", "fleet_outbox"),
+                                  ("outbox_events", "fleet_outbox_events")):
+                pending, event, received = conn.execute(
+                    "SELECT COUNT(*), MIN(event_time), MIN(ingest_time) FROM " + table).fetchone()
+                values[prefix + "_pending_rows"] = pending
+                values[prefix + "_oldest_event_time_ns"] = event or 0
+                values[prefix + "_oldest_event_age_seconds"] = (
+                    max(0, (current_ns - event) / 1_000_000_000) if event else 0)
+                values[prefix + "_oldest_enqueue_age_seconds"] = (
+                    max(0, (current_ns - received) / 1_000_000_000) if received else 0)
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return {"fleet_outbox_metrics_success": 0}
+    values["fleet_outbox_metrics_success"] = 1
+    return values
+
+
 class MetricsHandler(http.server.BaseHTTPRequestHandler):
     stats = {}
     db_path = ""
@@ -1551,35 +1579,11 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
 
-        pending = 0
-        oldest_ns = 0
-        ev_pending = 0
-        ev_oldest = 0
-        try:
-            conn = sqlite3.connect(self.db_path, timeout=5)
-            try:
-                row = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
-            except Exception:
-                row = None
-            if row:
-                pending = row[0] or 0
-                oldest_ns = row[1] or 0
-            try:
-                erow = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox_events").fetchone()
-            except Exception:
-                erow = None
-            if erow:
-                ev_pending = erow[0] or 0
-                ev_oldest = erow[1] or 0
-            conn.close()
-        except Exception:
-            pass
-
-        lines = [
-            f"fleet_outbox_pending_rows {pending}",
-            f"fleet_outbox_oldest_event_time_ns {oldest_ns}",
-            f"fleet_outbox_events_pending_rows {ev_pending}",
-            f"fleet_outbox_events_oldest_event_time_ns {ev_oldest}",
+        lines = ["%s %s" % item for item in outbox_metrics(self.db_path).items()]
+        lines.extend('fleet_last_receive_timestamp_seconds{topic="%s"} %s' %
+                     (topic, self.stats["last_receive_" + topic])
+                     for topic in DEFAULT_TOPICS if "last_receive_" + topic in self.stats)
+        lines.extend([
             f"fleet_messages_received_total {self.stats.get('messages_received', 0)}",
             f"fleet_signals_stored_total {self.stats.get('signals_stored', 0)}",
             f"fleet_events_stored_total {self.stats.get('events_stored', 0)}",
@@ -1594,7 +1598,7 @@ class MetricsHandler(http.server.BaseHTTPRequestHandler):
             f"fleet_dropped_events_total {self.stats.get('dropped_events', 0)}",
             f"fleet_outbox_overflow_drops_total {self.stats.get('outbox_overflow_drops', 0)}",
             f"fleet_event_overflow_drops_total {self.stats.get('event_overflow_drops', 0)}",
-        ]
+        ])
         body = "\n".join(lines).encode("utf-8") + b"\n"
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")

@@ -100,6 +100,9 @@ services:
     image: ${VEHICLE_VSS_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
     restart: unless-stopped
+    # Inline script changes need a service revision to trigger recreation.
+    labels:
+      datalake.recorder-revision: "1"
     # Allow the in-flight HTTP timeout and bounded final drain to finish.
     stop_grace_period: 90s
     depends_on:

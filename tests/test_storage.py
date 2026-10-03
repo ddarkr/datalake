@@ -1,5 +1,6 @@
 """Storage usage inventory regressions: real bucket totals, no fake zeros."""
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -136,6 +137,38 @@ class InventoryTest(unittest.TestCase):
         sm.refresh_once(FakeList([{"Contents": [{"Size": "invalid"}]}]), "b")
         self.assertIn('datalake_s3_bucket_bytes{scope="greptime"} 9', sm.render())
         self.assertIn("datalake_s3_inventory_success 0", sm.render())
+
+
+class OperationalMarkersTest(unittest.TestCase):
+    def test_unknown_fresh_stale_and_failed_preserve_success(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def metrics():
+                return sm.operational_metrics(directory)
+            self.assertEqual(metrics()["datalake_aggregate_status_known"], 0)
+            self.assertEqual(metrics()["datalake_restore_verification_known"], 0)
+            path = Path(directory, "aggregate-status.json")
+            path.write_text(json.dumps({"timestamp_seconds": 100, "running": 0,
+                                       "success": 1, "last_success_timestamp_seconds": 100,
+                                       "interval_seconds": 300}))
+            good = metrics()
+            self.assertEqual(good["datalake_aggregate_last_success_timestamp_seconds"], 100)
+            # Age belongs to the consumer: scraping must not renew persisted success.
+            self.assertEqual(metrics()["datalake_aggregate_status_timestamp_seconds"], 100)
+            path.write_text(json.dumps({"timestamp_seconds": 500, "running": 0,
+                                       "success": 0, "last_success_timestamp_seconds": 100,
+                                       "last_failure_timestamp_seconds": 500,
+                                       "vehicle_window_observation_success": 0}))
+            failed = metrics()
+            self.assertEqual(failed["datalake_aggregate_success"], 0)
+            self.assertEqual(failed["datalake_aggregate_last_success_timestamp_seconds"], 100)
+            self.assertFalse(any("lag_seconds" in key for key in failed))
+            path.write_text("{broken")
+            self.assertEqual(metrics()["datalake_aggregate_status_known"], 0)
+            self.assertNotIn("datalake_aggregate_success", metrics())
+            Path(directory, "restore-verification.json").write_text(json.dumps(
+                {"timestamp_seconds": 90, "backup_id": "synthetic"}))
+            self.assertEqual(metrics()["datalake_restore_verification_timestamp_seconds"], 90)
+            self.assertEqual(metrics()["datalake_restore_verification_known"], 1)
 
 
 if __name__ == "__main__":

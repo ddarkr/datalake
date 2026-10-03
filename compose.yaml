@@ -153,6 +153,8 @@ services:
     - source: battery_analysis_json
       target: /app/battery-analysis.json
       mode: 292
+    volumes:
+    - backup-data:/ops
     command:
     - python
     - /app/aggregate.py
@@ -162,6 +164,8 @@ services:
     image: ${ALLOY_IMAGE:-grafana/alloy:v1.19.2}
     profiles:
     - server
+    labels:
+      datalake.ingest-revision: '1'
     ports:
     - ${OTLP_GRPC_BIND_ADDRESS:-127.0.0.1}:${OTLP_GRPC_PORT:-4317}:4317
     - ${OTLP_HTTP_BIND_ADDRESS:-127.0.0.1}:${OTLP_HTTP_PORT:-4318}:4318
@@ -199,6 +203,8 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles:
     - server
+    labels:
+      datalake.trace-privacy-revision: '1'
     user: 65534:65534
     cap_drop:
     - ALL
@@ -326,6 +332,8 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles:
     - server
+    labels:
+      datalake.storage-metrics-revision: '1'
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -340,6 +348,7 @@ services:
     volumes:
     - backup-venv:/opt/venv:ro
     - greptime-data:/greptime-data:ro
+    - backup-data:/ops:ro
     configs:
     - source: storage_metrics_py
       target: /app/storage_metrics.py
@@ -574,6 +583,8 @@ services:
     profiles:
     - vehicle
     restart: unless-stopped
+    labels:
+      datalake.recorder-revision: '1'
     stop_grace_period: 90s
     depends_on:
       vehicle-setup:
@@ -627,7 +638,7 @@ services:
     - fleet
     restart: unless-stopped
     labels:
-      datalake.recorder-revision: '4'
+      datalake.recorder-revision: '5'
     stop_grace_period: 30s
     depends_on:
       fleet-deps:
@@ -1732,6 +1743,7 @@ configs:
       import signal
       import sys
       import time
+      import tempfile
       import urllib.error
       import urllib.parse
       import urllib.request
@@ -1750,9 +1762,9 @@ configs:
       # (per-token USD fields input_cost_per_token, output_cost_per_token,
       # cache_read_input_token_cost, cache_creation_input_token_cost,
       # output_cost_per_reasoning_token; entry identity is the model key plus
-      # litellm_provider). Memory-only: the aggregate service has no volume, so a
-      # restart refetches. Refresh is at most daily per process; a failed refresh
-      # keeps the last-good table and waits PRICE_RETRY_S before retrying, so a
+      # litellm_provider). Memory-only price cache; the operational-status volume
+      # does not persist prices, so a restart refetches. Refresh is at most daily
+      # per process; a failed refresh keeps the last-good table and waits PRICE_RETRY_S, so a
       # down registry never retries every aggregate pass.
       LITELLM_PRICE_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/main/"
                            "model_prices_and_context_window.json")
@@ -3968,7 +3980,97 @@ configs:
           return runtime.run_battery(ctx, cfg)
 
 
-      def run_all(ctx, cfg):
+      STATUS_PATH = "/ops/aggregate-status.json"
+
+
+      def write_status(status, path=STATUS_PATH):
+          """Atomic public operational state; never SQL, credentials, or row identities."""
+          directory = os.path.dirname(path)
+          os.makedirs(directory, exist_ok=True)
+          fd, temporary = tempfile.mkstemp(prefix=".aggregate-status-", dir=directory)
+          try:
+              with os.fdopen(fd, "w") as handle:
+                  json.dump(status, handle, allow_nan=False, separators=(",", ":"))
+                  handle.flush()
+                  os.fsync(handle.fileno())
+              os.replace(temporary, path)
+          finally:
+              if os.path.exists(temporary):
+                  os.unlink(temporary)
+
+
+      def read_status(path=STATUS_PATH):
+          try:
+              with open(path) as handle:
+                  state = json.load(handle)
+              return state if isinstance(state, dict) else {}
+          except (OSError, ValueError):
+              return {}
+
+
+      def startup_failure(path=STATUS_PATH):
+          status = read_status(path)
+          completed = time.time()
+          status.update(timestamp_seconds=completed, running=0, success=0,
+                        last_failure_timestamp_seconds=completed,
+                        failed_sections=["startup"], section="")
+          write_status(status, path)
+
+
+      def vehicle_window_lag(ctx):
+          """Observed event-window gap, not execution age or receipt/ingest lag."""
+          base_url, auth, db = ctx
+          _, raw = fetch_rows(base_url, auth, db,
+                              "SELECT source, MAX(event_time) FROM vehicle_signal"
+                              " WHERE value_num IS NOT NULL GROUP BY source")
+          _, summaries = fetch_rows(base_url, auth, db,
+                                    "SELECT source, MAX(window_start) FROM vehicle_agg"
+                                    " WHERE resolution='1m' GROUP BY source")
+          ends = {source: parse_ts(ts) for source, ts in summaries}
+          gaps = {}
+          for source, ts in raw:
+              latest, window = parse_ts(ts), ends.get(source)
+              if source and latest is not None and window is not None:
+                  gaps[source] = max(0, (latest - window).total_seconds() - 60)
+          return gaps
+
+
+      def run_pass(ctx, cfg, path=STATUS_PATH):
+          previous = read_status(path)
+          status = {key: previous[key] for key in (
+              "last_success_timestamp_seconds", "last_failure_timestamp_seconds",
+              "success") if key in previous}
+          status.update(timestamp_seconds=time.time(), running=1,
+                        last_start_timestamp_seconds=time.time(),
+                        interval_seconds=cfg["interval_s"])
+          write_status(status, path)
+
+          def progress(section):
+              status.update(timestamp_seconds=time.time(), section=section)
+              write_status(status, path)
+
+          try:
+              counts, failed = run_all(ctx, cfg, progress)
+              try:
+                  status["vehicle_window_lag_seconds"] = vehicle_window_lag(ctx)
+                  status["vehicle_window_observation_timestamp_seconds"] = time.time()
+                  status["vehicle_window_observation_success"] = 1
+              except Exception:
+                  status["vehicle_window_observation_success"] = 0
+              return counts, failed
+          except Exception:
+              failed = ["pass"]
+              raise
+          finally:
+              completed = time.time()
+              status.update(timestamp_seconds=completed, running=0,
+                            success=int(not failed), failed_sections=failed, section="")
+              status["last_failure_timestamp_seconds" if failed else
+                     "last_success_timestamp_seconds"] = completed
+              write_status(status, path)
+
+
+      def run_all(ctx, cfg, progress=None):
           """One pass over every section. Returns (rows, failed)."""
           base_url, auth, db = ctx
           _ = (base_url, auth, db)
@@ -3976,6 +4078,8 @@ configs:
           counts = {}
 
           def run_section(name, fn):
+              if progress is not None:
+                  progress(name)
               try:
                   n = fn()
                   counts[name] = n
@@ -4006,9 +4110,11 @@ configs:
               cfg = load_cfg()
           except SqlError as e:
               sys.stderr.write("aggregate: error: " + str(e) + "\n")
+              startup_failure()
               return 1
           if not cfg["password"]:
               sys.stderr.write("aggregate: error: GREPTIME_PASSWORD is required\n")
+              startup_failure()
               return 1
           auth = base64.b64encode((cfg["user"] + ":" + cfg["password"]).encode()).decode("ascii")
           ctx = (cfg["base_url"], auth, cfg["db"])
@@ -4022,6 +4128,7 @@ configs:
               except SqlError as e:
                   if time.monotonic() >= deadline:
                       sys.stderr.write("aggregate: error: db not ready: " + str(e) + "\n")
+                      startup_failure()
                       return 2
                   time.sleep(3)
 
@@ -4029,10 +4136,10 @@ configs:
           signal.signal(signal.SIGINT, _handle_stop)
 
           if env("AGG_RUN_ONCE", "") == "1":
-              _, failed = run_all(ctx, cfg)
+              _, failed = run_pass(ctx, cfg)
               return 3 if failed else 0
           while not STOP:
-              _, failed = run_all(ctx, cfg)
+              _, failed = run_pass(ctx, cfg)
               if failed:
                   sys.stderr.write("aggregate: pass had failures: " + ",".join(failed) + "\n")
               for _ in range(cfg["interval_s"]):
@@ -15284,21 +15391,46 @@ configs:
       import json
       import socket
       import urllib.error
+      import time
       import urllib.request
       from http.server import BaseHTTPRequestHandler, HTTPServer
 
       MAX_BODY = 16 * 1024 * 1024
       UPSTREAM = "http://alloy:4319/v1/traces"
+      CLIENTS = frozenset({"codex", "omp", "opencode2", "claude-code", "agy", "hermes"})
+      LAST_RECEIVED = {}
 
 
-      def redact(payload):
-          envelope = json.loads(payload)
+      def redact(envelope):
           for resource in envelope.get("resourceSpans", []):
               for scope in resource.get("scopeSpans", []):
                   for span in scope.get("spans", []):
                       span.pop("events", None)
                       span.pop("links", None)
           return json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()
+
+
+      def record_received(envelope):
+          """Accepted by the redacted receiver, not confirmed persisted by the DB."""
+          clients = set()
+          for resource in envelope.get("resourceSpans", []):
+              attrs = {a.get("key"): a.get("value", {}).get("stringValue")
+                       for a in resource.get("resource", {}).get("attributes", [])}
+              fallback = attrs.get("coding_agent.client") or attrs.get("service.name")
+              for scope in resource.get("scopeSpans", []):
+                  for span in scope.get("spans", []):
+                      label = next((a.get("value", {}).get("stringValue")
+                                    for a in span.get("attributes", [])
+                                    if a.get("key") == "coding_agent.client"), fallback)
+                      clients.add(label if label in CLIENTS else "other")
+          now = time.time()
+          LAST_RECEIVED.update({client: now for client in clients})
+
+
+      def receipt_metrics():
+          return "".join(
+              'datalake_trace_last_received_timestamp_seconds{client="%s"} %s\n' % (client, stamp)
+              for client, stamp in sorted(LAST_RECEIVED.items())).encode()
 
 
       class Handler(BaseHTTPRequestHandler):
@@ -15317,7 +15449,10 @@ configs:
               self.wfile.write(body)
 
           def do_GET(self):
-              self.respond(200 if self.path == "/health" else 404)
+              if self.path == "/metrics":
+                  self.respond(200, receipt_metrics(), "text/plain; version=0.0.4")
+              else:
+                  self.respond(200 if self.path == "/health" else 404)
 
           def do_POST(self):
               if self.path != "/v1/traces":
@@ -15352,7 +15487,8 @@ configs:
                   if len(body) > MAX_BODY:
                       self.respond(413)
                       return
-                  body = redact(body)
+                  envelope = json.loads(body)
+                  body = redact(envelope)
               except (ValueError, TypeError, AttributeError, RecursionError, OSError, EOFError):
                   self.respond(400)
                   return
@@ -15368,6 +15504,13 @@ configs:
                   if len(result) > 65536:
                       self.respond(502)
                       return
+                  if 200 <= status < 300:
+                      try:
+                          rejected = json.loads(result or b"{}").get("partialSuccess", {}).get("rejectedSpans", 0)
+                          if int(rejected) == 0:
+                              record_received(envelope)
+                      except (ValueError, TypeError, AttributeError):
+                          pass  # A malformed ACK cannot establish successful reception.
                   self.respond(status, result, content_type)
               except urllib.error.HTTPError as error:
                   # Preserve retryable status, never reflect upstream diagnostics.
@@ -15528,6 +15671,8 @@ configs:
             `set(attributes["coding_agent.repository.id"], resource.attributes["coding_agent.repository.id"]) where attributes["coding_agent.repository.id"] == nil and resource.attributes["coding_agent.repository.id"] != nil`,
             `set(attributes["vcs.ref.head.name"], resource.attributes["vcs.ref.head.name"]) where attributes["vcs.ref.head.name"] == nil and resource.attributes["vcs.ref.head.name"] != nil`,
             `keep_keys(attributes, ["gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.response.model", "gen_ai.response.id", "gen_ai.response.finish_reasons", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.reasoning.output_tokens", "gen_ai.tool.name", "gen_ai.tool.call.id", "gen_ai.conversation.id", "gen_ai.agent.id", "gen_ai.agent.name", "gen_ai.system", "coding_agent.client", "coding_agent.session.id", "coding_agent.agent.parent_id", "coding_agent.content_capture_mode", "coding_agent.signal_source", "error.type", "error_class", "cost_usd", "pi.gen_ai.usage.total_tokens", "pi.gen_ai.usage.server_tool_requests", "pi.gen_ai.cost.estimated_usd", "pi.gen_ai.cost.input_usd", "pi.gen_ai.cost.output_usd", "pi.gen_ai.cost.unavailable_reason", "pi.gen_ai.tool.status", "pi.gen_ai.oneshot.kind", "pi.gen_ai.agent.step.number", "pi.gen_ai.agent.step.count", "pi.gen_ai.handoff.from_agent.name", "pi.gen_ai.handoff.from_agent.id", "pi.gen_ai.handoff.to_agent.name", "pi.gen_ai.handoff.to_agent.id", "openai.request.service_tier", "openai.response.service_tier", "model", "query_source", "query_source_safe", "agent_id", "parent_agent_id", "speed", "duration_ms", "ttft_ms", "first_content_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_id", "client_request_id", "attempt", "success", "status_code", "tool_name", "tool_name_safe", "result_tokens", "tool_use_id", "interaction.sequence", "parent.source", "session.id", "session_source", "originator", "auth_mode", "app.version", "app.entrypoint", "terminal.type", "token_type", "kind", "status", "tool", "type", "start_type", "prompt.id", "turn.id", "workflow.run_id", "coding_agent.session.subagent_count", "coding_agent.session.lines.added", "coding_agent.session.lines.removed", "coding_agent.session.lines.accepted", "coding_agent.session.lines.rejected", "coding_agent.session.edit.accept_count", "coding_agent.session.edit.reject_count", "coding_agent.session.commit_count", "coding_agent.session.pr_count", "coding_agent.session.duration_ms", "coding_agent.session.outcome", "coding_agent.agent.id", "coding_agent.subagent.type", "coding_agent.subagent.status", "coding_agent.subagent.duration_ms", "coding_agent.edit.decision", "coding_agent.edit.lines.added", "coding_agent.edit.lines.removed", "coding_agent.edit.tool.name", "coding_agent.edit.language", "coding_agent.repository.id", "conversation.id", "event.name", "event.timestamp", "event.sequence", "agent_type", "agent.source", "is_built_in", "is_async", "total_tool_uses", "tool_namespace", "call_id", "decision", "source", "language", "client", "vcs.ref.head.name", "vcs.ref.head.revision"])`,
+            `set(attributes["error.type"], "reported_error") where attributes["error.type"] != nil and attributes["error.type"] != "tool_error"`,
+            `set(attributes["error_class"], "reported_error") where attributes["error_class"] != nil`,
             `set(name, "invoke_agent") where IsMatch(name, "^invoke_agent[ ].*")`,
             `set(name, "chat") where IsMatch(name, "^chat[ ].*")`,
             `set(name, "execute_tool") where IsMatch(name, "^execute_tool[ ].*")`,
@@ -15554,6 +15699,8 @@ configs:
             `set(attributes["coding_agent.repository.id"], resource.attributes["coding_agent.repository.id"]) where attributes["coding_agent.repository.id"] == nil and resource.attributes["coding_agent.repository.id"] != nil`,
             `set(attributes["vcs.ref.head.name"], resource.attributes["vcs.ref.head.name"]) where attributes["vcs.ref.head.name"] == nil and resource.attributes["vcs.ref.head.name"] != nil`,
             `keep_keys(attributes, ["event.name", "event.kind", "event.timestamp", "event.sequence", "message.uuid", "conversation.id", "turn.id", "call_id", "input_token_count", "output_token_count", "cached_token_count", "cache_write_token_count", "reasoning_token_count", "tool_token_count", "usage.estimated_usd", "cost_usd_micros", "gen_ai.operation.name", "gen_ai.provider.name", "gen_ai.request.model", "gen_ai.response.model", "gen_ai.response.id", "gen_ai.response.finish_reasons", "gen_ai.usage.input_tokens", "gen_ai.usage.output_tokens", "gen_ai.usage.cache_read.input_tokens", "gen_ai.usage.cache_creation.input_tokens", "gen_ai.usage.cache_write.input_tokens", "gen_ai.usage.reasoning.output_tokens", "gen_ai.tool.name", "gen_ai.tool.call.id", "gen_ai.conversation.id", "gen_ai.agent.id", "gen_ai.agent.name", "gen_ai.system", "coding_agent.client", "coding_agent.session.id", "coding_agent.agent.parent_id", "coding_agent.content_capture_mode", "coding_agent.signal_source", "error.type", "error_class", "cost_usd", "pi.gen_ai.usage.total_tokens", "pi.gen_ai.usage.server_tool_requests", "pi.gen_ai.cost.estimated_usd", "pi.gen_ai.cost.input_usd", "pi.gen_ai.cost.output_usd", "pi.gen_ai.cost.unavailable_reason", "pi.gen_ai.tool.status", "pi.gen_ai.oneshot.kind", "pi.gen_ai.agent.step.number", "pi.gen_ai.agent.step.count", "pi.gen_ai.handoff.from_agent.name", "pi.gen_ai.handoff.from_agent.id", "pi.gen_ai.handoff.to_agent.name", "pi.gen_ai.handoff.to_agent.id", "openai.request.service_tier", "openai.response.service_tier", "model", "query_source", "query_source_safe", "agent_id", "parent_agent_id", "speed", "duration_ms", "ttft_ms", "first_content_ms", "input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens", "request_id", "client_request_id", "attempt", "success", "status_code", "tool_name", "tool_name_safe", "result_tokens", "tool_use_id", "interaction.sequence", "parent.source", "session.id", "session_source", "originator", "auth_mode", "app.version", "app.entrypoint", "terminal.type", "token_type", "kind", "status", "tool", "type", "start_type", "prompt.id", "workflow.run_id", "coding_agent.session.subagent_count", "coding_agent.session.lines.added", "coding_agent.session.lines.removed", "coding_agent.session.lines.accepted", "coding_agent.session.lines.rejected", "coding_agent.session.edit.accept_count", "coding_agent.session.edit.reject_count", "coding_agent.session.commit_count", "coding_agent.session.pr_count", "coding_agent.session.duration_ms", "coding_agent.session.outcome", "coding_agent.agent.id", "coding_agent.subagent.type", "coding_agent.subagent.status", "coding_agent.subagent.duration_ms", "coding_agent.edit.decision", "coding_agent.edit.lines.added", "coding_agent.edit.lines.removed", "coding_agent.edit.tool.name", "coding_agent.edit.language", "coding_agent.repository.id", "agent_type", "agent.source", "is_built_in", "is_async", "total_tool_uses", "tool_namespace", "decision", "source", "language", "client", "vcs.ref.head.name", "vcs.ref.head.revision", "pi.omp.agent.step_count", "pi.omp.agent.chats.total", "pi.omp.agent.chats.total_latency_ms", "pi.omp.agent.tools.total", "pi.omp.agent.tools.ok", "pi.omp.agent.tools.error", "pi.omp.agent.tools.skipped", "pi.omp.agent.tools.blocked", "pi.omp.agent.tools.timeout", "pi.omp.agent.tools.aborted", "pi.omp.agent.tools.total_latency_ms", "pi.omp.agent.usage.input_tokens", "pi.omp.agent.usage.output_tokens", "pi.omp.agent.usage.cached_input_tokens", "pi.omp.agent.usage.cache_write_tokens", "pi.omp.agent.usage.reasoning_output_tokens", "pi.omp.agent.usage.total_tokens", "pi.omp.agent.cost.estimated_usd", "pi.omp.agent.errors.total"])`,
+            `set(attributes["error.type"], "reported_error") where attributes["error.type"] != nil and attributes["error.type"] != "tool_error"`,
+            `set(attributes["error_class"], "reported_error") where attributes["error_class"] != nil`,
           ]
         }
 
@@ -15576,6 +15723,7 @@ configs:
             `set(datapoint.attributes["coding_agent.repository.id"], resource.attributes["coding_agent.repository.id"]) where datapoint.attributes["coding_agent.repository.id"] == nil and resource.attributes["coding_agent.repository.id"] != nil`,
             `set(datapoint.attributes["vcs.ref.head.name"], resource.attributes["vcs.ref.head.name"]) where datapoint.attributes["vcs.ref.head.name"] == nil and resource.attributes["vcs.ref.head.name"] != nil`,
             `keep_keys(attributes, ["service.name", "host.name", "gen_ai.provider.name", "gen_ai.request.model", "model", "tool", "tool_name", "tool_name_safe", "status", "success", "kind", "token_type", "session.id", "auth_mode", "originator", "session_source", "app.version", "app.entrypoint", "query_source", "query_source_safe", "speed", "type", "start_type", "terminal.type", "gen_ai.operation.name", "gen_ai.response.service_tier", "gen_ai.token.type", "gen_ai.tool.name", "gen_ai.response.finish_reason", "pi.gen_ai.agent.id", "pi.gen_ai.agent.name", "pi.omp.tool.status", "error.type", "decision", "language", "coding_agent.client", "coding_agent.session.id", "client", "service.instance.id", "coding_agent.repository.id", "vcs.ref.head.name", "conversation.id", "gen_ai.conversation.id"])`,
+            `set(datapoint.attributes["error.type"], "reported_error") where datapoint.attributes["error.type"] != nil and datapoint.attributes["error.type"] != "tool_error"`,
             `set(datapoint.attributes["datalake.temporality"], metric.aggregation_temporality) where IsMatch(metric.name, "^(claude_code[.]lines_of_code[.]count|claude_code[.]code_edit_tool[.]decision|claude_code[.]commit[.]count|claude_code[.]pull_request[.]count|claude_code[.]active_time[.]total|coding_agent[.]lines_of_code[.]count|coding_agent[.]code_edit_tool[.]decision|coding_agent[.]commit[.]count|coding_agent[.]pull_request[.]count)$")`,
             `set(datapoint.attributes["datalake.start_time_unix_nano"], datapoint.start_time_unix_nano) where metric.aggregation_temporality == 2 and IsMatch(metric.name, "^(claude_code[.]lines_of_code[.]count|claude_code[.]code_edit_tool[.]decision|claude_code[.]commit[.]count|claude_code[.]pull_request[.]count|claude_code[.]active_time[.]total|coding_agent[.]lines_of_code[.]count|coding_agent[.]code_edit_tool[.]decision|coding_agent[.]commit[.]count|coding_agent[.]pull_request[.]count)$")`,
           ]
@@ -15668,6 +15816,7 @@ configs:
         targets = [
           {"__address__" = "127.0.0.1:12345", "job" = "alloy"},
           {"__address__" = "storage-metrics:9105", "job" = "storage-metrics"},
+          {"__address__" = "trace-privacy:4320", "job" = "trace-privacy"},
         ]
         honor_labels    = true
         scrape_interval = sys.env("INFRA_SCRAPE_INTERVAL")
@@ -15965,7 +16114,7 @@ configs:
       ]}
   grafana-dash-health:
     content: |
-      {"uid":"datalake-health","title":"Datalake Health","tags":["datalake","health"],"timezone":"Asia/Seoul","schemaVersion":39,"version":2,"time":{"from":"now-24h","to":"now"},"refresh":"5m","description":"Collection gaps and datalake infrastructure diagnostics. HTTP charts describe Greptime API traffic, not application/Caddy/browser requests. Missing series remain unknown.","templating":{"list":[{"name":"db_route","label":"Greptime API path","type":"query","datasource":{"type":"prometheus","uid":"greptime-prom"},"query":{"query":"label_values(greptime_servers_http_requests_total, path)","refId":"variable-db-route"},"definition":"label_values(greptime_servers_http_requests_total, path)","refresh":1,"sort":1,"multi":false,"includeAll":true,"allValue":".*","current":{"text":"All","value":"$$__all"}}]},"panels":[
+      {"uid":"datalake-health","title":"Datalake Health","tags":["datalake","health"],"timezone":"Asia/Seoul","schemaVersion":39,"version":3,"time":{"from":"now-24h","to":"now"},"refresh":"5m","description":"Collection gaps and datalake infrastructure diagnostics. HTTP charts describe Greptime API traffic, not application/Caddy/browser requests. Missing series remain unknown.","templating":{"list":[{"name":"db_route","label":"Greptime API path","type":"query","datasource":{"type":"prometheus","uid":"greptime-prom"},"query":{"query":"label_values(greptime_servers_http_requests_total, path)","refId":"variable-db-route"},"definition":"label_values(greptime_servers_http_requests_total, path)","refresh":1,"sort":1,"multi":false,"includeAll":true,"allValue":".*","current":{"text":"All","value":"$$__all"}}]},"panels":[
       {"id":0,"type":"text","title":"Note","fieldConfig":{"defaults":{},"overrides":[]},"options":{"content":"**Collection health is not application health.** No data is unknown, not a measured zero. Scrape availability only covers discovered targets; a missing target needs separate inventory/heartbeat monitoring. HTTP panels below measure the **Greptime database API**, not gasa-v2/Caddy, DB query spans or browser render time. Use Overview for actual trace identity and observed operation latency. Receiver stages may see the same trace twice; they are kept separate. Optional vehicle/MQTT inputs can legitimately be absent.","mode":"markdown"},"gridPos":{"x":0,"y":0,"w":24,"h":5}},
       {"id":1,"type":"stat","title":"Discovered scrape targets up · %","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"100 * sum(up) / count(up)","datasource":{"type":"prometheus","uid":"greptime-prom"},"instant":true}],"fieldConfig":{"defaults":{"unit":"percent","noValue":"No scrape data","min":0,"max":100},"overrides":[]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"x":0,"y":5,"w":6,"h":6},"description":"Only discovered targets are in the denominator. Missing series do not become healthy zeros or prove expected targets exist."},
       {"id":2,"type":"table","title":"Up by job/instance (Prom)","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"up","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":6,"y":5,"w":18,"h":6}},
@@ -15978,7 +16127,12 @@ configs:
       {"id":26,"type":"timeseries","title":"OTel span flow · receiver stages / exporters","description":"Stages are separate, not summed: ingress and redacted-trace receivers may count the same span. Sender retries can also affect counters; not unique end-to-end delivered spans.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"sum by (receiver) (rate(otelcol_receiver_accepted_spans_total{job=\"alloy\"}[$$__rate_interval]))","range":true,"instant":false,"format":"time_series","legendFormat":"accepted {{receiver}}"},{"refId":"B","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"sum by (exporter) (rate(otelcol_exporter_sent_spans_total{job=\"alloy\"}[$$__rate_interval]))","legendFormat":"sent {{exporter}}","range":true,"instant":false}],"fieldConfig":{"defaults":{"noValue":"No data","unit":"ops","color":{"mode":"palette-classic"},"custom":{"drawStyle":"line","lineWidth":1,"fillOpacity":8,"showPoints":"never","spanNulls":false}},"overrides":[]},"options":{"legend":{"showLegend":true,"displayMode":"table","placement":"bottom","calcs":["last"]},"tooltip":{"mode":"multi"}},"gridPos":{"x":12,"y":35,"w":12,"h":8}},
       {"id":27,"type":"timeseries","title":"Observed pipeline failures / second","description":"Refused/failed receiver spans and failed Prometheus samples are independently observed counters. Missing exporter failure counters are not fabricated as zero. Does not cover clients that never reach Alloy.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"sum by (receiver) (rate(otelcol_receiver_refused_spans_total{job=\"alloy\"}[$$__rate_interval]))","range":true,"instant":false,"format":"time_series","legendFormat":"refused {{receiver}}"},{"refId":"B","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"sum by (receiver) (rate(otelcol_receiver_failed_spans_total{job=\"alloy\"}[$$__rate_interval]))","legendFormat":"failed {{receiver}}","range":true,"instant":false},{"refId":"C","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"sum(rate(prometheus_remote_storage_samples_failed_total{job=\"alloy\"}[$$__rate_interval]))","legendFormat":"remote-write failed samples","range":true,"instant":false}],"fieldConfig":{"defaults":{"noValue":"No data","unit":"ops","color":{"mode":"palette-classic"},"custom":{"drawStyle":"line","lineWidth":1,"fillOpacity":8,"showPoints":"never","spanNulls":false}},"overrides":[]},"options":{"legend":{"showLegend":true,"displayMode":"table","placement":"bottom","calcs":["last"]},"tooltip":{"mode":"multi"}},"gridPos":{"x":0,"y":43,"w":12,"h":8}},
       {"id":28,"type":"stat","title":"Storage measurement freshness / success","description":"Age since the last successful private object inventory, evaluated at the selected range end. Success=0 is a failed probe; missing is unknown. Filesystem and S3 probes are separate.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - datalake_s3_inventory_timestamp_seconds{job=\"storage-metrics\"}","range":false,"instant":true,"format":"time_series","legendFormat":"S3 successful inventory age (seconds)"},{"refId":"B","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"datalake_s3_inventory_success{job=\"storage-metrics\"}","legendFormat":"S3 inventory success","instant":true,"format":"time_series"},{"refId":"C","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"datalake_local_storage_success{job=\"storage-metrics\"}","legendFormat":"Local storage probe success","instant":true,"format":"time_series"}],"fieldConfig":{"defaults":{"noValue":"No data","mappings":[{"type":"special","options":{"match":"null","result":{"text":"No data","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byFrameRefID","options":"A"},"properties":[{"id":"unit","value":"s"}]},{"matcher":{"id":"byFrameRefID","options":"B"},"properties":[{"id":"mappings","value":[{"type":"value","options":{"0":{"text":"Failed"},"1":{"text":"Succeeded"}}}]}]},{"matcher":{"id":"byFrameRefID","options":"C"},"properties":[{"id":"mappings","value":[{"type":"value","options":{"0":{"text":"Failed"},"1":{"text":"Succeeded"}}}]}]}]},"options":{"colorMode":"none","graphMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"textMode":"auto","orientation":"vertical"},"gridPos":{"x":12,"y":43,"w":12,"h":8}},
-      {"id":40,"type":"row","title":"Detailed metrics and optional input diagnostics","collapsed":true,"panels":[{"id":3,"type":"stat","title":"Last OTel span · all retained data","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CAST(MAX(timestamp) AS TIMESTAMP(6)) AS last_span FROM opentelemetry_traces","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"dateTimeAsIso","noValue":"No data"},"overrides":[]},"options":{"reduceOptions":{"calcs":["lastNotNull"],"fields":"/.*/","values":false},"orientation":"auto","textMode":"auto","colorMode":"none"},"gridPos":{"x":0,"y":52,"w":12,"h":9}},{"id":4,"type":"stat","title":"Last vehicle sample · all retained data","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CAST(MAX(event_time) AS TIMESTAMP(6)) AS last_sample FROM vehicle_signal","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"dateTimeAsIso","noValue":"No data"},"overrides":[]},"options":{"reduceOptions":{"calcs":["lastNotNull"],"fields":"/.*/","values":false},"orientation":"auto","textMode":"auto","colorMode":"none"},"gridPos":{"x":12,"y":52,"w":12,"h":9}},{"id":5,"type":"table","title":"Last span per coding client (silence = missing, not zero)","description":"Explicit client wins, then Codex namespace or verified native service aliases. Arbitrary service names remain provenance, not client identity. Retransmitted spans are deduplicated by trace/span ID. Only the final 48h of the selected range are scanned.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT client, COUNT(*) AS spans, CAST(MAX(ts) AS TIMESTAMP(6)) AS last_seen FROM (SELECT DISTINCT trace_id, span_id, COALESCE(NULLIF(`span_attributes.coding_agent.client`, ''), NULLIF(`span_attributes.client`, ''), CASE WHEN span_name LIKE 'codex.%' THEN 'codex' WHEN service_name IN ('claude-code','claude-code-desktop') THEN 'claude-code' WHEN service_name='oh-my-pi' THEN 'oh-my-pi' ELSE 'unknown' END) AS client, timestamp AS ts FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800)) AS dedup GROUP BY client ORDER BY last_seen DESC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":61,"w":12,"h":9}},{"id":6,"type":"table","title":"Last native log per client (log_attributes JSON; silence = missing)","description":"Canonical client selection matches aggregation: explicit client, Codex namespace, verified Claude/OMP service names, else unknown. Missing logs mean absence, not zero activity. Only the final 48h of the selected range are scanned.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT COALESCE(NULLIF(json_get_string(log_attributes, '$[\"coding_agent.client\"]'), ''), NULLIF(json_get_string(log_attributes, '$[\"client\"]'), ''), NULLIF(json_get_string(resource_attributes, '$[\"coding_agent.client\"]'), ''), NULLIF(json_get_string(resource_attributes, '$[\"client\"]'), ''), CASE WHEN json_get_string(log_attributes, '$[\"event.name\"]') LIKE 'codex.%' THEN 'codex' WHEN json_get_string(resource_attributes, '$[\"service.name\"]') IN ('claude-code','claude-code-desktop') THEN 'claude-code' WHEN json_get_string(resource_attributes, '$[\"service.name\"]')='oh-my-pi' THEN 'oh-my-pi' ELSE 'unknown' END) AS client, COUNT(*) AS logs, CAST(MAX(timestamp) AS TIMESTAMP(6)) AS last_seen FROM opentelemetry_logs WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800) GROUP BY client ORDER BY last_seen DESC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":61,"w":12,"h":9}},{"id":7,"type":"table","title":"Collector backlog/drops/uploads (Prom instant; vehicle scrape opt-in)","description":"Verbatim series from scripts/raw_recorder.py (:9102), scripts/raw_upload.py (:9103) and scripts/vss_recorder.py (:9104) via VEHICLE_METRICS_TARGETS (default empty = no scrape). raw_recorder_dropped = CAN drops; spool/pending = local backlog; last_finalize/last_upload = MF4 freshness (epoch seconds). Missing means not configured (absence), never zero.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"raw_recorder_dropped|raw_recorder_spool_files|raw_recorder_spool_bytes|raw_recorder_finalize_errors|raw_recorder_quarantined|raw_recorder_last_finalize|raw_uploader_pending_files|raw_uploader_pending_bytes|raw_uploader_failed|raw_uploader_dropped_verify|raw_uploader_last_upload|vss_outbox_pending_rows|vss_outbox_oldest_event_time_ns|vss_stored_rows_total|vss_uploaded_rows_total|vss_upload_failures_total|vss_stream_gaps_total|vss_unsupported_values_total|vss_snapshot_deduped_total\",job=~\"vehicle-raw-recorder|vehicle-raw-uploader|vss-recorder\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":70,"w":12,"h":9}},{"id":8,"type":"table","title":"Telegraf buffer (Prom instant; mqtt opt-in)","description":"Telegraf internal metrics; absence means no configured scrape. MQTT tracking records are reacquired from the broker after restart, not independently replayed by this disk buffer. Use publisher QoS1, broker persistence and unchanged client ID; at-least-once may duplicate arrivals.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"internal_.*\",job=\"telegraf\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":70,"w":12,"h":9}},{"id":9,"type":"table","title":"OTel queues and export delivery","description":"Alloy self-scrape: queue size/capacity, in-flight requests and sent/failed counters. Failure counters may be absent until exercised; absence is not a measured zero.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"otelcol_exporter_(queue_size|queue_capacity|in_flight_requests|sent_.*|send_failed_.*|enqueue_failed_.*)\",job=\"alloy\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":79,"w":12,"h":9}},{"id":10,"type":"table","title":"Local disk capacity and Greptime WAL bytes","description":"Read-only measurement of the filesystem containing greptime-data and logical files under its wal directory. Filesystem used/free includes other volumes sharing that filesystem; it is not a Greptime-only data-size estimate. Failed measurement emits success=0 without fake sizes.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"datalake_disk_.*|datalake_wal_bytes|datalake_local_storage_success\",job=\"storage-metrics\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":79,"w":12,"h":9}},{"id":11,"type":"table","title":"Private object-store inventories","description":"Actual whole-bucket bytes/object counts, not uploaded-byte counters. Greptime and Raw use separate restricted keys. Last-success timestamps are epoch seconds; success=0 retains stale totals, while File mode disables only S3 inventory. Default inventory cadence is one hour.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"datalake_s3_.*|raw_uploader_bucket_.*|raw_uploader_inventory_.*\",job=~\"storage-metrics|vehicle-raw-uploader\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":88,"w":12,"h":9}},{"id":12,"type":"table","title":"DBC validation / firmware health","description":"Sealed-chunk validation using the immutable epoch DBCs. Optional rule families remain absent until configured; consult configured and last-success metrics.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"can_validation_.*\",job=\"vehicle-raw-recorder\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":88,"w":12,"h":9}}],"gridPos":{"x":0,"y":51,"w":24,"h":1}}
+      {"id":29,"type":"stat","title":"Actual local receive age · traces / Fleet / VSS","description":"Local collector receipt, not source event time or DB persistence ACK. Traces: accepted nonempty redacted batch since process start; Fleet: valid matching envelopes; VSS: broker updates/snapshots (deduplicated or unsupported updates still received). Absent is unknown. AI logs/metrics and Home true receipt timestamps are unavailable in the current schema; event freshness is not receipt.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - fleet_last_receive_timestamp_seconds","legendFormat":"Fleet {{topic}} {{instance}}","range":false,"instant":true,"format":"time_series"},{"refId":"B","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - vss_last_receive_timestamp_seconds","legendFormat":"VSS {{instance}}","range":false,"instant":true,"format":"time_series"},{"refId":"C","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - datalake_trace_last_received_timestamp_seconds{job=\"trace-privacy\"}","legendFormat":"Traces {{client}} {{instance}}","range":false,"instant":true,"format":"time_series"}],"fieldConfig":{"defaults":{"noValue":"Unknown","unit":"s"},"overrides":[]},"options":{"colorMode":"none","graphMode":"none","reduceOptions":{"calcs":["last"],"fields":"","values":false},"textMode":"auto","orientation":"vertical"},"gridPos":{"x":0,"y":51,"w":12,"h":8}},
+      {"id":30,"type":"stat","title":"Outbox oldest queue residence · seconds","description":"Queue residence uses MIN(ingest_time), not vehicle event age. Measured empty backlog is zero. Unreadable outbox emits no age; inspect the probe-success table below (0=unreadable). Absence is unknown; no zero filling.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"fleet_outbox_oldest_enqueue_age_seconds","legendFormat":"Fleet signals {{instance}}","range":false,"instant":true,"format":"time_series"},{"refId":"B","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"fleet_outbox_events_oldest_enqueue_age_seconds","legendFormat":"Fleet events {{instance}}","range":false,"instant":true,"format":"time_series"},{"refId":"C","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"vss_outbox_oldest_enqueue_age_seconds","legendFormat":"VSS {{instance}}","range":false,"instant":true,"format":"time_series"}],"fieldConfig":{"defaults":{"noValue":"Unknown","unit":"s"},"overrides":[]},"options":{"colorMode":"none","graphMode":"none","reduceOptions":{"calcs":["last"],"fields":"","values":false},"textMode":"auto","orientation":"vertical"},"gridPos":{"x":12,"y":51,"w":12,"h":8}},
+      {"id":31,"type":"stat","title":"Aggregate execution freshness / vehicle data gap","description":"Last-success age measures completed job execution, NOT data lag. Vehicle gap is latest raw numeric sample minus latest completed 1m rollup end, per source, measured only when both exist. Observation age shows whether that gap measurement is fresh. Missing series stay unknown. Frontier gap is not per-path completeness or receipt/ACK lag. Last successful pass is SQL/orchestration completion, not proof of battery analytical validity; failed gap observation emits no samples.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - datalake_aggregate_last_success_timestamp_seconds{job=\"storage-metrics\"}","legendFormat":"Last successful pass age","range":false,"instant":true,"format":"time_series"},{"refId":"B","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"datalake_aggregate_vehicle_window_lag_seconds{job=\"storage-metrics\"}","legendFormat":"Vehicle raw→rollup gap {{source}}","range":false,"instant":true,"format":"time_series"},{"refId":"C","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - datalake_aggregate_vehicle_window_observation_timestamp_seconds{job=\"storage-metrics\"}","legendFormat":"Vehicle gap observation age","range":false,"instant":true,"format":"time_series"}],"fieldConfig":{"defaults":{"noValue":"Unknown","unit":"s"},"overrides":[]},"options":{"colorMode":"none","graphMode":"none","reduceOptions":{"calcs":["last"],"fields":"","values":false},"textMode":"auto","orientation":"vertical"},"gridPos":{"x":0,"y":59,"w":12,"h":8}},
+      {"id":32,"type":"stat","title":"Last offline restore verification age","description":"Age since a successful offline backup SHA/content restore verification. This does NOT prove database restart, queryability or recoverable application state. Missing timestamp is unknown, never zero; see verification-known flag below.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"time() - datalake_restore_verification_timestamp_seconds{job=\"storage-metrics\"}","legendFormat":"Offline verification age","range":false,"instant":true,"format":"time_series"}],"fieldConfig":{"defaults":{"noValue":"Unknown","unit":"s"},"overrides":[]},"options":{"colorMode":"none","graphMode":"none","reduceOptions":{"calcs":["last"],"fields":"","values":false},"textMode":"auto","orientation":"vertical"},"gridPos":{"x":12,"y":59,"w":12,"h":8}},
+      {"id":33,"type":"table","title":"Operational probe / pass state","description":"Outbox metrics_success=0 means unreadable, not empty. *_known=0 means no readable persisted status, not healthy. Aggregate success is last completed pass (1 success / 0 failure; absent before completion), running is current pass state, interval is configured seconds, status timestamp is last atomic update. Check freshness above before interpreting a retained status.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","datasource":{"type":"prometheus","uid":"greptime-prom"},"expr":"{__name__=~\"fleet_outbox_metrics_success|vss_outbox_metrics_success|datalake_aggregate_status_known|datalake_aggregate_vehicle_window_observation_success|datalake_aggregate_success|datalake_aggregate_running|datalake_aggregate_interval_seconds|datalake_aggregate_status_timestamp_seconds|datalake_restore_verification_known\"}","legendFormat":"State","range":false,"instant":true,"format":"table"}],"fieldConfig":{"defaults":{"noValue":"Unknown"},"overrides":[]},"options":{"showHeader":true,"cellHeight":"sm"},"gridPos":{"x":0,"y":67,"w":24,"h":6}},
+      {"id":40,"type":"row","title":"Detailed metrics and optional input diagnostics","collapsed":true,"panels":[{"id":3,"type":"stat","title":"Last OTel span · all retained data","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CAST(MAX(timestamp) AS TIMESTAMP(6)) AS last_span FROM opentelemetry_traces","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"dateTimeAsIso","noValue":"No data"},"overrides":[]},"options":{"reduceOptions":{"calcs":["lastNotNull"],"fields":"/.*/","values":false},"orientation":"auto","textMode":"auto","colorMode":"none"},"gridPos":{"x":0,"y":74,"w":12,"h":9}},{"id":4,"type":"stat","title":"Last vehicle sample · all retained data","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CAST(MAX(event_time) AS TIMESTAMP(6)) AS last_sample FROM vehicle_signal","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{"unit":"dateTimeAsIso","noValue":"No data"},"overrides":[]},"options":{"reduceOptions":{"calcs":["lastNotNull"],"fields":"/.*/","values":false},"orientation":"auto","textMode":"auto","colorMode":"none"},"gridPos":{"x":12,"y":74,"w":12,"h":9}},{"id":5,"type":"table","title":"Last span per coding client (silence = missing, not zero)","description":"Explicit client wins, then Codex namespace or verified native service aliases. Arbitrary service names remain provenance, not client identity. Retransmitted spans are deduplicated by trace/span ID. Only the final 48h of the selected range are scanned.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT client, COUNT(*) AS spans, CAST(MAX(ts) AS TIMESTAMP(6)) AS last_seen FROM (SELECT DISTINCT trace_id, span_id, COALESCE(NULLIF(`span_attributes.coding_agent.client`, ''), NULLIF(`span_attributes.client`, ''), CASE WHEN span_name LIKE 'codex.%' THEN 'codex' WHEN service_name IN ('claude-code','claude-code-desktop') THEN 'claude-code' WHEN service_name='oh-my-pi' THEN 'oh-my-pi' ELSE 'unknown' END) AS client, timestamp AS ts FROM opentelemetry_traces WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800)) AS dedup GROUP BY client ORDER BY last_seen DESC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":83,"w":12,"h":9}},{"id":6,"type":"table","title":"Last native log per client (log_attributes JSON; silence = missing)","description":"Canonical client selection matches aggregation: explicit client, Codex namespace, verified Claude/OMP service names, else unknown. Missing logs mean absence, not zero activity. Only the final 48h of the selected range are scanned.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT COALESCE(NULLIF(json_get_string(log_attributes, '$[\"coding_agent.client\"]'), ''), NULLIF(json_get_string(log_attributes, '$[\"client\"]'), ''), NULLIF(json_get_string(resource_attributes, '$[\"coding_agent.client\"]'), ''), NULLIF(json_get_string(resource_attributes, '$[\"client\"]'), ''), CASE WHEN json_get_string(log_attributes, '$[\"event.name\"]') LIKE 'codex.%' THEN 'codex' WHEN json_get_string(resource_attributes, '$[\"service.name\"]') IN ('claude-code','claude-code-desktop') THEN 'claude-code' WHEN json_get_string(resource_attributes, '$[\"service.name\"]')='oh-my-pi' THEN 'oh-my-pi' ELSE 'unknown' END) AS client, COUNT(*) AS logs, CAST(MAX(timestamp) AS TIMESTAMP(6)) AS last_seen FROM opentelemetry_logs WHERE $$__timeFilter(timestamp) AND timestamp >= FROM_UNIXTIME($$__unixEpochTo() - 172800) GROUP BY client ORDER BY last_seen DESC","datasource":{"type":"mysql","uid":"greptime-mysql"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":83,"w":12,"h":9}},{"id":7,"type":"table","title":"Collector backlog/drops/uploads (Prom instant; vehicle scrape opt-in)","description":"Verbatim series from scripts/raw_recorder.py (:9102), scripts/raw_upload.py (:9103) and scripts/vss_recorder.py (:9104) via VEHICLE_METRICS_TARGETS (default empty = no scrape). raw_recorder_dropped = CAN drops; spool/pending = local backlog; last_finalize/last_upload = MF4 freshness (epoch seconds). Missing means not configured (absence), never zero.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"raw_recorder_dropped|raw_recorder_spool_files|raw_recorder_spool_bytes|raw_recorder_finalize_errors|raw_recorder_quarantined|raw_recorder_last_finalize|raw_uploader_pending_files|raw_uploader_pending_bytes|raw_uploader_failed|raw_uploader_dropped_verify|raw_uploader_last_upload|vss_outbox_pending_rows|vss_outbox_oldest_event_time_ns|vss_stored_rows_total|vss_uploaded_rows_total|vss_upload_failures_total|vss_stream_gaps_total|vss_unsupported_values_total|vss_snapshot_deduped_total\",job=~\"vehicle-raw-recorder|vehicle-raw-uploader|vss-recorder\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":92,"w":12,"h":9}},{"id":8,"type":"table","title":"Telegraf buffer (Prom instant; mqtt opt-in)","description":"Telegraf internal metrics; absence means no configured scrape. MQTT tracking records are reacquired from the broker after restart, not independently replayed by this disk buffer. Use publisher QoS1, broker persistence and unchanged client ID; at-least-once may duplicate arrivals.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"internal_.*\",job=\"telegraf\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":92,"w":12,"h":9}},{"id":9,"type":"table","title":"OTel queues and export delivery","description":"Alloy self-scrape: queue size/capacity, in-flight requests and sent/failed counters. Failure counters may be absent until exercised; absence is not a measured zero.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"otelcol_exporter_(queue_size|queue_capacity|in_flight_requests|sent_.*|send_failed_.*|enqueue_failed_.*)\",job=\"alloy\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":101,"w":12,"h":9}},{"id":10,"type":"table","title":"Local disk capacity and Greptime WAL bytes","description":"Read-only measurement of the filesystem containing greptime-data and logical files under its wal directory. Filesystem used/free includes other volumes sharing that filesystem; it is not a Greptime-only data-size estimate. Failed measurement emits success=0 without fake sizes.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"datalake_disk_.*|datalake_wal_bytes|datalake_local_storage_success\",job=\"storage-metrics\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":101,"w":12,"h":9}},{"id":11,"type":"table","title":"Private object-store inventories","description":"Actual whole-bucket bytes/object counts, not uploaded-byte counters. Greptime and Raw use separate restricted keys. Last-success timestamps are epoch seconds; success=0 retains stale totals, while File mode disables only S3 inventory. Default inventory cadence is one hour.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"datalake_s3_.*|raw_uploader_bucket_.*|raw_uploader_inventory_.*\",job=~\"storage-metrics|vehicle-raw-uploader\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":0,"y":110,"w":12,"h":9}},{"id":12,"type":"table","title":"DBC validation / firmware health","description":"Sealed-chunk validation using the immutable epoch DBCs. Optional rule families remain absent until configured; consult configured and last-success metrics.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"can_validation_.*\",job=\"vehicle-raw-recorder\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[]},"options":{"showHeader":true},"gridPos":{"x":12,"y":110,"w":12,"h":9}}],"gridPos":{"x":0,"y":73,"w":24,"h":1}}
       ]}
   grafana-dash-battery:
     content: |
@@ -17181,6 +17335,8 @@ configs:
       """
 
       import os
+      import json
+      import math
       import signal
       import shutil
       import sys
@@ -17298,6 +17454,47 @@ configs:
               return {"datalake_local_storage_success": 0}
 
 
+      def operational_metrics(path="/ops"):
+          """Missing/corrupt markers are unknown; old timestamps remain visibly old."""
+          values = {}
+          for filename, prefix in (("aggregate-status.json", "datalake_aggregate"),
+                                   ("restore-verification.json", "datalake_restore_verification")):
+              try:
+                  with open(os.path.join(path, filename)) as handle:
+                      state = json.load(handle)
+                  stamp = state["timestamp_seconds"]
+                  if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                          or not math.isfinite(stamp) or stamp <= 0):
+                      raise ValueError("invalid timestamp")
+                  if not isinstance(state, dict):
+                      raise ValueError("invalid state")
+              except (OSError, ValueError, TypeError, KeyError):
+                  values[prefix + ("_status_known" if filename.startswith("aggregate") else "_known")] = 0
+                  continue
+              values[prefix + ("_status_known" if filename.startswith("aggregate") else "_known")] = 1
+              if filename.startswith("restore"):
+                  values[prefix + "_timestamp_seconds"] = stamp
+                  continue
+              values[prefix + "_status_timestamp_seconds"] = stamp
+              for key in ("interval_seconds", "running", "success",
+                          "last_start_timestamp_seconds", "last_success_timestamp_seconds",
+                          "last_failure_timestamp_seconds",
+                          "vehicle_window_observation_timestamp_seconds",
+                          "vehicle_window_observation_success"):
+                  value = state.get(key)
+                  if (not isinstance(value, bool) and isinstance(value, (int, float))
+                          and math.isfinite(value) and value >= 0):
+                      values[prefix + "_" + key] = value
+              if (state.get("vehicle_window_observation_success") == 1
+                      and isinstance(state.get("vehicle_window_lag_seconds"), dict)):
+                  for source, value in state.get("vehicle_window_lag_seconds", {}).items():
+                      if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                              and math.isfinite(value) and value >= 0):
+                          values[prefix + "_vehicle_window_lag_seconds{source="
+                                 + json.dumps(source, ensure_ascii=True) + "}"] = value
+          return values
+
+
 
       def render():
           with _SLOCK:
@@ -17312,6 +17509,7 @@ configs:
               lines.append("datalake_s3_inventory_timestamp_seconds %d"
                            % snap["timestamp"])
           lines.extend("%s %d" % item for item in filesystem_metrics().items())
+          lines.extend("%s %s" % item for item in operational_metrics().items())
           return "".join(l + "\n" for l in lines)
 
 
@@ -19255,6 +19453,8 @@ configs:
       """
 
       import os
+      import json
+      import math
       import signal
       import shutil
       import sys
@@ -19372,6 +19572,47 @@ configs:
               return {"datalake_local_storage_success": 0}
 
 
+      def operational_metrics(path="/ops"):
+          """Missing/corrupt markers are unknown; old timestamps remain visibly old."""
+          values = {}
+          for filename, prefix in (("aggregate-status.json", "datalake_aggregate"),
+                                   ("restore-verification.json", "datalake_restore_verification")):
+              try:
+                  with open(os.path.join(path, filename)) as handle:
+                      state = json.load(handle)
+                  stamp = state["timestamp_seconds"]
+                  if (isinstance(stamp, bool) or not isinstance(stamp, (int, float))
+                          or not math.isfinite(stamp) or stamp <= 0):
+                      raise ValueError("invalid timestamp")
+                  if not isinstance(state, dict):
+                      raise ValueError("invalid state")
+              except (OSError, ValueError, TypeError, KeyError):
+                  values[prefix + ("_status_known" if filename.startswith("aggregate") else "_known")] = 0
+                  continue
+              values[prefix + ("_status_known" if filename.startswith("aggregate") else "_known")] = 1
+              if filename.startswith("restore"):
+                  values[prefix + "_timestamp_seconds"] = stamp
+                  continue
+              values[prefix + "_status_timestamp_seconds"] = stamp
+              for key in ("interval_seconds", "running", "success",
+                          "last_start_timestamp_seconds", "last_success_timestamp_seconds",
+                          "last_failure_timestamp_seconds",
+                          "vehicle_window_observation_timestamp_seconds",
+                          "vehicle_window_observation_success"):
+                  value = state.get(key)
+                  if (not isinstance(value, bool) and isinstance(value, (int, float))
+                          and math.isfinite(value) and value >= 0):
+                      values[prefix + "_" + key] = value
+              if (state.get("vehicle_window_observation_success") == 1
+                      and isinstance(state.get("vehicle_window_lag_seconds"), dict)):
+                  for source, value in state.get("vehicle_window_lag_seconds", {}).items():
+                      if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                              and math.isfinite(value) and value >= 0):
+                          values[prefix + "_vehicle_window_lag_seconds{source="
+                                 + json.dumps(source, ensure_ascii=True) + "}"] = value
+          return values
+
+
 
       def render():
           with _SLOCK:
@@ -19386,6 +19627,7 @@ configs:
               lines.append("datalake_s3_inventory_timestamp_seconds %d"
                            % snap["timestamp"])
           lines.extend("%s %d" % item for item in filesystem_metrics().items())
+          lines.extend("%s %s" % item for item in operational_metrics().items())
           return "".join(l + "\n" for l in lines)
 
 
@@ -20350,14 +20592,15 @@ configs:
       def render_metrics(stats, outbox_path):
           """Prometheus exposition for the outbox/uploader state."""
           try:
-              conn = sqlite3.connect(outbox_path, timeout=5)
+              conn = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(outbox_path))
+                                     + "?mode=ro", uri=True, timeout=5)
               try:
-                  pending, oldest = conn.execute(
-                      "SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
+                  pending, oldest, received = conn.execute(
+                      "SELECT COUNT(*), MIN(event_time), MIN(ingest_time) FROM outbox").fetchone()
               finally:
                   conn.close()
           except Exception:
-              pending, oldest = -1, -1
+              pending, oldest, received = -1, -1, None
           if oldest is None:
               oldest = 0
 
@@ -20369,6 +20612,20 @@ configs:
               return (f"# HELP {name} {help_}\n# TYPE {name} counter\n"
                       f"{name} {value}\n")
 
+          ages = ""
+          if pending >= 0:
+              current = now_ns()
+              ages = (gauge("vss_outbox_oldest_event_age_seconds",
+                            "Original event age, not queue residence; seconds; 0 when empty.",
+                            max(0, (current - oldest) / 1e9) if oldest else 0)
+                      + gauge("vss_outbox_oldest_enqueue_age_seconds",
+                              "Age since local receipt/enqueue; seconds; 0 when empty.",
+                              max(0, (current - received) / 1e9) if received else 0))
+          if stats.get("last_receive_timestamp_seconds") is not None:
+              ages += gauge("vss_last_receive_timestamp_seconds",
+                            "Last locally received broker update/snapshot, including duplicates.",
+                            stats["last_receive_timestamp_seconds"])
+
           return (
               gauge("vss_outbox_pending_rows",
                     "Outbox rows buffered locally, not yet acked by Greptime.",
@@ -20376,6 +20633,9 @@ configs:
               + gauge("vss_outbox_oldest_event_time_ns",
                       "Oldest outbox event_time in ns; 0 when empty, -1 when unreadable.",
                       oldest)
+              + gauge("vss_outbox_metrics_success", "1 when outbox read succeeded, else 0.",
+                      int(pending >= 0))
+              + ages
               + counter("vss_stored_rows_total", "Rows written to the outbox.",
                         stats.get("stored", 0))
               + counter("vss_uploaded_rows_total",
@@ -20568,6 +20828,11 @@ configs:
           signal.signal(signal.SIGINT, _stop)
 
           def handle(conn, path, dp, snapshot=False):
+              received_ns = now_ns()
+              with lock:
+                  stats["last_receive_timestamp_seconds"] = received_ns / 1e9
+              if not snapshot:
+                  nonlocal_last_recv[0] = received_ns / 1e9
               try:
                   got = classify(dp.value)
               except UnsupportedValue as ex:
@@ -20585,12 +20850,10 @@ configs:
                              deterministic_event_id(
                                  vehicle, path, ets, meta["decode_epoch"],
                                  num, text, boolean),
-                             meta, units, num, text, boolean, now_ns())
+                             meta, units, num, text, boolean, received_ns)
               if store_update(conn, last, path, row):
                   with lock:
                       stats["stored"] += 1
-                  if not snapshot:
-                      nonlocal_last_recv[0] = time.time()
               else:
                   with lock:
                       stats["snap_deduped"] += 1
@@ -22140,6 +22403,7 @@ configs:
       def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
                           topic=TOPIC_V):
           """Parse one V payload and store allowlisted signals (with tombstones)."""
+          ingest_time_ns = now_ns()
           try:
               metadata, raw_signals = extract_protojson_records(
                   payload_bytes,
@@ -22153,7 +22417,7 @@ configs:
           if metadata is None:
               return 0  # Non-matching VIN filtered out
           _stats_bump(stats, "messages_received")
-          ingest_time_ns = now_ns()
+          stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
           envelope = envelope_id(topic, payload_bytes)
           stored = 0
           for source_field, raw_val in raw_signals:
@@ -22166,6 +22430,7 @@ configs:
       def process_envelope(conn, topic, payload_bytes, meta_env, stats,
                            max_rows=50000):
           """Parse one alerts/errors/connectivity envelope into event rows."""
+          ingest_time_ns = now_ns()
           try:
               metadata, items = extract_event_envelope(
                   topic, payload_bytes,
@@ -22178,7 +22443,7 @@ configs:
           if metadata is None:
               return 0  # Non-matching VIN filtered out
           _stats_bump(stats, "messages_received")
-          ingest_time_ns = now_ns()
+          stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
           envelope = envelope_id(topic, payload_bytes)
           stored = 0
           for item in items:
@@ -22244,6 +22509,32 @@ configs:
           return total
 
 
+      def outbox_metrics(path, current_ns=None):
+          """Receipt-based residence and original event age are distinct."""
+          current_ns = now_ns() if current_ns is None else current_ns
+          values = {}
+          try:
+              conn = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(path))
+                                     + "?mode=ro", uri=True, timeout=5)
+              try:
+                  for table, prefix in (("outbox", "fleet_outbox"),
+                                        ("outbox_events", "fleet_outbox_events")):
+                      pending, event, received = conn.execute(
+                          "SELECT COUNT(*), MIN(event_time), MIN(ingest_time) FROM " + table).fetchone()
+                      values[prefix + "_pending_rows"] = pending
+                      values[prefix + "_oldest_event_time_ns"] = event or 0
+                      values[prefix + "_oldest_event_age_seconds"] = (
+                          max(0, (current_ns - event) / 1_000_000_000) if event else 0)
+                      values[prefix + "_oldest_enqueue_age_seconds"] = (
+                          max(0, (current_ns - received) / 1_000_000_000) if received else 0)
+              finally:
+                  conn.close()
+          except sqlite3.Error:
+              return {"fleet_outbox_metrics_success": 0}
+          values["fleet_outbox_metrics_success"] = 1
+          return values
+
+
       class MetricsHandler(http.server.BaseHTTPRequestHandler):
           stats = {}
           db_path = ""
@@ -22254,35 +22545,11 @@ configs:
                   self.end_headers()
                   return
 
-              pending = 0
-              oldest_ns = 0
-              ev_pending = 0
-              ev_oldest = 0
-              try:
-                  conn = sqlite3.connect(self.db_path, timeout=5)
-                  try:
-                      row = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
-                  except Exception:
-                      row = None
-                  if row:
-                      pending = row[0] or 0
-                      oldest_ns = row[1] or 0
-                  try:
-                      erow = conn.execute("SELECT COUNT(*), MIN(event_time) FROM outbox_events").fetchone()
-                  except Exception:
-                      erow = None
-                  if erow:
-                      ev_pending = erow[0] or 0
-                      ev_oldest = erow[1] or 0
-                  conn.close()
-              except Exception:
-                  pass
-
-              lines = [
-                  f"fleet_outbox_pending_rows {pending}",
-                  f"fleet_outbox_oldest_event_time_ns {oldest_ns}",
-                  f"fleet_outbox_events_pending_rows {ev_pending}",
-                  f"fleet_outbox_events_oldest_event_time_ns {ev_oldest}",
+              lines = ["%s %s" % item for item in outbox_metrics(self.db_path).items()]
+              lines.extend('fleet_last_receive_timestamp_seconds{topic="%s"} %s' %
+                           (topic, self.stats["last_receive_" + topic])
+                           for topic in DEFAULT_TOPICS if "last_receive_" + topic in self.stats)
+              lines.extend([
                   f"fleet_messages_received_total {self.stats.get('messages_received', 0)}",
                   f"fleet_signals_stored_total {self.stats.get('signals_stored', 0)}",
                   f"fleet_events_stored_total {self.stats.get('events_stored', 0)}",
@@ -22297,7 +22564,7 @@ configs:
                   f"fleet_dropped_events_total {self.stats.get('dropped_events', 0)}",
                   f"fleet_outbox_overflow_drops_total {self.stats.get('outbox_overflow_drops', 0)}",
                   f"fleet_event_overflow_drops_total {self.stats.get('event_overflow_drops', 0)}",
-              ]
+              ])
               body = "\n".join(lines).encode("utf-8") + b"\n"
               self.send_response(200)
               self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
@@ -23371,14 +23638,15 @@ configs:
       def render_metrics(stats, outbox_path):
           """Prometheus exposition for the outbox/uploader state."""
           try:
-              conn = sqlite3.connect(outbox_path, timeout=5)
+              conn = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(outbox_path))
+                                     + "?mode=ro", uri=True, timeout=5)
               try:
-                  pending, oldest = conn.execute(
-                      "SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
+                  pending, oldest, received = conn.execute(
+                      "SELECT COUNT(*), MIN(event_time), MIN(ingest_time) FROM outbox").fetchone()
               finally:
                   conn.close()
           except Exception:
-              pending, oldest = -1, -1
+              pending, oldest, received = -1, -1, None
           if oldest is None:
               oldest = 0
 
@@ -23390,6 +23658,20 @@ configs:
               return (f"# HELP {name} {help_}\n# TYPE {name} counter\n"
                       f"{name} {value}\n")
 
+          ages = ""
+          if pending >= 0:
+              current = now_ns()
+              ages = (gauge("vss_outbox_oldest_event_age_seconds",
+                            "Original event age, not queue residence; seconds; 0 when empty.",
+                            max(0, (current - oldest) / 1e9) if oldest else 0)
+                      + gauge("vss_outbox_oldest_enqueue_age_seconds",
+                              "Age since local receipt/enqueue; seconds; 0 when empty.",
+                              max(0, (current - received) / 1e9) if received else 0))
+          if stats.get("last_receive_timestamp_seconds") is not None:
+              ages += gauge("vss_last_receive_timestamp_seconds",
+                            "Last locally received broker update/snapshot, including duplicates.",
+                            stats["last_receive_timestamp_seconds"])
+
           return (
               gauge("vss_outbox_pending_rows",
                     "Outbox rows buffered locally, not yet acked by Greptime.",
@@ -23397,6 +23679,9 @@ configs:
               + gauge("vss_outbox_oldest_event_time_ns",
                       "Oldest outbox event_time in ns; 0 when empty, -1 when unreadable.",
                       oldest)
+              + gauge("vss_outbox_metrics_success", "1 when outbox read succeeded, else 0.",
+                      int(pending >= 0))
+              + ages
               + counter("vss_stored_rows_total", "Rows written to the outbox.",
                         stats.get("stored", 0))
               + counter("vss_uploaded_rows_total",
@@ -23589,6 +23874,11 @@ configs:
           signal.signal(signal.SIGINT, _stop)
 
           def handle(conn, path, dp, snapshot=False):
+              received_ns = now_ns()
+              with lock:
+                  stats["last_receive_timestamp_seconds"] = received_ns / 1e9
+              if not snapshot:
+                  nonlocal_last_recv[0] = received_ns / 1e9
               try:
                   got = classify(dp.value)
               except UnsupportedValue as ex:
@@ -23606,12 +23896,10 @@ configs:
                              deterministic_event_id(
                                  vehicle, path, ets, meta["decode_epoch"],
                                  num, text, boolean),
-                             meta, units, num, text, boolean, now_ns())
+                             meta, units, num, text, boolean, received_ns)
               if store_update(conn, last, path, row):
                   with lock:
                       stats["stored"] += 1
-                  if not snapshot:
-                      nonlocal_last_recv[0] = time.time()
               else:
                   with lock:
                       stats["snap_deduped"] += 1

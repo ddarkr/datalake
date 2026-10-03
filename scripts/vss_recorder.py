@@ -404,14 +404,15 @@ def upload_once(conn, table, base_url, db, user, password, limit=500):
 def render_metrics(stats, outbox_path):
     """Prometheus exposition for the outbox/uploader state."""
     try:
-        conn = sqlite3.connect(outbox_path, timeout=5)
+        conn = sqlite3.connect("file:" + urllib.parse.quote(os.path.abspath(outbox_path))
+                               + "?mode=ro", uri=True, timeout=5)
         try:
-            pending, oldest = conn.execute(
-                "SELECT COUNT(*), MIN(event_time) FROM outbox").fetchone()
+            pending, oldest, received = conn.execute(
+                "SELECT COUNT(*), MIN(event_time), MIN(ingest_time) FROM outbox").fetchone()
         finally:
             conn.close()
     except Exception:
-        pending, oldest = -1, -1
+        pending, oldest, received = -1, -1, None
     if oldest is None:
         oldest = 0
 
@@ -423,6 +424,20 @@ def render_metrics(stats, outbox_path):
         return (f"# HELP {name} {help_}\n# TYPE {name} counter\n"
                 f"{name} {value}\n")
 
+    ages = ""
+    if pending >= 0:
+        current = now_ns()
+        ages = (gauge("vss_outbox_oldest_event_age_seconds",
+                      "Original event age, not queue residence; seconds; 0 when empty.",
+                      max(0, (current - oldest) / 1e9) if oldest else 0)
+                + gauge("vss_outbox_oldest_enqueue_age_seconds",
+                        "Age since local receipt/enqueue; seconds; 0 when empty.",
+                        max(0, (current - received) / 1e9) if received else 0))
+    if stats.get("last_receive_timestamp_seconds") is not None:
+        ages += gauge("vss_last_receive_timestamp_seconds",
+                      "Last locally received broker update/snapshot, including duplicates.",
+                      stats["last_receive_timestamp_seconds"])
+
     return (
         gauge("vss_outbox_pending_rows",
               "Outbox rows buffered locally, not yet acked by Greptime.",
@@ -430,6 +445,9 @@ def render_metrics(stats, outbox_path):
         + gauge("vss_outbox_oldest_event_time_ns",
                 "Oldest outbox event_time in ns; 0 when empty, -1 when unreadable.",
                 oldest)
+        + gauge("vss_outbox_metrics_success", "1 when outbox read succeeded, else 0.",
+                int(pending >= 0))
+        + ages
         + counter("vss_stored_rows_total", "Rows written to the outbox.",
                   stats.get("stored", 0))
         + counter("vss_uploaded_rows_total",
@@ -622,6 +640,11 @@ def run():
     signal.signal(signal.SIGINT, _stop)
 
     def handle(conn, path, dp, snapshot=False):
+        received_ns = now_ns()
+        with lock:
+            stats["last_receive_timestamp_seconds"] = received_ns / 1e9
+        if not snapshot:
+            nonlocal_last_recv[0] = received_ns / 1e9
         try:
             got = classify(dp.value)
         except UnsupportedValue as ex:
@@ -639,12 +662,10 @@ def run():
                        deterministic_event_id(
                            vehicle, path, ets, meta["decode_epoch"],
                            num, text, boolean),
-                       meta, units, num, text, boolean, now_ns())
+                       meta, units, num, text, boolean, received_ns)
         if store_update(conn, last, path, row):
             with lock:
                 stats["stored"] += 1
-            if not snapshot:
-                nonlocal_last_recv[0] = time.time()
         else:
             with lock:
                 stats["snap_deduped"] += 1

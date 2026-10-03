@@ -51,6 +51,7 @@ import re
 import signal
 import sys
 import time
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -69,9 +70,9 @@ TTL_UNIT_S = {"s": 1, "m": 60, "h": 3600, "d": 86400}
 # (per-token USD fields input_cost_per_token, output_cost_per_token,
 # cache_read_input_token_cost, cache_creation_input_token_cost,
 # output_cost_per_reasoning_token; entry identity is the model key plus
-# litellm_provider). Memory-only: the aggregate service has no volume, so a
-# restart refetches. Refresh is at most daily per process; a failed refresh
-# keeps the last-good table and waits PRICE_RETRY_S before retrying, so a
+# litellm_provider). Memory-only price cache; the operational-status volume
+# does not persist prices, so a restart refetches. Refresh is at most daily
+# per process; a failed refresh keeps the last-good table and waits PRICE_RETRY_S, so a
 # down registry never retries every aggregate pass.
 LITELLM_PRICE_URL = ("https://raw.githubusercontent.com/BerriAI/litellm/main/"
                      "model_prices_and_context_window.json")
@@ -2287,7 +2288,97 @@ def battery_section(ctx, cfg):
     return runtime.run_battery(ctx, cfg)
 
 
-def run_all(ctx, cfg):
+STATUS_PATH = "/ops/aggregate-status.json"
+
+
+def write_status(status, path=STATUS_PATH):
+    """Atomic public operational state; never SQL, credentials, or row identities."""
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".aggregate-status-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(status, handle, allow_nan=False, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def read_status(path=STATUS_PATH):
+    try:
+        with open(path) as handle:
+            state = json.load(handle)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def startup_failure(path=STATUS_PATH):
+    status = read_status(path)
+    completed = time.time()
+    status.update(timestamp_seconds=completed, running=0, success=0,
+                  last_failure_timestamp_seconds=completed,
+                  failed_sections=["startup"], section="")
+    write_status(status, path)
+
+
+def vehicle_window_lag(ctx):
+    """Observed event-window gap, not execution age or receipt/ingest lag."""
+    base_url, auth, db = ctx
+    _, raw = fetch_rows(base_url, auth, db,
+                        "SELECT source, MAX(event_time) FROM vehicle_signal"
+                        " WHERE value_num IS NOT NULL GROUP BY source")
+    _, summaries = fetch_rows(base_url, auth, db,
+                              "SELECT source, MAX(window_start) FROM vehicle_agg"
+                              " WHERE resolution='1m' GROUP BY source")
+    ends = {source: parse_ts(ts) for source, ts in summaries}
+    gaps = {}
+    for source, ts in raw:
+        latest, window = parse_ts(ts), ends.get(source)
+        if source and latest is not None and window is not None:
+            gaps[source] = max(0, (latest - window).total_seconds() - 60)
+    return gaps
+
+
+def run_pass(ctx, cfg, path=STATUS_PATH):
+    previous = read_status(path)
+    status = {key: previous[key] for key in (
+        "last_success_timestamp_seconds", "last_failure_timestamp_seconds",
+        "success") if key in previous}
+    status.update(timestamp_seconds=time.time(), running=1,
+                  last_start_timestamp_seconds=time.time(),
+                  interval_seconds=cfg["interval_s"])
+    write_status(status, path)
+
+    def progress(section):
+        status.update(timestamp_seconds=time.time(), section=section)
+        write_status(status, path)
+
+    try:
+        counts, failed = run_all(ctx, cfg, progress)
+        try:
+            status["vehicle_window_lag_seconds"] = vehicle_window_lag(ctx)
+            status["vehicle_window_observation_timestamp_seconds"] = time.time()
+            status["vehicle_window_observation_success"] = 1
+        except Exception:
+            status["vehicle_window_observation_success"] = 0
+        return counts, failed
+    except Exception:
+        failed = ["pass"]
+        raise
+    finally:
+        completed = time.time()
+        status.update(timestamp_seconds=completed, running=0,
+                      success=int(not failed), failed_sections=failed, section="")
+        status["last_failure_timestamp_seconds" if failed else
+               "last_success_timestamp_seconds"] = completed
+        write_status(status, path)
+
+
+def run_all(ctx, cfg, progress=None):
     """One pass over every section. Returns (rows, failed)."""
     base_url, auth, db = ctx
     _ = (base_url, auth, db)
@@ -2295,6 +2386,8 @@ def run_all(ctx, cfg):
     counts = {}
 
     def run_section(name, fn):
+        if progress is not None:
+            progress(name)
         try:
             n = fn()
             counts[name] = n
@@ -2325,9 +2418,11 @@ def main():
         cfg = load_cfg()
     except SqlError as e:
         sys.stderr.write("aggregate: error: " + str(e) + "\n")
+        startup_failure()
         return 1
     if not cfg["password"]:
         sys.stderr.write("aggregate: error: GREPTIME_PASSWORD is required\n")
+        startup_failure()
         return 1
     auth = base64.b64encode((cfg["user"] + ":" + cfg["password"]).encode()).decode("ascii")
     ctx = (cfg["base_url"], auth, cfg["db"])
@@ -2341,6 +2436,7 @@ def main():
         except SqlError as e:
             if time.monotonic() >= deadline:
                 sys.stderr.write("aggregate: error: db not ready: " + str(e) + "\n")
+                startup_failure()
                 return 2
             time.sleep(3)
 
@@ -2348,10 +2444,10 @@ def main():
     signal.signal(signal.SIGINT, _handle_stop)
 
     if env("AGG_RUN_ONCE", "") == "1":
-        _, failed = run_all(ctx, cfg)
+        _, failed = run_pass(ctx, cfg)
         return 3 if failed else 0
     while not STOP:
-        _, failed = run_all(ctx, cfg)
+        _, failed = run_pass(ctx, cfg)
         if failed:
             sys.stderr.write("aggregate: pass had failures: " + ",".join(failed) + "\n")
         for _ in range(cfg["interval_s"]):
