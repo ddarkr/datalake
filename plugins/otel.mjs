@@ -1,11 +1,14 @@
-import { createHash, randomUUID } from 'node:crypto';
-import { readFileSync, realpathSync, statSync } from 'node:fs';
-import { mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
+import { closeSync, constants, fstatSync, openSync, readSync, realpathSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { join, resolve } from 'node:path';
+import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { setTimeout as delay } from 'node:timers/promises';
+import { promisify } from 'node:util';
+import { acquireProcessLock, openOutbox } from './outbox.mjs';
+import { readSenderStatus, startSender } from './sender.mjs';
+
+const execFileAsync = promisify(execFile);
 
 export function isMain(url) {
   try { return fileURLToPath(url) === realpathSync(process.argv[1]); }
@@ -14,53 +17,10 @@ export function isMain(url) {
 
 // One native hook per session; never evict a live process just because export is slow.
 export async function withStateLock(directory, action) {
-  const lock = join(directory, 'hook.lock');
-  const candidate = `${lock}.${randomUUID()}`;
-  const ownerPath = path => join(path, 'owner.json');
-  const dead = pid => {
-    if (!Number.isSafeInteger(pid) || pid <= 0) return false;
-    try { process.kill(pid, 0); return false; }
-    catch (error) { return error.code === 'ESRCH'; }
-  };
-  const owner = async () => {
-    try { return JSON.parse(await readFile(ownerPath(lock), 'utf8')).pid; }
-    catch (error) { if (error.code === 'ENOENT') return undefined; throw error; }
-  };
-  await mkdir(candidate, { mode: 0o700 });
-  let acquired = false;
-  try {
-    await writeFile(ownerPath(candidate), JSON.stringify({ pid: process.pid }), { mode: 0o600, flag: 'wx' });
-    for (let attempt = 0; attempt < 25; attempt++) {
-      try { await rename(candidate, lock); acquired = true; break; }
-      catch (error) { if (!['EEXIST', 'ENOTEMPTY'].includes(error.code)) throw error; }
-      if (dead(await owner())) {
-        // Only one contender reaps; recheck after claiming in case another replaced the old lock.
-        const reaping = join(lock, 'reaping');
-        try {
-          await mkdir(reaping, { mode: 0o700 });
-          let retired = false;
-          try {
-            if (dead(await owner())) {
-              const removed = `${lock}.${randomUUID()}`;
-              // Rename before deleting: never expose an empty live lock to a new contender.
-              await rename(lock, removed);
-              retired = true;
-              await rm(removed, { recursive: true, force: true });
-            }
-          } finally { if (!retired) await rm(reaping, { recursive: true, force: true }); }
-        } catch (error) { if (!['EEXIST', 'ENOENT'].includes(error.code)) throw error; }
-      }
-      await delay(10);
-    }
-    if (acquired) return await action();
-    // Contention leaves checkpoints untouched; a later native hook retries the same records.
-  } finally {
-    if (acquired) {
-      const removed = `${lock}.${randomUUID()}`;
-      await rename(lock, removed);
-      await rm(removed, { recursive: true, force: true });
-    } else await rm(candidate, { recursive: true, force: true });
-  }
+  const release = await acquireProcessLock(directory, join(directory, 'hook.lock'), { waitMs: 250, legacyPidOnly: true });
+  // Contention leaves checkpoints untouched; a later native hook retries the same records.
+  if (!release) return;
+  try { return await action(); } finally { await release(); }
 }
 
 export const defaultConfigPath = () => process.env.DATALAKE_OTEL_CONFIG || join(homedir(), '.config', 'doda-datalake', 'otel.json');
@@ -134,23 +94,42 @@ export function validateConfig(raw) {
   return { endpoint: endpoint.href, headers, timeoutMs, ...(raw.allowInsecureHttp === true ? { allowInsecureHttp: true } : {}) };
 }
 
-export function loadConfig(options = {}) {
-  if (options.endpoint !== undefined) return validateConfig(options);
-  const path = options.configPath || defaultConfigPath();
+function configSource(options = {}) {
+  if (options.endpoint !== undefined) return { config: validateConfig(options), source: 'inline' };
+  const path = resolve(options.configPath || defaultConfigPath());
   let raw;
+  let descriptor;
   try {
-    const info = statSync(path);
-    if (!info.isFile() || info.size > 65536 || (process.platform !== 'win32' && (info.mode & 0o077))) throw new Error('unsafe-config');
-    raw = JSON.parse(readFileSync(path, 'utf8'));
+    // Fail closed for file configs where private ownership/no-follow cannot be enforced.
+    descriptor = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW || 0) | (constants.O_NONBLOCK || 0));
+    if (process.platform === 'win32' || !constants.O_NOFOLLOW || typeof process.getuid !== 'function') throw new Error('unsafe-platform');
+    const info = fstatSync(descriptor);
+    if (!info.isFile() || info.nlink !== 1 || info.uid !== process.getuid() || info.size > 65536 || (info.mode & 0o077)) throw new Error('unsafe-config');
+    const buffer = Buffer.alloc(65537);
+    let bytes = 0;
+    while (bytes < buffer.length) {
+      const count = readSync(descriptor, buffer, bytes, buffer.length - bytes, null);
+      if (!count) break;
+      bytes += count;
+    }
+    if (bytes > 65536) throw new Error('unsafe-config');
+    raw = JSON.parse(buffer.toString('utf8', 0, bytes));
   } catch (error) {
     if (error.code === 'ENOENT' && !options.configPath && !process.env.DATALAKE_OTEL_CONFIG) {
-      if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return null;
-      return validateConfig({ endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT, headers: parseHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS) });
+      if (!process.env.OTEL_EXPORTER_OTLP_ENDPOINT) return { config: null, source: 'env' };
+      return {
+        config: validateConfig({ endpoint: process.env.OTEL_EXPORTER_OTLP_ENDPOINT, headers: parseHeaders(process.env.OTEL_EXPORTER_OTLP_HEADERS) }),
+        source: 'env',
+      };
     }
     throw new Error('Cannot read private OTLP configuration; check JSON and file permissions (0600)');
+  } finally {
+    if (descriptor !== undefined) closeSync(descriptor);
   }
-  return validateConfig(raw);
+  return { config: validateConfig(raw), source: path, configPath: path };
 }
+
+export function loadConfig(options = {}) { return configSource(options).config; }
 
 // Provider IDs are opaque, not URL paths (OpenAI tool IDs include call_id|item_id).
 // Bound printable ASCII; OTLP trace/span IDs are hashes of these identities.
@@ -194,79 +173,155 @@ function spanFor(client, event) {
   return span;
 }
 
-export function createTelemetry(client, options = {}) {
-  if (typeof client !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(client)) throw new Error('Invalid telemetry client');
-  let config;
-  try { config = loadConfig(options); } catch {
-    diagnostic('Export disabled: invalid private configuration');
+export function serializeEvent(client, event) {
+  try {
+    if (typeof client !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(client)) throw new Error('invalid-client');
+    const span = spanFor(client, event);
+    const serviceName = event?.attributes?.['service.name'];
+    const resourceName = typeof serviceName === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(serviceName) ? serviceName : client;
+    const body = JSON.stringify({ resourceSpans: [{
+      resource: { attributes: [{ key: 'service.name', value: { stringValue: resourceName } }] },
+      scopeSpans: [{ scope: { name: 'doda-datalake', version: '1.0.0' }, spans: [span] }],
+    }] });
+    return { identity: span.traceId + span.spanId, body };
+  } catch {
+    throw new Error('Invalid telemetry event');
   }
-  if (config === null) diagnostic('Export disabled: configure DATALAKE_OTEL_CONFIG or the private default config');
-  const pending = new Set();
-  async function send(event) {
-    try {
-      const serviceName = event?.attributes?.['service.name'];
-      const resourceName = typeof serviceName === 'string' && /^[A-Za-z0-9_.-]{1,128}$/.test(serviceName) ? serviceName : client;
-      const body = JSON.stringify({ resourceSpans: [{
-        resource: { attributes: [{ key: 'service.name', value: { stringValue: resourceName } }] },
-        scopeSpans: [{ scope: { name: 'doda-datalake', version: '1.0.0' }, spans: [spanFor(client, event)] }],
-      }] });
-      const response = await fetch(config.endpoint, {
-        method: 'POST', redirect: 'error',
-        headers: { ...config.headers, 'Content-Type': 'application/json' },
-        body, signal: AbortSignal.timeout(config.timeoutMs),
-      });
-      if (!response.ok) {
-        await response.body?.cancel();
-        diagnostic(`Export rejected (HTTP ${response.status})`);
-        return false;
-      }
-      // An OTLP partial success is not a successful delivery of this span.
-      let text = '';
-      let bytes = 0;
-      const decoder = new TextDecoder();
-      for await (const chunk of response.body || []) {
-        bytes += chunk.byteLength;
-        if (bytes > 65536) throw new Error('oversized-response');
-        text += decoder.decode(chunk, { stream: true });
-      }
-      text += decoder.decode();
-      if (text) {
-        const result = JSON.parse(text);
-        if (Number(result.partialSuccess?.rejectedSpans || 0) > 0) {
-          diagnostic('Collector rejected the telemetry span');
-          return false;
-        }
-      }
-      return true;
-    } catch {
-      diagnostic('Export failed; event not delivered (details suppressed to protect credentials)');
+}
+
+export async function sendPayload(config, body) {
+  try {
+    const response = await fetch(config.endpoint, {
+      method: 'POST', redirect: 'error',
+      headers: { ...config.headers, 'Content-Type': 'application/json' },
+      body, signal: AbortSignal.timeout(config.timeoutMs),
+    });
+    if (!response.ok) {
+      await response.body?.cancel();
+      diagnostic(`Export rejected (HTTP ${response.status})`);
       return false;
     }
+    // An OTLP partial success is not a successful delivery of this span.
+    let text = '';
+    let bytes = 0;
+    const decoder = new TextDecoder();
+    for await (const chunk of response.body || []) {
+      bytes += chunk.byteLength;
+      if (bytes > 65536) throw new Error('oversized-response');
+      text += decoder.decode(chunk, { stream: true });
+    }
+    text += decoder.decode();
+    if (text) {
+      const result = JSON.parse(text);
+      if (!result || typeof result !== 'object' || Array.isArray(result)) throw new Error('invalid-response');
+      if (Object.hasOwn(result, 'partialSuccess')) {
+        const partial = result.partialSuccess;
+        if (!partial || typeof partial !== 'object' || Array.isArray(partial)) throw new Error('invalid-partial-success');
+        if (Object.hasOwn(partial, 'errorMessage') && typeof partial.errorMessage !== 'string') throw new Error('invalid-partial-success');
+        if (Object.hasOwn(partial, 'rejectedSpans')) {
+          const rejected = partial.rejectedSpans;
+          if (!(typeof rejected === 'number' && Number.isInteger(rejected) && rejected >= 0)
+            && !(typeof rejected === 'string' && /^[0-9]+$/.test(rejected))) throw new Error('invalid-rejected-spans');
+          if (typeof rejected === 'number' ? rejected !== 0 : !/^0+$/.test(rejected)) {
+            diagnostic('Collector rejected the telemetry span');
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  } catch {
+    diagnostic('Export failed; event not delivered (details suppressed to protect credentials)');
+    return false;
+  }
+}
+
+export function createTelemetry(client, options = {}) {
+  if (typeof client !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(client)) throw new Error('Invalid telemetry client');
+  let selected, root, route;
+  const limits = { maxEntries: options.maxEntries, maxBytes: options.maxBytes };
+  const nodeBinary = options.nodeBinary;
+  try {
+    selected = configSource(options);
+    const profile = options.profile ?? 'default';
+    if (typeof profile !== 'string' || profile.length > 4096 || /[\x00-\x1f\x7f]/.test(profile)) throw new Error('invalid-profile');
+    const base = resolve(options.stateRoot ?? join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'doda-datalake', 'otel'));
+    if (selected.config) {
+      const endpointHash = hash(selected.config.endpoint, 64);
+      const key = hash(JSON.stringify([client, selected.source, profile, endpointHash]), 64);
+      route = { key, endpointHash, ...(selected.configPath ? { configPath: selected.configPath } : {}) };
+      root = join(base, key);
+    }
+  } catch { selected = undefined; }
+  if (!selected?.config) diagnostic('Export disabled: private configuration unavailable');
+  const pending = new Set();
+  let outbox, warnedPending = false;
+  const warnPending = () => {
+    if (!warnedPending) {
+      warnedPending = true;
+      diagnostic('Accepted telemetry remains pending; check private configuration and collector availability');
+    }
+  };
+  async function accept(serialized) {
+    let accepted = false;
+    try {
+      outbox ??= openOutbox({ root, route, ...limits }).catch(error => { outbox = undefined; throw error; });
+      const queue = await outbox;
+      const status = await readSenderStatus(root);
+      if (status?.state.startsWith('pending-')) warnPending();
+      accepted = await queue.put(serialized);
+      if (!accepted) {
+        diagnostic('Local telemetry queue unavailable or full; event not accepted');
+        return false;
+      }
+      // OMP waits for pipe transfer only; other hosts may also wait for worker readiness.
+      await startSender({ root, route, config: selected.config, nodeBinary, waitForReady: options.waitForSenderReady });
+    } catch {
+      if (accepted) warnPending();
+      else diagnostic('Local telemetry queue unavailable; event not accepted');
+    }
+    return accepted;
   }
   return {
-    emit(event) {
-      if (!config) return Promise.resolve(false);
-      // ponytail: bounded in-flight export, not an offline spool; use a local OTel collector when durable client delivery is required.
-      if (pending.size >= 128) {
-        diagnostic('Export queue full; event not delivered');
+    get enabled() { return Boolean(selected?.config); },
+    enqueue(event) {
+      if (!selected?.config) return Promise.resolve(false);
+      let serialized;
+      try { serialized = serializeEvent(client, event); }
+      catch {
+        diagnostic('Invalid telemetry event; event not accepted');
         return Promise.resolve(false);
       }
-      const request = send(event);
-      pending.add(request);
-      request.finally(() => pending.delete(request));
-      return request;
+      // Only local work is bounded here; a refused event must not advance caller checkpoints.
+      if (pending.size >= 128) {
+        diagnostic('Local telemetry queue busy; event not accepted');
+        return Promise.resolve(false);
+      }
+      const operation = accept(serialized);
+      pending.add(operation);
+      operation.then(() => pending.delete(operation), () => pending.delete(operation));
+      return operation;
     },
-    async flush() { await Promise.all([...pending]); },
+    async flushLocal() {
+      while (pending.size) await Promise.all([...pending]);
+    },
   };
 }
 
-export function repositoryContext(cwd) {
+export async function repositoryContext(cwd) {
   if (typeof cwd !== 'string' || !cwd) return {};
-  const git = args => spawnSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: 1000, stdio: ['ignore', 'pipe', 'ignore'] });
-  const root = git(['rev-parse', '--show-toplevel']);
-  if (root.status !== 0 || !root.stdout.trim()) return {};
-  const metadata = { 'coding_agent.repository.id': hash(root.stdout.trim(), 64) };
-  const branch = git(['symbolic-ref', '--quiet', '--short', 'HEAD']);
-  if (branch.status === 0 && branch.stdout.trim().length <= 256) metadata['vcs.ref.head.name'] = branch.stdout.trim();
+  const git = async args => {
+    try {
+      const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], {
+        encoding: 'utf8', timeout: 1000, maxBuffer: 1024 * 1024,
+      });
+      return stdout.trim();
+    } catch { return null; }
+  };
+  const root = await git(['rev-parse', '--show-toplevel']);
+  if (!root) return {};
+  const metadata = { 'coding_agent.repository.id': hash(root, 64) };
+  const branch = await git(['symbolic-ref', '--quiet', '--short', 'HEAD']);
+  if (branch !== null && branch.length <= 256) metadata['vcs.ref.head.name'] = branch;
   return metadata;
 }

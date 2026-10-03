@@ -81,7 +81,7 @@ export OTLP_ENDPOINT='http://192.168.99.10:4318'
 
 주소와 포트는 실제 배포에 맞게 바꾸세요. **3단계의 두 `configure.mjs` 명령에 `--allow-insecure-http`를 추가**해야 합니다. 이 옵션은 사설 IPv4(`10/8`, `172.16/12`, `192.168/16`)만 허용하며, 공인 IP나 DNS 이름의 HTTP는 여전히 거부합니다. 허용 여부는 생성된 private JSON에 저장되고, 다른 설정 파일의 기본 보안 정책은 바뀌지 않습니다.
 
-OMP에만 적용하려면 3단계의 설정 파일명을 `omp-arcane.json`처럼 구분하고, OMP 설치 시 그 파일을 `--config`로 지정하세요. SSH 터널 프로세스는 필요 없지만 해당 LAN에 접속되어 있어야 하며, 전송 실패 시 플러그인이 로컬 디스크에 재전송 대기열을 남기지는 않습니다.
+OMP에만 적용하려면 3단계의 설정 파일명을 `omp-arcane.json`처럼 구분하고, OMP 설치 시 그 파일을 `--config`로 지정하세요. SSH 터널 프로세스는 필요 없습니다. OMP의 종료·재전송 동작은 아래 OMP 항목을 참고하세요.
 
 ## 3. 인증을 안전하게 설정하기
 
@@ -201,6 +201,10 @@ omp --profile work
 
 기존 네이티브 **트레이스**가 같은 수집 주소로 전송되는 경우 토큰 사용량은 네이티브 쪽에 맡깁니다. 메트릭·로그만 켰거나 다른 주소로 보내는 경우에는 플러그인 사용량 전송을 유지합니다.
 
+OMP 이벤트는 먼저 사용자 전용 영속 큐에 저장하고, 별도 Node sender가 HTTP 전송과 재시도를 처리합니다. 종료 훅은 로컬 저장과 sender의 private pipe에 bootstrap 전달이 끝날 때까지만 기다립니다. sender 초기화 ACK나 수집기의 HTTP 응답은 기다리지 않으며, bootstrap을 받은 sender는 OMP가 종료된 뒤에도 전송을 계속합니다. 보조 Git 정보는 500ms 안에 준비되지 않으면 생략합니다. 로컬 디스크 I/O나 Node 런타임 탐색 자체가 지연되면 종료가 늦어질 수 있습니다.
+
+sender 시작에 실패해도 이미 저장한 이벤트는 대기열에 남습니다. 다음 이벤트가 들어오면 sender 시작을 다시 시도합니다. 큐가 가득 차거나 로컬 저장에 실패한 이벤트까지 보존되는 것은 아니므로 진단 경고를 확인하고, 대기열을 임의로 삭제하지 마세요.
+
 ### opencode2
 
 ```bash
@@ -275,12 +279,13 @@ ssh -N -o ExitOnForwardFailure=yes \
 | `HTTP 401` 또는 `403` | OTLP 계정이 서버와 같은지 확인. Grafana·DB 계정과 혼동하지 않았는지 확인. 프록시의 추가 접근 정책도 확인. 비밀번호를 로그에 출력하지 말 것. |
 | `404`, `405` 또는 리디렉션 상태 | OTLP HTTP 주소인지 확인. 프록시가 최종 `/v1/traces` POST 경로를 전달하는지 확인. Grafana·Arcane 관리 주소는 사용하지 않음. |
 | 연결 실패 또는 timeout | SSH 터널이 살아 있는지, 원격 포트가 실제 `OTLP_HTTP_PORT`인지, 서버가 기동되어 있는지 확인. TLS 인증서 신뢰도 확인. |
+| OMP `handler timed out after 2000ms` | 갱신된 확장을 로드하도록 OMP 재시작. 종료 시 sender 초기화·HTTP 응답은 기다리지 않으며, 계속 발생하면 로컬 디스크·큐 잠금·Node 탐색 지연 확인. HTTP timeout을 늘려 해결하지 말 것. |
 | `Export disabled: invalid private configuration` | 지정한 파일이 존재하는지, JSON 형식이 올바른지 확인. `chmod 600 "$DATALAKE_OTEL_CONFIG"`로 권한 제한. 파일 내용은 공유하지 말 것. |
 | `Configuration already exists` | 재설정이 맞는지 확인 후 configure 명령에 `--replace` 추가. 기존 인증을 자동 승계하지 않으므로 인증 파일도 다시 지정. |
 | 설치는 됐는데 새 span이 없음 | 실제로 사용하는 홈·프로필에 설치했는지, 재시작했는지 확인. Codex `/hooks` 신뢰, OMP 확장 비활성화 옵션, Claude 정책·비활성화 상태 확인. |
 | opencode2 관리 포트 충돌 | 기존 사용자 서버를 강제 종료하지 말 것. `run --standalone`으로 분리하여 확인하거나 정상적인 서버 관리 절차로 해결. |
 | 토큰은 있지만 비용이 비어 있음 | Codex·Claude 훅에는 비용 원본이 없어 누락 상태로 둠. 0원이라는 뜻이 아님. OMP·opencode2의 보고 비용도 청구서와 같다고 보장하지 않음. |
-| 오프라인 동안 사용량 누락 | 직접 전송기에 영속 오프라인 큐는 없음. 내구성 있는 재전송이 필요하면 에이전트 컴퓨터에 별도 OTel Collector를 구성. |
+| 오프라인 동안 사용량 누락 | OMP는 영속 큐와 별도 sender로 재시도. 로컬 저장 실패·용량 초과 경고와 sender 시작 실패 확인. 갱신 전에 큐에 저장되지 않은 과거 이벤트는 복구되지 않음. |
 
 서버 관리자가 추가 진단할 때는 서버의 Compose 디렉터리에서 `docker compose logs --since 10m alloy aggregate`를 확인할 수 있습니다. 로그를 공유하기 전 민감한 정보가 없는지 검토하세요.
 

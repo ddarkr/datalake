@@ -7,7 +7,7 @@ import { isMain } from '../otel.mjs';
 
 const pluginName = 'doda-datalake-otel';
 const root = fileURLToPath(new URL('../', import.meta.url));
-const ownedFiles = ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'claude-code/hook.mjs', 'otel.mjs', 'claude-code/config-path.json'];
+const ownedFiles = ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'claude-code/hook.mjs', 'otel.mjs', 'outbox.mjs', 'sender.mjs', 'claude-code/config-path.json'];
 const markerName = '.datalake-otel-install.json';
 const fail = message => { throw Object.assign(new Error(message), { code: 'DATALAKE_INSTALL' }); };
 

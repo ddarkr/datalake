@@ -4,7 +4,7 @@ import { link, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createTelemetry, isMain } from '../otel.mjs';
+import { createTelemetry, isMain, withStateLock } from '../otel.mjs';
 import { collectUsage } from './usage.mjs';
 
 // Pinned wire contract: openai/codex rust-v0.142.4, codex-rs/hooks/src/schema.rs.
@@ -91,8 +91,20 @@ export async function handleHook(input, { telemetry, stateDir, now = Date.now } 
   const events = [];
   if (event) {
     event = await firstObservation(path(`event:${event.eventId}`), event);
-    await telemetry.emit(event);
-    events.push(event);
+    const receiptPath = path(`queued:${event.eventId}`);
+    // Serialize duplicates only; another completion must not wait for this event's bootstrap.
+    const lockDirectory = `${receiptPath}.lock`;
+    await mkdir(lockDirectory, { recursive: true, mode: 0o700 });
+    const queued = await withStateLock(lockDirectory, async () => {
+      const receipt = await existing(receiptPath);
+      if (receipt?.version === 1 && receipt.queued === true) return false;
+      let accepted = false;
+      try { accepted = await telemetry.enqueue(event); } catch {}
+      if (accepted !== true) return false;
+      await firstObservation(receiptPath, { version: 1, queued: true });
+      return true;
+    });
+    if (queued) events.push(event);
   }
   if (eventName !== 'SubagentStart' && !(eventName === 'SessionStart' && input.source === 'compact')) {
     events.push(...await collectUsage(input, { telemetry, stateDir: directory, prime: eventName === 'SessionStart' }));
@@ -117,10 +129,10 @@ export async function runHook() {
       return;
     }
     if (input.hook_event_name === 'SessionStart') process.stderr.write('[datalake] Codex source=plugin: 같은 세션의 네이티브 OTel을 같은 데이터레이크로 병행 수집하지 마세요.\n');
-    const telemetry = createTelemetry('codex', { configPath: settings?.configPath });
     const dataRoot = process.env.PLUGIN_DATA ?? join(process.env.CODEX_HOME ?? join(homedir(), '.codex'), 'doda-datalake-state');
+    const telemetry = createTelemetry('codex', { configPath: settings?.configPath, profile: dataRoot, stateRoot: join(dataRoot, 'outbox') });
     await handleHook(input, { telemetry, stateDir: join(dataRoot, 'metadata') });
-    await telemetry.flush();
+    await telemetry.flushLocal();
   } catch {
     process.stderr.write('[datalake] Codex 메타데이터 처리 실패; 원문과 오류 상세는 기록하지 않았습니다.\n');
   }

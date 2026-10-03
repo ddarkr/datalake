@@ -1,3 +1,4 @@
+import { setTimeout as delay } from 'node:timers/promises';
 import { createTelemetry, repositoryContext } from '../otel.mjs';
 
 // OpenCode 2.0.1/2.0.12: define() returns this exact { id, setup }
@@ -55,13 +56,14 @@ export function createEventMapper(baseAttributes = {}) {
     const sessionId = data.sessionID;
     let state = sessions.get(sessionId);
     if (!state) {
-      state = { seq: -1, steps: new Map(), tools: new Map() };
+      state = { observedSeq: -1, steps: new Map(), tools: new Map() };
       sessions.set(sessionId, state);
     }
-    // Native durable sequences are ordered within each session. Repeated
-    // delivery must not manufacture another billable LLM or tool operation.
-    if (event.durable.seq <= state.seq) return [];
-    state.seq = event.durable.seq;
+    // This is an observed-native watermark, not durable-local acceptance.
+    // Pending projections retain their identities independently; a partial
+    // acceptance is never reconstructed or replayed from a later native item.
+    if (event.durable.seq <= state.observedSeq) return [];
+    state.observedSeq = event.durable.seq;
     const endTimeMs = event.created;
     const make = (kind, eventId, startTimeMs, attributes, parentEventId) => ({
       kind, sessionId, eventId, startTimeMs, endTimeMs,
@@ -163,29 +165,99 @@ export function createEventMapper(baseAttributes = {}) {
 export default {
   id: pluginId,
   setup(ctx) {
-    const telemetry = createTelemetry('opencode', { configPath: ctx.options?.configPath });
-    const attributes = repositoryContext(ctx.location.directory);
+    const telemetry = createTelemetry('opencode', {
+      configPath: ctx.options?.configPath,
+      stateRoot: ctx.options?.stateRoot,
+      profile: ctx.options?.profile,
+      nodeBinary: ctx.options?.nodeBinary,
+    });
+    if (telemetry.enabled === false) return async () => {};
+    const controller = new AbortController();
+    const context = Promise.race([
+      repositoryContext(ctx.location.directory).catch(() => ({})),
+      new Promise(resolve => controller.signal.addEventListener('abort', () => resolve({}), { once: true })),
+    ]);
+    const attributes = {};
     if (label(ctx.app?.name)) attributes['service.name'] = ctx.app.name;
     const mapEvent = createEventMapper(attributes);
-    const controller = new AbortController();
-    const consume = (async () => {
+    // Project synchronously before any await: only this sanitized batch, never
+    // the native item's text, input, or provider state, survives local failure.
+    const project = item => {
+      if (item.done || controller.signal.aborted) return null;
+      const event = item.value;
+      // The host bus can include other locations; one location's plugin must
+      // not export another location's activity a second time.
+      if (event.location && (event.location.directory !== ctx.location.directory ||
+          event.location.workspaceID !== ctx.location.workspaceID)) return [];
+      return mapEvent(event);
+    };
+    // ponytail: 256 sanitized spans per plugin; refuse new projections at the
+    // ceiling rather than retaining the host's unbounded raw pubsub backlog.
+    const pending = [];
+    const pendingLimit = 256;
+    let overflowWarned = false;
+    let subscriptionDone = false;
+    let wakeHandoff;
+    const handoff = (async () => {
+      const repository = await context;
+      let backoff = 100;
       try {
-        for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          if (controller.signal.aborted) break;
-          // The host bus can include other locations; one location's plugin
-          // must not export another location's activity a second time.
-          if (event.location && (event.location.directory !== ctx.location.directory ||
-              event.location.workspaceID !== ctx.location.workspaceID)) continue;
-          for (const span of mapEvent(event)) void telemetry.emit(span).catch(() => {});
+        while (pending.length || !controller.signal.aborted) {
+          if (!pending.length) {
+            if (subscriptionDone || controller.signal.aborted) break;
+            await new Promise(resolve => { wakeHandoff = resolve; });
+            wakeHandoff = undefined;
+            continue;
+          }
+          const span = pending[0];
+          span.attributes = { ...repository, ...span.attributes };
+          let accepted = false;
+          try { accepted = await telemetry.enqueue(span); } catch {}
+          // Shutdown makes one final local attempt per pending span, with no
+          // retry sleep and no wait for the detached sender's HTTP response.
+          if (accepted === true || controller.signal.aborted) {
+            pending.shift();
+            backoff = 100;
+          } else {
+            try { await delay(backoff, undefined, { signal: controller.signal }); }
+            catch (error) { if (!controller.signal.aborted) throw error; }
+            backoff = Math.min(backoff * 2, 60000);
+          }
+        }
+      } catch {
+        if (!controller.signal.aborted) console.error('[datalake-otel] opencode2 local handoff stopped');
+      }
+    })();
+    controller.signal.addEventListener('abort', () => wakeHandoff?.(), { once: true });
+    const consume = (async () => {
+      let iterator;
+      try {
+        iterator = ctx.event.subscribe({ signal: controller.signal })[Symbol.asyncIterator]();
+        while (!controller.signal.aborted) {
+          const batch = project(await iterator.next());
+          if (batch === null) break;
+          if (!batch.length) continue;
+          if (pending.length + batch.length > pendingLimit) {
+            if (!overflowWarned) {
+              overflowWarned = true;
+              console.error('[datalake-otel] opencode2 local metadata buffer full; new telemetry not accepted');
+            }
+            continue;
+          }
+          pending.push(...batch);
+          wakeHandoff?.();
         }
       } catch {
         if (!controller.signal.aborted) console.error('[datalake-otel] opencode2 event subscription stopped');
+      } finally {
+        subscriptionDone = true;
+        wakeHandoff?.();
+        await iterator?.return?.();
       }
     })();
     return async () => {
       controller.abort();
-      await consume;
-      await telemetry.flush();
+      try { await Promise.all([consume, handoff]); } finally { await telemetry.flushLocal(); }
     };
   },
 };

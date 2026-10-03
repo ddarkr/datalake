@@ -73,7 +73,7 @@ export async function install(args = []) {
       await writeFile(markerPath, MARKER, { mode: 0o600, flag: 'wx' });
     }
     for (const path of ['.agents/plugins', 'plugin/.codex-plugin', 'plugin/codex']) await mkdir(join(plan.marketplace, path), { recursive: true, mode: 0o700 });
-    for (const path of ['otel.mjs', '.codex-plugin/plugin.json', 'codex/hook.mjs', 'codex/usage.mjs', 'codex/hooks.json']) {
+    for (const path of ['otel.mjs', 'outbox.mjs', 'sender.mjs', '.codex-plugin/plugin.json', 'codex/hook.mjs', 'codex/usage.mjs', 'codex/hooks.json']) {
       const target = join(plan.pluginRoot, path);
       try { if ((await lstat(target)).isSymbolicLink()) throw new Error('플러그인 파일의 심볼릭 링크는 덮어쓰지 않습니다.'); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }

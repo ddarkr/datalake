@@ -42,8 +42,9 @@ export function agentDirectory({ home = homedir(), profile, isolated = false, en
   return agentDir;
 }
 
-function loader(configPath, moduleURL = extensionURL) {
-  return marker + `import extension from ${JSON.stringify(moduleURL)};\nexport default pi => extension(pi, ${JSON.stringify(configPath ? { configPath } : {})});\n`;
+function loader(configPath, moduleURL = extensionURL, profile) {
+  const options = { ...(configPath ? { configPath } : {}), ...(profile ? { profile } : {}) };
+  return marker + `import extension from ${JSON.stringify(moduleURL)};\nexport default pi => extension(pi, ${JSON.stringify(options)});\n`;
 }
 
 function ownedLoader(text) {
@@ -54,9 +55,10 @@ function ownedLoader(text) {
     const url = JSON.parse(match[1]);
     const options = JSON.parse(match[2]);
     return typeof url === 'string' && url.startsWith('file:') && options &&
-      Object.keys(options).every(key => key === 'configPath') &&
+      Object.keys(options).every(key => key === 'configPath' || key === 'profile') &&
       (options.configPath === undefined || typeof options.configPath === 'string') &&
-      text === loader(options.configPath, url);
+      (options.profile === undefined || typeof options.profile === 'string') &&
+      text === loader(options.configPath, url, options.profile);
   } catch { return false; }
 }
 
@@ -86,8 +88,9 @@ export async function install(args = process.argv.slice(2), env = process.env) {
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (existing !== undefined && !ownedLoader(existing)) throw new Error('기존 파일이 관리 로더와 다릅니다. 변경하지 않았습니다.');
   const configPath = values.config ? resolve(values.config) : undefined;
-  const content = loader(configPath);
-  if (!values.uninstall && existing !== undefined && existing !== content) {
+  const content = loader(configPath, extensionURL, directory);
+  const migrate = existing === loader(configPath) && existing !== content;
+  if (!values.uninstall && existing !== undefined && existing !== content && !migrate) {
     throw new Error('설치 옵션이 기존 로더와 다릅니다. 먼저 --uninstall --apply로 제거하세요.');
   }
   const action = values.uninstall ? '제거' : '설치';
@@ -98,8 +101,10 @@ export async function install(args = process.argv.slice(2), env = process.env) {
   } else if (existing === undefined) {
     await mkdir(dirname(path), { recursive: true });
     await writeFile(path, content, { flag: 'wx', mode: 0o600 });
+  } else if (migrate) {
+    await writeFile(path, content, { mode: 0o600 });
   }
-  return { path, changed: values.uninstall ? existing !== undefined : existing === undefined };
+  return { path, changed: values.uninstall ? existing !== undefined : existing === undefined || migrate };
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(resolve(process.argv[1])).href) {

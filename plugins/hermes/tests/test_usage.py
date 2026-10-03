@@ -61,7 +61,7 @@ class ProjectionTests(unittest.TestCase):
         span = body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
         session = attributes(body)['coding_agent.session.id']
         event = json.dumps(['post_api_request', 'request-1', 0], separators=(',', ':'))
-        script = "import {createTelemetry} from './plugins/otel.mjs'; globalThis.fetch=async(u,o)=>{console.log(o.body);return {ok:true,body:[]}}; await createTelemetry('hermes',{endpoint:'http://localhost:4318'}).emit(" + json.dumps(dict(kind='llm.turn', sessionId=session, eventId=event, startTimeMs=1700000000125, endTimeMs=1700000001250)) + ");"
+        script = "import {serializeEvent} from './plugins/otel.mjs'; console.log(serializeEvent('hermes'," + json.dumps(dict(kind='llm.turn', sessionId=session, eventId=event, startTimeMs=1700000000125, endTimeMs=1700000001250)) + ").body);"
         oracle = json.loads(subprocess.check_output(['node', '--input-type=module', '-e', script], cwd=ROOT.parents[1], text=True))
         other = oracle['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
         for key in ('traceId', 'spanId', 'startTimeUnixNano', 'endTimeUnixNano', 'name', 'kind', 'status'):

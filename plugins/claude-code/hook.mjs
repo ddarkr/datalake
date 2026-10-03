@@ -138,11 +138,13 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
     await save(eventPath, { kind: isTool ? 'tool.call' : 'subagent', sessionId, eventId, parentEventId: isTool && agentId ? `subagent:${agentId}` : session?.eventId, startTimeMs: now, attributes }, true);
     return;
   }
-  async function emitOnce(event) {
-    const claim = join(stateDir, `sent-${hash(event.eventId)}.json`);
-    if (await json(claim)) return true;
-    if (!await telemetry.emit(event)) return false;
-    await save(claim, {});
+  async function enqueueOnce(event) {
+    // Existing sent receipts prove collector ACK; queued-v2 proves only durable local acceptance.
+    const legacy = join(stateDir, `sent-${hash(event.eventId)}.json`);
+    const queued = join(stateDir, `queued-v2-${hash(event.eventId)}.json`);
+    if (await json(legacy) !== undefined || await json(queued) !== undefined) return true;
+    if (!await telemetry.enqueue(event)) return false;
+    await save(queued, {});
     return true;
   }
   const completed = [];
@@ -153,8 +155,8 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
       const observedStart = event !== undefined;
       // No pre-hook means no observed start: completion is still a real zero-duration event.
       if (!event) event = { kind: isTool ? 'tool.call' : 'subagent', sessionId, eventId, startTimeMs: now, parentEventId: session?.eventId, attributes: isTool ? { 'gen_ai.tool.name': builtins.has(input.tool_name) ? input.tool_name : 'custom', 'gen_ai.tool.call.id': toolId } : { 'coding_agent.agent.id': agentId, 'coding_agent.subagent.type': agentTypes.has(input.agent_type) ? input.agent_type : 'custom' } };
-      if (isTool && hook === 'PostToolUseFailure') event.error = true;
       if (event.endTimeMs === undefined) {
+        if (isTool && hook === 'PostToolUseFailure') event.error = true;
         event.endTimeMs = Math.max(event.startTimeMs, now);
         if (observedStart) {
           const duration = Math.max(0, event.endTimeMs - event.startTimeMs);
@@ -184,20 +186,24 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
     }
     completed.unshift(session);
   }
-  // Wait for every ACK before releasing serialization, including a mixed false/throw batch.
-  const delivered = await Promise.allSettled(completed.map(emitOnce));
-  if (checkpoint && delivered.every(result => result.status === 'fulfilled' && result.value)) {
+  // Every local put settles before releasing serialization, even a mixed false/throw batch.
+  const accepted = await Promise.allSettled(completed.map(enqueueOnce));
+  if (checkpoint && accepted.every(result => result.status === 'fulfilled' && result.value)) {
     await save(checkpoint.path, checkpoint.value);
   }
-  const failure = delivered.find(result => result.status === 'rejected');
+  const failure = accepted.find(result => result.status === 'rejected');
   if (failure) throw failure.reason;
 }
 
 async function main() {
   // OTEL_* is scrubbed from Claude hook children; installation stores only a private config path.
   const pointer = await json(fileURLToPath(new URL('./config-path.json', import.meta.url)));
-  const telemetry = createTelemetry('claude-code', { configPath: process.env.DATALAKE_OTEL_CONFIG || pointer?.configPath });
-  const stateRoot = join(process.env.CLAUDE_PLUGIN_DATA || join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'plugins', 'data', 'doda-datalake-otel'), 'sessions');
+  const dataRoot = process.env.CLAUDE_PLUGIN_DATA || join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'plugins', 'data', 'doda-datalake-otel');
+  const telemetry = createTelemetry('claude-code', {
+    configPath: process.env.DATALAKE_OTEL_CONFIG || pointer?.configPath,
+    profile: dataRoot, stateRoot: join(dataRoot, 'outbox'),
+  });
+  const stateRoot = join(dataRoot, 'sessions');
   let input = '', size = 0;
   process.stdin.setEncoding('utf8');
   for await (const chunk of process.stdin) {
@@ -209,7 +215,7 @@ async function main() {
     // Native usage received by the datalake takes precedence; the native exporter may target
     // a different backend or emit only metrics, so its enable flag must not suppress this path.
     await handleHook(JSON.parse(input), { telemetry, stateRoot });
-  } finally { await telemetry.flush(); }
+  } finally { await telemetry.flushLocal(); }
 }
 
 if (isMain(import.meta.url)) {

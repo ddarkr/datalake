@@ -1,4 +1,6 @@
 import { createTelemetry, loadConfig, repositoryContext } from '../otel.mjs';
+import { agentDirectory } from './install.mjs';
+import { setTimeout as delay } from 'node:timers/promises';
 
 // OMP 18.2.6: extensions/types.ts, task/executor.ts and
 // tui/overlays/session-observer-registry.ts. Prepared factories are rebound
@@ -54,7 +56,11 @@ export function usageAttributes(usage) {
 
 /** Native default extension factory; second argument is used by the installed bootstrap. */
 export default function ompTelemetry(pi, options = {}) {
-  const telemetry = options.telemetry ?? createTelemetry('oh-my-pi', { configPath: options.configPath });
+  const telemetry = options.telemetry ?? createTelemetry('oh-my-pi', {
+    configPath: options.configPath, stateRoot: options.stateRoot,
+    profile: options.profile ?? agentDirectory({ env: options.env ?? process.env }),
+    waitForSenderReady: false,
+  });
   const clock = options.clock ?? Date.now;
   const repoContext = options.repositoryContext ?? repositoryContext;
   let pluginEndpoint;
@@ -63,17 +69,32 @@ export default function ompTelemetry(pi, options = {}) {
   let current;
   const states = new Map();
   const ownRoutes = new Set();
+  const scheduled = new Set();
 
   // Do not return exporter promises from observability hooks: slow/offline OTLP
   // must not delay tools, prompt delivery, or detached message notifications.
-  function emit(state, event) {
-    if (state.sent.has(event.eventId)) return;
-    state.sent.add(event.eventId);
-    void Promise.resolve().then(() => telemetry.emit({
-      ...event,
-      sessionId: state.sessionId,
-      attributes: { ...state.attributes, ...event.attributes },
-    })).catch(() => {});
+  function enqueue(state, event) {
+    const id = event.eventId;
+    if (state.queued.has(id) || state.inFlight.has(id)) return;
+    let projected = state.retry.get(id);
+    if (!projected) {
+      const metadata = { ...event, sessionId: state.sessionId, attributes: { ...event.attributes } };
+      projected = state.attributesReady.then(() => Object.freeze({
+        ...metadata, attributes: Object.freeze({ ...state.attributes, ...metadata.attributes }),
+      }));
+      state.retry.set(id, projected);
+    }
+    state.inFlight.add(id);
+    const operation = projected.then(event => telemetry.enqueue(event)).then(accepted => {
+      if (accepted === true) {
+        state.queued.add(id);
+        state.retry.delete(id);
+      }
+    }).catch(() => {}).finally(() => {
+      state.inFlight.delete(id);
+      scheduled.delete(operation);
+    });
+    scheduled.add(operation);
   }
 
   function stateFor(ctx) {
@@ -82,10 +103,14 @@ export default function ompTelemetry(pi, options = {}) {
     if (current?.nativeId === id) return current;
     if (current) close(current);
     const route = childRoutes.get(ctx.sessionManager.getSessionFile());
+    const prior = states.get(id);
+    const previous = prior?.sessionId === (route?.sessionId ?? id) ? prior : undefined;
     current = {
       nativeId: id, sessionId: route?.sessionId ?? id,
       rootId: route?.eventId ?? `session:${id}:${clock()}`,
-      start: clock(), sent: new Set(), tools: new Map(), children: new Map(),
+      start: clock(), queued: previous?.queued ?? new Set(),
+      inFlight: previous?.inFlight ?? new Set(), retry: previous?.retry ?? new Map(),
+      tools: new Map(), children: new Map(),
       attributes: { 'coding_agent.agent.id': route?.agentId ?? id },
       child: Boolean(route), closed: false,
       nativeUsage: route?.nativeUsage ?? nativeUsage,
@@ -95,20 +120,28 @@ export default function ompTelemetry(pi, options = {}) {
     }
     if (route) current.attributes['coding_agent.agent.parent_id'] = route.parentAgentId;
     states.set(id, current);
-    // Never retain the context, raw cwd, transcript, or native event object.
+    // Capture only the directory string, never the native context or event.
     const state = current;
-    void Promise.resolve().then(() => repoContext(ctx.cwd)).then(attrs => {
+    const cwd = ctx.cwd;
+    // ponytail: optional Git metadata gets 500ms; use a cached snapshot if slow repositories need full coverage.
+    const metadataBudget = new AbortController();
+    state.attributesReady = Promise.race([
+      Promise.resolve().then(() => repoContext(cwd)),
+      delay(500, {}, { signal: metadataBudget.signal }),
+    ]).then(attrs => {
       Object.assign(state.attributes, attrs);
-    }).catch(() => {});
+    }).catch(() => {}).finally(() => metadataBudget.abort());
     return state;
   }
 
   function close(state) {
-    if (state.closed) return;
-    state.closed = true;
-    if (!state.child) emit(state, {
+    if (!state.closed) {
+      state.closed = true;
+      state.end = clock();
+    }
+    if (!state.child) enqueue(state, {
       kind: 'session', eventId: state.rootId,
-      startTimeMs: state.start, endTimeMs: clock(),
+      startTimeMs: state.start, endTimeMs: state.end,
     });
   }
 
@@ -138,7 +171,7 @@ export default function ompTelemetry(pi, options = {}) {
     ]) if (identity(value)) attributes[key] = value;
     const end = number(message.completedAt) ? message.completedAt
       : number(message.duration) ? message.timestamp + message.duration : clock();
-    emit(state, {
+    enqueue(state, {
       kind: 'llm.turn', eventId, parentEventId: state.rootId,
       startTimeMs: message.timestamp, endTimeMs: Math.max(message.timestamp, end), attributes,
       error: message.stopReason === 'error' || message.stopReason === 'aborted',
@@ -156,7 +189,7 @@ export default function ompTelemetry(pi, options = {}) {
     const end = clock();
     const attributes = { 'gen_ai.tool.call.id': event.toolCallId };
     if (identity(event.toolName)) attributes['gen_ai.tool.name'] = event.toolName;
-    emit(state, {
+    enqueue(state, {
       kind: 'tool.call', eventId: `tool:${state.nativeId}:${event.toolCallId}`,
       parentEventId: tool?.parent ?? state.rootId,
       startTimeMs: tool?.start ?? end, endTimeMs: end,
@@ -197,7 +230,7 @@ export default function ompTelemetry(pi, options = {}) {
       'coding_agent.subagent.duration_ms': Math.max(0, end - child.start),
     };
     if (identity(payload.agent)) attributes['coding_agent.subagent.type'] = payload.agent;
-    emit(state, {
+    enqueue(state, {
       kind: 'subagent', eventId: child.eventId, parentEventId: child.parent,
       startTimeMs: child.start, endTimeMs: end, attributes,
       error: payload.status !== 'completed',
@@ -207,8 +240,7 @@ export default function ompTelemetry(pi, options = {}) {
     for (const state of states.values()) close(state);
     unsubscribe();
     for (const path of ownRoutes) childRoutes.delete(path);
-    // Emit is queued in microtasks above; allow it to enter the sender first.
-    await Promise.resolve();
-    await telemetry.flush().catch(() => {});
+    while (scheduled.size) await Promise.all([...scheduled]);
+    await telemetry.flushLocal().catch(() => {});
   });
 }

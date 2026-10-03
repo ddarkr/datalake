@@ -1,11 +1,13 @@
 #!/usr/bin/env node
-import { randomUUID } from 'node:crypto';
-import { readFile, writeFile, unlink, mkdir, stat, appendFile, rename } from 'node:fs/promises';
+import { createHash, randomUUID } from 'node:crypto';
+import { readFile, writeFile, unlink, mkdir, stat, rename, open } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
-import { join, isAbsolute } from 'node:path';
+import { dirname, join, isAbsolute } from 'node:path';
+import { parseArgs } from 'node:util';
 import { createTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
 
-async function resolveConfigPath() {
+async function resolveConfigPath(explicit) {
+  if (explicit) return explicit;
   if (process.env.DATALAKE_OTEL_CONFIG) return process.env.DATALAKE_OTEL_CONFIG;
   const arcane = join(homedir(), '.config', 'doda-datalake', 'agy-arcane.json');
   try {
@@ -21,8 +23,27 @@ function stateDir(sessionId) {
   return join(tmpdir(), 'doda-datalake-agy', safeSession);
 }
 
-function toolStatePath(sessionId, stepIdx) {
-  return join(stateDir(sessionId), `tool-${stepIdx}.json`);
+function toolStatePath(sessionId, eventId) {
+  const identity = createHash('sha256').update(eventId).digest('hex');
+  return join(stateDir(sessionId), `tool-${identity}.json`);
+}
+
+async function readToolState(sessionId, stepIdx, toolName, eventId) {
+  const paths = [toolStatePath(sessionId, eventId)];
+  // Old step-only files are read only when their recorded identity matches.
+  if (/^[a-zA-Z0-9_-]+$/.test(String(stepIdx))) {
+    paths.push(join(stateDir(sessionId), `tool-${stepIdx}.json`));
+  }
+  for (const path of paths) {
+    try {
+      const state = JSON.parse(await readFile(path, 'utf8'));
+      if (state?.toolName !== toolName || (state.eventId && state.eventId !== eventId)) continue;
+      if (state.event && (state.event.eventId !== eventId
+        || state.event.sessionId !== String(sessionId) || state.event.kind !== 'tool.call')) continue;
+      return state;
+    } catch {}
+  }
+  return undefined;
 }
 
 function cursorPath(sessionId) {
@@ -31,9 +52,16 @@ function cursorPath(sessionId) {
 
 async function save(path, value) {
   const temporary = `${path}.${randomUUID()}`;
-  await writeFile(temporary, JSON.stringify(value), { mode: 0o600, flag: 'wx' });
-  try { await rename(temporary, path); }
-  finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
+  const file = await open(temporary, 'wx', 0o600);
+  try {
+    await file.writeFile(JSON.stringify(value));
+    await file.sync();
+  } finally { await file.close(); }
+  try {
+    await rename(temporary, path);
+    const directory = await open(dirname(path), 'r');
+    try { await directory.sync(); } finally { await directory.close(); }
+  } finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
 }
 
 // 텍스트 길이 기반 고정밀 토큰 근사치 계산 (Gemini/Claude 표준: ~3.8 글자당 1토큰)
@@ -80,19 +108,22 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const cPath = cursorPath(sessionId);
 
-  let cursor = { lastProcessedIndex: -1, sentEventIds: [] };
+  let cursor = { version: 2, lastProcessedIndex: -1, sentEventIds: [], queuedEventIds: [] };
   try {
     cursor = JSON.parse(await readFile(cPath, 'utf8'));
   } catch {}
+  cursor.version = 2;
 
   const turns = [];
   const subagents = [];
+  // Historical sent IDs prove remote ACKs, not new local handoffs.
   const sent = new Set(cursor.sentEventIds ?? []);
-  async function emitOnce(event, output) {
-    if (sent.has(event.eventId)) return true;
-    if (!await telemetry.emit(event)) return false;
-    sent.add(event.eventId);
-    cursor.sentEventIds = [...sent];
+  const queued = new Set(cursor.queuedEventIds ?? []);
+  async function enqueueOnce(event, output) {
+    if (sent.has(event.eventId) || queued.has(event.eventId)) return true;
+    if (!await telemetry.enqueue(event)) return false;
+    queued.add(event.eventId);
+    cursor.queuedEventIds = [...queued];
     await save(cPath, cursor);
     output.push(event);
     return true;
@@ -150,7 +181,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
             },
           };
 
-          if (!await emitOnce(turnEvent, turns)) return { turns, subagents };
+          const stepEvents = [turnEvent];
 
           // 서브에이전트 호출 발견 시 계층 트레이스(subagent span) 생성
           if (step.tool_calls && Array.isArray(step.tool_calls)) {
@@ -175,16 +206,24 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
                       'gen_ai.request.model': String(sa.Model || model).slice(0, 128),
                     },
                   };
-                  if (!await emitOnce(subagentEvent, subagents)) return { turns, subagents };
+                  stepEvents.push(subagentEvent);
                 }
               }
             }
           }
 
+          // Snapshot the entire step before its first local handoff, including retry times.
+          if (!cursor.pendingStep || cursor.pendingStep.index !== stepIndex) {
+            cursor.pendingStep = { index: stepIndex, events: stepEvents };
+            await save(cPath, cursor);
+          }
+          for (const event of cursor.pendingStep.events) {
+            if (!await enqueueOnce(event, event.kind === 'llm.turn' ? turns : subagents)) return { turns, subagents };
+          }
           cursor.lastProcessedIndex = stepIndex;
-          // A turn's checkpoint includes every child ACK; preserve partial identities on retry.
-          sent.clear();
-          cursor.sentEventIds = [];
+          delete cursor.pendingStep;
+          queued.clear();
+          cursor.queuedEventIds = [];
           await save(cPath, cursor);
         }
 
@@ -210,7 +249,7 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
   if (!sessionId) return [];
 
   const clock = now();
-  const repoAttrs = repositoryContext(cwd);
+  const repoAttrs = await repositoryContext(cwd);
   const model = payload.modelName || 'gemini-3.8-flash';
   const events = [];
 
@@ -226,13 +265,12 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
   // 1. PreToolUse: 도구 실행 시작 시각 기록 (0ms duration 방지)
   if (preToolFlag) {
     const stepIdx = payload.stepIdx ?? 0;
-    const toolName = payload.toolCall?.name || 'unknown_tool';
-    const filePath = toolStatePath(sessionId, stepIdx);
-
-    try {
-      await mkdir(stateDir(sessionId), { recursive: true, mode: 0o700 });
-      await writeFile(filePath, JSON.stringify({ startTimeMs: clock, toolName }), { mode: 0o600, flag: 'wx' });
-    } catch {}
+    const toolName = payload.toolName || payload.toolCall?.name || 'unknown_tool';
+    const eventId = `tool:${stepIdx}:${toolName}`;
+    const filePath = toolStatePath(sessionId, eventId);
+    if (!await readToolState(sessionId, stepIdx, toolName, eventId)) {
+      await save(filePath, { version: 2, eventId, startTimeMs: clock, toolName });
+    }
     return [];
   }
 
@@ -288,26 +326,27 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
       },
     };
 
-    if (await telemetry.emit(sessionEvent)) events.push(sessionEvent);
+    const stopPath = join(stateDir(sessionId), 'stop.json');
+    let stopState;
+    try { stopState = JSON.parse(await readFile(stopPath, 'utf8')); } catch {}
+    if (!stopState) {
+      stopState = { version: 2, event: sessionEvent, queued: false };
+      await save(stopPath, stopState);
+    }
+    if (!stopState.queued && await telemetry.enqueue(stopState.event)) {
+      stopState.queued = true;
+      await save(stopPath, stopState);
+      events.push(stopState.event);
+    }
   } else {
     // 3. PostToolUse: 도구 실행 완료 시 실제 소요시간 계산 및 직전 턴 증분 즉시 전송
     const stepIdx = payload.stepIdx ?? 0;
-    let toolName = payload.toolName || (payload.toolCall?.name);
+    const toolName = payload.toolName || payload.toolCall?.name || 'unknown_tool';
+    const eventId = `tool:${stepIdx}:${toolName}`;
     const isError = Boolean(payload.error);
-    const filePath = toolStatePath(sessionId, stepIdx);
-
-    let startTimeMs = clock - 50;
-    let toolState;
-    try {
-      toolState = JSON.parse(await readFile(filePath, 'utf8'));
-      if (Number.isFinite(toolState?.startTimeMs)) {
-        startTimeMs = toolState.startTimeMs;
-      }
-      if (!toolName && toolState?.toolName) {
-        toolName = toolState.toolName;
-      }
-    } catch {}
-    if (!toolName) toolName = 'unknown_tool';
+    const filePath = toolStatePath(sessionId, eventId);
+    const toolState = await readToolState(sessionId, stepIdx, toolName, eventId);
+    const startTimeMs = Number.isFinite(toolState?.startTimeMs) ? toolState.startTimeMs : clock - 50;
 
     const endTimeMs = clock;
     const durationMs = Math.max(1, endTimeMs - startTimeMs);
@@ -315,7 +354,7 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     const toolEvent = toolState?.event ?? {
       kind: 'tool.call',
       sessionId: String(sessionId),
-      eventId: `tool:${stepIdx}:${toolName}`,
+      eventId,
       startTimeMs,
       endTimeMs,
       error: isError,
@@ -327,11 +366,15 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
       },
     };
 
-    // Retain the first observed completion and duration until the collector acknowledges it.
-    await save(filePath, { startTimeMs, toolName, event: toolEvent });
-    if (await telemetry.emit(toolEvent)) {
-      await unlink(filePath).catch(error => { if (error.code !== 'ENOENT') throw error; });
-      events.push(toolEvent);
+    // Keep the first completion body and a local receipt after durable acceptance.
+    if (!toolState?.queued) {
+      const receipt = { version: 2, eventId, startTimeMs, toolName, event: toolEvent, queued: false };
+      await save(filePath, receipt);
+      if (await telemetry.enqueue(toolEvent)) {
+        receipt.queued = true;
+        await save(filePath, receipt);
+        events.push(toolEvent);
+      }
     }
 
     // 실시간 증분 턴 전송 (세션 중 강제 종료 방지)
@@ -339,45 +382,37 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     events.push(...turns, ...subagents);
   }
 
-  await telemetry.flush();
+  await telemetry.flushLocal();
   return events;
 }
 
 if (isMain(import.meta.url)) {
-  let raw = '';
-  process.stdin.setEncoding('utf8');
-  for await (const chunk of process.stdin) {
-    raw += chunk;
-  }
-
   try {
+    const { values } = parseArgs({
+      options: {
+        config: { type: 'string' },
+        'pre-tool': { type: 'boolean' },
+        'post-invocation': { type: 'boolean' },
+        stop: { type: 'boolean' },
+      },
+    });
+    const chunks = [];
+    let bytes = 0;
+    for await (const chunk of process.stdin) {
+      bytes += chunk.length;
+      if (bytes > 1024 * 1024) throw new Error('Hook input too large');
+      chunks.push(chunk);
+    }
+    const raw = Buffer.concat(chunks).toString('utf8');
     const payload = raw.trim() ? JSON.parse(raw) : {};
-    const configPath = await resolveConfigPath();
-    const telemetry = createTelemetry('agy', { configPath });
+    const configPath = await resolveConfigPath(values.config);
+    const telemetry = createTelemetry('agy', { configPath, profile: homedir() });
+    await handleHook(payload, {
+      telemetry,
+      isPreTool: values['pre-tool'],
+      isPostInvocation: values['post-invocation'],
+    });
+  } catch {}
 
-    const isPreTool = process.argv.includes('--pre-tool');
-    const isPostInvocation = process.argv.includes('--post-invocation');
-
-    const events = await handleHook(payload, { telemetry, isPreTool, isPostInvocation });
-
-    // 검증용 로컬 로그 기록
-    try {
-      const logFile = join(homedir(), '.config', 'doda-datalake', 'agy_telemetry.log');
-      const logEntry = JSON.stringify({
-        time: new Date().toISOString(),
-        sessionId: payload?.conversationId || payload?.session_id,
-        isStop: Boolean(payload.terminationReason),
-        isPreTool,
-        eventCount: events.length,
-        events: events.map(e => `${e.kind}:${e.eventId}`)
-      }) + '\n';
-      await appendFile(logFile, logEntry, 'utf8');
-    } catch {}
-  } catch (err) {}
-
-  if (process.argv.includes('--pre-tool')) {
-    console.log(JSON.stringify({ decision: 'allow' }));
-  } else {
-    console.log('{}');
-  }
+  console.log(process.argv.includes('--pre-tool') ? JSON.stringify({ decision: 'allow' }) : '{}');
 }
