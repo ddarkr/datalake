@@ -87,6 +87,7 @@ Exit codes: 0 ok, 1 usage/env error, 2 precondition failure, 3 IO error.
 """
 
 import glob
+from contextlib import closing
 import hashlib
 import io
 import json
@@ -113,7 +114,9 @@ LABELS = ("greptime-data", "greptime-etc")
 S3ENV = ("S3_ENDPOINT_URL", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 CHUNK = 1 << 20
-SMALL_CAP = 1 << 20
+# ponytail: bound JSON inventory memory; use a streamed inventory format if 64 MiB is insufficient.
+CONTROL_CAP = 64 << 20
+SIDECAR_CAP = 1 << 20
 ID_TRIES = 5
 
 
@@ -259,23 +262,37 @@ def s3_stream_hash(client, bucket, key):
     """Streaming SHA256 of a remote object; never holds it wholly in memory."""
     h = hashlib.sha256()
     size = 0
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
-    while True:
-        chunk = body.read(CHUNK)
-        if not chunk:
-            break
-        h.update(chunk)
-        size += len(chunk)
+    with closing(client.get_object(Bucket=bucket, Key=key)["Body"]) as body:
+        while True:
+            chunk = body.read(CHUNK)
+            if not chunk:
+                break
+            h.update(chunk)
+            size += len(chunk)
     return h.hexdigest(), size
 
 
-def s3_get_small(client, bucket, key):
-    """Full read for small control objects only (COMPLETE/manifest/sidecar)."""
-    body = client.get_object(Bucket=bucket, Key=key)["Body"]
-    blob = body.read()
-    if len(blob) > SMALL_CAP:
-        raise IOError("control object too large (refusing full read): " + key)
-    return blob
+def read_control(body, cap, label):
+    """Bound each read and the total retained bytes, even without ContentLength."""
+    with io.BytesIO() as buffer:
+        while True:
+            chunk = body.read(min(CHUNK, cap + 1 - buffer.tell()))
+            if not chunk:
+                return buffer.getvalue()
+            buffer.write(chunk)
+            if buffer.tell() > cap:
+                raise IOError("control object too large (limit %d bytes): %s" % (cap, label))
+
+
+def s3_get_control(client, bucket, key, cap=None):
+    """Manifest/COMPLETE share the writer's bound; sidecars have a smaller bound."""
+    if cap is None:
+        cap = CONTROL_CAP
+    response = client.get_object(Bucket=bucket, Key=key)
+    with closing(response["Body"]) as body:
+        if response.get("ContentLength", 0) > cap:
+            raise IOError("control object too large (limit %d bytes): %s" % (cap, key))
+        return read_control(body, cap, key)
 
 
 def s3_delete_keys(client, bucket, keys):
@@ -349,6 +366,8 @@ def cmd_list():
 
 def write_local_tar(d, name, srcs, manifest):
     raw_manifest = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    if len(raw_manifest) > CONTROL_CAP:
+        raise IOError("manifest exceeds control size limit (%d bytes)" % CONTROL_CAP)
     path = os.path.join(d, name)
     tmp = path + ".tmp"
     try:
@@ -517,6 +536,8 @@ def cmd_backup():
                 "sst": [{"key": o["key"], "size": o["size"], "sha256": o["sha256"]}
                         for o in snap_objects],
             }, sort_keys=True).encode("utf-8")
+            if len(complete) > CONTROL_CAP:
+                raise IOError("COMPLETE exceeds control size limit (%d bytes)" % CONTROL_CAP)
             owned.append(rbase + name)  # BEFORE each write
             s3_put_file_verified(s3, bucket, rbase + name, path, digest, tar_size)
             owned.append(rbase + name + SIDECAR_SUFFIX)
@@ -740,15 +761,15 @@ def read_sidecar_digest(path):
     if not os.path.isfile(sidecar):
         return None, "backup sidecar required but missing: " + sidecar
     try:
-        with open(sidecar, encoding="utf-8") as f:
-            parts = f.read().split()
+        with open(sidecar, "rb") as f:
+            parts = read_control(f, SIDECAR_CAP, sidecar).decode("utf-8").split()
         if len(parts) != 2 or not SHA_RE.match(parts[0]):
             return None, "backup sidecar malformed: " + sidecar
         if parts[1] != os.path.basename(path):
             return None, "backup sidecar names another archive: " + sidecar
         return parts[0], None
-    except OSError:
-        return None, "backup sidecar unreadable: " + sidecar
+    except (OSError, UnicodeError):
+        return None, "backup sidecar unreadable or oversized: " + sidecar
 
 
 def load_manifest(path):
@@ -765,9 +786,10 @@ def load_manifest(path):
     try:
         with tarfile.open(path, "r:gz") as tar:
             info = tar.getmember(MANIFEST_NAME)
-            if info.size > SMALL_CAP:
-                return None, None, None, "manifest implausibly large (refusing)", 2
-            raw = tar.extractfile(MANIFEST_NAME).read()
+            if info.size > CONTROL_CAP:
+                return None, None, None, "manifest exceeds control size limit (refusing)", 2
+            with tar.extractfile(MANIFEST_NAME) as stream:
+                raw = read_control(stream, CONTROL_CAP, MANIFEST_NAME)
             if len(raw) != info.size:
                 return None, None, None, "manifest short read (torn archive?)", 3
         manifest = json.loads(raw.decode("utf-8"))
@@ -825,10 +847,13 @@ def fetch_complete(client, bucket, bp, bid):
     """Read + schema-check the COMPLETE record for one backup id."""
     rbase = remote_base(bp, bid)
     try:
-        raw = s3_get_small(client, bucket, rbase + COMPLETE_NAME)
-    except Exception:
-        return None, ("no COMPLETE record for %s (incomplete backup or failed"
-                      " upload: not restorable)" % bid)
+        raw = s3_get_control(client, bucket, rbase + COMPLETE_NAME)
+    except Exception as e:
+        code = getattr(e, "response", {}).get("Error", {}).get("Code")
+        if isinstance(e, KeyError) or code in ("NoSuchKey", "404", "NotFound"):
+            return None, ("no COMPLETE record for %s (incomplete backup or failed"
+                          " upload: not restorable)" % bid)
+        return None, "COMPLETE record unreadable for %s (refusing): %s" % (bid, str(e)[:200])
     try:
         complete = json.loads(raw.decode("utf-8"))
     except Exception:
@@ -848,7 +873,7 @@ def check_against_complete(path, side_digest, raw_manifest, sst_objs, complete):
     if side_digest != complete["tar_sha256"]:
         return "sidecar digest differs from COMPLETE record (refusing)"
     with open(path + SIDECAR_SUFFIX, "rb") as stream:
-        side_raw = stream.read()
+        side_raw = read_control(stream, SIDECAR_CAP, path + SIDECAR_SUFFIX)
     if hashlib.sha256(side_raw).hexdigest() != complete["sidecar_sha256"]:
         return "sidecar bytes differ from COMPLETE record (refusing)"
     if hashlib.sha256(raw_manifest).hexdigest() != complete["manifest_sha256"]:
@@ -893,24 +918,25 @@ def download_remote_backup(d, client, bucket, bp, want):
     try:
         h = hashlib.sha256()
         size = 0
-        body = client.get_object(Bucket=bucket, Key=rbase + expected_tar)["Body"]
-        with open(tmp, "wb") as f:
-            while True:
-                chunk = body.read(CHUNK)
-                if not chunk:
-                    break
-                f.write(chunk)
-                h.update(chunk)
-                size += len(chunk)
+        with closing(client.get_object(Bucket=bucket, Key=rbase + expected_tar)["Body"]) as body:
+            with open(tmp, "wb") as f:
+                while True:
+                    chunk = body.read(CHUNK)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    h.update(chunk)
+                    size += len(chunk)
         if h.hexdigest() != complete["tar_sha256"] or size != complete["tar_size"]:
             raise IOError("downloaded tar differs from COMPLETE record (refusing)")
-        side_raw = s3_get_small(client, bucket, rbase + expected_tar + SIDECAR_SUFFIX)
+        side_raw = s3_get_control(client, bucket, rbase + expected_tar + SIDECAR_SUFFIX,
+                                  SIDECAR_CAP)
         parts = side_raw.decode("utf-8").split()
         if len(parts) != 2 or parts[0] != complete["tar_sha256"]:
             raise IOError("remote sidecar differs from COMPLETE record (refusing)")
         if hashlib.sha256(side_raw).hexdigest() != complete["sidecar_sha256"]:
             raise IOError("remote sidecar bytes differ from COMPLETE record (refusing)")
-        remote_manifest = s3_get_small(client, bucket, rbase + MANIFEST_NAME)
+        remote_manifest = s3_get_control(client, bucket, rbase + MANIFEST_NAME)
         if hashlib.sha256(remote_manifest).hexdigest() != complete["manifest_sha256"]:
             raise IOError("remote manifest differs from COMPLETE record (refusing)")
         os.chmod(tmp, 0o600)
@@ -970,6 +996,23 @@ def s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
         rollback_owned(s3, bucket, written)
         raise
     return written
+
+
+def record_restore_verification(d, bid):
+    """Last successful offline content verification, not a DB restart check."""
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=d,
+                                         prefix=".restore-verification-", suffix=".tmp",
+                                         delete=False) as stream:
+            tmp = stream.name
+            json.dump({"timestamp_seconds": time.time(), "backup_id": bid}, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, os.path.join(d, "restore-verification.json"))
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def cmd_restore():
@@ -1051,7 +1094,13 @@ def cmd_restore():
                          + str(e)[:200], code=3)
     try:
         staged_populate(d, path)
+        record_restore_verification(d, manifest["backup_id"])
     except IOError as e:
+        for target, _label in targets():
+            try:
+                clear_dir(target)
+            except OSError:
+                pass
         if s3 is not None and written_sst:
             rollback_owned(s3, env("S3_BUCKET"), written_sst)
         return fail(str(e)[:300], code=3)

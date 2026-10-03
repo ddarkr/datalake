@@ -83,23 +83,25 @@ class FakeStream:
         self._blob = blob
         self._pos = 0
         self._limit = len(blob) if limit is None else limit
+        self.closed = False
 
     def read(self, n=-1):
+        assert not self.closed, "read after close"
+        assert n is not None and n >= 0, "unbounded remote read"
         if self._pos >= self._limit:
             return b""
-        if n is None or n < 0:
-            n = self._limit - self._pos
         chunk = self._blob[self._pos:self._pos + n]
         self._pos += len(chunk)
         return chunk
+
+    def close(self):
+        self.closed = True
 
 
 class FakeS3:
     """Same surface backup.py drives: list/head/get/put/copy/delete.
 
-    get_object returns a CHUNKED stream (FakeStream), not a whole blob, so
-    any full-read shortcut in backup.py would still pass here but the
-    streaming tests (short-read injection, size cap) catch memory shortcuts.
+    get_object returns a bounded-read-only stream tracked for close assertions.
     corrupt dict maps Key -> bytes actually stored on GET (simulating
     bit-rot the stream hash must catch). put_store maps Key -> bytes the
     fake keeps regardless of what was sent (simulating a lying transport).
@@ -115,6 +117,7 @@ class FakeS3:
         self.drop_tail = dict(drop_tail or {})
         self.copies = 0
         self.deleted = []
+        self.streams = []
 
     def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
         keys = sorted(k for k in self.objects if k.startswith(Prefix))
@@ -142,7 +145,9 @@ class FakeS3:
         blob = self.corrupt.get(Key, self.objects[Key])
         if Key in self.drop_tail:
             blob = blob[:self.drop_tail[Key]]
-        return {"Body": FakeStream(blob)}
+        stream = FakeStream(blob)
+        self.streams.append(stream)
+        return {"Body": stream, "ContentLength": len(blob)}
 
     def put_object(self, Bucket, Key, Body, ContentLength=None, Metadata=None):
         if self.fail_put_key is not None and Key == self.fail_put_key:
@@ -1137,6 +1142,7 @@ def test_failed_download_leaves_no_tar():
         assert [f for f in os.listdir(bdir) if f.endswith(".tar.gz")] == []
         assert [f for f in os.listdir(bdir) if f.endswith(".tmp")] == []
         assert hash_tree(tgt) == {}
+        assert all(stream.closed for stream in fake.streams)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -1250,6 +1256,145 @@ def test_latest_restore_uses_creation_order_within_one_second():
         restore_env()
 
 
+def test_large_sst_inventory_roundtrips_local_and_remote():
+    inventory = {"test-root/data/" + str(i).zfill(5) + "-" + "a" * 64 + ".sst":
+                 ("synthetic-sst-%d" % i).encode() for i in range(8001)}
+    for remote in (False, True):
+        fake = FakeS3(inventory)
+        tmp, src, tgt, bdir, env = fresh_layout("S3", fake)
+        try:
+            setenv(env)
+            expected = hash_tree(src)
+            assert bk.cmd_backup() == 0
+            bid = _remote_bid(bdir)
+            rbase = "test-backups/%s/" % bid
+            assert len(fake.objects[rbase + "manifest.json"]) > 1 << 20
+            assert len(fake.objects[rbase + "COMPLETE"]) > 1 << 20
+            if remote:
+                for name in os.listdir(bdir):
+                    os.unlink(os.path.join(bdir, name))
+            fake.objects = {k: v for k, v in fake.objects.items()
+                            if not k.startswith("test-root/")}
+            assert bk.cmd_restore() == 0
+            assert hash_tree(tgt) == expected
+            assert {k: v for k, v in fake.objects.items()
+                    if k.startswith("test-root/")} == inventory
+            with open(os.path.join(bdir, "restore-verification.json")) as stream:
+                marker = json.load(stream)
+            assert marker["backup_id"] == bid
+            assert marker["timestamp_seconds"] > 0
+            assert all(stream.closed for stream in fake.streams)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            restore_env()
+
+
+def test_inventory_limit_is_shared_by_backup_and_restore():
+    fake = FakeS3(sst_fixture())
+    tmp, src, tgt, bdir, env = fresh_layout("S3", fake)
+    old_cap = bk.CONTROL_CAP
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid = _remote_bid(bdir)
+        raw = fake.objects["test-backups/%s/manifest.json" % bid]
+        bk.CONTROL_CAP = len(raw)
+        assert bk.cmd_restore() == 0
+        assert hash_tree(tgt) == hash_tree(src)
+        before = dict(fake.objects)
+        local_before = set(os.listdir(bdir))
+        bk.CONTROL_CAP -= 1
+        assert bk.cmd_backup() == 3
+        assert fake.objects == before
+        assert set(os.listdir(bdir)) == local_before
+        for label in bk.LABELS:
+            bk.clear_dir(os.path.join(tgt, label))
+        assert bk.cmd_restore() == 2
+        assert hash_tree(tgt) == {}
+        assert all(stream.closed for stream in fake.streams)
+    finally:
+        bk.CONTROL_CAP = old_cap
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_oversized_complete_is_not_missing_and_closes_body():
+    fake = FakeS3({"backups/id/COMPLETE": b"x" * 17})
+    old_cap = bk.CONTROL_CAP
+    try:
+        bk.CONTROL_CAP = 16
+        complete, error = bk.fetch_complete(fake, "bucket", "backups", "id")
+        assert complete is None
+        assert "too large" in error and "no COMPLETE" not in error
+        assert fake.streams[-1].closed
+        assert fake.streams[-1]._pos == 0  # ContentLength refuses before allocating.
+        # Missing/lying length still enforces the bound during reads.
+        get = fake.get_object
+        fake.get_object = lambda **kw: {"Body": get(**kw)["Body"]}
+        complete, error = bk.fetch_complete(fake, "bucket", "backups", "id")
+        assert complete is None and "too large" in error
+        assert fake.streams[-1].closed and fake.streams[-1]._pos == 17
+    finally:
+        bk.CONTROL_CAP = old_cap
+
+
+def test_stream_bodies_close_on_read_failure():
+    class BrokenStream(FakeStream):
+        def read(self, n=-1):
+            raise IOError("injected read failure")
+
+    body = BrokenStream(b"")
+    fake = FakeS3()
+    fake.get_object = lambda **kw: {"Body": body}
+    try:
+        bk.s3_stream_hash(fake, "bucket", "key")
+        assert False, "read failure must propagate"
+    except IOError:
+        assert body.closed
+    body = BrokenStream(b"")
+    complete, error = bk.fetch_complete(fake, "bucket", "backups", "id")
+    assert complete is None and "injected read failure" in error and body.closed
+
+
+def test_failed_restore_preserves_last_success_marker():
+    tmp, _src, tgt, bdir, env = fresh_layout("File")
+    original_replace = bk.os.replace
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        assert bk.cmd_restore() == 0
+        marker_path = os.path.join(bdir, "restore-verification.json")
+        with open(marker_path, "rb") as stream:
+            before = stream.read()
+        for label in bk.LABELS:
+            bk.clear_dir(os.path.join(tgt, label))
+        with open(newest_tar(bdir) + ".sha256", "w") as stream:
+            stream.write("0" * 64 + "  " + os.path.basename(newest_tar(bdir)) + "\n")
+        assert bk.cmd_restore() == 2
+        assert hash_tree(tgt) == {}
+        with open(marker_path, "rb") as stream:
+            assert stream.read() == before
+        # Marker publication failure must not turn this restore into a success
+        # or replace the last successful timestamp.
+        write_sidecar(newest_tar(bdir))
+
+        def fail_marker(source, destination):
+            if destination == marker_path:
+                raise PermissionError("injected marker publication failure")
+            return original_replace(source, destination)
+
+        bk.os.replace = fail_marker
+        assert bk.cmd_restore() == 3
+        assert hash_tree(tgt) == {}
+        with open(marker_path, "rb") as stream:
+            assert stream.read() == before
+        assert not [name for name in os.listdir(bdir) if name.endswith(".tmp")]
+    finally:
+        bk.os.replace = original_replace
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
 if __name__ == "__main__":
     test_backup_refuses_running_db()
     test_backup_requires_offline_confirmation()
@@ -1291,4 +1436,9 @@ if __name__ == "__main__":
     test_restore_rejects_identity_change()
     test_prune_never_deletes_just_written()
     test_unreadable_live_sst_is_never_overwritten_or_deleted()
-    print("test_backup: ok (40 tests)")
+    test_large_sst_inventory_roundtrips_local_and_remote()
+    test_inventory_limit_is_shared_by_backup_and_restore()
+    test_oversized_complete_is_not_missing_and_closes_body()
+    test_stream_bodies_close_on_read_failure()
+    test_failed_restore_preserves_last_success_marker()
+    print("test_backup: ok (45 tests)")
