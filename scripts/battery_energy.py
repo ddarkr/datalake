@@ -57,15 +57,18 @@ Supplied endpoint uncertainty propagates against a fixed reference only.
 import math
 import os
 import sys
+from datetime import datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import battery_common as bc
 
 CODE_VERSION = "1.0.0"
-ALGORITHM_VERSION = "1.2.0"
+ALGORITHM_VERSION = "1.3.0"
 ANALYSIS_ID = "battery_energy"
 
 SUPPORTED_METRICS = (
+    "battery.energy.latest_power_kw",
+    "battery.energy.latest_pack_voltage_v",
     "battery.energy.charge_session_energy_kwh",
     "battery.energy.discharge_session_energy_kwh",
     "battery.energy.full_usable_capacity_kwh",
@@ -87,6 +90,8 @@ SUPPORTED_METRICS = (
 )
 
 METRIC_UNITS = {
+    "battery.energy.latest_power_kw": "kW",
+    "battery.energy.latest_pack_voltage_v": "V",
     "battery.energy.charge_session_energy_kwh": "kWh",
     "battery.energy.discharge_session_energy_kwh": "kWh",
     "battery.energy.full_usable_capacity_kwh": "kWh",
@@ -135,6 +140,7 @@ FIELD_DEFAULTS = {
 }
 
 SIGN_METRICS = (
+    "battery.energy.latest_power_kw",
     "battery.energy.vi_charge_energy_kwh",
     "battery.energy.vi_discharge_energy_kwh",
     "battery.energy.charge_throughput_ah",
@@ -144,6 +150,8 @@ SIGN_METRICS = (
 )
 
 CAL_METRICS = (
+    "battery.energy.latest_power_kw",
+    "battery.energy.latest_pack_voltage_v",
     "battery.energy.vi_charge_energy_kwh",
     "battery.energy.vi_discharge_energy_kwh",
     "battery.energy.charge_throughput_ah",
@@ -818,6 +826,53 @@ def _in_window(tst, window):
         and (window[1] is None or tst <= window[1])
 
 
+def _latest_physical_results(scope, window, currents, voltages, sign,
+                             sign_error, cal_error, gap, ecfg, cal_ver):
+    """Latest legs are barriers, never search backward for a usable pair."""
+    current = currents[-1] if currents else None
+    voltage = voltages[-1] if voltages else None
+    out = []
+    for suffix, unit in (("latest_pack_voltage_v", "V"),
+                         ("latest_power_kw", "kW")):
+        metric = "battery.energy." + suffix
+        power = unit == "kW"
+        stamp = max([r["event_time_ns"] for r in (current, voltage) if r]
+                    or [0]) if power else voltage["event_time_ns"] if voltage else 0
+        error = cal_error or (sign_error if power else None)
+        reason, value = "sparse:no_latest_sample", None
+        if voltage is not None:
+            value = voltage["value_num"]
+            reason = "invalid:latest_voltage"
+            if value is not None and value <= 0:
+                value = None
+            if power:
+                if sign is None:
+                    reason, value = "missing_calibration:current_sign", None
+                elif current is None or current["event_time_ns"] != voltage["event_time_ns"]:
+                    reason, value = "unmatched:latest_voltage_current", None
+                elif current["value_num"] is None:
+                    reason, value = "invalid:latest_current", None
+                elif value is not None:
+                    value = _finite(value * current["value_num"] * sign / 1000)
+            if window[1] is not None and window[1] - stamp > gap:
+                reason, value = "stale:latest_sample", None
+        reason += ";asof_ns=%d" % stamp
+        if error:
+            row = _error_row(scope, window, metric, error, ecfg)
+        elif value is None:
+            row = _unavailable(scope, window, metric, reason, int(bool(stamp)),
+                               ecfg, cal_ver)
+        else:
+            row = _derived(scope, window, metric, value, unit,
+                           "latest_calibrated_sample;asof_ns=%d" % stamp,
+                           2 if power else 1, ecfg, cal_ver)
+        if stamp:
+            seconds, nanos = divmod(stamp, 1000000000)
+            row["value_text"] = (datetime.fromtimestamp(seconds, timezone.utc)
+                                 .strftime("%Y-%m-%d %H:%M:%S") + ".%09d" % nanos)
+        out.append(row)
+    return out
+
 def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
                    field_cals, cal_error, reference, ref_error,
                    uncertainties, unc_error, ecfg):
@@ -876,6 +931,10 @@ def _analyze_scope(scope, ordered, window, parsed, sign, sign_error,
     counter_deltas = _counter_deltas_for_efc(counter_rows)
     cal_ver_vi = _cal_version(vol_entries, cur_entries)
     cal_ver_i = _cal_version(cur_entries)
+    current_rows = [{"event_time_ns": t, "value_num": v} for t, v in cur_pairs]
+    out.extend(_latest_physical_results(
+        scope, window, current_rows, volt_rows, sign, sign_error, cal_error,
+        gap, ecfg, cal_ver_vi))
     signed_current = [(tst, sign * val if val is not None else None) for tst, val in cur_pairs] \
         if sign is not None else []
     vi_steps = []

@@ -335,6 +335,110 @@ def test_battery_period_totals_sum_latest_revision_per_window():
             assert rows[0][3] == 2
 
 
+def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
+    dashboard = json.loads(configs[dashboard_name]["content"])
+    panel = next(p for p in _all_battery_panels(dashboard["panels"])
+                 if p["id"] == panel_id)
+    return (panel["targets"][0]["rawSql"].replace("$$", "$")
+            .replace("$__timeFilter(window_start)", f"window_start BETWEEN {start} AND {end}")
+            .replace("$__timeFilter(s.event_time)", f"s.event_time BETWEEN {start} AND {end}")
+            .replace("$__timeFilter(event_time)", f"event_time BETWEEN {start} AND {end}")
+            .replace("$__unixEpochTo()", str(end))
+            .replace("${vehicle:sqlstring}", "''")
+            .replace("${source:sqlstring}", "''")
+            .replace("${epoch:sqlstring}", "''"))
+
+
+def test_physical_cards_latest_analysis_and_new_raw_barriers():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    cards = (("grafana-dash-vehicle-overview", 6, "latest_power_kw", "kW", -18.45),
+             ("grafana-dash-drives", 7, "latest_power_kw", "kW", -18.45),
+             ("grafana-dash-charging", 6, "latest_power_kw", "kW", -18.45),
+             ("grafana-dash-battery", 42, "latest_power_kw", "kW", -18.45),
+             ("grafana-dash-battery", 46, "latest_pack_voltage_v", "V", 410.0))
+    for dashboard, panel, suffix, unit, value in cards:
+        query = _physical_query(configs, dashboard, panel, start=0, end=7800)
+        with _battery_db() as db:
+            db.create_function("FROM_UNIXTIME", 1, lambda epoch: epoch)
+            assert db.execute(query).fetchall() == []
+            def insert(ws, revision, reading, status, computed):
+                db.execute("""INSERT INTO vehicle_analysis
+                    (window_start, window_end, vehicle, metric, source,
+                     analysis_id, revision, value, value_text, unit, status,
+                     decode_epoch, computed_at) VALUES
+                    (?, ?, 'v', ?, 'fleet', 'battery_energy', ?, ?, '7140',
+                     ?, ?, 'fleet-v1', ?)""",
+                           (ws, ws+3599, "battery.energy."+suffix, revision,
+                            reading, unit, status, computed))
+            insert(0, "older-window", value+1, "derived", 10000)
+            # Unavailable identities in the newest hour may be omitted by runtime.
+            # An older stored physical number must not fill that absence.
+            assert db.execute(query).fetchone()[4] is None
+            insert(3600, "good", value, "derived", 10001)
+            assert db.execute(query).fetchone()[4] == value
+            insert(3600, "uncalibrated", None, "unavailable", 10002)
+            assert db.execute(query).fetchone()[4] is None
+            insert(3600, "recalibrated", value, "derived", 10003)
+            # A newer bad raw leg blocks old analyzed numbers before next job.
+            db.execute("""INSERT INTO vehicle_signal VALUES
+                (7500, 'v', 'fleet', 'fleet-v1', 'PackVoltage',
+                 NULL, NULL, 'invalid', 9000, 'new-invalid')""")
+            assert db.execute(query).fetchone()[4] is None
+            db.execute("DELETE FROM vehicle_signal")
+            # Late-ingested same-time invalid observations also need reanalysis.
+            db.execute("""INSERT INTO vehicle_signal VALUES
+                (7140, 'v', 'fleet', 'fleet-v1', 'PackVoltage',
+                 NULL, NULL, 'invalid', 11000, 'late-invalid')""")
+            assert db.execute(query).fetchone()[4] is None
+            db.execute("UPDATE vehicle_signal SET decode_epoch = 'other'")
+            assert db.execute(query).fetchone()[4] == value
+
+
+def test_physical_graphs_keep_signed_samples_and_latest_invalid_revision():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for dashboard, panel in (("grafana-dash-vehicle-overview", 12),
+                             ("grafana-dash-charging", 10),
+                             ("grafana-dash-battery", 56)):
+        query = _physical_query(configs, dashboard, panel)
+        with _battery_db() as db:
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            for revision, value, status, computed in (
+                    ("r1", -18.45, "derived", 2100),
+                    ("r2", None, "unavailable", 2101)):
+                db.execute("""INSERT INTO vehicle_analysis
+                    (window_start, window_end, vehicle, metric, source,
+                     analysis_id, revision, value, value_text, unit, status,
+                     decode_epoch, computed_at) VALUES
+                    (1500, 1600, 'v', 'battery.energy.latest_power_kw', 'fleet',
+                     'battery_energy', ?, ?, '1550', 'kW', ?, 'fleet-v1', ?)""",
+                           (revision, value, status, computed))
+                row = db.execute(query).fetchone()
+                assert row[0] == 1550 and row[2] == value
+
+
+def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for panel, field, unit in ((44, "BrickVoltageMax", "V"),
+                               (45, "BrickVoltageMin", "V"),
+                               (51, "ModuleTempMax", "celsius"),
+                               (52, "ModuleTempMin", "celsius")):
+        query = _physical_query(configs, "grafana-dash-battery", panel)
+        with _battery_db() as db:
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            db.execute("""INSERT INTO vehicle_signal VALUES
+                (1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
+                 'unit_unverified', 1500, 'raw')""", (field,))
+            row = db.execute(query).fetchone()
+            index = 4 if panel == 52 else 3
+            assert row[index] is None
+            db.execute("UPDATE vehicle_signal SET unit = ?, quality = 'ok'", (unit,))
+            assert db.execute(query).fetchone()[index] == 4
+            db.execute("""INSERT INTO vehicle_signal VALUES
+                (1600, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
+                 'invalid', 1600, 'invalid')""", (field, unit))
+            assert db.execute(query).fetchone()[index] is None
+
+
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
@@ -342,4 +446,7 @@ if __name__ == "__main__":
     test_battery_dashboard_warning_overlap_keeps_started_before_range()
     test_battery_cards_raw_display_latest_valid_only()
     test_battery_cards_latest_window_energy_not_lifetime()
+    test_physical_cards_latest_analysis_and_new_raw_barriers()
+    test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
+    test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
     print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")

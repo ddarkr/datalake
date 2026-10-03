@@ -287,6 +287,58 @@ def test_bms_circular_never_promoted_to_soh():
     assert one(en.analyze(rows, [], cal()), 'bms_circular_capacity_kwh')['value'] is None
 
 
+def test_latest_physical_sample_requires_scoped_units_scale_offset_and_sign():
+    rows = [sig(T0, 'PackVoltage', 200), sig(T0, 'PackCurrent', 5)]
+    cfg = cal()
+    cfg['energy']['field_calibration']['PackVoltage'].update(
+        unit_scale=2, unit_offset=10)
+    cfg['energy']['field_calibration']['PackCurrent'].update(
+        unit_scale=10, unit_offset=-5)
+    for sign, expected in (('positive_charge', 18.45),
+                           ('positive_discharge', -18.45)):
+        cfg['energy']['current_sign'] = sign
+        out = en.analyze(rows, [], cfg)
+        voltage = one(out, 'latest_pack_voltage_v')
+        power = one(out, 'latest_power_kw')
+        assert voltage['value'] == 410 and voltage['unit'] == 'V'
+        assert abs(power['value'] - expected) < 1e-10 and power['unit'] == 'kW'
+        assert power['value_text'] == voltage['value_text']
+        assert power['value_text'].endswith('.000000000')
+        assert 'asof_ns=%d' % T0 in power['reason']
+    for missing in ({}, {'energy': {'current_sign': 'positive_charge'}},
+                    {'energy': {'field_calibration': cfg['energy']['field_calibration']}}):
+        assert one(en.analyze(rows, [], missing), 'latest_power_kw')['value'] is None
+    wrong_scope = copy.deepcopy(cfg)
+    wrong_scope['energy']['field_calibration']['PackVoltage']['vehicle'] = 'other'
+    assert one(en.analyze(rows, [], wrong_scope), 'latest_power_kw')['value'] is None
+    assert one(en.analyze(rows, [], wrong_scope), 'latest_pack_voltage_v')['value'] is None
+    # Native physical unit metadata needs no guessed scope calibration.
+    native = [sig(T0, 'PackVoltage', 410, 'V'), sig(T0, 'PackCurrent', 45, 'A')]
+    assert one(en.analyze(native, [], {'energy': {'current_sign': -1}}),
+               'latest_power_kw')['value'] == -18.45
+
+
+def test_latest_physical_invalid_unmatched_conflicting_and_stale_never_fallback():
+    good = pair(T0, -100)
+    assert one(en.analyze(good, [], cal()), 'latest_power_kw')['value'] == -40
+    for bad in (pair(T0+STEP, None),
+                [sig(T0+STEP, 'PackVoltage', None, quality='invalid')],
+                [sig(T0+STEP, 'PackCurrent', 20)],
+                pair(T0+STEP, 10) + [sig(T0+STEP, 'PackVoltage', 401)]):
+        out = en.analyze(good+bad, [], cal())
+        assert one(out, 'latest_power_kw')['value'] is None
+    out = en.analyze(good+[sig(T0+STEP, 'PackVoltage', 401)], [], cal())
+    assert one(out, 'latest_pack_voltage_v')['value'] == 401
+    assert one(out, 'latest_power_kw')['value'] is None
+    cfg = dict(cal(), window_start_ns=T0, window_end_ns=T0+2*STEP)
+    assert one(en.analyze(good, [], cfg), 'latest_power_kw')['value'] == -40
+    cfg['window_end_ns'] += 1
+    for suffix in ('latest_power_kw', 'latest_pack_voltage_v'):
+        result = one(en.analyze(good, [], cfg), suffix)
+        assert result['value'] is None and result['reason'].startswith('stale:')
+    assert one(en.analyze(pair(T0, 0), [], cal()), 'latest_power_kw')['value'] == 0
+
+
 if __name__ == '__main__':
     names = sorted(n for n in globals() if n.startswith('test_'))
     for name in names:

@@ -173,7 +173,10 @@ docker compose --profile server --profile fleet up -d
 - 최신 판정은 `computed_at` 순서이므로 aggregate 실행 호스트의 시계를 동기화해야 합니다. 과거 시각으로 실행한 성공 재계산은 더 최신 시각의 오류 리비전을 덮지 못합니다. Docker VM과 호스트의 시계도 함께 확인하십시오.
 
 ### 에너지·용량과 전기적 추정의 해석
-- 에너지 분석 1.2.0은 전류/전력의 0 교차를 나누어 충전·방전 총량을 각각 적분합니다. invalid·단위 미확인·동시각 충돌을 건너뛰어 적분하지 않으며, `decision_time_ns`가 있으면 수집 시각이 없는 관측도 제외합니다.
+- 에너지 분석 1.3.0은 전류/전력의 0 교차를 나누어 충전·방전 총량을 각각 적분합니다. invalid·단위 미확인·동시각 충돌을 건너뛰어 적분하지 않으며, `decision_time_ns`가 있으면 수집 시각이 없는 관측도 제외합니다.
+- `battery.energy.latest_power_kw`·`latest_pack_voltage_v`는 각 완료된 시간 구간의 **마지막 물리 관측**이며 실시간 값·시간 평균·적분 kWh가 아닙니다. V/A 단위가 확인되거나 `energy.field_calibration`의 정확한 `vehicle/source/decode_epoch` 범위에 맞는 `unit_scale`·`unit_offset`이 있어야 하며, 전력은 `current_sign`(+ 충전/− 사용 convention)도 필요합니다. `fleet/fleet-v1`이라는 이름 자체는 교정 증거가 아닙니다.
+- 최신 전압/전류 각 leg가 같은 관측 시각이어야 순간 V×I를 계산합니다. 최신 invalid·단위 미확인·동시각 충돌·시각 불일치는 NULL이며 더 오래된 정상 pair를 찾지 않습니다. 관측이 구간 끝에서 `energy.max_gap_ns`(기본 10분)보다 오래됐어도 NULL입니다. `value_text`는 실제 관측 시각의 UTC 문자열(나노초 9자리), reason의 `asof_ns`는 원본 ns이고 `window_start/end`는 분석 시간 구간입니다.
+- 전력·팩 전압 카드는 선택 기간 끝 직전 완료된 시간 구간만 보여 주고, 그 구간의 결과가 없으면 과거 구간 숫자로 대체하지 않습니다. 더 최근 원시 leg나 분석 완료 후 늦게 도착한 leg도 재분석 전까지 판단 불가입니다. 전력 그래프는 시간 구간당 마지막 교정 샘플을 실제 관측 시각에 점으로 표시합니다. 셀 전압·모듈 온도의 원시 물리 카드/그래프는 V/celsius 단위 메타데이터가 확인된 샘플만 표시하며 unit NULL은 판단 불가입니다. 셀 번호 보고 빈도는 전압 교정과 별개인 식별자 관측입니다.
 - `DCChargingEnergyIn`은 배터리 유입 AC+DC, `ACChargingEnergyIn`은 충전기 측 AC입니다. 서로 더하지 않습니다. `LifetimeEnergyUsed`는 방전 누적량이며, EFC는 Ah·누적계·V×I 중 한 종류만 선택합니다.
 - 충전·방전 세션은 부호가 교정된 전류, 충전 전력 또는 누적계 변화를 사용합니다. 양쪽의 관측된 유휴 경계와 연속된 누적계 끝점이 있어야 완료 에너지를 인정합니다. 시간 경계를 넘은 세션은 종료 시간 구간에 한 번만 기록합니다. 시간별 누적계 차분(`*_energy_in_kwh`, `discharge_energy_kwh`)은 직전 구간의 마지막 유효 값이 `max_gap_ns` 안에 있으면 그 값을 시작점으로 삼아(`anchor=prior_window`) 인접 구간의 합이 누적계 전체 증가량과 같게 나눕니다. 직전 값이 무효·충돌이거나 너무 멀면 구간 안 값만 씁니다. 적분값에는 구간 밖 에너지를 포함하지 않습니다.
 - `parked_discharge_kwh`는 차량이 오프라인·수면이라 보고가 `max_gap_ns`보다 길게 끊긴 동안의 `LifetimeEnergyUsed` 증가량입니다. 보고가 재개된 시간 구간에 한 번만 기록하므로 `discharge_energy_kwh` 합계와 더하면 누적계 전체 증가량과 같습니다. 공백이 `energy.max_offline_gap_ns`(기본 24시간)보다 길거나 끝점이 무효면 계산하지 않습니다. runtime은 이 공백을 포함하도록 윈도우 앞 24시간의 원시 신호를 함께 읽습니다.
