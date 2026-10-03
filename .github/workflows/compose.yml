@@ -38,8 +38,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install renderer dependency
-        run: python -m pip install PyYAML==6.0.2
+      - name: Install renderer and pinned synthetic CAN/RAW dependencies
+        run: |
+          python -m pip install --only-binary=:all: PyYAML==6.0.2 \
+            python-can==4.6.1 asammdf==8.8.27 zstd==1.5.6.1 \
+            cantools==40.7.1 py-expression-eval==0.3.14 boto3==1.43.98
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -65,9 +68,7 @@ jobs:
           python tests/test_activity.py
           python tests/test_vehicle_aggregate.py
           python tests/test_fleet.py
-          python tests/test_raw.py
-          python tests/test_redecode.py
-          python tests/test_can_validation.py
+          python tools/demo.py regressions
           python tests/test_vss.py
           python tests/test_vss_setup.py
           for f in tests/test_battery_*.py; do python "$f"; done
@@ -85,3 +86,23 @@ jobs:
           for profile in server home mqtt vehicle fleet backup redecode '*'; do
             docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
           done
+  synthetic-runtime:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Start the isolated File-store demo
+        run: python tools/demo.py start --state "$RUNNER_TEMP/datalake-demo"
+      - name: Check collection, dedup, queued replay, privacy and fresh offline restore
+        run: python tools/demo.py check --state "$RUNNER_TEMP/datalake-demo"
+      - name: Show synthetic verification evidence
+        run: python tools/demo.py status --state "$RUNNER_TEMP/datalake-demo"
+      - name: Remove only this demo's projects and volumes
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/datalake-demo/state.json"; then
+            python tools/demo.py stop --state "$RUNNER_TEMP/datalake-demo"
+          fi
