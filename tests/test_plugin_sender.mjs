@@ -232,20 +232,21 @@ async function fixture(t) {
 
 const scenario = (name, run) => test(name, { timeout: 90000 }, async t => run(await fixture(t)));
 
-function producer(f, item, record, { cwd = f.directory, path = process.env.PATH, execPath, bun = false, nodeBinary, binary = process.execPath } = {}) {
+function producer(f, item, record, { cwd = f.directory, path = process.env.PATH, execPath, bun = false, nodeBinary, binary = process.execPath, nativeNode = binary === process.execPath, runtimeEnv = {} } = {}) {
   const code = `
     import {openOutbox} from ${JSON.stringify(outboxUrl)};
     import {startSender} from ${JSON.stringify(senderUrl)};
     let input=''; for await (const chunk of process.stdin) input+=chunk;
-    const {root,route,config,record,execPath,bun,nodeBinary}=JSON.parse(input);
+    const {root,route,config,record,execPath,bun,nodeBinary,runtimeEnv}=JSON.parse(input);
     const outbox=await openOutbox({root,route});
     const accepted=await outbox.put(record);
     if(execPath!==undefined) process.execPath=execPath;
     if(bun) Object.defineProperty(process.versions,'bun',{value:'fixture'});
+    Object.assign(process.env,runtimeEnv);
     await startSender({root,route,config,nodeBinary});
     console.log(JSON.stringify({accepted}));
   `;
-  const child = spawn(binary, [...(binary === process.execPath ? ['--input-type=module', '-e'] : ['--eval']), code], {
+  const child = spawn(binary, [...(nativeNode ? ['--input-type=module', '-e'] : ['--eval']), code], {
     cwd, env: { PATH: path }, stdio: ['pipe', 'pipe', 'pipe'],
   });
   f.children.add(child);
@@ -254,7 +255,7 @@ function producer(f, item, record, { cwd = f.directory, path = process.env.PATH,
   const result = { code, output: '', errors: '' };
   child.stdout.on('data', chunk => { result.output += chunk; });
   child.stderr.on('data', chunk => { result.errors += chunk; });
-  child.stdin.end(JSON.stringify({ root: item.root, route: item.route, config: item.config, record, execPath, bun, nodeBinary }));
+  child.stdin.end(JSON.stringify({ root: item.root, route: item.route, config: item.config, record, execPath, bun, nodeBinary, runtimeEnv }));
   result.complete = async () => {
     assert.equal((await bounded(exited, 'producer exit without collector ACK', 5000))[0], 0);
     await bounded(closed, 'producer stdio close without collector ACK', 5000);
@@ -277,6 +278,49 @@ scenario('Held collector ACK does not retain producer exit or stdio', async f =>
   await f.privateSpool(held.root);
   reply(held.entries()[0]);
   await f.done(held);
+});
+
+test('Linux running Node delivers from writable toolcache without trusting project runtimes or preloads', { timeout: 90000 }, async t => {
+  if (process.platform !== 'linux') return t.skip('Linux kernel executable pinning');
+  const f = await fixture(t);
+  const cache = join(f.directory, 'hostedtoolcache');
+  const project = join(f.directory, 'project');
+  const bin = join(project, 'bin');
+  await mkdir(cache);
+  await chmod(cache, 0o777);
+  const runtime = join(cache, 'node');
+  await copyFile(process.execPath, runtime);
+  await chmod(runtime, 0o777);
+  await mkdir(bin, { recursive: true });
+  await mkdir(join(project, '.git'));
+  const marker = join(f.directory, 'untrusted-runtime-marker');
+  const fake = join(bin, 'node');
+  const preload = join(project, 'preload.cjs');
+  await writeFile(fake, `#!/bin/sh\nprintf executed > ${shellQuote(marker)}\n`, { mode: 0o700 });
+  await writeFile(preload, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'preloaded');process.exit(1);`, { mode: 0o600 });
+  const held = await f.scope('writable-toolcache');
+  const record = event('writable-toolcache');
+  f.handlers.set(held.path, () => {});
+  await producer(f, held, record, {
+    cwd: project, path: `${bin}${delimiter}${cache}`, binary: runtime, nativeNode: true,
+    runtimeEnv: { NODE_OPTIONS: `--require=${preload}`, LD_PRELOAD: preload, LD_LIBRARY_PATH: project },
+  }).complete();
+  await until(() => held.entries().length === 1, 'kernel-pinned Node held HTTP request');
+  assert.equal(held.entries()[0].authorization, syntheticSecret);
+  assert.equal(held.entries()[0].body, record.body);
+  assert.deepEqual(await held.outbox.status().then(({ pending, done }) => ({ pending, done })), { pending: 1, done: 0 });
+  await assert.rejects(readFile(marker), error => error.code === 'ENOENT');
+  reply(held.entries()[0]);
+  await f.done(held);
+
+  // Even an actual native Node image is not eligible when launched from the project.
+  await copyFile(process.execPath, fake);
+  const refused = await f.scope('project-native-node');
+  f.handlers.set(refused.path, entry => reply(entry));
+  await producer(f, refused, event('project-native-node'), { cwd: project, path: bin, binary: fake, nativeNode: true }).complete();
+  assert.deepEqual(await refused.outbox.status().then(({ pending, done }) => ({ pending, done })), { pending: 1, done: 0 });
+  assert.equal(refused.entries().length, 0);
+  await f.pendingState(refused, 'pending-launch');
 });
 
 scenario('Project PATH never executes fake Node or receives credential bootstrap', async f => {

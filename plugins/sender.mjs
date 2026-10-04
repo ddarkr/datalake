@@ -151,10 +151,26 @@ async function actualNode(path, root, env, timeout) {
   return path;
 }
 
+async function currentNodeImage(roots) {
+  if (process.platform !== 'linux' || !process.versions.node || process.versions.bun || !isAbsolute(process.execPath)) throw new Error('sender-runtime');
+  const image = '/proc/self/exe';
+  const canonical = await fs.realpath(image);
+  if (roots.some(root => inside(resolve(process.execPath), root) || inside(canonical, root))) throw new Error('sender-runtime');
+  const running = await fs.stat(image);
+  const reported = await fs.stat(process.execPath);
+  if (!running.isFile() || (running.uid !== 0 && running.uid !== uid)
+    || running.dev !== reported.dev || running.ino !== reported.ino) throw new Error('sender-runtime');
+  // Linux pins the executing inode and forbids writes to it (ETXTBSY). Exec through
+  // procfs, not its replaceable tool-cache pathname; PATH discovery stays strict.
+  return image;
+}
+
 let pinnedNode;
 async function defaultNode(root, env) {
   if (pinnedNode) return pinnedNode;
   const roots = await projectRoots(await fs.realpath(process.cwd()));
+  try { pinnedNode = await currentNodeImage(roots); return pinnedNode; }
+  catch { /* Other hosts and spoofed/project runtimes use strict path discovery. */ }
   const candidates = [];
   if (process.versions.node && !process.versions.bun) candidates.push(process.execPath);
   for (const directory of (process.env.PATH || '').split(delimiter)) {

@@ -76,7 +76,8 @@ Arcane 등 Compose 관리 도구에서도 같은 `compose.yaml`과 환경변수�
 - 서버 `.env` 전체를 에이전트 장비에 복사하지 마세요. 수집 주소와 OTLP 인증만 전달합니다.
 - OMP와 opencode2는 설치 후에도 저장소 경로를 참조합니다. 저장소를 이동·삭제하지 마세요.
 - 플러그인 설치 후 클라이언트를 재시작하고 실제 새 세션을 확인해야 합니다. Codex는 훅 신뢰 승인도 필요합니다.
-- 공통 JavaScript 직접 전송 플러그인에는 영속 오프라인 재전송 큐가 없습니다. Hermes의 SQLite outbox는 별도 계약을 따릅니다. 서버 Alloy 큐는 서버에 도착하지 못한 데이터를 복구하지 못합니다.
+- 공통 JavaScript 플러그인은 허용된 메타데이터를 로컬 영속 큐에 저장하고 별도 sender로 전송합니다. 로컬 수락은 collector ACK가 아니며, ACK 전까지 레코드는 보류 상태로 남습니다. Hermes의 SQLite outbox는 별도 계약을 따릅니다. 서버 Alloy 큐는 서버에 도착하지 못한 데이터를 복구하지 못합니다.
+- Linux native Node에서는 검증된 현재 실행 이미지를 `/proc/self/exe`로 고정해 sender를 시작하므로 도구 캐시의 쓰기 가능한 상위 경로를 신뢰하지 않습니다. 프로젝트 내부 Node와 안전하지 않은 PATH 후보는 사용하지 않으며, 안전한 런타임이 없으면 수락된 데이터는 보류 상태로 유지됩니다.
 
 ### Home Assistant / MQTT
 
