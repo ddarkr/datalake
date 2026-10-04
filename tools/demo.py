@@ -326,6 +326,7 @@ def restore_check(state):
     finally:
         compose(state, "down", "--volumes", "--remove-orphans", restore=True)
         compose(state, "up", "-d")
+        discover(state)
         wait_for(lambda: sql(state, "SELECT 1"), "original demo restart")
     return {table: len(rows) for table, rows in expected.items()}
 
@@ -341,6 +342,7 @@ def calibrated_battery(state):
 
 
 def check(state):
+    discover(state)
     if not state.get("queued_verified"):
         compose(state, "stop", "greptimedb")
         try:
@@ -353,6 +355,8 @@ def check(state):
             compose(state, "up", "-d", "greptimedb", "alloy")
         finally:
             compose(state, "start", "greptimedb", "alloy")
+            # Dynamic host ports belong to a running container, not its saved state.
+            discover(state)
         wait_for(lambda: summaries_ready(state, queued=True), "durable queued delivery", timeout=360)
         state["queued_verified"] = True
         save_state(state)
