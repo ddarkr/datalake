@@ -94,6 +94,7 @@ python3 tools/demo.py start
 ```
 
 실제 `.env`·개인 계정·차량·S3를 사용하지 않습니다. 임시 디렉터리의 `0600` 합성 자격 증명, 별도 Compose 프로젝트·볼륨, File 저장소와 Docker가 할당한 **loopback 전용 빈 포트**를 사용합니다. 최초 실행은 고정 버전 이미지와 PyPI 패키지를 다운로드합니다. 데모는 종료하지 않고 남겨 두며 출력 JSON의 `grafana_url`에서 로그인한 뒤 `/d/datalake-ai-usage`를 엽니다. 사용자명은 `demo`, 암호는 출력의 `credentials_file`에 있는 `GF_ADMIN_PASSWORD`입니다. 이 파일을 공개 로그에 붙이지 마세요.
+배터리 교정도 데모의 Compose override에서 합성 설정으로 교체합니다. 배포 파일에 개인 교정값이 inline되어 있어도 데모 분석에는 사용하지 않습니다.
 
 호스트와 Docker VM의 시계가 일치해야 합니다. 큰 시계 차이는 Grafana 로그인 세션과 상대 시각 표시를 깨뜨립니다. 배터리 카드의 과거 관측을 확인하려면 해당 완료 시간창을 포함하는 절대 조회 범위를 선택하세요.
 

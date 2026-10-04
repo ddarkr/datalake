@@ -222,6 +222,8 @@ def start(directory):
             "restart": "unless-stopped"}
     # JSON mappings are YAML mappings; only native !override port tags need YAML text.
     override += "  demo-wire: " + json.dumps(wire) + "\nvolumes:\n  demo-fixtures: {}\n"
+    # Override even private bundles that inline their operator calibration.
+    override += "configs:\n  battery_analysis_json:\n    content: " + json.dumps(env["BATTERY_ANALYSIS_CONFIG_JSON"]) + "\n"
     private_write(directory / "override.yaml", override)
     compose(state, "up", "-d")
     discover(state)
