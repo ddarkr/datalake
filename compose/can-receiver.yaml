@@ -1,0 +1,102 @@
+services:
+  can-receiver-deps:
+    image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [can-receiver]
+    volumes:
+      - receiver-venv:/opt/venv
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        printf '%s' 'cantools==40.7.1 opentelemetry-proto==1.38.0' > /tmp/.can_receiver_want;
+        if test -f /opt/venv/.can_receiver_ready &&
+        cmp -s /tmp/.can_receiver_want /opt/venv/.can_receiver_ready; then exit 0; fi;
+        python3 -m venv --clear /opt/venv &&
+        /opt/venv/bin/pip install --no-cache-dir --only-binary=:all:
+        cantools==40.7.1 opentelemetry-proto==1.38.0 &&
+        cp /tmp/.can_receiver_want /opt/venv/.can_receiver_ready
+    restart: "no"
+
+  can-receiver:
+    image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [can-receiver]
+    depends_on:
+      can-receiver-deps:
+        condition: service_completed_successfully
+    labels:
+      datalake.can-receiver-revision: "1"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    configs:
+      - source: can_receiver_py
+        target: /app/can_receiver.py
+        mode: 0444
+      - source: can_decoder_py
+        target: /app/can_decoder.py
+        mode: 0444
+      - source: can_otlp_wire_py
+        target: /app/can_otlp_wire.py
+        mode: 0444
+    volumes:
+      - receiver-venv:/opt/venv:ro
+      - can-receiver-raw:/data
+      - can-receiver-definitions:/definitions:ro
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      CAN_OTLP_USER: ${CAN_OTLP_USER:-}
+      CAN_OTLP_PASSWORD: ${CAN_OTLP_PASSWORD:-}
+      CAN_VEHICLE: ${CAN_VEHICLE:-}
+      CAN_COLLECTOR_ID: ${CAN_COLLECTOR_ID:-}
+      GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
+      GREPTIME_DB: ${GREPTIME_DB:-}
+      GREPTIME_USER: ${GREPTIME_USER:-}
+      GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+    command:
+      - /opt/venv/bin/python
+      - /app/can_receiver.py
+      - serve
+      - --database
+      - /data/raw.sqlite3
+      - --dbc
+      - /definitions/observed.dbc
+      - --definitions
+      - /definitions/observed.json
+      - --vehicle
+      - ${CAN_VEHICLE:-}
+      - --collector-id
+      - ${CAN_COLLECTOR_ID:-}
+      - --greptime-url
+      - ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
+      - --greptime-db
+      - ${GREPTIME_DB:-}
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "4319"
+    ports:
+      - "127.0.0.1:${CAN_RECEIVER_PORT:-4319}:4319"
+    restart: unless-stopped
+    stop_grace_period: 30s
+
+configs:
+  can_receiver_py:
+    x-source: scripts/can_receiver.py
+  can_decoder_py:
+    x-source: scripts/can_decoder.py
+  can_otlp_wire_py:
+    x-source: scripts/can_otlp_wire.py
+
+volumes:
+  receiver-venv:
+  can-receiver-raw:
+    external: true
+    name: ${CAN_RECEIVER_RAW_VOLUME:-datalake_can-receiver-raw}
+  can-receiver-definitions:
+    external: true
+    name: ${CAN_RECEIVER_DEFINITIONS_VOLUME:-datalake_can-receiver-definitions}

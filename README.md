@@ -137,9 +137,12 @@ flowchart LR
 | `home`, `mqtt` | 서버의 선택적 홈 수집 경로 |
 | `vehicle` | 별도 Linux 장비의 CAN 원본·VSS 수집 |
 | `fleet` | 서버의 선택적 Fleet Telemetry 수신 |
+| `can-receiver` | 서버의 선택적 CAN raw 수신·영속 보관·DBC 디코딩 |
 | `backup`, `redecode` | 오프라인 백업·복원 및 CAN 재해석 작업 |
 
 GreptimeDB는 standalone 구성입니다. 기본 저장소는 S3 호환 스토리지이며 로컬 파일 저장 모드도 있습니다. S3 모드에서도 로컬 볼륨이 필요하며, 버킷만으로 전체 DB를 복구할 수 있다고 가정하지 않습니다. 백업·복원은 DB 쓰기를 중지한 상태에서 별도로 수행합니다.
+
+CAN receiver와 배포 설정은 이 저장소에서 관리합니다. 차량 측 capture/uploader는 별도 `tesla-obd` 프로젝트가 담당합니다. DBC와 companion 정의 JSON, 실제 CAN 원본은 공개 저장소에 넣지 않고 운영자가 외부 private 볼륨으로 공급합니다. 기존 SocketCAN `vehicle` 경로와 별개이며, [운영 절차](docs/operations.md)의 raw 보존·단일 worker 계약을 따릅니다.
 
 ## 수집 범위와 개인정보
 

@@ -216,14 +216,14 @@ docker compose --profile server --profile fleet up -d
 - 로컬 검증 명령(운영 자격 증명이 아닌 격리 DB와 합성 교정값을 사용):
   ```bash
   python -m pip install PyYAML==6.0.2
-  python tools/render.py compose/core.yaml compose/database.yaml compose/ingest.yaml compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml compose/vehicle-vss.yaml compose/tesla-fleet.yaml compose/redecode.yaml --out compose.yaml
+  python tools/render.py compose/core.yaml compose/database.yaml compose/ingest.yaml compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml compose/vehicle-vss.yaml compose/tesla-fleet.yaml compose/redecode.yaml compose/can-receiver.yaml --out compose.yaml
   python tools/check_env.py
   python tests/test_render.py
-  for profile in server home mqtt vehicle fleet backup redecode '*'; do docker compose --env-file .env.example --profile server --profile "$profile" config --quiet; done
+  for profile in server home mqtt vehicle fleet backup redecode can-receiver '*'; do docker compose --env-file .env.example --profile server --profile "$profile" config --quiet; done
   for name in common reference conditions energy electrical alerts rul runtime; do python "tests/test_battery_$name.py" || exit; done
   AGG_RUN_ONCE=1 python scripts/aggregate.py  # 격리 GREPTIME_* 필수; 운영 DB로 실행하지 않음
   ```
-  배포 번들 재생성 순서는 CI(`.github/workflows/compose.yml`)와 같은 9개 조각을 사용합니다. 배포 전에는 생성물의 aggregate configs를 격리 컨테이너에 마운트하여 실제 프로세스 실행과 소스 해시 일치도 확인합니다.
+  배포 번들 재생성 순서는 CI(`.github/workflows/compose.yml`)와 같은 10개 조각을 사용합니다. 배포 전에는 생성물의 aggregate configs를 격리 컨테이너에 마운트하여 실제 프로세스 실행과 소스 해시 일치도 확인합니다.
 
 ### 포트/폴링/outbox 한계와 배포 승인
 - 사설 포트: Fleet ZMQ 5555는 `tesla-helper_default` 사설망 내부이며, Greptime HTTP/MySQL·Grafana 바인드는 기본 loopback입니다. 원격은 Tailnet IP로만 열고 `0.0.0.0` 기본은 사용하지 않습니다.
