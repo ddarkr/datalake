@@ -77,6 +77,8 @@ jobs:
             module="${f%.py}"
             python -m "${module//\//.}"
           done
+      - name: Check packaged read-only CAN receiver startup and durable replay
+        run: python -m tests.test_can_receiver_compose
       - name: Check generated deployment bundle is current
         run: |
           python tools/render.py \
