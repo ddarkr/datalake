@@ -95,7 +95,7 @@ class ReceiverBehavior(unittest.TestCase):
                 {"seq": seq, "offset_ns": seq, "phase": "capture", "data": b"\r"}
                 for seq in range(6000)
             ])
-            archive.decode_once(decoder)
+            archive.decode_once(decoder, limit=1)
             # A completed, retained prefix with no decoded signals or partial frame.
             with archive.connect() as conn:
                 state = json.loads(conn.execute("SELECT state_json FROM decode_states").fetchone()[0])
@@ -125,8 +125,7 @@ class ReceiverBehavior(unittest.TestCase):
                     yield conn
 
             with patch.object(archive, "connect", bounded_connect):
-                self.assertTrue(archive.decode_once(decoder))
-                self.assertTrue(archive.decode_once(decoder))
+                self.assertTrue(archive.decode_once(decoder, limit=2))
                 self.assertFalse(archive.decode_once(decoder))
             with archive.connect() as conn:
                 rows = [json.loads(row[0]) for row in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
@@ -135,11 +134,97 @@ class ReceiverBehavior(unittest.TestCase):
             replay = synthetic_decoder(directory, revision="synthetic-v2")
             archive.register_epoch(replay, explicit=True)
             with patch.object(archive, "connect", bounded_connect):
-                self.assertTrue(archive.decode_once(replay))
+                self.assertTrue(archive.decode_once(replay, limit=1))
             with archive.connect() as conn:
                 cursor = conn.execute("SELECT next_seq FROM decode_states WHERE epoch=?", (replay.epoch,)).fetchone()[0]
                 self.assertEqual(cursor, 1)
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 6002)
+
+    def test_batch_failure_rolls_back_cursors_and_outbox_before_restart(self):
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "batch-session", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        chunks = [{"seq": seq, "offset_ns": seq, "phase": "capture", "data": data}
+                  for seq, data in enumerate([b"t12320200\r", b"t123204", b"00\r"])]
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            path = Path(directory) / "raw.sqlite"
+            archive = Archive(path, disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(meta, chunks)
+            before = archive.status()
+            decode = decoder.decode
+
+            def fail_second(meta, chunk, state):
+                if chunk["seq"] == 1:
+                    raise ValueError("injected decoder failure")
+                return decode(meta, chunk, state)
+
+            with patch.object(decoder, "decode", fail_second), patch(
+                    "scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                with self.assertRaisesRegex(ValueError, "injected decoder failure"):
+                    archive.decode_once(decoder)
+            self.assertEqual(archive.status(), before)
+            archive = Archive(path, disk_reserve_bytes=0)
+            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                self.assertEqual(archive.decode_once(decoder, limit=2), 2)
+            self.assertEqual(archive.status()["epochs"][0]["remaining_chunks"], 1)
+            archive = Archive(path, disk_reserve_bytes=0)
+            self.assertEqual(archive.decode_once(decoder), 1)
+            with archive.connect() as conn:
+                rows = [json.loads(r[0]) for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            self.assertEqual([(r["event_time"], r["value_num"]) for r in rows],
+                             [(meta["started_ns"], 1.0), (meta["started_ns"] + 2, 2.0)])
+            self.assertEqual(archive.status()["raw_chunks"], 3)
+            self.assertEqual(archive.status()["epochs"][0]["remaining_chunks"], 0)
+
+    def test_decode_continues_during_blocked_upload_and_shutdown_joins_uploader(self):
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "blocked-upload", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        chunks = [{"seq": seq, "offset_ns": seq, "phase": "capture", "data": b"t12320200\r"}
+                  for seq in range(500)]
+        entered, release = threading.Event(), threading.Event()
+
+        class HeldSink(SQLSink):
+            def do_POST(self):
+                entered.set()
+                release.wait(10)
+                super().do_POST()
+
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(meta, chunks[:1])
+            archive.decode_once(decoder)
+            sink = HTTPServer(("127.0.0.1", 0), HeldSink)
+            sink.mode = "outage"
+            sink_thread = threading.Thread(target=sink.serve_forever, daemon=True)
+            sink_thread.start()
+            greptime = Greptime(f"http://127.0.0.1:{sink.server_port}", "synthetic", "test", "test", timeout=10)
+            worker = Worker(archive, decoder, greptime, interval=0.01)
+            worker.start()
+            try:
+                wait_for(entered.is_set)
+                archive.accept(meta, chunks[1:])
+                wait_for(lambda: archive.status()["epochs"][0]["remaining_chunks"] == 0)
+                self.assertEqual(archive.status()["pending_rows"], 500)
+                worker.stop_event.set()
+                worker.join(0.05)
+                self.assertTrue(worker.is_alive())  # Exclusive archive ownership must outlive the pending upload.
+                release.set()
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(archive.status()["pending_rows"], 500)
+                self.assertEqual(archive.status()["raw_chunks"], 500)
+            finally:
+                release.set()
+                worker.stop_event.set()
+                worker.join(10)
+                sink.shutdown()
+                sink.server_close()
+                sink_thread.join(3)
 
     def test_durable_auth_dedup_split_restart_and_downstream_retry(self):
         meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
@@ -215,7 +300,6 @@ class ReceiverBehavior(unittest.TestCase):
                 endpoint = f"http://127.0.0.1:{server.server_port}"
                 self.assertEqual(post(chunks[1:])[0], 200)
                 self.assertEqual(post(chunks)[0], 200)
-                self.assertTrue(archive.decode_once(decoder))
                 self.assertTrue(archive.decode_once(decoder))
                 self.assertFalse(archive.decode_once(decoder))
                 with archive.connect() as conn:

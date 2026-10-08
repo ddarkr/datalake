@@ -168,6 +168,10 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
 
 초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps와 receiver **두 서비스의 revision label**을 함께 갱신하세요. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
 
+디코딩은 한 트랜잭션에 최대 1,000청크를 처리하고, 청크 처리 사이에 경과 시간을 확인하여 50ms를 넘으면 commit하고 쓰기 잠금을 해제합니다. 개별 청크 처리·commit 시간까지 포함한 엄격한 50ms 상한은 아닙니다. parser 상태·decode cursor·outbox는 함께 commit하거나 함께 rollback하며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
+
+단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속되며, 업로드 워커만 최대 20,000행씩 INSERT하고 ACK된 행을 제거합니다. `--outbox-limit`으로 1–20,000행 사이에서 조정할 수 있으며 기본값은 20,000입니다. 배치를 채우려고 기다리지는 않습니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK는 배치 전체를 보존합니다. 정상 종료 시 진행 중인 업로드가 완료되거나 HTTP timeout에 도달하기 전에는 archive의 독점 소유권을 해제하지 않습니다. SQLite 원본의 수신 ACK는 여전히 Greptime 저장 완료를 뜻하지 않습니다.
+
 `python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver 인계

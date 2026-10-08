@@ -816,7 +816,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '3'
+      datalake.can-receiver-revision: '4'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -840,7 +840,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '3'
+      datalake.can-receiver-revision: '4'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -25673,40 +25673,51 @@ configs:
                       conn.execute("INSERT INTO epochs VALUES(?,?)", (decoder.epoch, decoder.mapping_revision))
                   conn.commit()
 
-          def decode_once(self, decoder):
+          def decode_once(self, decoder, limit=1000):
+              """Commit ordered chunks, their parser cursors and outbox rows atomically."""
               with self.connect() as conn:
                   conn.execute("BEGIN IMMEDIATE")
-                  # CROSS JOIN keeps cursor lookup outside the retained raw history.
-                  raw = conn.execute(
-                      "SELECT c.*,s.meta_json,d.state_json,d.counts_json,d.rows FROM sessions s "
-                      "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
-                      "CROSS JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(d.next_seq,0) "
-                      "ORDER BY c.id LIMIT 1", (decoder.epoch,),
-                  ).fetchone()
-                  if raw is None:
-                      return False
-                  self.reserve()
-                  meta = json.loads(raw["meta_json"])
-                  chunk = {key: raw[key] for key in ("seq", "offset_ns", "phase", "data")}
-                  state = json.loads(raw["state_json"]) if raw["state_json"] else None
-                  rows, state, counts = decoder.decode(meta, chunk, state)
-                  totals = json.loads(raw["counts_json"]) if raw["counts_json"] else {}
-                  for key, value in counts.items():
-                      if type(value) is not int or value < 0:
-                          raise ValueError("invalid decoder count")
-                      totals[key] = value if key == "tail_bytes" else totals.get(key, 0) + value
-                  for row in rows:
-                      validate_row(row)
-                      if row["vehicle"] != meta["vehicle"] or row["collector_id"] != meta["collector_id"] or row["decode_epoch"] != decoder.epoch:
-                          raise ValueError("decoder row identity mismatch")
-                      conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)", (row["event_id"], decoder.epoch, _json(row)))
-                  conn.execute(
-                      "INSERT INTO decode_states VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
-                      "next_seq=excluded.next_seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows=excluded.rows",
-                      (raw["session"], decoder.epoch, raw["seq"] + 1, _json(state), _json(totals), (raw["rows"] or 0) + len(rows)),
-                  )
+                  # Release the writer lock between batches so raw ingestion can proceed.
+                  deadline = time.monotonic() + 0.05
+                  processed = 0
+                  while processed < limit:
+                      # CROSS JOIN keeps cursor lookup outside the retained raw history.
+                      raw = conn.execute(
+                          "SELECT c.*,s.meta_json,d.state_json,d.counts_json,d.rows FROM sessions s "
+                          "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
+                          "CROSS JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(d.next_seq,0) "
+                          "ORDER BY c.id LIMIT 1", (decoder.epoch,),
+                      ).fetchone()
+                      if raw is None:
+                          break
+                      self.reserve()
+                      meta = json.loads(raw["meta_json"])
+                      chunk = {key: raw[key] for key in ("seq", "offset_ns", "phase", "data")}
+                      state = json.loads(raw["state_json"]) if raw["state_json"] else None
+                      rows, state, counts = decoder.decode(meta, chunk, state)
+                      totals = json.loads(raw["counts_json"]) if raw["counts_json"] else {}
+                      for key, value in counts.items():
+                          if type(value) is not int or value < 0:
+                              raise ValueError("invalid decoder count")
+                          totals[key] = value if key == "tail_bytes" else totals.get(key, 0) + value
+                      for row in rows:
+                          validate_row(row)
+                          if row["vehicle"] != meta["vehicle"] or row["collector_id"] != meta["collector_id"] or row["decode_epoch"] != decoder.epoch:
+                              raise ValueError("decoder row identity mismatch")
+                      conn.executemany(
+                          "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
+                          [(row["event_id"], decoder.epoch, _json(row)) for row in rows],
+                      )
+                      conn.execute(
+                          "INSERT INTO decode_states VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
+                          "next_seq=excluded.next_seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows=excluded.rows",
+                          (raw["session"], decoder.epoch, raw["seq"] + 1, _json(state), _json(totals), (raw["rows"] or 0) + len(rows)),
+                      )
+                      processed += 1
+                      if time.monotonic() >= deadline:
+                          break
                   conn.commit()
-                  return True
+                  return processed
 
           def record_error(self, kind):
               if kind not in {"decode_failure", "greptime_failure", "greptime_partial_ack", "archive_disk_reserve"}:
@@ -25718,7 +25729,7 @@ configs:
                   )
                   conn.commit()
 
-          def flush_once(self, greptime, limit=500):
+          def flush_once(self, greptime, limit=20000):
               with self.connect() as conn:
                   batch = conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)).fetchall()
               if not batch:
@@ -25852,7 +25863,7 @@ configs:
 
 
       class Worker(threading.Thread):
-          def __init__(self, archive, decoder, greptime, interval=1, outbox_limit=500):
+          def __init__(self, archive, decoder, greptime, interval=1, outbox_limit=20000):
               super().__init__(name="can-archive-worker", daemon=True)
               self.archive, self.decoder, self.greptime = archive, decoder, greptime
               self.interval, self.outbox_limit = interval, outbox_limit
@@ -25864,32 +25875,37 @@ configs:
               except (sqlite3.Error, OSError):
                   pass  # Storage failure must not kill the receiver or disclose raw data.
 
-          def run(self):
+          def _upload(self):
+              # One consumer owns ACK deletion; decoding can keep filling the durable outbox.
               while not self.stop_event.is_set():
                   progressed = False
-                  failed = False
                   try:
-                      # ponytail: one ordered worker; parallelize only if decode throughput needs it.
-                      for _ in range(16):
-                          if self.stop_event.is_set() or not self.archive.decode_once(self.decoder):
-                              break
-                          progressed = True
-                  except Rejection:
-                      failed = True
-                      self._error("archive_disk_reserve")
-                  except Exception:
-                      failed = True
-                      self._error("decode_failure")
-                  try:
-                      progressed = bool(self.archive.flush_once(self.greptime, self.outbox_limit)) or progressed
+                      progressed = bool(self.archive.flush_once(self.greptime, self.outbox_limit))
                   except DownstreamError as exc:
-                      failed = True
                       self._error(str(exc))
                   except Exception:
-                      failed = True
                       self._error("greptime_failure")
-                  if failed or not progressed:
+                  if not progressed:
                       self.stop_event.wait(self.interval)
+
+          def run(self):
+              uploader = threading.Thread(target=self._upload, name="can-archive-uploader", daemon=True)
+              uploader.start()
+              try:
+                  while not self.stop_event.is_set():
+                      progressed = False
+                      try:
+                          progressed = bool(self.archive.decode_once(self.decoder))
+                      except Rejection:
+                          self._error("archive_disk_reserve")
+                      except Exception:
+                          self._error("decode_failure")
+                      if not progressed:
+                          self.stop_event.wait(self.interval)
+              finally:
+                  self.stop_event.set()
+                  # Do not release exclusive archive ownership while an HTTP ACK is pending.
+                  uploader.join()
 
 
       class Receiver(HTTPServer):
@@ -26038,7 +26054,7 @@ configs:
           serve.add_argument("--port", type=int, default=4319)
           serve.add_argument("--worker-interval", type=float, default=1)
           serve.add_argument("--http-timeout", type=float, default=15)
-          serve.add_argument("--outbox-limit", type=int, default=500)
+          serve.add_argument("--outbox-limit", type=int, default=20000)
           args = parser.parse_args(argv)
           try:
               if args.command == "status":
@@ -26048,7 +26064,7 @@ configs:
               if args.disk_reserve_mib < 0:
                   raise ConfigurationError("disk_reserve_must_be_nonnegative")
               if args.command == "serve":
-                  if not 0 <= args.port <= 65535 or not math.isfinite(args.worker_interval) or args.worker_interval <= 0 or not math.isfinite(args.http_timeout) or args.http_timeout <= 0 or not 1 <= args.outbox_limit <= 500:
+                  if not 0 <= args.port <= 65535 or not math.isfinite(args.worker_interval) or args.worker_interval <= 0 or not math.isfinite(args.http_timeout) or args.http_timeout <= 0 or not 1 <= args.outbox_limit <= 20000:
                       raise ConfigurationError("invalid_receiver_limits")
                   otlp_user, otlp_password = _credentials("CAN_OTLP")
                   db_user, db_password = _credentials("GREPTIME")
