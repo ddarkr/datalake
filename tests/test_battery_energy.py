@@ -5,8 +5,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'scripts'))
-import battery_energy as en
+from scripts.analytics.battery import battery_energy as en
 
 HOUR = 3600000000000
 T0 = 1790474400000000000

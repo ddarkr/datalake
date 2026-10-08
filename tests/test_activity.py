@@ -1,22 +1,9 @@
 """Activity normalization boundary regressions: pure function, stdlib only."""
-import importlib.util
 import os
 import unittest
 from datetime import datetime
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(
-        name, os.path.join(SCRIPTS, name + ".py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-act = load("activity")
+from scripts.telemetry import activity as act
 
 
 def dt(y, mo, d, h=0, mi=0, s=0):

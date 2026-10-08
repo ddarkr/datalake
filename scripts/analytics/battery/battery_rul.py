@@ -7,7 +7,7 @@ stdlib-only battery_reference loader for input envelopes).
 What this is: a fitted supervised ridge-regression model that predicts
 discharge-cycle RUL from history available at prediction time, trained on
 official NASA PCoE lab-cell discharge records ingested by
-scripts/battery_reference.py. Plus one honest train-mean baseline for
+scripts/analytics/battery/battery_reference.py. Plus one honest train-mean baseline for
 comparison. No fabricated weights: every number in the artifact is fitted
 or counted from the supplied reference JSON.
 
@@ -63,12 +63,12 @@ Config contract (config is a plain dict):
   No thresholds, no enable flags, no calibration refs. Empty/absent "rul"
   runs uncalibrated: per-metric unavailable rows, never guessed numbers.
 CLI (all stdlib, no training inside the reference loader):
-  python3 scripts/battery_rul.py train REFERENCE_JSON MODEL_JSON
+  python3 -m scripts.analytics.battery.battery_rul train REFERENCE_JSON MODEL_JSON
       [--test-battery ID ...] [--min-history N] [--slope-window N]
       [--ridge FLOAT]
-  python3 scripts/battery_rul.py evaluate REFERENCE_JSON MODEL_JSON
+  python3 -m scripts.analytics.battery.battery_rul evaluate REFERENCE_JSON MODEL_JSON
       [--test-battery ID ...]
-  python3 scripts/battery_rul.py predict --model MODEL_JSON
+  python3 -m scripts.analytics.battery.battery_rul predict --model MODEL_JSON
       --history HISTORY_JSON
   HISTORY_JSON: {"domain": str, "history": [{...entries as above...}]}.
   Offline predict accepts entries with or without observed_ns and keeps
@@ -91,12 +91,10 @@ report it as a labelled diagnostic.
 import argparse
 import json
 import math
-import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import battery_common as bc
-import battery_reference as br
+from scripts.analytics.battery import battery_common as bc
+from scripts.analytics.battery import battery_reference as br
 
 CODE_VERSION = "1.0.0"
 ALGORITHM_VERSION = "1.0.0"

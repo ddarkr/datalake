@@ -119,6 +119,7 @@ Writes quote every identifier ("window_start","vehicle","metric",...)
 import base64
 import datetime as dt
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -128,8 +129,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import battery_common as bc
+from scripts.analytics.battery import battery_common as bc
 
 RUNTIME_VERSION = "1.0.3"
 ANALYSIS_TABLE = "vehicle_analysis"
@@ -140,11 +140,11 @@ CONFIG_PATH_DEFAULT = "/app/battery-analysis.json"
 CONFIG_SUFFIXES = ("conditions", "energy", "electrical", "rul", "alerts")
 
 MODULE_FILES = (
-    ("battery_conditions", "conditions"),
-    ("battery_energy", "energy"),
-    ("battery_electrical", "electrical"),
-    ("battery_rul", "rul"),
-    ("battery_alerts", "alerts"),
+    ("scripts.analytics.battery.battery_conditions", "conditions"),
+    ("scripts.analytics.battery.battery_energy", "energy"),
+    ("scripts.analytics.battery.battery_electrical", "electrical"),
+    ("scripts.analytics.battery.battery_rul", "rul"),
+    ("scripts.analytics.battery.battery_alerts", "alerts"),
 )
 
 MISSING_TABLE_HINTS = ("not found", "not exist", "does not exist",
@@ -510,13 +510,14 @@ def get_analyzers():
     """[(key, suffix, analyze_fn|None)]. Missing files stay None (isolated)."""
     out = []
     for module_name, suffix in MODULE_FILES:
+        key = module_name.rsplit(".", 1)[-1]
         try:
-            module = __import__(module_name)
+            module = importlib.import_module(module_name)
         except Exception:
-            out.append((module_name, suffix, None))
+            out.append((key, suffix, None))
             continue
         fn = getattr(module, "analyze", None)
-        out.append((module_name, suffix,
+        out.append((key, suffix,
                     fn if callable(fn) else None))
     return out
 
@@ -560,7 +561,7 @@ def fill_missing_identity(rows, scope, window, computed_at_ns,
     """
     vehicle, source, epoch = scope
     ws, we = window
-    module_keys = {key for key, _ in MODULE_FILES}
+    module_keys = {name.rsplit(".", 1)[-1] for name, _ in MODULE_FILES}
     for row in rows:
         if not isinstance(row, dict):
             continue
@@ -1294,7 +1295,7 @@ def main(argv=None):
             overrides["db"] = token.split("=", 1)[1]
         elif token in ("-h", "--help"):
             sys.stdout.write(
-                "usage: battery_runtime.py [--battery-only] "
+                "usage: python -m scripts.analytics.battery.battery_runtime [--battery-only] "
                 "[--config=PATH] [--backfill-start=TS] [--backfill-end=TS] "
                 "[--lookback-hours=N] [--max-rows=N] [--vehicle=ID] "
                 "[--base-url=URL] [--db=NAME]\n"

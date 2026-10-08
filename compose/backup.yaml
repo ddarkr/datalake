@@ -14,7 +14,7 @@
 # There is no live-backup mode: a tar of a running standalone is torn WAL,
 # not crash-consistent, and no such claim is made here.
 #
-# Automated S3 workflow (all inside scripts/backup.py, boto3 pinned via
+# Automated S3 workflow (all inside scripts/storage/backup.py, boto3 pinned via
 # backup-deps venv; real B2 unverified — needs live credentials):
 # S3 backup: offline check -> SST objects copied from s3://BUCKET/ROOT/ to
 #   the immutable s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/sst/ (SHA256+size
@@ -67,7 +67,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "1"
+      datalake.storage-metrics-revision: "2"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -85,11 +85,12 @@ services:
       - backup-data:/ops:ro
     configs:
       - source: storage_metrics_py
-        target: /app/storage_metrics.py
+        target: /app/scripts/storage/storage_metrics.py
         mode: 0444
       - source: greptime_preflight
-        target: /app/greptime_preflight.py
-    entrypoint: [/opt/venv/bin/python, /app/storage_metrics.py]
+        target: /app/scripts/database/greptime_preflight.py
+    working_dir: /app
+    entrypoint: [/opt/venv/bin/python, -m, scripts.storage.storage_metrics]
     # Internal only: scraped via the server network, never host-published.
     expose:
       - "9105"
@@ -122,19 +123,20 @@ services:
       - backup-venv:/opt/venv:ro
     configs:
       - source: backup_py
-        target: /app/backup.py
+        target: /app/scripts/storage/backup.py
         mode: 0444
       - source: greptime_preflight
-        target: /app/greptime_preflight.py
-    entrypoint: ["/opt/venv/bin/python", "/app/backup.py"]
+        target: /app/scripts/database/greptime_preflight.py
+    working_dir: /app
+    entrypoint: ["/opt/venv/bin/python", "-m", "scripts.storage.backup"]
     command: ["backup"]
     restart: "no"
 
 configs:
   backup_py:
-    x-source: scripts/backup.py
+    x-source: scripts/storage/backup.py
   storage_metrics_py:
-    x-source: scripts/storage_metrics.py
+    x-source: scripts/storage/storage_metrics.py
 
 
 volumes:

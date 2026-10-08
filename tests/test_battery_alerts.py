@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Tests for scripts/battery_alerts.py. Plain asserts, stdlib only; __main__ runner."""
+"""Tests for scripts.analytics.battery.battery_alerts. Plain asserts, stdlib only; __main__ runner."""
 
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_alerts as al
-import battery_common as bc
+from scripts.analytics.battery import battery_alerts as al
+from scripts.analytics.battery import battery_common as bc
 
 MANUAL = "https://www.tesla.com/ownersmanual/model3/en_us/Owners_Manual.pdf"
 

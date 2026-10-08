@@ -1,4 +1,4 @@
-"""Behavior tests for scripts/battery_runtime.py.
+"""Behavior tests for scripts.analytics.battery.battery_runtime.
 
 Plain asserts, stdlib only; doubles as __main__ runner. All inputs are
 tiny in-memory dicts and fake fetch/insert seams -- never a live DB, never
@@ -17,9 +17,8 @@ import sys
 import tempfile
 import sqlite3
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_common as bc
-import battery_runtime as br
+from scripts.analytics.battery import battery_common as bc
+from scripts.analytics.battery import battery_runtime as br
 
 
 def _sig(vehicle, source, epoch, ns, field="BatteryCurrent", value=10.0,
@@ -333,7 +332,7 @@ def test_episode_identity_fold_keeps_revision():
 
 
 def test_bad_battery_limit_does_not_abort_aggregate_startup():
-    import aggregate
+    from scripts.analytics import aggregate
     original_env = dict(os.environ)
     try:
         os.environ.clear()
@@ -538,7 +537,7 @@ def test_prepared_scope_rows_do_not_mutate_across_windows():
                   unit="%", quality="valid")
     prepared = bc.prepare_signals([first, second])
     snapshot = [dict(r) for r in prepared]
-    import battery_conditions as co
+    from scripts.analytics.battery import battery_conditions as co
     one = {"window_start_ns": 8 * hour, "window_end_ns": 9 * hour - 1}
     two = {"window_start_ns": 9 * hour, "window_end_ns": 10 * hour - 1}
     first_out = co.analyze(prepared, [], one)

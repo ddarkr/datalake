@@ -8,28 +8,14 @@ Raw sealing. No source-text or shape-only tests.
 """
 
 import hashlib
-import importlib.util
 import json
 import os
 import sys
 import tempfile
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(
-        "cv_" + name, os.path.join(SCRIPTS, name + ".py"))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules["cv_" + name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-cv = load("can_validation")
-rec = load("raw_recorder")
+from scripts.vehicle.raw import can_validation as cv
+from scripts.vehicle.raw import raw_recorder as rec
 
 PRIMARY = """VERSION ""
 NS_ :

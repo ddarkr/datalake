@@ -52,8 +52,7 @@ import os
 import sys
 import urllib.parse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import battery_common as bc
+from scripts.analytics.battery import battery_common as bc
 
 LOADER_VERSION = "1.0.0"
 NASA_SOURCE_URL = ("https://phm-datasets.s3.amazonaws.com/"

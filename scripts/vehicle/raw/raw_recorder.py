@@ -43,9 +43,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    import can_validation as _cv
+    from scripts.vehicle.raw import can_validation as _cv
 except ImportError:
     _cv = None  # validation unavailable; Raw capture never depends on it
 
@@ -678,7 +677,7 @@ def replay_allowed(iface):
 
 def run_replay(args):
     if not args:
-        print("usage: raw_recorder.py replay <file.mf4> [vcan_iface]",
+        print("usage: python -m scripts.vehicle.raw.raw_recorder replay <file.mf4> [vcan_iface]",
               file=sys.stderr)
         return 2
     iface = args[1] if len(args) > 1 else e("CAN_INTERFACE", "can0")

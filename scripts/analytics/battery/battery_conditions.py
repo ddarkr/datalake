@@ -98,11 +98,8 @@ Public numerical helpers (pure, stdlib):
   ``analyze(signals, events, config)`` -> list[dict] via make_result.
 """
 
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import battery_common as bc
+from scripts.analytics.battery import battery_common as bc
 
 ALGORITHM_VERSION = "1.2.0"
 ANALYSIS_ID = "battery_conditions"

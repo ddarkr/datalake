@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.recorder-revision: "5"
+      datalake.recorder-revision: "6"
     stop_grace_period: 30s
     depends_on:
       fleet-deps:
@@ -31,7 +31,7 @@ services:
         condition: service_completed_successfully
     configs:
       - source: fleet_recorder_py
-        target: /app/fleet_recorder.py
+        target: /app/scripts/ingest/fleet_recorder.py
         mode: 0444
     volumes:
       - fleet-venv:/opt/venv:ro
@@ -39,7 +39,8 @@ services:
     networks:
       - default
       - tesla-helper-net
-    command: ["/opt/venv/bin/python", "-u", "/app/fleet_recorder.py"]
+    working_dir: /app
+    command: ["/opt/venv/bin/python", "-u", "-m", "scripts.ingest.fleet_recorder"]
     environment:
       FLEET_ZMQ_ENDPOINT: ${FLEET_ZMQ_ENDPOINT:-tcp://fleet-telemetry:5555}
       FLEET_ZMQ_TOPICS: ${FLEET_ZMQ_TOPICS:-tesla_V,tesla_alerts,tesla_errors,tesla_connectivity}
@@ -67,7 +68,7 @@ services:
 
 configs:
   fleet_recorder_py:
-    x-source: scripts/fleet_recorder.py
+    x-source: scripts/ingest/fleet_recorder.py
 
 volumes:
   fleet-venv: {}

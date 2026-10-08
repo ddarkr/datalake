@@ -2,11 +2,12 @@ services:
   redecode-setup:
     image: ${REDECODE_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [redecode]
-    command: ["python3", "/scripts/vehicle_setup.py"]
+    working_dir: /app
+    command: ["python3", "-m", "scripts.vehicle.vehicle_setup"]
     restart: "no"
     configs:
       - source: redecode_vehicle_setup_py
-        target: /scripts/vehicle_setup.py
+        target: /app/scripts/vehicle/vehicle_setup.py
     volumes:
       - vehicle-data:/data
     environment:
@@ -77,16 +78,16 @@ services:
         condition: service_completed_successfully
     configs:
       - source: redecode_py
-        target: /app/redecode.py
+        target: /app/scripts/vehicle/raw/redecode.py
         mode: 0444
       - source: redecode_vss_recorder_py
-        target: /app/vss_recorder.py
+        target: /app/scripts/vehicle/vss_recorder.py
         mode: 0444
       - source: redecode_vehicle_setup_py
-        target: /app/vehicle_setup.py
+        target: /app/scripts/vehicle/vehicle_setup.py
         mode: 0444
       - source: redecode_raw_recorder_py
-        target: /app/raw_recorder.py
+        target: /app/scripts/vehicle/raw/raw_recorder.py
         mode: 0444
     volumes:
       - redecode-venv:/opt/venv:ro
@@ -119,18 +120,19 @@ services:
       RAW_S3_REGION: ${RAW_S3_REGION:-}
       RAW_S3_ACCESS_KEY_ID: ${RAW_S3_ACCESS_KEY_ID:-}
       RAW_S3_SECRET_ACCESS_KEY: ${RAW_S3_SECRET_ACCESS_KEY:-}
-    command: [/opt/venv/bin/python, /app/redecode.py]
+    working_dir: /app
+    command: [/opt/venv/bin/python, -m, scripts.vehicle.raw.redecode]
     restart: "no"
 
 configs:
   redecode_py:
-    x-source: scripts/redecode.py
+    x-source: scripts/vehicle/raw/redecode.py
   redecode_vss_recorder_py:
-    x-source: scripts/vss_recorder.py
+    x-source: scripts/vehicle/vss_recorder.py
   redecode_vehicle_setup_py:
-    x-source: scripts/vehicle_setup.py
+    x-source: scripts/vehicle/vehicle_setup.py
   redecode_raw_recorder_py:
-    x-source: scripts/raw_recorder.py
+    x-source: scripts/vehicle/raw/raw_recorder.py
 
 volumes:
   redecode-venv:

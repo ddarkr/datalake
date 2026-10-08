@@ -1,7 +1,7 @@
-"""Behavioral regression tests for scripts/backup.py.
+"""Behavioral regression tests for scripts.storage.backup.
 
 Framework-free: plain asserts + in-process S3 fake (no network, no real B2).
-Run with: python3 tests/test_backup.py
+Run with: python3 -m tests.test_backup
 (Not run here by siblings: project-wide validation is the parent's job.)
 
 Behavioral checks (each fails against the named defect, passes fixed):
@@ -44,8 +44,7 @@ import tarfile
 import tempfile
 import threading
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import backup as bk
+from scripts.storage import backup as bk
 
 CLOSED_URL = "http://127.0.0.1:9"
 B2ENV = {
@@ -1078,7 +1077,7 @@ def test_occupied_remote_namespace_fails_closed():
     tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
     try:
         setenv(env)
-        import backup as _bk
+        from scripts.storage import backup as _bk
         orig_hex = _bk.secrets.token_hex
         orig_ns = _bk.time.time_ns
         fixed_ns = orig_ns()

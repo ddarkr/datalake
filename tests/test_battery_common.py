@@ -1,13 +1,12 @@
-"""Regression tests for scripts/battery_common.py and the battery schema
-in scripts/db_init.py. Plain asserts, stdlib only; doubles as __main__ runner.
+"""Regression tests for scripts.analytics.battery.battery_common and the battery schema
+in scripts.database.db_init. Plain asserts, stdlib only; doubles as __main__ runner.
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_common as bc
-import db_init
+from scripts.analytics.battery import battery_common as bc
+from scripts.database import db_init
 
 
 def sig(ts, vehicle="v", source="fleet", epoch="e1", path="P",

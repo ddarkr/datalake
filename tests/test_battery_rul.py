@@ -1,4 +1,4 @@
-"""Behavior tests for scripts/battery_rul.py.
+"""Behavior tests for scripts.analytics.battery.battery_rul.
 
 Plain asserts, stdlib only; doubles as __main__ runner. All inputs are
 tiny synthetic lab-cell operation mappings through the real
@@ -11,9 +11,8 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_reference as br
-import battery_rul as rul
+from scripts.analytics.battery import battery_reference as br
+from scripts.analytics.battery import battery_rul as rul
 
 
 def dis(cap, times=(0.0, 1800.0, 3600.0)):

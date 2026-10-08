@@ -30,9 +30,11 @@ services:
     user: "0:0"
     profiles:
       - server
+    working_dir: /app
     command:
       - python
-      - /preflight.py
+      - -m
+      - scripts.database.greptime_preflight
     environment:
       GREPTIME_DB: ${GREPTIME_DB:-datalake}
       GREPTIME_USER: ${GREPTIME_USER:-datalake}
@@ -53,13 +55,13 @@ services:
       OUT_DIR: /out
     configs:
       - source: greptime_preflight
-        target: /preflight.py
+        target: /app/scripts/database/greptime_preflight.py
     volumes:
       - greptime-etc:/out
     restart: "no"
 configs:
   greptime_preflight:
-    x-source: scripts/greptime_preflight.py
+    x-source: scripts/database/greptime_preflight.py
 volumes:
   greptime-data:
   greptime-etc:

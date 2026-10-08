@@ -218,7 +218,7 @@ def start(directory):
             "command": ["sh", "-ec", "pip install --disable-pip-version-check --no-cache-dir opentelemetry-proto==1.39.1 && python /demo/demo.py _wire"],
             "ports": ["127.0.0.1::18144"], "environment": env | {"GREPTIME_HTTP_URL": "http://greptimedb:4000", "OTLP_HTTP_URL": "http://alloy:4318"},
             "volumes": [f"{ROOT / 'tools/demo.py'}:/demo/demo.py:ro", f"{ROOT / 'tests/test_privacy.py'}:/demo/test_privacy.py:ro",
-                        f"{ROOT / 'scripts/fleet_recorder.py'}:/demo/fleet_recorder.py:ro", "demo-fixtures:/fixtures"],
+                        f"{ROOT / 'scripts/ingest/fleet_recorder.py'}:/demo/scripts/ingest/fleet_recorder.py:ro", "demo-fixtures:/fixtures"],
             "restart": "unless-stopped"}
     # JSON mappings are YAML mappings; only native !override port tags need YAML text.
     override += "  demo-wire: " + json.dumps(wire) + "\nvolumes:\n  demo-fixtures: {}\n"
@@ -430,7 +430,7 @@ def container_mode(mode):
                        and float(line.rsplit(" ", 1)[-1]) > 0 for line in metrics.splitlines())
         wait_for(queued, "persistent Alloy trace queue", timeout=90)
     elif mode == "_fleet":
-        import fleet_recorder as fleet
+        from scripts.ingest import fleet_recorder as fleet
         meta = dict.fromkeys(("target_vin", "vehicle_id", "vehicle_salt", "decode_epoch", "vss_version",
                               "vehicle_firmware", "mapping_revision", "collector_version", "collector_id", "config_version"), "")
         meta.update(target_vin="SYNTHETIC-DEMO-NOT-A-VEHICLE", vehicle_id="demo-car",
@@ -463,13 +463,13 @@ def container_mode(mode):
 def regressions():
     """Mandatory synthetic CAN/RAW checks: any skip is a CI failure."""
     import unittest
-    sys.path.insert(0, str(ROOT / "tests"))
-    import test_redecode
+    sys.path.insert(0, str(ROOT))
+    from tests import test_redecode
     with tempfile.TemporaryDirectory(prefix="datalake-kuksa-") as work:
         os.environ["KUKSA_SRC_DIR"] = test_redecode.ensure_kuksa_src(work)
         suite = unittest.TestSuite()
         for name in ("test_raw.py", "test_redecode.py", "test_can_validation.py"):
-            suite.addTests(unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern=name))
+            suite.addTests(unittest.defaultTestLoader.discover(str(ROOT / "tests"), pattern=name, top_level_dir=str(ROOT)))
         result = unittest.TextTestRunner(verbosity=2).run(suite)
         if not result.wasSuccessful() or result.skipped:
             raise SystemExit(f"mandatory CAN/RAW regression failed or skipped: {result.skipped}")

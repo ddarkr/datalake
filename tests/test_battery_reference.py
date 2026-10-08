@@ -1,4 +1,4 @@
-"""Behavior tests for scripts/battery_reference.py.
+"""Behavior tests for scripts.analytics.battery.battery_reference.
 
 Plain asserts, stdlib only; doubles as __main__ runner. All inputs are
 tiny in-memory operation mappings (the stdlib seam convert_operations
@@ -9,8 +9,7 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_reference as br
+from scripts.analytics.battery import battery_reference as br
 
 
 def dis(cap, n=4, start=0.0, step=10.0, v0=4.1, dv=0.3, i=-2.0, c=24.0):

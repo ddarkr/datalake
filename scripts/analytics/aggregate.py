@@ -57,7 +57,7 @@ import urllib.parse
 import urllib.request
 from bisect import bisect_right
 
-from activity import (ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIELDS,
+from scripts.telemetry.activity import (ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIELDS,
                       ACTIVITY_TRACE_ATTRIBUTES, summarize_activity)
 
 MISSING_TABLE_HINTS = ("not found", "not exist", "does not exist", "unknown table")
@@ -2284,7 +2284,7 @@ def battery_section(ctx, cfg):
     unit tests importing aggregate never require sibling analyzer files;
     missing battery_runtime fails the section (loud), never silent zeros."""
     import importlib
-    runtime = importlib.import_module("battery_runtime")
+    runtime = importlib.import_module("scripts.analytics.battery.battery_runtime")
     return runtime.run_battery(ctx, cfg)
 
 

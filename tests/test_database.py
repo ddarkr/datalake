@@ -1,7 +1,7 @@
-"""Scoped regression tests for scripts/db_init.py and scripts/aggregate.py.
+"""Scoped regression tests for scripts.database.db_init and scripts.analytics.aggregate.
 
 Framework-free: plain asserts + stdlib fake HTTP server. Run with:
-  python3 tests/test_database.py
+  python3 -m tests.test_database
 Covers (all behavioral, via payload round-trip through the fake server):
   SQL error -> SqlError; malformed response shapes -> SqlError;
   per-call billing excludes rollup ops and cumulative parents;
@@ -20,8 +20,7 @@ import threading
 import urllib.parse
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import aggregate as agg
+from scripts.analytics import aggregate as agg
 
 
 

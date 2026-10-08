@@ -86,7 +86,7 @@ Scope scalars keep ``battery_alerts``. ``episode_id`` still rides every
 row; runtime should also include it in persisted logical identity.
 """
 
-import battery_common as bc
+from scripts.analytics.battery import battery_common as bc
 
 ALGORITHM_VERSION = "1.2.1"
 ANALYSIS_ID = "battery_alerts"

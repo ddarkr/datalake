@@ -1,6 +1,6 @@
 """Regression tests for vehicle VSS setup + recorder helpers (stdlib only).
 
-Run: python3 tests/test_vss.py
+Run: python3 -m tests.test_vss
 Covers: duplicate CAN-ID rejection, override replace semantics, mapping
 signal validation, outbox value classification, INSERT escaping,
 store column-order roundtrip, fail-closed Greptime ack (HTTP200 errors,
@@ -13,7 +13,6 @@ reflecting outbox state.
 """
 
 import calendar
-import importlib.util
 import json
 import os
 import sqlite3
@@ -27,17 +26,8 @@ from unittest import mock
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def load(name):
-    spec = importlib.util.spec_from_file_location(
-        name, os.path.join(REPO, "scripts", name + ".py"))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-setup = load("vehicle_setup")
-rec = load("vss_recorder")
+from scripts.vehicle import vehicle_setup as setup
+from scripts.vehicle import vss_recorder as rec
 
 DBC_A = """VERSION ""
 

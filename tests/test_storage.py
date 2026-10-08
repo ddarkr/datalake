@@ -1,5 +1,4 @@
 """Storage usage inventory regressions: real bucket totals, no fake zeros."""
-import importlib.util
 import json
 import os
 import sys
@@ -7,20 +6,8 @@ import unittest
 import tempfile
 from pathlib import Path
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(
-        name, os.path.join(SCRIPTS, name + ".py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-sm = load("storage_metrics")
-upl = load("raw_upload")
+from scripts.storage import storage_metrics as sm
+from scripts.vehicle.raw import raw_upload as upl
 
 ENV_KEYS = ("GREPTIME_STORAGE_TYPE", "S3_ENDPOINT_URL", "S3_BUCKET",
             "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")

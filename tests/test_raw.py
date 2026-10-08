@@ -7,27 +7,14 @@ deterministic remote keys, triple-upload ack rule (all locals kept on any
 failure, manifest-pin drift fail-closed to quarantine, partial sets
 invisible), replay safety gate.
 """
-import importlib.util
 import json
 import os
 import sys
 import tempfile
 import unittest
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-SCRIPTS = os.path.join(os.path.dirname(HERE), "scripts")
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(
-        name, os.path.join(SCRIPTS, name + ".py"))
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-rec = load("raw_recorder")
-upl = load("raw_upload")
+from scripts.vehicle.raw import raw_recorder as rec
+from scripts.vehicle.raw import raw_upload as upl
 
 SYN = [{"seq": i + 1, "twall_ns": 1_700_000_000_000_000_000 + i * 1_000_000,
         "tcan": 1700000000.0 + i * 0.001, "bus": "can0",

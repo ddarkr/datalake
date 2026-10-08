@@ -1,4 +1,4 @@
-"""Focused stdlib tests for scripts/battery_electrical.py. Plain asserts,
+"""Focused stdlib tests for scripts.analytics.battery.battery_electrical. Plain asserts,
 stdlib only; doubles as __main__ runner. All circuits/curves are synthetic
 (supplied validated calibration), never Tesla pack truth.
 """
@@ -7,8 +7,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_electrical as be
+from scripts.analytics.battery import battery_electrical as be
 
 HOUR = 3600000000000
 T0 = 1700000000000000000

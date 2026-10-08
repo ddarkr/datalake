@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Focused stdlib tests for scripts/battery_conditions.py. Plain asserts,
+"""Focused stdlib tests for scripts.analytics.battery.battery_conditions. Plain asserts,
 stdlib only; doubles as __main__ runner. All numbers are synthetic with
 analytic expected answers, never Tesla health cutoffs. Known-hour
 fixtures explicitly declare max_gap_ns (production gap limit is kept);
@@ -8,9 +8,8 @@ hour-spaced legs never rely on incidental defaults."""
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import battery_common as bc
-import battery_conditions as co
+from scripts.analytics.battery import battery_common as bc
+from scripts.analytics.battery import battery_conditions as co
 
 HOUR = 3600000000000
 T0 = 1700000000000000000

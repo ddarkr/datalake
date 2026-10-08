@@ -38,15 +38,16 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.trace-privacy-revision: "1"
+      datalake.trace-privacy-revision: "2"
     user: "65534:65534"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
     # Internal only; it forwards Alloy's private auth without storing credentials.
-    command: ["python", "/opt/datalake/trace_privacy.py"]
+    working_dir: /app
+    command: ["python", "-m", "scripts.telemetry.trace_privacy"]
     configs:
       - source: trace_privacy_script
-        target: /opt/datalake/trace_privacy.py
+        target: /app/scripts/telemetry/trace_privacy.py
     restart: unless-stopped
 
   alloy-home:
@@ -95,7 +96,7 @@ services:
 
 configs:
   trace_privacy_script:
-    x-source: scripts/trace_privacy.py
+    x-source: scripts/telemetry/trace_privacy.py
   alloy_config:
     content: |
       // Server ingest: OTLP in -> privacy redact -> durable OTLP/HTTP -> GreptimeDB.

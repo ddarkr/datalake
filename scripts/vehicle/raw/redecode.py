@@ -43,13 +43,12 @@ import sys
 import time
 import urllib.request
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 try:
-    import vss_recorder as vr
-    import raw_recorder as rr
+    from scripts.vehicle import vss_recorder as vr
+    from scripts.vehicle.raw import raw_recorder as rr
 except ImportError as ex:
     sys.stderr.write(
-        f"redecode: error: recorder modules must be mounted beside me: {ex}\n")
+        f"redecode: error: recorder packages must be mounted under /app/scripts: {ex}\n")
     raise SystemExit(2)
 
 

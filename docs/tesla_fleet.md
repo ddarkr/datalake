@@ -189,13 +189,13 @@ docker compose --profile server --profile fleet up -d
 - 전체 참조 데이터는 B0005/B0006/B0007/B0018 네 랩 셀입니다. B0007은 right-censored이며 종단 사이클을 발명하지 않습니다. 랩 셀 방법 검증용일 뿐 Tesla 팩 수명 검증이 아니며, Tesla 정확도 주장은 없습니다.
 - 오프라인 로더(선택적 scipy는 `.mat` 읽기에만 한정, aggregate에는 scipy 없음):
   ```bash
-  python3 scripts/battery_reference.py <input.mat|dir> <output.json> [--eol-ah 1.4] [--pretty]
+  python3 -m scripts.analytics.battery.battery_reference <input.mat|dir> <output.json> [--eol-ah 1.4] [--pretty]
   ```
-- 실제 RUL 학습/평가/추론(`scripts/battery_rul.py`, JSON만, pickle 없음):
+- 실제 RUL 학습/평가/추론(`scripts/analytics/battery/battery_rul.py`, JSON만, pickle 없음):
   ```bash
-  python3 scripts/battery_rul.py train REFERENCE_JSON MODEL_JSON [--test-battery ID ...] [--min-history N] [--slope-window N] [--ridge FLOAT]
-  python3 scripts/battery_rul.py evaluate REFERENCE_JSON MODEL_JSON [--test-battery ID ...]
-  python3 scripts/battery_rul.py predict --model MODEL_JSON --history HISTORY_JSON
+  python3 -m scripts.analytics.battery.battery_rul train REFERENCE_JSON MODEL_JSON [--test-battery ID ...] [--min-history N] [--slope-window N] [--ridge FLOAT]
+  python3 -m scripts.analytics.battery.battery_rul evaluate REFERENCE_JSON MODEL_JSON [--test-battery ID ...]
+  python3 -m scripts.analytics.battery.battery_rul predict --model MODEL_JSON --history HISTORY_JSON
   ```
   aggregate 설정의 `rul.model`은 파일 경로가 아니라 학습 산출 dict를 인라인으로 붙여넣은 것이며, `rul.domain`은 모델의 dataset_domain(`nasa-pcoe-lab`)과 일치해야 합니다. `rul.history_scope {vehicle, source, decode_epoch}`는 선택 사항이지만 aggregate 신호에 스코프가 있으면 필수이며 일치해야 합니다. 실차 스코프(fleet/tesla/vehicle_signal/vss 포함)는 NASA 모델에 항상 거부됩니다. history 항목의 `observed_ns`는 선택 사항이지만 `decision_time_ns`가 설정되면 전 항목에 필수입니다. `model_version`은 적합 내용에 대한 결정론적 `sha256:<hex>`입니다(형식 `battery-rul-model/1` 유지). 예시의 `"rul": {}`는 그대로 유효합니다(→ `unavailable missing_model`). CLI 입력(`REFERENCE_JSON`/`MODEL_JSON`/`HISTORY_JSON {domain, history}`)은 오프라인 전용이며 aggregate 마운트가 아닙니다. `evaluate`는 학습 배터리와 겹치는 `--test-battery`를 거부하고(`train_test_overlap`) 참조 domain/EOL을 모델과 대조합니다(`domain_mismatch`/`eol_mismatch`).
 
@@ -218,10 +218,10 @@ docker compose --profile server --profile fleet up -d
   python -m pip install PyYAML==6.0.2
   python tools/render.py compose/core.yaml compose/database.yaml compose/ingest.yaml compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml compose/vehicle-vss.yaml compose/tesla-fleet.yaml compose/redecode.yaml compose/can-receiver.yaml --out compose.yaml
   python tools/check_env.py
-  python tests/test_render.py
+  python -m tests.test_render
   for profile in server home mqtt vehicle fleet backup redecode can-receiver '*'; do docker compose --env-file .env.example --profile server --profile "$profile" config --quiet; done
-  for name in common reference conditions energy electrical alerts rul runtime; do python "tests/test_battery_$name.py" || exit; done
-  AGG_RUN_ONCE=1 python scripts/aggregate.py  # 격리 GREPTIME_* 필수; 운영 DB로 실행하지 않음
+  for name in common reference conditions energy electrical alerts rul runtime; do python -m "tests.test_battery_$name" || exit; done
+  AGG_RUN_ONCE=1 python -m scripts.analytics.aggregate  # 격리 GREPTIME_* 필수; 운영 DB로 실행하지 않음
   ```
   배포 번들 재생성 순서는 CI(`.github/workflows/compose.yml`)와 같은 10개 조각을 사용합니다. 배포 전에는 생성물의 aggregate configs를 격리 컨테이너에 마운트하여 실제 프로세스 실행과 소스 해시 일치도 확인합니다.
 

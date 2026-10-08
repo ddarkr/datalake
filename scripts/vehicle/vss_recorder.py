@@ -329,7 +329,7 @@ def load_manifest(path):
 
 
 def mapped_paths(mapping_path):
-    from vehicle_setup import find_mappings, iter_nodes
+    from scripts.vehicle.vehicle_setup import find_mappings, iter_nodes
     with open(mapping_path) as f:
         mapping = json.load(f)
     refs = find_mappings(mapping.get("Vehicle", {}), "Vehicle")

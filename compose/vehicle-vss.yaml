@@ -2,11 +2,12 @@ services:
   vehicle-setup:
     image: ${VEHICLE_VSS_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
-    command: ["python3", "/scripts/vehicle_setup.py"]
+    working_dir: /app
+    command: ["python3", "-m", "scripts.vehicle.vehicle_setup"]
     restart: "no"
     configs:
       - source: vehicle-setup-script
-        target: /scripts/vehicle_setup.py
+        target: /app/scripts/vehicle/vehicle_setup.py
     volumes:
       - vehicle-data:/data
     environment:
@@ -102,7 +103,7 @@ services:
     restart: unless-stopped
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.recorder-revision: "1"
+      datalake.recorder-revision: "2"
     # Allow the in-flight HTTP timeout and bounded final drain to finish.
     stop_grace_period: 90s
     depends_on:
@@ -114,13 +115,14 @@ services:
         condition: service_started
     configs:
       - source: vehicle-setup-script
-        target: /scripts/vehicle_setup.py
+        target: /app/scripts/vehicle/vehicle_setup.py
       - source: vss-recorder-script
-        target: /scripts/vss_recorder.py
+        target: /app/scripts/vehicle/vss_recorder.py
     volumes:
       - vehicle-venv:/opt/venv:ro
       - vehicle-data:/data
-    command: ["/opt/venv/bin/python", "-u", "/scripts/vss_recorder.py"]
+    working_dir: /app
+    command: ["/opt/venv/bin/python", "-u", "-m", "scripts.vehicle.vss_recorder"]
     environment:
       VEHICLE_ID: ${VEHICLE_ID:-}
       DATABROKER_HOST: kuksa-databroker
@@ -141,9 +143,9 @@ services:
       - ${VSS_METRICS_HOST:-127.0.0.1}:${VSS_METRICS_PORT:-9104}:9104
 configs:
   vehicle-setup-script:
-    x-source: scripts/vehicle_setup.py
+    x-source: scripts/vehicle/vehicle_setup.py
   vss-recorder-script:
-    x-source: scripts/vss_recorder.py
+    x-source: scripts/vehicle/vss_recorder.py
 
 volumes:
   vehicle-data: {}

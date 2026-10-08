@@ -8,7 +8,7 @@
 | 경로 | 역할 |
 | --- | --- |
 | [`compose/`](../compose/) | 서비스·수집기·대시보드 원본 조각 |
-| [`scripts/`](../scripts/) | 초기화, 집계, 차량 기록, 백업·복원 구현 |
+| [`scripts/`](../scripts/) | 도메인별 Python 실행 모듈과 라이브러리 |
 | [`plugins/`](../plugins/) | 코딩 에이전트 연결과 설치기 |
 | [`tools/render.py`](../tools/render.py) | 원본을 단일 배포 파일로 생성 |
 | [`tools/check_env.py`](../tools/check_env.py) | Compose 환경변수와 예제의 일치 검사 |
@@ -16,7 +16,27 @@
 | [`tests/`](../tests/) | 동작·보안·스토리지·렌더링 검증 |
 | [`.github/workflows/compose.yml`](../.github/workflows/compose.yml) | push/PR 시 비밀 정보·플러그인·회귀·생성물·프로필 검사 |
 
-`compose.yaml`은 생성물입니다. 직접 편집하지 말고 `compose/*.yaml`과 `scripts/*`를 수정한 뒤 아래 **명시적 순서**로 재생성하세요. 기본 glob 순서는 CI의 생성 순서와 다릅니다.
+### Python 도메인
+
+| 경로 | 책임 |
+| --- | --- |
+| `scripts/ingest/can/` | 서버 CAN OTLP 수신, SQLite 원본 보관, 해석·wire 계약 |
+| `scripts/ingest/fleet_recorder.py` | Fleet ZMQ 수신과 영속 전송 대기열 |
+| `scripts/vehicle/` | 차량 정의 준비와 VSS 수집 |
+| `scripts/vehicle/raw/` | SocketCAN 원본 기록, MF4 검증·업로드·재해석 |
+| `scripts/analytics/` | AI·차량·홈 집계 실행 |
+| `scripts/analytics/battery/` | 배터리 분석과 DB 실행 어댑터 |
+| `scripts/telemetry/` | AI 활동 필드·요약 계약과 수집 개인정보 처리 |
+| `scripts/database/` | DB 설정 검증·준비와 스키마 초기화 |
+| `scripts/storage/` | 백업·복구와 저장소 지표 |
+
+`scripts`는 Python namespace package입니다. 저장소 루트에서 `python -m scripts.<도메인>.<모듈>`로 실행하며, 로컬 모듈은 같은 정규 경로로 import합니다. 컨테이너도 `/app/scripts/`에 같은 구조를 마운트하고 `/app`에서 실행합니다. 파일 직접 실행이나 이전 평탄 경로는 지원하지 않습니다. 예를 들어 CAN 상태 조회는 `python -m scripts.ingest.can.can_receiver status --database /private/path/raw.sqlite3`입니다.
+
+테스트는 루트에서 `python -m tests.test_can_receiver`처럼 실행합니다. 배터리 계산 모듈은 DB·수집기를 import하지 않으며 `battery_runtime`이 조회·분석·저장을 연결합니다. SocketCAN/MF4 원본 경로와 서버 CAN/SQLite 원본 경로는 별도 계약입니다.
+
+### 배포 번들 생성
+
+`compose.yaml`은 생성물입니다. 직접 편집하지 말고 `compose/*.yaml`과 `scripts/**/*.py`를 수정한 뒤 아래 **명시적 순서**로 재생성하세요. 기본 glob 순서는 CI의 생성 순서와 다릅니다.
 
 ```bash
 python3 -m venv .venv
@@ -31,7 +51,7 @@ python tools/render.py \
   --out compose.yaml
 
 python tools/check_env.py
-python tests/test_render.py
+python -m tests.test_render
 
 for profile in server home mqtt vehicle fleet backup redecode can-receiver '*'; do
   docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
@@ -82,14 +102,14 @@ Gitleaks `8.30.1`이 설치된 개발 환경에서는 다음 명령으로 동일
 ```bash
 gitleaks dir . --redact=100 --ignore-gitleaks-allow
 gitleaks git . --redact=100 --ignore-gitleaks-allow --log-opts="--all --full-history"
-python tests/test_trace_privacy.py
+python -m tests.test_trace_privacy
 ```
 
 개인 `.env`나 운영 설정이 있는 로컬 디렉터리에서는 `gitleaks dir`가 해당 파일을 읽을 수 있습니다. 공유 가능한 로그만 남기고, 실제 운영 파일을 공개 CI에 업로드하지 마세요. CI의 작업 디렉터리에는 공개 checkout만 있습니다.
 
 서버·운영 자격 증명이 필요 없는 Python 회귀 목록은 workflow의 `Check offline Python regressions` 단계에 명시합니다. CI는 Compose vehicle/redecode와 같은 `python-can==4.6.1`, `asammdf==8.8.27`, `zstd==1.5.6.1`, `cantools==40.7.1`, `py-expression-eval==0.3.14`, `boto3==1.43.98`을 설치합니다. `python tools/demo.py regressions`는 RAW/MF4·재해석·CAN validation 검사 중 하나라도 skip되면 실패합니다. 재해석용 `eclipse-kuksa/kuksa-can-provider`는 태그가 아닌 commit `d03dd7db364dd1ce9f7d0c614d80ebf6642ad167`의 세 `dbcfeederlib` 파일을 내려받아 기존 테스트의 SHA256으로 검증합니다. 이 다운로드 또는 PyPI에 접근할 수 없으면 CI는 실패하며 성공으로 대체하지 않습니다. 선택적 외부 Hermes checkout 호환성은 별도 범위입니다.
 
-CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentelemetry-proto==1.38.0` 후 `python tests/test_can_receiver.py`로 실행합니다. 운영 DBC·원본·자격 증명은 사용하지 않습니다. 기존 wire privacy 런타임의 `opentelemetry-proto==1.39.1`은 별도 감사 컨테이너에 유지하며 receiver의 venv와 섞지 않습니다.
+CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentelemetry-proto==1.38.0` 후 `python -m tests.test_can_receiver`로 실행합니다. 운영 DBC·원본·자격 증명은 사용하지 않습니다. 기존 wire privacy 런타임의 `opentelemetry-proto==1.39.1`은 별도 감사 컨테이너에 유지하며 receiver의 venv와 섞지 않습니다.
 
 ## 합성 런타임 통합 검사
 

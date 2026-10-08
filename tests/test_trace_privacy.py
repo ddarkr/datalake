@@ -8,9 +8,8 @@ import urllib.error
 import urllib.request
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from trace_privacy import redact
-import trace_privacy
+from scripts.telemetry.trace_privacy import redact
+from scripts.telemetry import trace_privacy
 
 
 def test_private_arrays_removed_without_losing_usage():
@@ -97,7 +96,7 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
                           "http://127.0.0.1:%d/v1/traces" % backend.server_port):
             assert post(False) == 401
             assert trace_privacy.receipt_metrics() == b""
-            with patch("trace_privacy.time.time", return_value=100):
+            with patch("scripts.telemetry.trace_privacy.time.time", return_value=100):
                 assert post() == 200
             assert trace_privacy.LAST_RECEIVED == {"omp": 100}
             Backend.status = 503
@@ -109,7 +108,7 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
             Backend.response = b"{}"
             private = "synthetic/private-token-sentinel"
             payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0]["attributes"][0]["value"]["stringValue"] = private
-            with patch("trace_privacy.time.time", return_value=200):
+            with patch("scripts.telemetry.trace_privacy.time.time", return_value=200):
                 assert post() == 200
             with urllib.request.urlopen(url + "/metrics", timeout=5) as response:
                 metrics = response.read()

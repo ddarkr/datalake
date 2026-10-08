@@ -17,11 +17,9 @@ from unittest.mock import patch
 import urllib.error
 import urllib.request
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-
-from can_decoder import Decoder
-from can_receiver import Archive, ConfigurationError, Greptime, Receiver, Worker, archive_status, render_insert
-from can_otlp_wire import MAX_REQUEST_BYTES, check_response, decode_batch, encode_batch
+from scripts.ingest.can.can_decoder import Decoder
+from scripts.ingest.can.can_receiver import Archive, ConfigurationError, Greptime, Receiver, Worker, archive_status, render_insert
+from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, check_response, decode_batch, encode_batch
 
 
 def synthetic_decoder(directory, revision="synthetic-v1"):
@@ -73,7 +71,8 @@ class ReceiverBehavior(unittest.TestCase):
             private = Path(inside)
             alias = Path(outside) / "workspace"
             alias.symlink_to(private, target_is_directory=True)
-            paths = (private / "raw.sqlite",
+            paths = (workspace / "raw.sqlite",
+                     private / "raw.sqlite",
                      private / "missing" / ".." / "raw.sqlite",
                      alias / "raw.sqlite")
             for path in paths:

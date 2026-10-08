@@ -13,7 +13,7 @@ the real Alloy endpoint, then polls GreptimeDB SQL until the records land
 
 Inputs (all required, no defaults that fake a pass): OTLP_HTTP_URL,
 GREPTIME_HTTP_URL, GREPTIME_DB, GREPTIME_USER, GREPTIME_PASSWORD,
-OTLP_USER, OTLP_PASSWORD. Run: python tests/test_privacy.py.
+OTLP_USER, OTLP_PASSWORD. Run: python -m tests.test_privacy.
 The test starts an auditing proxy on OTLP_WIRE_HOST (default 127.0.0.1),
 OTLP_WIRE_PORT (default 18144). Point Alloy's GREPTIME_HTTP_URL at that
 proxy, but set this test's GREPTIME_HTTP_URL to the real database.

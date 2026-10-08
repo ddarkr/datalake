@@ -25,7 +25,8 @@ services:
   raw-recorder:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
-    command: [/opt/venv/bin/python, /app/raw_recorder.py]
+    working_dir: /app
+    command: [/opt/venv/bin/python, -m, scripts.vehicle.raw.raw_recorder]
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully
@@ -34,10 +35,10 @@ services:
       - NET_RAW
     configs:
       - source: raw_recorder_py
-        target: /app/raw_recorder.py
+        target: /app/scripts/vehicle/raw/raw_recorder.py
         mode: 0444
       - source: raw_can_validation_py
-        target: /app/can_validation.py
+        target: /app/scripts/vehicle/raw/can_validation.py
         mode: 0444
     volumes:
       - vehicle-venv:/opt/venv:ro
@@ -71,10 +72,10 @@ services:
         condition: service_completed_successfully
     configs:
       - source: raw_upload_py
-        target: /app/raw_upload.py
+        target: /app/scripts/vehicle/raw/raw_upload.py
         mode: 0444
       - source: raw_storage_metrics_py
-        target: /app/storage_metrics.py
+        target: /app/scripts/storage/storage_metrics.py
         mode: 0444
     volumes:
       - vehicle-venv:/opt/venv:ro
@@ -93,18 +94,19 @@ services:
     # Container listener is fixed; only this host-side bind is configurable.
     ports:
       - ${RAW_METRICS_HOST:-127.0.0.1}:${RAW_UPLOAD_METRICS_PORT:-9103}:9103
-    command: [/opt/venv/bin/python, /app/raw_upload.py]
+    working_dir: /app
+    command: [/opt/venv/bin/python, -m, scripts.vehicle.raw.raw_upload]
     restart: unless-stopped
 
 configs:
   raw_recorder_py:
-    x-source: scripts/raw_recorder.py
+    x-source: scripts/vehicle/raw/raw_recorder.py
   raw_upload_py:
-    x-source: scripts/raw_upload.py
+    x-source: scripts/vehicle/raw/raw_upload.py
   raw_can_validation_py:
-    x-source: scripts/can_validation.py
+    x-source: scripts/vehicle/raw/can_validation.py
   raw_storage_metrics_py:
-    x-source: scripts/storage_metrics.py
+    x-source: scripts/storage/storage_metrics.py
 
 volumes:
   vehicle-venv:

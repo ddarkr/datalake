@@ -163,7 +163,7 @@ docker rm can-definitions-load
 docker compose --env-file .env --profile can-receiver config --quiet
 docker compose --env-file .env --profile can-receiver up -d can-receiver
 docker compose --env-file .env --profile can-receiver exec can-receiver \
-  /opt/venv/bin/python /app/can_receiver.py status --database /data/raw.sqlite3
+  /opt/venv/bin/python -m scripts.ingest.can.can_receiver status --database /data/raw.sqlite3
 ```
 
 초기 `can-receiver-deps`는 PyPI 네트워크가 필요하며 pinned 의존성이 바뀌면 venv를 다시 만듭니다. 코드 configs를 바꿀 때는 해당 receiver의 revision label도 갱신해 재생성을 유도합니다. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
@@ -181,7 +181,7 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
 ```bash
 docker compose --env-file .env --profile can-receiver stop can-receiver
 docker compose --env-file .env --profile can-receiver run --rm --no-deps can-receiver \
-  /opt/venv/bin/python /app/can_receiver.py re-decode \
+  /opt/venv/bin/python -m scripts.ingest.can.can_receiver re-decode \
   --database /data/raw.sqlite3 --dbc /definitions/observed.dbc \
   --definitions /definitions/observed.json
 docker compose --env-file .env --profile can-receiver up -d can-receiver

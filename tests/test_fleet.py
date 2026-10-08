@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Strict Regression tests for Tesla Fleet Telemetry recorder (scripts/fleet_recorder.py).
+"""Strict Regression tests for Tesla Fleet Telemetry recorder (scripts.ingest.fleet_recorder).
 
 Covers (stdlib only):
   - Exact 9-digit nanosecond preservation of original createdAt without fraction truncations
@@ -38,9 +38,8 @@ from datetime import datetime, timezone
 from unittest.mock import patch
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(REPO, "scripts"))
-import fleet_recorder as fr
-import aggregate as agg
+from scripts.ingest import fleet_recorder as fr
+from scripts.analytics import aggregate as agg
 
 
 class TimestampNanosecondPreservationTest(unittest.TestCase):
@@ -329,7 +328,7 @@ class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.tmp_dir.name, "absent.sqlite")))
 
     def test_vss_queue_failure_is_unknown_not_empty(self):
-        import vss_recorder as vss
+        from scripts.vehicle import vss_recorder as vss
         path = os.path.join(self.tmp_dir.name, "vss.sqlite")
         conn = vss.open_outbox(path)
         conn.execute("INSERT INTO outbox(event_id,event_time,vehicle,path,source,decode_epoch,"

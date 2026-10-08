@@ -55,12 +55,9 @@ Supplied endpoint uncertainty propagates against a fixed reference only.
 """
 
 import math
-import os
-import sys
 from datetime import datetime, timezone
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import battery_common as bc
+from scripts.analytics.battery import battery_common as bc
 
 CODE_VERSION = "1.0.0"
 ALGORITHM_VERSION = "1.3.0"

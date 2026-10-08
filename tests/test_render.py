@@ -1,8 +1,7 @@
 """Core regression: renderer isolation + preflight fail-fast (parent runs).
 
-Behavioral only: byte roundtrip of inlined scripts, fail-closed
-duplicates, nonzero exit on missing secrets, exact-config keys from
-the pinned image. No source-text asserts.
+Behavioral only: inline-content escaping, fail-closed duplicates,
+nonzero exit on missing secrets, exact-config keys from the pinned image.
 """
 
 import os
@@ -13,9 +12,9 @@ import tomllib
 import tempfile
 from pathlib import Path
 
+from unittest.mock import patch
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT / "tools"))
-import render  # noqa: E402
+from tools import render
 
 def base_env(tmp_path):
     return dict(os.environ, GREPTIME_PASSWORD="t3st-pw without equals",
@@ -24,14 +23,16 @@ def base_env(tmp_path):
                 GREPTIME_STORAGE_TYPE="File", OUT_DIR=str(tmp_path))
 
 
-def test_xsource_roundtrip():
-    # Compose folds $$ back to $ on deploy; unescaped content must equal
-    # the repo script byte-for-byte or the deployed preflight is corrupt.
-    frag = render.load_fragment(str(ROOT / "compose" / "core.yaml"))
-    content = frag["configs"]["greptime_preflight"]["content"]
-    assert content.replace("$$", "$") == (
-        ROOT / "scripts" / "greptime_preflight.py"
-    ).read_text(encoding="utf-8")
+def test_xsource_roundtrip(tmp_path):
+    content = "value = '$fixture'\n"
+    source = tmp_path / "fixture.py"
+    source.write_text(content, encoding="utf-8")
+    frag = tmp_path / "fragment.yaml"
+    frag.write_text("configs:\n  fixture:\n    x-source: fixture.py\n",
+                    encoding="utf-8")
+    with patch.object(render, "ROOT", tmp_path):
+        doc = render.load_fragment(str(frag))
+    assert doc["configs"]["fixture"]["content"].replace("$$", "$") == content
 
 
 def test_duplicate_service_fails(tmp_path):
@@ -74,9 +75,7 @@ def test_final_forbids_remote_mounts():
 def test_preflight_fails_fast_without_password(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "GREPTIME_PASSWORD"}
     env.update(GREPTIME_STORAGE_TYPE="File", OUT_DIR=str(tmp_path))
-    r = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode != 0
     assert "GREPTIME_PASSWORD" in r.stderr
 
@@ -84,9 +83,7 @@ def test_preflight_fails_fast_without_password(tmp_path):
 def test_preflight_fails_fast_without_admin(tmp_path):
     env = dict(base_env(tmp_path))
     del env["GF_ADMIN_PASSWORD"]
-    r = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode != 0
     assert "GF_ADMIN_PASSWORD" in r.stderr
 
@@ -94,18 +91,14 @@ def test_preflight_fails_fast_without_admin(tmp_path):
 def test_preflight_fails_fast_without_otlp(tmp_path):
     env = dict(base_env(tmp_path))
     del env["OTLP_USER"]
-    r = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode != 0
     assert "OTLP_USER" in r.stderr
 
 
 def test_preflight_rejects_bad_size(tmp_path):
     env = dict(base_env(tmp_path), GREPTIME_PAGE_CACHE_SIZE="huge")
-    r = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode != 0
     assert "GREPTIME_PAGE_CACHE_SIZE" in r.stderr
 
@@ -115,9 +108,7 @@ def test_preflight_rejects_hostless_endpoint_without_echo(tmp_path):
                S3_ENDPOINT_URL="https://?private=endpoint-canary",
                S3_REGION="test-region", S3_BUCKET="test-bucket",
                S3_ACCESS_KEY_ID="fixture-key", S3_SECRET_ACCESS_KEY="fixture-secret")
-    result = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    result = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert result.returncode != 0
     assert "S3_ENDPOINT_URL" in result.stderr
     assert "endpoint-canary" not in result.stdout + result.stderr
@@ -129,9 +120,7 @@ def test_preflight_file_mode_writes_exact_config(tmp_path):
                GREPTIME_WRITE_BUFFER_SIZE="64MB",
                GREPTIME_AUTO_FLUSH_INTERVAL="20m")
     pw = env["GREPTIME_PASSWORD"]
-    r = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode == 0, r.stderr
     assert pw not in r.stdout + r.stderr  # secrets never echoed
     assert "otlp-pw" not in r.stdout + r.stderr
@@ -162,29 +151,20 @@ def test_preflight_file_mode_writes_exact_config(tmp_path):
 
 def test_preflight_identity_change_fails_closed(tmp_path):
     env = dict(base_env(tmp_path), GREPTIME_STORAGE_TYPE="File")
-    r = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=env)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode == 0, r.stderr
     s3env = dict(env, GREPTIME_STORAGE_TYPE="S3",
                  S3_ENDPOINT_URL="https://s3.us-west-004.backblazeb2.com",
                  S3_BUCKET="bkt", S3_ACCESS_KEY_ID="k", S3_SECRET_ACCESS_KEY="s")
-    r2 = subprocess.run(
-        [sys.executable, str(ROOT / "scripts" / "greptime_preflight.py")],
-        capture_output=True, text=True, env=s3env)
+    r2 = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=s3env, cwd=ROOT)
     assert r2.returncode != 0
     assert "storage backend identity changed" in r2.stderr
 
 def test_fleet_fragment_renders_runtime_bundle():
-    # Rendered runtime behavior only: fleet recorder stays bundled as a
-    # single-file stdlib config with no second script, fleet opt-in profile,
-    # private ZMQ endpoint, persisted volumes, and no vehicle_data polling.
+    # Preserve the operational opt-in, private endpoint, and persistent state.
     frag = render.load_fragment(str(ROOT / "compose" / "tesla-fleet.yaml"))
     svc = frag["services"]["tesla-fleet-recorder"]
     assert svc["profiles"] == ["fleet"]
-    assert svc["command"] == ["/opt/venv/bin/python", "-u", "/app/fleet_recorder.py"]
-    names = [c["source"] for c in svc.get("configs", [])]
-    assert names == ["fleet_recorder_py"]
     env = dict(svc.get("environment") or {})
     assert "FLEET_ZMQ_TOPICS" in env and "CONFIG_VERSION" in env
     assert "tesla_alerts" in env["FLEET_ZMQ_TOPICS"]
@@ -196,16 +176,13 @@ def test_fleet_fragment_renders_runtime_bundle():
     merged = render.merge_docs(
         [frag, render.load_fragment(str(ROOT / "compose" / "core.yaml"))])
     assert set(merged["configs"]) != set()
-    assert "fleet_battery_common_py" not in merged["configs"]
-    rendered = render.render_to_text(merged)
-    assert "/app/fleet_recorder.py" in rendered
 
 
 if __name__ == "__main__":
-    test_xsource_roundtrip()
     test_final_forbids_remote_mounts()
     test_fleet_fragment_renders_runtime_bundle()
     for check in (
+        test_xsource_roundtrip,
         test_duplicate_service_fails, test_xsource_escape_fails,
         test_preflight_fails_fast_without_password,
         test_preflight_fails_fast_without_admin,

@@ -23,7 +23,7 @@ services:
     profiles: [server]
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.schema-revision: "1"
+      datalake.schema-revision: "2"
     depends_on:
       greptimedb:
         condition: service_started
@@ -36,19 +36,20 @@ services:
       OTEL_TTL: ${OTEL_TTL:-}
     configs:
       - source: db_init_py
-        target: /app/db_init.py
+        target: /app/scripts/database/db_init.py
         mode: 0444
       - source: activity_py
-        target: /app/activity.py
+        target: /app/scripts/telemetry/activity.py
         mode: 0444
-    command: ["python", "/app/db_init.py"]
+    working_dir: /app
+    command: ["python", "-m", "scripts.database.db_init"]
     restart: "no"
 
   aggregate:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.aggregate-revision: "11"
+      datalake.aggregate-revision: "12"
     depends_on:
       greptimedb:
         condition: service_started
@@ -86,66 +87,67 @@ services:
       HOME_AGG_SOURCES: "${HOME_AGG_SOURCES:-[]}"
     configs:
       - source: aggregate_py
-        target: /app/aggregate.py
+        target: /app/scripts/analytics/aggregate.py
         mode: 0444
       - source: activity_py
-        target: /app/activity.py
+        target: /app/scripts/telemetry/activity.py
         mode: 0444
       - source: battery_common_py
-        target: /app/battery_common.py
+        target: /app/scripts/analytics/battery/battery_common.py
         mode: 0444
       - source: battery_reference_py
-        target: /app/battery_reference.py
+        target: /app/scripts/analytics/battery/battery_reference.py
         mode: 0444
       - source: battery_conditions_py
-        target: /app/battery_conditions.py
+        target: /app/scripts/analytics/battery/battery_conditions.py
         mode: 0444
       - source: battery_energy_py
-        target: /app/battery_energy.py
+        target: /app/scripts/analytics/battery/battery_energy.py
         mode: 0444
       - source: battery_electrical_py
-        target: /app/battery_electrical.py
+        target: /app/scripts/analytics/battery/battery_electrical.py
         mode: 0444
       - source: battery_rul_py
-        target: /app/battery_rul.py
+        target: /app/scripts/analytics/battery/battery_rul.py
         mode: 0444
       - source: battery_alerts_py
-        target: /app/battery_alerts.py
+        target: /app/scripts/analytics/battery/battery_alerts.py
         mode: 0444
       - source: battery_runtime_py
-        target: /app/battery_runtime.py
+        target: /app/scripts/analytics/battery/battery_runtime.py
         mode: 0444
       - source: battery_analysis_json
         target: /app/battery-analysis.json
         mode: 0444
     volumes:
       - backup-data:/ops
-    command: ["python", "/app/aggregate.py"]
+    working_dir: /app
+    command: ["python", "-m", "scripts.analytics.aggregate"]
     restart: unless-stopped
     stop_grace_period: 30s
 
 configs:
   db_init_py:
-    x-source: scripts/db_init.py
+    x-source: scripts/database/db_init.py
   aggregate_py:
-    x-source: scripts/aggregate.py
+    x-source: scripts/analytics/aggregate.py
   activity_py:
-    x-source: scripts/activity.py
+    x-source: scripts/telemetry/activity.py
   battery_common_py:
-    x-source: scripts/battery_common.py
+    x-source: scripts/analytics/battery/battery_common.py
   battery_reference_py:
-    x-source: scripts/battery_reference.py
+    x-source: scripts/analytics/battery/battery_reference.py
   battery_conditions_py:
-    x-source: scripts/battery_conditions.py
+    x-source: scripts/analytics/battery/battery_conditions.py
   battery_energy_py:
-    x-source: scripts/battery_energy.py
+    x-source: scripts/analytics/battery/battery_energy.py
   battery_electrical_py:
-    x-source: scripts/battery_electrical.py
+    x-source: scripts/analytics/battery/battery_electrical.py
   battery_rul_py:
-    x-source: scripts/battery_rul.py
+    x-source: scripts/analytics/battery/battery_rul.py
   battery_alerts_py:
-    x-source: scripts/battery_alerts.py
+    x-source: scripts/analytics/battery/battery_alerts.py
   battery_runtime_py:
-    x-source: scripts/battery_runtime.py
+    x-source: scripts/analytics/battery/battery_runtime.py
   battery_analysis_json:
     content: ${BATTERY_ANALYSIS_CONFIG_JSON:-{}}

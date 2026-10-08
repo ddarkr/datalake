@@ -103,7 +103,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from greptime_preflight import derive_b2_region
+from scripts.database.greptime_preflight import derive_b2_region
 
 BACKUP_PREFIX = "greptime-backup-"
 BACKUP_SUFFIX = ".tar.gz"
@@ -1112,7 +1112,7 @@ def cmd_restore():
 
 def main(argv):
     if len(argv) != 2 or argv[1] not in ("backup", "restore", "list"):
-        sys.stderr.write("usage: backup.py [backup|restore|list]\n")
+        sys.stderr.write("usage: python -m scripts.storage.backup [backup|restore|list]\n")
         return 1
     if argv[1] == "backup":
         return cmd_backup()

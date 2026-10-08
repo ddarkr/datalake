@@ -18,7 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-from activity import ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIELDS, ACTIVITY_TRACE_ATTRIBUTES
+from scripts.telemetry.activity import ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIELDS, ACTIVITY_TRACE_ATTRIBUTES
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TTL_RE = re.compile(r"^[0-9]+[smhd]$")

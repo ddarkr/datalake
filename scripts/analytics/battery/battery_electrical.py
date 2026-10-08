@@ -119,11 +119,8 @@ Metrics (namespace battery.electrical.*):
 
 import bisect
 import math
-import os
-import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import battery_common as bc
+from scripts.analytics.battery import battery_common as bc
 
 ALGORITHM_VERSION = "1.1.0"
 ANALYSIS_ID = "battery_electrical"

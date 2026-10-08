@@ -7,7 +7,6 @@ idempotence, and new-epoch coexistence. No CAN socket is ever opened.
 
 import gzip
 import hashlib
-import importlib.util
 import json
 import os
 import struct
@@ -17,20 +16,8 @@ import unittest
 import urllib.request
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SCRIPTS = os.path.join(REPO, "scripts")
-
-
-def load(name):
-    spec = importlib.util.spec_from_file_location(
-        name, os.path.join(SCRIPTS, name + ".py"))
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-vr = load("vss_recorder")
-rd = load("redecode")
+from scripts.vehicle import vss_recorder as vr
+from scripts.vehicle.raw import redecode as rd
 
 # eclipse-kuksa/kuksa-can-provider tag 0.5.0 (same pin as redecode-deps).
 KUKSA_COMMIT = "d03dd7db364dd1ce9f7d0c614d80ebf6642ad167"

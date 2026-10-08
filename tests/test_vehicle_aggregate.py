@@ -4,8 +4,7 @@ import sys
 import unittest
 from datetime import datetime
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "scripts"))
-import aggregate as agg
+from scripts.analytics import aggregate as agg
 
 
 def dt(h=0, m=0, s=0):

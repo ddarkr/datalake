@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 try:
-    from storage_metrics import bucket_inventory as _bucket_inventory
+    from scripts.storage.storage_metrics import bucket_inventory as _bucket_inventory
 except ImportError:  # validation helper absent: uploads continue regardless
     _bucket_inventory = None
 

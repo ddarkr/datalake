@@ -24,7 +24,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: "2"
+      datalake.can-receiver-revision: "3"
     user: "10001:10001"
     read_only: true
     tmpfs:
@@ -34,13 +34,13 @@ services:
       - no-new-privileges:true
     configs:
       - source: can_receiver_py
-        target: /app/can_receiver.py
+        target: /app/scripts/ingest/can/can_receiver.py
         mode: 0444
       - source: can_decoder_py
-        target: /app/can_decoder.py
+        target: /app/scripts/ingest/can/can_decoder.py
         mode: 0444
       - source: can_otlp_wire_py
-        target: /app/can_otlp_wire.py
+        target: /app/scripts/ingest/can/can_otlp_wire.py
         mode: 0444
     volumes:
       - receiver-venv:/opt/venv:ro
@@ -57,9 +57,11 @@ services:
       GREPTIME_DB: ${GREPTIME_DB:-}
       GREPTIME_USER: ${GREPTIME_USER:-}
       GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+    working_dir: /app
     command:
       - /opt/venv/bin/python
-      - /app/can_receiver.py
+      - -m
+      - scripts.ingest.can.can_receiver
       - serve
       - --database
       - /data/raw.sqlite3
@@ -86,11 +88,11 @@ services:
 
 configs:
   can_receiver_py:
-    x-source: scripts/can_receiver.py
+    x-source: scripts/ingest/can/can_receiver.py
   can_decoder_py:
-    x-source: scripts/can_decoder.py
+    x-source: scripts/ingest/can/can_decoder.py
   can_otlp_wire_py:
-    x-source: scripts/can_otlp_wire.py
+    x-source: scripts/ingest/can/can_otlp_wire.py
 
 volumes:
   receiver-venv:

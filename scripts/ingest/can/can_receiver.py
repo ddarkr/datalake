@@ -1,7 +1,7 @@
 """Authenticated OTLP raw archive and resumable CAN-to-Greptime worker.
 
 A successful /v1/logs response acknowledges SQLite raw durability, not Greptime.
-Raw chunks are never deleted. Run with ``python /app/can_receiver.py serve|status|re-decode``.
+Raw chunks are never deleted. Run from /app with ``python -m scripts.ingest.can.can_receiver serve|status|re-decode``.
 """
 from __future__ import annotations
 
@@ -27,8 +27,8 @@ import urllib.parse
 import urllib.request
 import zlib
 
-from can_decoder import Decoder
-from can_otlp_wire import MAX_REQUEST_BYTES, decode_batch, success_response
+from scripts.ingest.can.can_decoder import Decoder
+from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, decode_batch, success_response
 
 COLUMNS = (
     "event_time", "vehicle", "path", "source", "event_id", "decode_epoch",
@@ -100,8 +100,7 @@ def _credentials(prefix):
 def _archive_path(path):
     path = Path(path).absolute()
     resolved = path.resolve()
-    script_directory = Path(__file__).resolve().parent
-    workspace = script_directory.parent if script_directory.name == "scripts" else script_directory
+    workspace = Path(__file__).resolve().parents[3]
     if resolved == workspace or workspace in resolved.parents:
         raise ConfigurationError("archive_must_be_outside_workspace")
     return path

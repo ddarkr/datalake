@@ -76,7 +76,7 @@ def bucket_inventory(client, bucket):
 def make_client():
     import boto3  # noqa: pinned dep, lazy so File mode never needs it
     from botocore.config import Config
-    from greptime_preflight import derive_b2_region
+    from scripts.database.greptime_preflight import derive_b2_region
     return boto3.client(
         "s3", endpoint_url=e("S3_ENDPOINT_URL") or None,
         region_name=e("S3_REGION") or derive_b2_region(e("S3_ENDPOINT_URL")) or None,

@@ -58,22 +58,25 @@ jobs:
       - name: Check environment contract and renderer regressions
         run: |
           python tools/check_env.py
-          python tests/test_render.py
+          python -m tests.test_render
       - name: Check offline Python regressions (no credentials or services)
         run: |
-          python tests/test_trace_privacy.py
-          python tests/test_backup.py
-          python tests/test_storage.py
-          python tests/test_database.py
-          python tests/test_dashboards.py
-          python tests/test_activity.py
-          python tests/test_vehicle_aggregate.py
-          python tests/test_fleet.py
-          python tests/test_can_receiver.py
+          python -m tests.test_trace_privacy
+          python -m tests.test_backup
+          python -m tests.test_storage
+          python -m tests.test_database
+          python -m tests.test_dashboards
+          python -m tests.test_activity
+          python -m tests.test_vehicle_aggregate
+          python -m tests.test_fleet
+          python -m tests.test_can_receiver
           python tools/demo.py regressions
-          python tests/test_vss.py
-          python tests/test_vss_setup.py
-          for f in tests/test_battery_*.py; do python "$f"; done
+          python -m tests.test_vss
+          python -m tests.test_vss_setup
+          for f in tests/test_battery_*.py; do
+            module="${f%.py}"
+            python -m "${module//\//.}"
+          done
       - name: Check generated deployment bundle is current
         run: |
           python tools/render.py \
