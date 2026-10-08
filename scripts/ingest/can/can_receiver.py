@@ -8,8 +8,11 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import datetime
 import fcntl
+import hashlib
 import hmac
+import http.client
 import ipaddress
 import json
 import math
@@ -17,14 +20,13 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import socket
 import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
-import urllib.error
 import urllib.parse
-import urllib.request
 import zlib
 
 from scripts.ingest.can.can_decoder import Decoder
@@ -58,11 +60,18 @@ CREATE TABLE IF NOT EXISTS decode_states (
  epoch TEXT NOT NULL REFERENCES epochs(epoch), next_seq INTEGER NOT NULL,
  state_json TEXT NOT NULL, counts_json TEXT NOT NULL, rows INTEGER NOT NULL,
  PRIMARY KEY(session,epoch));
+CREATE TABLE IF NOT EXISTS decode_partial (
+ session INTEGER NOT NULL REFERENCES sessions(id),
+ epoch TEXT NOT NULL REFERENCES epochs(epoch), seq INTEGER NOT NULL,
+ state_json TEXT NOT NULL, counts_json TEXT NOT NULL, rows_emitted INTEGER NOT NULL,
+ PRIMARY KEY(session,epoch));
 CREATE TABLE IF NOT EXISTS outbox (
  id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
  epoch TEXT NOT NULL REFERENCES epochs(epoch), row_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS worker_errors (
  kind TEXT PRIMARY KEY, count INTEGER NOT NULL, last_ns INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS archive_meta (
+ key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 """
 
 
@@ -120,6 +129,71 @@ def exclusive_archive(path):
     finally:
         os.close(fd)
 
+DECODE_ROW_BUDGET = 2000
+
+
+def _meta_bump(conn, key, delta):
+    conn.execute("INSERT INTO archive_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=value+?",
+                 (key, delta, delta))
+
+
+def _meta_set(conn, key, value):
+    conn.execute("INSERT INTO archive_meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                 (key, value))
+
+
+def _migrate_counters(conn):
+    """Bounded one-time migration: populate incremental counters from a legacy DB, then serve them without scans."""
+    if conn.execute("SELECT value FROM archive_meta WHERE key='raw_chunks'").fetchone() is not None:
+        return False
+    raw, raw_bytes = conn.execute("SELECT COUNT(*),COALESCE(SUM(length(data)),0) FROM raw_chunks").fetchone()
+    outbox = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+    decoded = conn.execute("SELECT COALESCE(SUM(rows),0) FROM decode_states").fetchone()[0]
+    for key, value in (("raw_chunks", raw), ("raw_bytes", raw_bytes), ("outbox_rows", outbox),
+                       ("decoded_rows_total", decoded), ("acked_rows_total", 0)):
+        conn.execute("INSERT OR IGNORE INTO archive_meta(key,value) VALUES(?,?)", (key, value))
+    return True
+
+
+HOUR_NS = 3600 * 10**9
+
+
+def _ns_timestamp(value):
+    """Greptime string-literal timestamp matching the Analytics ts_lit convention."""
+    moment = datetime.datetime.fromtimestamp(value / 10**9, tz=datetime.timezone.utc)
+    return moment.strftime("%Y-%m-%d %H:%M:%S.") + "%09d" % (value % 10**9)
+
+
+def _hour_floor(value):
+    return (value // HOUR_NS) * HOUR_NS
+
+
+def _sql_string(value):
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _dirty_inserts(rows, received_at):
+    """One INSERT row per affected hour bucket: original event_time floor, stable generation, single notify time.
+
+    Generation is sha256 over the sorted ACKed canonical row_json bytes in the
+    bucket (exact identities AND content): a same-PK value/quality/unit
+    correction changes the hash, while an identical replay reproduces it.
+    """
+    buckets = {}
+    for canonical, row in rows:
+        key = (_hour_floor(row["event_time"]), row["vehicle"], row["source"], row["decode_epoch"])
+        buckets.setdefault(key, []).append(canonical)
+    statements = []
+    for (window_ns, vehicle, source, epoch), canonicals in sorted(buckets.items()):
+        digest = hashlib.sha256()
+        for canonical in sorted(canonicals):
+            digest.update(canonical.encode())
+            digest.update(b"\0")
+        statements.append("(" + ",".join((
+            _sql_string(_ns_timestamp(window_ns)[:19]),
+            _sql_string(vehicle), _sql_string(source), _sql_string(epoch),
+            _sql_string(digest.hexdigest()), _sql_string(received_at))) + ")")
+    return statements
 
 class Archive:
     def __init__(self, path, disk_reserve_bytes=64 * 1024 * 1024):
@@ -138,6 +212,11 @@ class Archive:
             os.close(fd)
         with self.connect() as conn:
             conn.executescript(SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            _migrate_counters(conn)
+            conn.commit()
+
+
 
     def connect(self):
         conn = sqlite3.connect(self.path, timeout=5)
@@ -198,6 +277,11 @@ class Archive:
                     )
                     next_seq, last_offset, added = seq + 1, offset, added + 1
             conn.execute("UPDATE sessions SET next_seq=?,last_offset_ns=? WHERE id=?", (next_seq, last_offset, session_id))
+            if added:
+                new_bytes = sum(len(c["data"]) for c in chunks if c["seq"] >= next_seq - added)
+                _meta_bump(conn, "raw_chunks", added)
+                _meta_bump(conn, "raw_bytes", new_bytes)
+                _meta_set(conn, "last_receive_ns", time.time_ns())
             conn.commit()
             return added
 
@@ -215,53 +299,169 @@ class Archive:
             conn.commit()
 
     def decode_once(self, decoder, limit=1000):
-        """Commit ordered chunks, their parser cursors and outbox rows atomically."""
-        with self.connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            # Release the writer lock between batches so raw ingestion can proceed.
-            deadline = time.monotonic() + 0.05
-            processed = 0
-            while processed < limit:
-                # CROSS JOIN keeps cursor lookup outside the retained raw history.
+        """Decode an ordered multi-chunk batch without holding the writer lock during CPU work.
+
+        Chunks and parser cursors are read briefly, decoded outside any SQLite
+        transaction via Decoder.decode_some(meta,chunk,state,max_rows), then
+        committed ONCE (cursor CAS + all rows + partial state + counters). A
+        failure anywhere in the batch commits nothing: cursors, outbox rows,
+        counters, and freshness stay exactly as before the call. A partial
+        chunk still survives crashes via durable decode_partial state committed
+        with its batch; rows stay under plain INSERT (re-emit fails loudly via
+        UNIQUE instead of silently duplicating).
+        """
+        decode_some = decoder.decode_some
+        # Release the writer lock between batches so raw ingestion can proceed.
+        # Global row budget across the batch: a dense chunk that does not finish
+        # within budget stages alone and commits its resume state; later chunks
+        # wait for the next call so no remaining frames are skipped.
+        deadline = time.monotonic() + 0.05
+        staged = []
+        emitted_rows = 0
+        while len(staged) < limit:
+            with self.connect() as conn:
+                # Indexed candidate kept in its original shape; staged seqs
+                # override the persisted cursor through an in-memory CTE.
+                # Invariant: staged holds exactly seqs [cursor, cursor+n) per
+                # session in order, so the next wanted seq is anchor+n.
+                progress = {}
+                for entry in staged:
+                    progress[entry[0]["session"]] = entry[0]["seq"] + 1
+                placeholders = ",".join("(?,?)" for _ in progress) or "(NULL,NULL)"
+                params = []
+                for session, want in progress.items():
+                    params.extend((session, want))
                 raw = conn.execute(
-                    "SELECT c.*,s.meta_json,d.state_json,d.counts_json,d.rows FROM sessions s "
+                    "WITH progress(session,next_seq) AS (VALUES " + placeholders + ") "
+                    "SELECT c.session AS session, c.seq AS seq, c.offset_ns AS offset_ns, "
+                    "c.phase AS phase, c.data AS data, s.meta_json AS meta_json, d.state_json AS state_json, "
+                    "d.counts_json AS counts_json, d.rows AS rows FROM sessions s "
                     "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
-                    "CROSS JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(d.next_seq,0) "
-                    "ORDER BY c.id LIMIT 1", (decoder.epoch,),
+                    "LEFT JOIN progress p ON p.session=s.id "
+                    "CROSS JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(p.next_seq,d.next_seq,0) "
+                    "ORDER BY c.id LIMIT 1", (*params, decoder.epoch),
                 ).fetchone()
                 if raw is None:
                     break
-                self.reserve()
-                meta = json.loads(raw["meta_json"])
-                chunk = {key: raw[key] for key in ("seq", "offset_ns", "phase", "data")}
+                partial = conn.execute(
+                    "SELECT seq,state_json,counts_json,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
+                    (raw["session"], decoder.epoch),
+                ).fetchone()
+                anchor = conn.execute(
+                    "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
+                    (raw["session"], decoder.epoch),
+                ).fetchone()
+            self.reserve()
+            meta = json.loads(raw["meta_json"])
+            chunk = {key: raw[key] for key in ("seq", "offset_ns", "phase", "data")}
+            if partial is not None and partial["seq"] == raw["seq"]:
+                state = json.loads(partial["state_json"])
+                carried, emitted = json.loads(partial["counts_json"]), partial["rows_emitted"]
+            elif raw["session"] in progress:
+                # Continue from the staged predecessor's output state: it has
+                # not committed yet, so the persisted cursor still points at it.
+                state = next(e[2]["state"] for e in reversed(staged) if e[0]["session"] == raw["session"])
+                carried, emitted = {}, 0
+            else:
                 state = json.loads(raw["state_json"]) if raw["state_json"] else None
-                rows, state, counts = decoder.decode(meta, chunk, state)
+                carried, emitted = {}, 0
+            rows, state, counts, done = decode_some(meta, chunk, state, max(1, DECODE_ROW_BUDGET - emitted_rows))
+            if type(done) is not bool:
+                raise ValueError("invalid decode batch completion flag")
+            if raw["session"] in progress:
+                # Continue totals from the staged predecessor: the persisted
+                # cursor still holds pre-batch counts.
+                totals = dict(next(w["totals"] for r, c, w in reversed(staged) if r["session"] == raw["session"]))
+            else:
                 totals = json.loads(raw["counts_json"]) if raw["counts_json"] else {}
-                for key, value in counts.items():
+            for deltas in ([carried] if carried else []) + [counts]:
+                for key, value in deltas.items():
                     if type(value) is not int or value < 0:
                         raise ValueError("invalid decoder count")
                     totals[key] = value if key == "tail_bytes" else totals.get(key, 0) + value
-                for row in rows:
-                    validate_row(row)
-                    if row["vehicle"] != meta["vehicle"] or row["collector_id"] != meta["collector_id"] or row["decode_epoch"] != decoder.epoch:
-                        raise ValueError("decoder row identity mismatch")
+            for row in rows:
+                validate_row(row)
+                if row["vehicle"] != meta["vehicle"] or row["collector_id"] != meta["collector_id"] or row["decode_epoch"] != decoder.epoch:
+                    raise ValueError("decoder row identity mismatch")
+            if not done and not rows:
+                raise ValueError("decoder partial batch must emit rows")
+            staged.append((raw, chunk, {"state": state, "counts": counts, "done": done, "totals": totals,
+                                        "carried": carried, "emitted": emitted, "rows": rows,
+                                        "partial": partial, "anchor": anchor}))
+            emitted_rows += len(rows)
+            if not done or emitted_rows >= DECODE_ROW_BUDGET or time.monotonic() >= deadline:
+                break
+        if not staged:
+            return 0
+        for _, _, work in staged:
+            work["canonicals"] = [_json(row) for row in work["rows"]]
+        staged_bytes = sum(len(c.encode()) for _, _, work in staged for c in work["canonicals"])
+        self.reserve(staged_bytes + len(staged) * 512 + staged_bytes // 4)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            # Validate each session's anchor ONCE before any writes: staged
+            # same-session writes are ours, not an external race.
+            seen = set()
+            for raw, chunk, work in staged:
+                if raw["session"] in seen:
+                    continue
+                seen.add(raw["session"])
+                anchor = conn.execute(
+                    "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
+                    (raw["session"], decoder.epoch),
+                ).fetchone()
+                before = work["anchor"]
+                if (anchor["next_seq"] if anchor else 0) != (before["next_seq"] if before else 0) or \
+                        (anchor["state_json"] if anchor else None) != (before["state_json"] if before else None) or \
+                        (anchor["counts_json"] if anchor else None) != (before["counts_json"] if before else None) or \
+                        (anchor["rows"] if anchor else 0) != (before["rows"] if before else 0):
+                    raise ValueError("decode cursor moved during decode")
+                if work["partial"] is not None:
+                    current = conn.execute(
+                        "SELECT seq,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
+                        (raw["session"], decoder.epoch),
+                    ).fetchone()
+                    if work["partial"]["seq"] == raw["seq"]:
+                        if current is None or current["seq"] != raw["seq"] or current["rows_emitted"] != work["emitted"]:
+                            raise ValueError("decode partial moved during decode")
+                    elif current is not None and current["seq"] != raw["seq"]:
+                        conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
+                                     (raw["session"], decoder.epoch))
+            committed = {}
+            for raw, chunk, work in staged:
                 conn.executemany(
                     "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-                    [(row["event_id"], decoder.epoch, _json(row)) for row in rows],
+                    [(row["event_id"], decoder.epoch, canonical) for row, canonical in zip(work["rows"], work["canonicals"])],
                 )
-                conn.execute(
-                    "INSERT INTO decode_states VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
-                    "next_seq=excluded.next_seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows=excluded.rows",
-                    (raw["session"], decoder.epoch, raw["seq"] + 1, _json(state), _json(totals), (raw["rows"] or 0) + len(rows)),
-                )
-                processed += 1
-                if time.monotonic() >= deadline:
-                    break
+                # Chain within the batch: later chunks of the same session build
+                # on this commit, not on the pre-batch persisted cursor.
+                prior = committed.get(raw["session"], (raw["rows"] or 0))
+                if work["done"]:
+                    conn.execute(
+                        "INSERT INTO decode_states VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
+                        "next_seq=excluded.next_seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows=excluded.rows",
+                        (raw["session"], decoder.epoch, raw["seq"] + 1, _json(work["state"]), _json(work["totals"]), prior + work["emitted"] + len(work["rows"])),
+                    )
+                    conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
+                                 (raw["session"], decoder.epoch))
+                else:
+                    merged = dict(work["carried"])
+                    for key, value in work["counts"].items():
+                        merged[key] = value if key == "tail_bytes" else merged.get(key, 0) + value
+                    conn.execute(
+                        "INSERT INTO decode_partial VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
+                        "seq=excluded.seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows_emitted=excluded.rows_emitted",
+                        (raw["session"], decoder.epoch, raw["seq"], _json(work["state"]), _json(merged), work["emitted"] + len(work["rows"])),
+                    )
+                committed[raw["session"]] = prior + work["emitted"] + len(work["rows"])
+                _meta_bump(conn, "outbox_rows", len(work["rows"]))
+                _meta_bump(conn, "decoded_rows_total", len(work["rows"]))
+            _meta_set(conn, "last_decode_ns", time.time_ns())
             conn.commit()
-            return processed
+        return len(staged)
 
     def record_error(self, kind):
-        if kind not in {"decode_failure", "greptime_failure", "greptime_partial_ack", "greptime_timeout", "greptime_row_too_large", "archive_disk_reserve"}:
+        if kind not in {"decode_failure", "greptime_failure", "greptime_partial_ack", "greptime_timeout", "greptime_row_too_large", "archive_disk_reserve", "dirty_notify_failure"}:
             raise ValueError("invalid error category")
         with self.connect() as conn:
             conn.execute(
@@ -271,28 +471,60 @@ class Archive:
             conn.commit()
 
     def flush_once(self, greptime, limit=20000, max_body_bytes=None):
+        """Send one fitting ordered prefix; dirty-notify after full ACK, delete only then."""
         budget = getattr(greptime, "max_body_bytes", DEFAULT_MAX_BODY_BYTES) if max_body_bytes is None else max_body_bytes
+        prefix = "sql=" + urllib.parse.quote_plus(_SQL_PREFIX, safe="", encoding="utf-8", errors="strict")
+        total = len(prefix.encode("ascii"))
+        chosen, count, texts = [], 0, []
         with self.connect() as conn:
-            batch = conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)).fetchall()
-        if not batch:
-            return 0
-        rows = [json.loads(record["row_json"]) for record in batch]
-        cells = [_render_cell(row) for row in rows]
-        count = select_prefix_count(cells, budget)
-        if not count:
+            for record in conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)):
+                canonical = record["row_json"]
+                row = json.loads(canonical)
+                cell = _render_cell(row)
+                addition = _urlencoded_len(cell) + (0 if count == 0 else _COMMA_ENCODED_LEN)
+                if total + addition > budget:
+                    break
+                total += addition
+                chosen.append((record["id"], canonical, row))
+                texts.append(cell)
+                count += 1
+                if count >= limit:
+                    break
+        if not chosen:
+            with self.connect() as conn:
+                if conn.execute("SELECT 1 FROM outbox LIMIT 1").fetchone() is None:
+                    return 0
             # The oversized head row stays durable; nothing is skipped or deleted.
             raise DownstreamError("greptime_row_too_large")
-        payload = encode_body(_SQL_PREFIX + ",".join(cells[:count]))
+        rows = [(canonical, row) for _, canonical, row in chosen]
+        payload = encode_body(_SQL_PREFIX + ",".join(texts))
         if greptime.send_body(payload) != count:
             raise DownstreamError("greptime_partial_ack")
+        received_at = _ns_timestamp(time.time_ns())
+        statements = _dirty_inserts(rows, received_at)
+        dirty = encode_body('INSERT INTO "vehicle_signal_dirty" '
+                            '("window_start","vehicle","source","decode_epoch","generation","received_at") VALUES '
+                            + ",".join(statements))
+        try:
+            affected = greptime.send_body(dirty)
+        except DownstreamError:
+            raise DownstreamError("dirty_notify_failure") from None
+        if affected != len(statements):
+            raise DownstreamError("dirty_notify_failure")
+        now = time.time_ns()
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            conn.executemany("DELETE FROM outbox WHERE id=?", [(r["id"],) for r in batch[:count]])
+            conn.executemany("DELETE FROM outbox WHERE id=?", [(ident,) for ident, _, _ in chosen])
+            _meta_bump(conn, "outbox_rows", -len(chosen))
+            _meta_bump(conn, "acked_rows_total", len(chosen))
+            _meta_set(conn, "last_full_ack_ns", now)
             conn.commit()
         return count
 
     def status(self):
-        return archive_status(self.path)
+        facts = archive_status(self.path)
+        facts["disk_reserve_bytes"] = self.disk_reserve_bytes
+        return facts
 
 
 def archive_status(path):
@@ -300,9 +532,19 @@ def archive_status(path):
     uri = path.as_uri() + "?mode=ro"
     with contextlib.closing(sqlite3.connect(uri, uri=True, timeout=5)) as conn:
         conn.execute("BEGIN")
-        raw, raw_bytes = conn.execute("SELECT COUNT(*),COALESCE(SUM(length(data)),0) FROM raw_chunks").fetchone()
+        try:
+            meta = {key: value for key, value in conn.execute("SELECT key,value FROM archive_meta")}
+        except sqlite3.Error:
+            meta = {}
+        raw = meta.get("raw_chunks")
+        if raw is None:
+            raw, raw_bytes = conn.execute("SELECT COUNT(*),COALESCE(SUM(length(data)),0) FROM raw_chunks").fetchone()
+        else:
+            raw_bytes = meta.get("raw_bytes", 0)
         sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
         pending = conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
+        oldest = conn.execute("SELECT MIN(id) FROM outbox").fetchone()[0]
+        backlog = 0
         epochs = []
         for (epoch,) in conn.execute("SELECT epoch FROM epochs ORDER BY rowid"):
             processed, rows = conn.execute("SELECT COALESCE(SUM(next_seq),0),COALESCE(SUM(rows),0) FROM decode_states WHERE epoch=?", (epoch,)).fetchone()
@@ -311,8 +553,22 @@ def archive_status(path):
                 for key, value in json.loads(encoded).items():
                     totals[key] = totals.get(key, 0) + value
             epochs.append({"epoch": epoch, "processed_chunks": processed, "remaining_chunks": raw - processed, "decoded_rows": rows, "counts": totals})
+            backlog += raw - processed
         errors = {kind: {"count": count, "last_ns": last} for kind, count, last in conn.execute("SELECT kind,count,last_ns FROM worker_errors")}
-        return {"sessions": sessions, "raw_chunks": raw, "raw_bytes": raw_bytes, "pending_rows": pending, "epochs": epochs, "errors": errors}
+        freshness = {key: meta.get(key) for key in ("last_receive_ns", "last_decode_ns", "last_full_ack_ns")}
+        counters = {key: meta.get(key, 0) for key in ("decoded_rows_total", "acked_rows_total")}
+    facts = {"sessions": sessions, "raw_chunks": raw, "raw_bytes": raw_bytes, "pending_rows": pending,
+             "epochs": epochs, "errors": errors, "oldest_pending_id": oldest, "backlog_chunks": backlog,
+             "freshness": freshness, "counters": counters, "disk_reserve_bytes": None,
+             "db_bytes": None, "wal_bytes": None, "disk_free_bytes": None}
+    try:
+        facts["db_bytes"] = path.stat().st_size
+        wal = path.with_name(path.name + "-wal")
+        facts["wal_bytes"] = wal.stat().st_size if wal.exists() else 0
+        facts["disk_free_bytes"] = shutil.disk_usage(path.parent).free
+    except OSError:
+        pass
+    return facts
 
 
 def validate_row(row):
@@ -371,28 +627,11 @@ def _urlencoded_len(text):
     return len(urllib.parse.quote_plus(text, safe="", encoding="utf-8", errors="strict").encode("ascii"))
 
 
-def select_prefix_count(cells, max_body_bytes):
-    """Largest ordered prefix whose URL-encoded body fits; single O(total) pass."""
-    total = 4 + _urlencoded_len(_SQL_PREFIX)  # "sql=" form field name and separator.
-    count = 0
-    for index, cell in enumerate(cells):
-        if index:
-            total += _COMMA_ENCODED_LEN
-        total += _urlencoded_len(cell)
-        if total > max_body_bytes:
-            break
-        count = index + 1
-    return count
-
-
 def encode_body(sql):
     """Exact URL-encoded SQL request body bytes sent to Greptime."""
     return urllib.parse.urlencode({"sql": sql}).encode()
 
-
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
 
 
 class Greptime:
@@ -417,26 +656,65 @@ class Greptime:
         self.authorization = "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
         self.timeout = timeout
         self.max_body_bytes = max_body_bytes
-        self.opener = urllib.request.build_opener(_NoRedirect())
+        self._parts = urllib.parse.urlsplit(base_url.rstrip("/"))
+        self._lock = threading.RLock()
+        self._connection = None
 
-    def body_for(self, rows):
-        """Exact URL-encoded body for exactly these rows; callers enforce the byte budget."""
-        return encode_body(render_insert(rows))
 
-    def fit(self, rows):
-        """Largest ordered prefix within this client's byte budget in one O(total) pass."""
-        return select_prefix_count([_render_cell(row) for row in rows], self.max_body_bytes)
+    def _connect(self):
+        target = (self._parts.hostname, self._parts.port or (443 if self._parts.scheme == "https" else 80))
+        if self._parts.scheme == "https":
+            connection = http.client.HTTPSConnection(target[0], target[1], timeout=self.timeout)
+        else:
+            connection = http.client.HTTPConnection(target[0], target[1], timeout=self.timeout)
+        connection.connect()
+        self._connection = connection
+
+    def close(self):
+        with self._lock:
+            connection, self._connection = self._connection, None
+        if connection is not None:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def _post(self, payload):
+        """Single POST over a reused connection; any ambiguity closes it."""
+        query = self.url.split("/v1/sql?", 1)[1]
+        with self._lock:
+            try:
+                if self._connection is None:
+                    self._connect()
+                self._connection.request("POST", "/v1/sql?" + query, body=payload, headers={
+                    "Authorization": self.authorization, "Content-Type": "application/x-www-form-urlencoded",
+                    "Content-Length": str(len(payload)), "Host": self._parts.hostname,
+                })
+                response = self._connection.getresponse()
+                body = response.read(65537)
+                keep = response.getheader("Connection", "").lower() != "close" and response.status == 200
+                status = response.status
+                if status in _REDIRECT_CODES and response.getheader("Location") is not None:
+                    status = 599  # Never follow redirects; auth must not leak to a new URL.
+            except (TimeoutError, socket.timeout):
+                self.close()
+                raise DownstreamError("greptime_timeout") from None
+            except (http.client.HTTPException, OSError, ValueError):
+                self.close()
+                raise DownstreamError("greptime_failure") from None
+            if status != 200 or len(body) > 65536:
+                self.close()
+                raise DownstreamError("greptime_failure")
+            if not keep:
+                self.close()
+            return body
 
     def send_body(self, payload):
         """POST an exact body; returns affected rows without weakening ACK semantics."""
-        request = urllib.request.Request(self.url, data=payload, headers={
-            "Authorization": self.authorization, "Content-Type": "application/x-www-form-urlencoded",
-        })
+        if type(payload) is not bytes or not 0 < len(payload) <= 64 * 1024 * 1024:
+            raise ValueError("Greptime payload must be bounded bytes")
+        body = self._post(payload)
         try:
-            with self.opener.open(request, timeout=self.timeout) as response:
-                body = response.read(65537)
-                if response.status != 200 or len(body) > 65536:
-                    raise DownstreamError("greptime_failure")
             payload_json = json.loads(body)
             if not isinstance(payload_json, dict) or type(payload_json.get("code", 0)) is not int or payload_json.get("code", 0) != 0:
                 raise DownstreamError("greptime_failure")
@@ -452,17 +730,9 @@ class Greptime:
                     raise DownstreamError("greptime_failure")
                 affected += item[keys[0]]
             return affected
-        except (TimeoutError, socket.timeout):
-            raise DownstreamError("greptime_timeout") from None
-        except urllib.error.URLError as exc:
-            if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
-                raise DownstreamError("greptime_timeout") from None
-            raise DownstreamError("greptime_failure") from None
-        except (OSError, ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             raise DownstreamError("greptime_failure") from None
 
-    def insert(self, rows):
-        return self.send_body(self.body_for(rows))
 
 
 class Worker(threading.Thread):
@@ -511,12 +781,18 @@ class Worker(threading.Thread):
             uploader.join()
 
 
+SERVER_CONCURRENCY = 4
+
+
 class Receiver(HTTPServer):
     request_queue_size = 16
+    daemon_threads = True
 
-    def __init__(self, address, archive, vehicle, collector_id, user, password, timeout=15):
+    def __init__(self, address, archive, vehicle, collector_id, user, password, timeout=15, concurrency=SERVER_CONCURRENCY):
         if not user or not password or ":" in user:
             raise ConfigurationError("can_otlp_credentials_required")
+        if type(concurrency) is bool or not isinstance(concurrency, int) or concurrency < 1:
+            raise ConfigurationError("invalid_receiver_concurrency")
         self.archive = archive
         self.vehicle, self.collector_id = _identity(vehicle), _identity(collector_id)
         with archive.connect() as conn:
@@ -524,7 +800,35 @@ class Receiver(HTTPServer):
                 raise ConfigurationError("archive_identity_conflicts_with_configuration")
         self.expected_auth = (user + ":" + password).encode()
         self.read_timeout = timeout
+        self._slots = threading.BoundedSemaphore(concurrency)
+        self._shutdown = threading.Event()
         super().__init__(address, Handler)
+
+    def process_request(self, request, client_address):
+        if self._shutdown.is_set() or not self._slots.acquire(blocking=False):
+            try:
+                request.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                request.close()
+            except OSError:
+                pass
+            return
+        worker = threading.Thread(target=self._serve_slot, args=(request, client_address), daemon=True)
+        worker.start()
+
+    def _serve_slot(self, request, client_address):
+        try:
+            self.finish_request(request, client_address)
+        except Exception:
+            self.handle_error(request, client_address)
+        finally:
+            try:
+                self.shutdown_request(request)
+            except OSError:
+                pass
+            self._slots.release()
 
     def finish_request(self, request, client_address):
         # A whole-request deadline also bounds clients trickling headers/body.
@@ -537,9 +841,13 @@ class Receiver(HTTPServer):
         deadline.daemon = True
         deadline.start()
         try:
-            super().finish_request(request, client_address)
+            self.RequestHandlerClass(request, client_address, self)
         finally:
             deadline.cancel()
+
+    def server_close(self):
+        self._shutdown.set()
+        super().server_close()
 
     def handle_error(self, request, client_address):
         pass  # Never let stdlib traceback logging include client-controlled data.
@@ -548,6 +856,7 @@ class Receiver(HTTPServer):
 class Handler(BaseHTTPRequestHandler):
     server_version = "CANArchive"
     sys_version = ""
+    protocol_version = "HTTP/1.1"
 
     def setup(self):
         self.request.settimeout(self.server.read_timeout)
@@ -560,11 +869,13 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(code, b'{"error":"invalid_http_request"}')
 
     def reply(self, code, body, protobuf=False):
-        self.close_connection = True
+        # Success keeps the connection alive for client reuse; any error,
+        # timeout, or framing ambiguity closes it so no state leaks across requests.
+        self.close_connection = code != 200
         self.send_response(code)
         self.send_header("Content-Type", "application/x-protobuf" if protobuf else "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "close")
+        self.send_header("Connection", "keep-alive" if code == 200 else "close")
         if code == 401:
             self.send_header("WWW-Authenticate", 'Basic realm="CANArchive"')
         self.end_headers()
@@ -611,7 +922,9 @@ class Handler(BaseHTTPRequestHandler):
                 raise Rejection(415, "unsupported_content_encoding")
             compressed = self.rfile.read(length)
             if len(compressed) != length:
+                self._expected_remainder = length - len(compressed)
                 raise Rejection(400, "truncated_request")
+            self._expected_remainder = 0
             try:
                 stream = zlib.decompressobj(16 + zlib.MAX_WBITS)
                 payload = stream.decompress(compressed, MAX_REQUEST_BYTES + 1)
@@ -637,6 +950,11 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(503, b'{"error":"archive_unavailable"}')
         except Exception:
             self.reply(500, b'{"error":"receiver_failure"}')
+        finally:
+            if self.request_version != "HTTP/1.0" and not self.close_connection:
+                remaining = getattr(self, "_expected_remainder", 0)
+                if remaining:
+                    self.close_connection = True
 
 
 def main(argv=None):
@@ -687,14 +1005,25 @@ def main(argv=None):
             worker = Worker(archive, decoder, greptime, args.worker_interval, args.outbox_limit, args.max_body_bytes)
             worker.start()
             print(_json({"receiver": "ready", "port": server.server_port}), flush=True)
+
+            def _stop(signum, frame):
+                # shutdown() must not run in the serve_forever thread itself: it blocks
+                # waiting for that same thread. Signal from a helper thread instead.
+                worker.stop_event.set()
+                threading.Thread(target=server.shutdown, daemon=True).start()
+            previous_term = signal.getsignal(signal.SIGTERM)
+            previous_int = signal.getsignal(signal.SIGINT)
+            signal.signal(signal.SIGTERM, _stop)
+            signal.signal(signal.SIGINT, _stop)
             try:
                 server.serve_forever()
-            except KeyboardInterrupt:
-                pass
             finally:
+                signal.signal(signal.SIGTERM, previous_term)
+                signal.signal(signal.SIGINT, previous_int)
                 server.server_close()
                 worker.stop_event.set()
                 worker.join()
+                greptime.close()
         return 0
     except ConfigurationError as exc:
         print(_json({"error": str(exc)}), flush=True)

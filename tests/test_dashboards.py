@@ -398,6 +398,11 @@ def test_physical_cards_latest_analysis_and_new_raw_barriers():
                 (7500, 'v', 'fleet', 'fleet-v1', 'PackVoltage',
                  NULL, NULL, 'invalid', 9000, 'new-invalid')""")
             assert db.execute(query).fetchone()[4] is None
+            # Configured analyzer field overrides must share the freshness barrier.
+            db.execute("UPDATE vehicle_signal SET source_field = 'CustomVoltage'")
+            assert db.execute(query).fetchone()[4] is None
+            db.execute("UPDATE vehicle_signal SET event_time = 8500")
+            assert db.execute(query).fetchone()[4] is None
             db.execute("DELETE FROM vehicle_signal")
             # Late-ingested same-time invalid observations also need reanalysis.
             db.execute("""INSERT INTO vehicle_signal
@@ -590,6 +595,48 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
             (1700, "demo-can", -2.0)]
 
 
+def test_coverage_frontier_lists_scopes_without_range_rows():
+    """Panel 92: whole-history frontier lists scopes even with zero range rows."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-vehicle-overview", 92)
+    query = query.replace("$__timeFilter(ingest_time)", "ingest_time BETWEEN 1000 AND 2000")
+    with _battery_db() as db:
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, ingest_time) VALUES (?, ?, ?, ?, ?)""",
+                       [(100, "stale-car", "can", "old", 100),
+                        (1500, "can-car", "can", "new", 2500)])
+        rows = {(row[0], row[2]): row for row in db.execute(query)}
+        assert rows["stale-car", "old"][3] == "선택 기간에 관측 없음"
+        assert rows["stale-car", "old"][6:] == (0, 0)
+        assert rows["can-car", "new"][6:] == (1, 0)
+
+
+def test_transition_timeline_starts_from_boundary_sample():
+    """Gear timeline: latest pre-range row anchors the series; tombstones stay NULL."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-vehicle-overview", 14)
+    query = (query.replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
+             .replace("$__unixEpochFrom()", "1000"))
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.create_function("FROM_UNIXTIME", 1, lambda value: value)
+        for event, text, quality in (
+                (100, "DI_GEAR_N", "reported_unverified"),
+                (500, "DI_GEAR_P", "reported_unverified"),
+                (1100, "DI_GEAR_P", "reported_unverified"),
+                (1300, "UNKNOWN(9)", "reported_unverified"),
+                (1400, "DI_GEAR_D", "invalid"),
+                (1500, "DI_GEAR_D", "reported_unverified")):
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, value_text, unit, quality, ingest_time, envelope_id, path)
+                VALUES (?, 'v', 'can', 'e1', 'DI_gear', NULL, ?, NULL, ?, ?, ?, 'Vehicle.CAN.x118.DI_gear')""",
+                       (event, text, quality, event, str(event)))
+        rows = [(row[0], row[2]) for row in db.execute(query)]
+        assert rows == [(500, "DI_GEAR_P"), (1100, "DI_GEAR_P"),
+                        (1300, None), (1400, None), (1500, "DI_GEAR_D")]
+
+
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
@@ -605,4 +652,6 @@ if __name__ == "__main__":
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()
     test_vehicle_identity_canonical_selection_and_scope_split()
+    test_coverage_frontier_lists_scopes_without_range_rows()
+    test_transition_timeline_starts_from_boundary_sample()
     print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")

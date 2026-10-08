@@ -340,6 +340,46 @@ def _parse_config(ecfg):
             "reference_source": source}
 
 
+def required_fields(config=None):
+    """Exact source_field set this analyzer may read (defaults + overrides).
+
+    All FIELD_DEFAULTS values plus the effective field_calibration keys
+    (V/A only) and any nominal_pack_field BMS reference. Malformed field
+    entries or calibration maps -> EnergyError (fail closed, never
+    silently valid). No calibration/cost semantics.
+    """
+    cfg_all = config if isinstance(config, dict) else {}
+    if config is not None and not isinstance(config, dict):
+        raise EnergyError("malformed: energy config dict")
+    ecfg = cfg_all.get("energy", cfg_all)
+    if ecfg is None:
+        ecfg = {}
+    if not isinstance(ecfg, dict):
+        raise EnergyError("malformed: energy config dict")
+    parsed = _parse_config(ecfg)
+    fields = set(parsed["fields"].values())
+    raw_cal = ecfg.get("field_calibration")
+    if raw_cal is not None:
+        if not isinstance(raw_cal, dict):
+            raise EnergyError("malformed: field_calibration dict")
+        for field, entry in raw_cal.items():
+            if not isinstance(field, str) or not field:
+                raise EnergyError(
+                    "malformed: field_calibration field names")
+            fields.add(field)
+            cands = entry if isinstance(entry, list) else [entry]
+            for cand in cands:
+                if field == parsed["fields"]["voltage_field"]:
+                    _parse_scoped_calibration(cand, field, "V")
+                elif field == parsed["fields"]["current_field"]:
+                    _parse_scoped_calibration(cand, field, "A")
+                else:
+                    raise EnergyError(
+                        "malformed: field_calibration[%s] not a V/A field"
+                        % field)
+    return fields
+
+
 def _parse_uncertainties(ecfg):
     out = {}
     for key in ("soc_uncertainty_pct", "energy_uncertainty_kwh"):

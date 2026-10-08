@@ -83,6 +83,14 @@ credentials are STALE: the next db-init/preflight run regenerates
 greptimedb.toml + auth/users from the current `.env`. S3 keys are read from
 the standard S3_* env and never printed.
 
+Capacity (both modes, separate filesystems): backup preflights 2x the live
+source bytes + BACKUP_RESERVE_BYTES (default 64MiB) free on BACKUP_DIR before
+any write (a tar of incompressible SSTs peaks near source size). Restore
+preflights tar + uncompressed members + reserve free on BACKUP_DIR for staging
+and members + reserve free on every restore target filesystem. Shortfalls
+refuse BEFORE any write (exit 2); unreadable disks fail closed (exit 3).
+Failed runs delete only their own writes; the source is never mutated.
+
 Exit codes: 0 ok, 1 usage/env error, 2 precondition failure, 3 IO error.
 """
 
@@ -395,11 +403,13 @@ def write_local_tar(d, name, srcs, manifest):
     return path, digest, raw_manifest
 
 
-def prune_local(d, path, keep):
-    files = sorted(glob.glob(os.path.join(d, BACKUP_PREFIX + "*" + BACKUP_SUFFIX)))
+def prune_local(d, path, keep, prefix=BACKUP_PREFIX, suffix=BACKUP_SUFFIX,
+                sidecar_suffix=SIDECAR_SUFFIX):
+    """Delete generations beyond keep, never the file just written."""
+    files = sorted(glob.glob(os.path.join(d, prefix + "*" + suffix)))
     for old in files[:-keep]:
         if old != path:
-            for victim in (old, old + SIDECAR_SUFFIX):
+            for victim in (old, old + sidecar_suffix):
                 try:
                     os.unlink(victim)
                 except FileNotFoundError:
@@ -409,22 +419,47 @@ def prune_local(d, path, keep):
                                      + str(e)[:100] + "\n")
 
 
-def claim_backup_id(d, s3, bucket, bp):
+def claim_backup_id(d, s3, bucket, bp, prefix=BACKUP_PREFIX,
+                    suffix=BACKUP_SUFFIX, sidecar_suffix=SIDECAR_SUFFIX):
     """Time-sortable id with random suffix, proven fresh locally AND remotely.
     An occupied remote namespace is never written into (fail closed)."""
     for _ in range(ID_TRIES):
         now_ns = time.time_ns()
         stamp = (time.strftime("%Y%m%dT%H%M%S", time.gmtime(now_ns // 1_000_000_000))
                  + ".%09dZ" % (now_ns % 1_000_000_000))
-        bid = BACKUP_PREFIX + stamp + "-" + secrets.token_hex(3)
-        if (os.path.exists(os.path.join(d, bid + BACKUP_SUFFIX))
-                or os.path.exists(os.path.join(d, bid + BACKUP_SUFFIX + SIDECAR_SUFFIX))):
+        bid = prefix + stamp + "-" + secrets.token_hex(3)
+        if (os.path.exists(os.path.join(d, bid + suffix))
+                or os.path.exists(os.path.join(d, bid + suffix + sidecar_suffix))):
             continue
         if s3 is not None:
             if s3_list_all(s3, bucket, remote_base(bp, bid)):
                 continue
         return bid, stamp
     raise IOError("could not claim a fresh backup namespace (collision)")
+
+
+def read_reserve(var="BACKUP_RESERVE_BYTES"):
+    """Returns (reserve, errmsg): <var> floor for staging-space preflights."""
+    try:
+        reserve = int(env(var, str(64 << 20)))
+    except ValueError:
+        return None, var + " must be an integer"
+    if reserve < 0:
+        return None, var + " must be >= 0"
+    return reserve, None
+
+
+def tree_bytes(srcs):
+    """Summed regular-file bytes under srcs (symlinks already refused)."""
+    total = 0
+    for s in srcs:
+        for root, _dirs, files in os.walk(s, followlinks=False):
+            for name in files:
+                p = os.path.join(root, name)
+                if os.path.islink(p):
+                    raise IOError("source symlink appeared mid-backup (refusing): " + p)
+                total += os.path.getsize(p)
+    return total
 
 
 def cmd_backup():
@@ -448,6 +483,17 @@ def cmd_backup():
         return fail("BACKUP_KEEP must be an integer", code=1)
     if keep < 1:
         keep = 1
+    reserve, rerr = read_reserve()
+    if rerr is not None:
+        return fail(rerr, code=1)
+    try:
+        source_bytes = tree_bytes(srcs)
+        need = 2 * source_bytes + reserve
+        if shutil.disk_usage(d).free < need:
+            return fail("backup refused: insufficient space in %s (need %d bytes)"
+                        % (d, need), code=2)
+    except OSError as e:
+        return fail("backup preflight failed: " + str(e)[:200], code=3)
     ident = current_identity()
     s3 = None
     bucket = ""
@@ -724,18 +770,19 @@ def copy_contents(src, dst):
                 raise IOError("unsupported entry in staging: " + entry.name)
 
 
-def normalize_want(choice):
+def normalize_want(choice, sidecar_suffix=SIDECAR_SUFFIX, suffix=BACKUP_SUFFIX):
     base = os.path.basename(choice)
-    if base.endswith(SIDECAR_SUFFIX):
-        base = base[:-len(SIDECAR_SUFFIX)]
-    if base.endswith(BACKUP_SUFFIX):
-        base = base[:-len(BACKUP_SUFFIX)]
+    if base.endswith(sidecar_suffix):
+        base = base[:-len(sidecar_suffix)]
+    if base.endswith(suffix):
+        base = base[:-len(suffix)]
     return base
 
 
-def resolve_local_archive(d):
+def resolve_local_archive(d, file_var="BACKUP_FILE", prefix=BACKUP_PREFIX,
+                          suffix=BACKUP_SUFFIX):
     """Returns (path, want): local tar to use, or remote backup id to fetch."""
-    choice = env("BACKUP_FILE", "")
+    choice = env(file_var, "")
     if choice:
         if os.path.isabs(choice):
             if os.path.isfile(choice):
@@ -744,12 +791,12 @@ def resolve_local_archive(d):
         direct = os.path.join(d, choice)
         if os.path.isfile(direct):
             return direct, None
-        if not choice.endswith(BACKUP_SUFFIX):
-            suffixed = direct + BACKUP_SUFFIX
+        if not choice.endswith(suffix):
+            suffixed = direct + suffix
             if os.path.isfile(suffixed):
                 return suffixed, None
         return None, normalize_want(choice)
-    files = sorted(glob.glob(os.path.join(d, BACKUP_PREFIX + "*" + BACKUP_SUFFIX)))
+    files = sorted(glob.glob(os.path.join(d, prefix + "*" + suffix)))
     if files:
         return files[-1], None
     return None, None
@@ -1050,12 +1097,27 @@ def cmd_restore():
         return fail(serr, code=2)
     if ident["storage_type"] == "File" and sha256_file(path) != side_digest:
         return fail("backup hash mismatch (torn/corrupt download?): " + path, code=2)
-    manifest, raw_manifest, _members, merr, mcode = load_manifest(path)
+    manifest, raw_manifest, members, merr, mcode = load_manifest(path)
     if merr is not None:
         return fail(merr, code=mcode)
     problem = ensure_targets_empty()
     if problem is not None:
         return fail(problem, code=2)
+    reserve, rerr = read_reserve()
+    if rerr is not None:
+        return fail(rerr, code=1)
+    try:
+        members_total = sum(m.size for m in members if m.isfile())
+        tar_size = os.path.getsize(path)
+        if shutil.disk_usage(d).free < tar_size + members_total + reserve:
+            return fail("restore refused: insufficient staging space in " + d,
+                        code=2)
+        for target, _label in targets():
+            if shutil.disk_usage(target).free < members_total + reserve:
+                return fail("restore refused: insufficient space for restore targets",
+                            code=2)
+    except OSError as e:
+        return fail("restore preflight failed: " + str(e)[:200], code=3)
     written_sst = []
     if ident["storage_type"] == "S3":
         miss = s3_missing()

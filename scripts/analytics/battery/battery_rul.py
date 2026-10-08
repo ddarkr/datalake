@@ -141,6 +141,16 @@ def _fail(msg):
     return 2
 
 
+def required_fields(config=None):
+    """Exact source_field set this analyzer reads: empty (scope only).
+
+    RUL consumes only config history + signal scope identity, never
+    signal values, so no source_field narrowing applies. Returns the
+    empty set. No calibration/cost semantics.
+    """
+    return set()
+
+
 def _is_int(value):
     return isinstance(value, int) and not isinstance(value, bool)
 

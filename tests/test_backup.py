@@ -1354,6 +1354,53 @@ def test_stream_bodies_close_on_read_failure():
     complete, error = bk.fetch_complete(fake, "bucket", "backups", "id")
     assert complete is None and "injected read failure" in error and body.closed
 
+def test_backup_preflight_counts_source_bytes_and_refuses():
+    tmp, src, _tgt, bdir, env = fresh_layout("File")
+    real_usage = shutil.disk_usage
+    try:
+        setenv(env)
+        calls = []
+
+        def fake_usage(path):
+            calls.append(path)
+            if path == bdir:
+                return type("U", (), {"free": 1})()
+            return real_usage(path)
+
+        shutil.disk_usage = fake_usage
+        assert bk.cmd_backup() == 2
+        assert [f for f in os.listdir(bdir) if f.endswith(".tar.gz")] == []
+        assert bdir in calls, "backup dir must be preflighted"
+    finally:
+        shutil.disk_usage = real_usage
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_restore_preflight_checks_each_target_filesystem():
+    tmp, _src, _tgt, bdir, env = fresh_layout("File")
+    real_usage = shutil.disk_usage
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        targets = [t for t, _label in bk.targets()]
+        calls = []
+
+        def fake_usage(path):
+            calls.append(path)
+            if path == targets[-1]:
+                return type("U", (), {"free": 1})()
+            return real_usage(path)
+
+        shutil.disk_usage = fake_usage
+        assert bk.cmd_restore() == 2
+        assert targets[-1] in calls, "each restore target fs must be checked"
+        assert hash_tree(os.path.join(tmp, "tgt")) == {}
+    finally:
+        shutil.disk_usage = real_usage
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
 
 def test_failed_restore_preserves_last_success_marker():
     tmp, _src, tgt, bdir, env = fresh_layout("File")
@@ -1439,5 +1486,7 @@ if __name__ == "__main__":
     test_inventory_limit_is_shared_by_backup_and_restore()
     test_oversized_complete_is_not_missing_and_closes_body()
     test_stream_bodies_close_on_read_failure()
+    test_backup_preflight_counts_source_bytes_and_refuses()
+    test_restore_preflight_checks_each_target_filesystem()
     test_failed_restore_preserves_last_success_marker()
-    print("test_backup: ok (45 tests)")
+    print("test_backup: ok (47 tests)")

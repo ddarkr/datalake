@@ -29,7 +29,7 @@ from bisect import bisect_right
 from itertools import groupby
 
 SCHEMA_VERSION = "1"
-CODE_VERSION = "1.0.0"
+CODE_VERSION = "1.0.1"
 
 STATUSES = frozenset({"reported", "derived", "estimated", "unavailable", "error"})
 
@@ -164,6 +164,24 @@ class _PreparedSignals(list):
 def prepare_signals(signals):
     """Validate/canonicalize raw rows once; order, duplicates, barriers kept."""
     return _PreparedSignals(normalize_signals(signals))
+
+
+def prepare_by_scope(signals):
+    """Single-pass normalize + group by (vehicle, source, decode_epoch).
+
+    One scan of the raw input; each scope gets its own _PreparedSignals
+    so per-scope prepared rows keep mutation isolation (normalize_signals
+    on a _PreparedSignals still detaches via copies) and cross-scope
+    quality never merges. Rows missing time/identity drop, never guessed.
+    """
+    grouped = {}
+    for raw in signals or []:
+        sig = normalize_signal(raw)
+        if sig is None:
+            continue
+        key = (sig["vehicle"], sig["source"], sig["decode_epoch"])
+        grouped.setdefault(key, []).append(sig)
+    return {key: _PreparedSignals(rows) for key, rows in grouped.items()}
 
 
 def normalize_signals(signals):

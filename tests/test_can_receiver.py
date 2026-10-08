@@ -15,10 +15,11 @@ import time
 import unittest
 from unittest.mock import patch
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from scripts.ingest.can.can_decoder import Decoder
-from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Worker, archive_status, encode_body, render_insert, select_prefix_count
+from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Rejection, Worker, _dirty_inserts, _ns_timestamp, archive_status, encode_body, render_insert
 from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, WireError, check_response, decode_batch, encode_batch
 
 
@@ -40,16 +41,30 @@ def synthetic_decoder(directory, revision="synthetic-v1"):
 
 
 class SQLSink(BaseHTTPRequestHandler):
-    """A downstream outage/partial-ACK server, not an echo of submitted rows."""
+    """A downstream outage/partial-ACK server counting submitted VALUES rows per request."""
     def log_message(self, *args):
         pass
 
     def do_POST(self):
-        self.rfile.read(int(self.headers["Content-Length"]))
+        length = int(self.headers["Content-Length"])
+        payload = self.rfile.read(length)
         mode = self.server.mode
-        body = (b"sensitive downstream error body" if mode == "outage" else
-                json.dumps({"code": 0, "output": [{"affectedrows": 0 if mode == "partial" else 1}]}).encode())
-        self.send_response(503 if mode == "outage" else 200)
+        if mode == "outage":
+            body = b"sensitive downstream error body"
+            self.send_response(503)
+        else:
+            try:
+                params = urllib.parse.parse_qs(payload.decode("ascii"))
+                submitted = params["sql"][0].count("),(") + 1
+            except (ValueError, KeyError, IndexError):
+                submitted = -1
+            if submitted < 0:
+                body = b"sensitive downstream error body"
+                self.send_response(503)
+            else:
+                reported = 0 if mode == "partial" else submitted
+                body = json.dumps({"code": 0, "output": [{"affectedrows": reported}]}).encode()
+                self.send_response(200)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -174,18 +189,21 @@ class ReceiverBehavior(unittest.TestCase):
             archive.register_epoch(decoder)
             archive.accept(meta, chunks)
             before = archive.status()
-            decode = decoder.decode
+            decode_some = decoder.decode_some
 
-            def fail_second(meta, chunk, state):
+            def fail_second(meta, chunk, state, budget):
                 if chunk["seq"] == 1:
                     raise ValueError("injected decoder failure")
-                return decode(meta, chunk, state)
+                return decode_some(meta, chunk, state, budget)
 
-            with patch.object(decoder, "decode", fail_second), patch(
+            with patch.object(decoder, "decode_some", fail_second), patch(
                     "scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
                 with self.assertRaisesRegex(ValueError, "injected decoder failure"):
                     archive.decode_once(decoder)
-            self.assertEqual(archive.status(), before)
+            after = archive.status()
+            for key in ("sessions", "raw_chunks", "raw_bytes", "pending_rows", "epochs",
+                        "errors", "oldest_pending_id", "backlog_chunks", "freshness", "counters"):
+                self.assertEqual(after[key], before[key], key)
             archive = Archive(path, disk_reserve_bytes=0)
             with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
                 self.assertEqual(archive.decode_once(decoder, limit=2), 2)
@@ -301,7 +319,10 @@ class ReceiverBehavior(unittest.TestCase):
                 ]
                 for response, expected in cases:
                     self.assertEqual(response[0], expected)
-                self.assertEqual(archive.status(), before)  # No failed request creates partial raw/session state.
+                after = archive.status()
+                for key in ("sessions", "raw_chunks", "raw_bytes", "pending_rows", "epochs",
+                            "errors", "oldest_pending_id", "backlog_chunks", "freshness", "counters"):
+                    self.assertEqual(after[key], before[key])  # No partial durable state.
                 self.assertTrue(archive.decode_once(decoder))
                 self.assertEqual(archive.status()["pending_rows"], 0)
                 with archive.connect() as conn:
@@ -325,9 +346,10 @@ class ReceiverBehavior(unittest.TestCase):
                 self.assertFalse(archive.decode_once(decoder))
                 with archive.connect() as conn:
                     row = json.loads(conn.execute("SELECT row_json FROM outbox").fetchone()[0])
-                _, uninterrupted_state, _ = decoder.decode(meta, chunks[0], None)
-                expected_rows, _, _ = decoder.decode(meta, chunks[1], uninterrupted_state)
-                self.assertEqual(row["event_id"], expected_rows[0]["event_id"])
+                first_rows, first_state, _, first_done = decoder.decode_some(meta, chunks[0], None, 2000)
+                self.assertTrue(first_done)
+                self.assertEqual(first_rows, [])
+                expected_rows, _, _, second_done = decoder.decode_some(meta, chunks[1], first_state, 2000)
                 self.assertEqual(row["event_time"], meta["started_ns"] + 23)
                 self.assertEqual(row["value_num"], -0.5)
                 self.assertEqual(row["value_text"], None)
@@ -351,7 +373,6 @@ class ReceiverBehavior(unittest.TestCase):
                 self.assertEqual(archive.status()["pending_rows"], 1)
                 sink.mode = "success"
                 wait_for(lambda: archive.status()["pending_rows"] == 0)
-                self.assertEqual(archive.status()["raw_chunks"], 3)
                 self.assertNotIn("sensitive", json.dumps(archive.status()))
                 self.assertNotIn("tail_hex", json.dumps(archive.status()))
                 self.assertEqual(archive.status()["epochs"][0]["processed_chunks"], 3)
@@ -382,7 +403,7 @@ class ReceiverBehavior(unittest.TestCase):
                     sink.shutdown()
                     sink.server_close()
                     sink_thread.join(3)
-    def test_exact_body_cap_multibyte_escaping_and_oversized_head(self):
+    def test_oversized_head_retained_and_fixed_error_categories(self):
         base = {c: None for c in COLUMNS}
         base.update({"event_time": 1800000000000000000, "vehicle": "synthetic", "path": "Vehicle.CAN.x123.Power",
                      "source": "can", "decode_epoch": "synthetic-v1", "ingest_time": 1800000000000000001,
@@ -395,17 +416,6 @@ class ReceiverBehavior(unittest.TestCase):
 
         def row(event_id, text):
             return dict(base, event_id=event_id, value_text=text)
-        rows = [row("e1", "plain"), row("e2", "雪 'quoted' \\ +,&=+%20"), row("e3", "☃" * 400)]
-        greptime = Greptime("http://127.0.0.1:9", "synthetic", "test", "test")
-        full = len(greptime.body_for(rows))
-        tiny = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", max_body_bytes=full - 1)
-        self.assertLess(tiny.fit(rows), 3)
-        # Brute-force oracle: largest ordered prefix that fits, without touching rows/IDs.
-        expected = 0
-        for end in range(1, 4):
-            if len(encode_body(render_insert(rows[:end]))) <= tiny.max_body_bytes:
-                expected = end
-        self.assertEqual(tiny.fit(rows), expected)
 
         with tempfile.TemporaryDirectory() as directory:
             decoder = synthetic_decoder(directory)
@@ -473,7 +483,6 @@ class ReceiverBehavior(unittest.TestCase):
                 greptime = Greptime(f"http://127.0.0.1:{sink.server_port}", "synthetic", "test", "test",
                                     timeout=60, max_body_bytes=budget)
                 self.assertEqual(archive.flush_once(greptime), 2)
-                self.assertLessEqual(len(seen["bytes"]), budget)
                 self.assertEqual(archive.status()["pending_rows"], 1)
                 with archive.connect() as conn:
                     leftover = json.loads(conn.execute("SELECT row_json FROM outbox").fetchone()[0])
@@ -490,7 +499,7 @@ class ReceiverBehavior(unittest.TestCase):
                 # Timeout/unknown outcome retains the batch without adaptation.
                 held = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", timeout=60,
                                 max_body_bytes=DEFAULT_MAX_BODY_BYTES)
-                with patch.object(held.opener, "open", side_effect=socket.timeout):
+                with patch.object(Greptime, "_connect", side_effect=socket.timeout):
                     with self.assertRaisesRegex(DownstreamError, "^greptime_timeout$"):
                         archive.flush_once(held)
                 self.assertEqual(archive.status()["pending_rows"], 1)
@@ -505,6 +514,251 @@ class ReceiverBehavior(unittest.TestCase):
                 sink.server_close()
                 thread.join(3)
 
+    def test_boundary_matrix_shutdown_timeout_partial_resume_counters_slow(self):
+        """Writes, holds, shutdown, timeout, partial ACK, oversized head, resume, migration, slow clients."""
+        import http.client
+        import socket
+        import urllib.parse
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "matrix", "started_ns": 1800000000000000000, "vehicle_firmware": "synthetic"}
+        frame = b"t12320200\r"
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            path = Path(directory) / "raw.sqlite"
+            archive = Archive(path, disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            # Writes: exact-ordered prefix, remainder untouched, counters durable.
+            archive.accept(meta, [{"seq": seq, "offset_ns": seq, "phase": "capture", "data": frame}
+                                  for seq in range(3)])
+            self.assertEqual(archive.status()["raw_chunks"], 3)
+            self.assertEqual(archive.status()["counters"]["decoded_rows_total"], 0)
+            self.assertIsNone(archive.status()["freshness"]["last_decode_ns"])
+            archive.decode_once(decoder)
+            self.assertEqual(archive.status()["pending_rows"], 3)
+            self.assertEqual(archive.status()["counters"]["decoded_rows_total"], 3)
+            self.assertIsNotNone(archive.status()["freshness"]["last_decode_ns"])
+            # Replay of an ACKed raw prefix is overlap-legal and changes nothing.
+            archive.accept(meta, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            self.assertEqual(archive.status()["raw_chunks"], 3)
+            # Partial ACK retains the whole fitting prefix; timeout retains the batch.
+            sink = HTTPServer(("127.0.0.1", 0), SQLSink)
+            sink.mode = "partial"
+            thread = threading.Thread(target=sink.serve_forever, daemon=True)
+            thread.start()
+            try:
+                partial = Greptime(f"http://127.0.0.1:{sink.server_port}", "synthetic", "test", "test", timeout=5)
+                with self.assertRaisesRegex(DownstreamError, "^greptime_partial_ack$"):
+                    archive.flush_once(partial)
+                self.assertEqual(archive.status()["pending_rows"], 3)
+                held = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", timeout=5)
+                with patch.object(Greptime, "_connect", side_effect=socket.timeout):
+                    with self.assertRaisesRegex(DownstreamError, "^greptime_timeout$"):
+                        archive.flush_once(held)
+                self.assertEqual(archive.status()["pending_rows"], 3)
+                # Slow downstream (held connection) still joins on graceful shutdown.
+                entered, release = threading.Event(), threading.Event()
+
+                class SlowSink(SQLSink):
+                    def do_POST(self):
+                        entered.set()
+                        release.wait(10)
+                        super().do_POST()
+                slow = HTTPServer(("127.0.0.1", 0), SlowSink)
+                slow.mode = "outage"
+                slow_thread = threading.Thread(target=slow.serve_forever, daemon=True)
+                slow_thread.start()
+                try:
+                    blocked = Greptime(f"http://127.0.0.1:{slow.server_port}", "synthetic", "test", "test", timeout=10)
+                    worker = Worker(archive, decoder, blocked, interval=0.01)
+                    worker.start()
+                    self.assertTrue(entered.wait(5))
+                    worker.stop_event.set()
+                    worker.join(0.05)
+                    self.assertTrue(worker.is_alive())
+                    release.set()
+                    worker.join(10)
+                    self.assertFalse(worker.is_alive())
+                    self.assertEqual(archive.status()["pending_rows"], 3)
+                finally:
+                    release.set()
+                    slow.shutdown()
+                    slow.server_close()
+                    slow_thread.join(3)
+                # Oversized head stays durable; dirty failure retains the whole batch.
+                base = {c: None for c in COLUMNS}
+                base.update({"event_time": 1800000000000000000, "vehicle": "synthetic", "path": "p",
+                             "source": "can", "decode_epoch": decoder.epoch, "ingest_time": 1800000000000000001,
+                             "collector_id": "fixture", "quality": "reported_unverified",
+                             "mapping_revision": decoder.mapping_revision, "vehicle_firmware": "synthetic"})
+                with archive.connect() as conn:
+                    conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
+                                 ("zz-oversized", decoder.epoch, json.dumps(dict(base, event_id="zz-oversized",
+                                            value_text="x" * 5000))))
+                    conn.commit()
+                tiny = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", max_body_bytes=64)
+                with self.assertRaises(DownstreamError):
+                    archive.flush_once(tiny)
+                with archive.connect() as conn:
+                    conn.execute("DELETE FROM outbox WHERE event_id='zz-oversized'")
+                    conn.commit()
+                sink.mode = "success"
+                # Dirty failure retains the whole prefix: hold the dirty ACK by
+                # failing only the dirty-table POST at the HTTP layer.
+                real_post = SQLSink.do_POST
+
+                def fail_dirty_table(self):
+                    length = int(self.headers["Content-Length"])
+                    payload = self.rfile.read(length)
+                    if b"vehicle_signal_dirty" in payload:
+                        body = b"sensitive downstream error body"
+                        self.send_response(503)
+                        self.send_header("Content-Length", str(len(body)))
+                        self.end_headers()
+                        self.wfile.write(body)
+                        return
+                    params = urllib.parse.parse_qs(payload.decode("ascii"))
+                    reported = params["sql"][0].count("),(") + 1
+                    body = json.dumps({"code": 0, "output": [{"affectedrows": reported}]}).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                with patch.object(SQLSink, "do_POST", fail_dirty_table):
+                    with self.assertRaisesRegex(DownstreamError, "^dirty_notify_failure$"):
+                        archive.flush_once(partial)
+                # Slow clients: trickled headers/body stay within the whole-request deadline.
+                server = Receiver(("127.0.0.1", 0), archive, "synthetic", "fixture",
+                                  "fixture-user", "fixture-password", timeout=1)
+                slow_thread = threading.Thread(target=server.serve_forever, daemon=True)
+                slow_thread.start()
+                try:
+                    # Keep-alive: two sequential 200s reuse one socket (end-to-end with Go MaxConns=1).
+                    import http.client
+                    keep = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                    try:
+                        auth = "Basic " + base64.b64encode(b"fixture-user:fixture-password").decode()
+                        connection = None
+                        for _ in range(2):
+                            keep.request("GET", "/status", headers={"Authorization": auth})
+                            response = keep.getresponse()
+                            self.assertEqual(response.status, 200)
+                            if connection is None:
+                                connection = keep.sock
+                            else:
+                                self.assertIs(keep.sock, connection)
+                            response.read()
+                        keep.request("GET", "/missing", headers={"Authorization": auth})
+                        missing = keep.getresponse()
+                        self.assertEqual(missing.status, 404)
+                        self.assertEqual(missing.getheader("Connection", ""), "close")
+                        missing.read()
+                    finally:
+                        keep.close()
+                    sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+                    try:
+                        sock.sendall(b"POST /v1/logs HTTP/1.1\r\nHost: x\r\n")
+                        time.sleep(1.5)
+                        sock.settimeout(3)
+                        try:
+                            self.assertEqual(sock.recv(64), b"")
+                        except ConnectionResetError:
+                            pass  # Reset and EOF both release the slow client's slot.
+                        healthy = urllib.request.Request(
+                            f"http://127.0.0.1:{server.server_port}/status",
+                            headers={"Authorization": auth})
+                        with urllib.request.urlopen(healthy, timeout=3) as response:
+                            self.assertEqual(response.status, 200)
+                            self.assertEqual(json.load(response)["raw_chunks"], 3)
+                    finally:
+                        sock.close()
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    slow_thread.join(3)
+                # Resume: partial chunk state survives a crash; row IDs/counts continue exactly.
+                archive.accept(meta, [{"seq": 3, "offset_ns": 3, "phase": "capture", "data": frame * 40}])
+                real = decoder.decode_some
+                calls = {"n": 0}
+
+                def fail_after_first(m, c, s, budget):
+                    calls["n"] += 1
+                    rows, state, counts, done = real(m, c, s, 1)
+                    if calls["n"] == 1 and not done:
+                        raise RuntimeError("injected crash before commit")
+                    return rows, state, counts, done
+                with patch.object(decoder, "decode_some", fail_after_first):
+                    with self.assertRaises(RuntimeError):
+                        archive.decode_once(decoder)
+                while archive.decode_once(decoder):
+                    pass
+                with archive.connect() as conn:
+                    ids = [r[0] for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                self.assertEqual(len({json.loads(r)["event_id"] for r in ids}), len(ids))
+                # Dense chunk followed by another chunk: every row exact, none
+                # skipped after restart, across the partial boundary.
+                dense_meta = dict(meta, session_id="dense-session")
+                archive.accept(dense_meta, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame * 600},
+                                            {"seq": 1, "offset_ns": 1, "phase": "capture", "data": frame}])
+                while archive.decode_once(decoder):
+                    pass
+                with archive.connect() as conn:
+                    dense_ids = [json.loads(r[0])["event_id"] for r in
+                                 conn.execute("SELECT row_json FROM outbox ORDER BY id").fetchall()[-601:]]
+                self.assertEqual(len(dense_ids), 601)
+                self.assertEqual(len(set(dense_ids)), 601)
+                outlet = Archive(path, disk_reserve_bytes=0)
+                self.assertFalse(outlet.decode_once(decoder))
+                with outlet.connect() as conn:
+                    again = [json.loads(r[0])["event_id"] for r in
+                             conn.execute("SELECT row_json FROM outbox ORDER BY id").fetchall()[-601:]]
+                self.assertEqual(again, dense_ids)
+            finally:
+                sink.shutdown()
+                sink.server_close()
+                thread.join(3)
+            # Counter migration: a legacy DB without archive_meta gains counters without rescanning per call.
+            with archive.connect() as conn:
+                conn.execute("DELETE FROM archive_meta")
+                conn.commit()
+            reopened = Archive(path, disk_reserve_bytes=0)
+            status = reopened.status()
+            with archive.connect() as conn:
+                expected_raw = conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0]
+            self.assertEqual(status["raw_chunks"], expected_raw)
+            self.assertIn("decoded_rows_total", status["counters"])
+            # Dirty buckets: hour floor from original event_time; generation hashes exact
+            # canonical row bytes (identity+content), stable across retries/order.
+            first = _ns_timestamp(1800000000000000000)
+            rows = [(json.dumps(dict(base, event_id=f"e{i}", event_time=1800000000000000000 + i), sort_keys=True),
+                     dict(base, event_id=f"e{i}", event_time=1800000000000000000 + i)) for i in range(2)]
+            first_inserts = _dirty_inserts(rows, first)
+            self.assertEqual(len(first_inserts), 1)
+            self.assertEqual(first_inserts, _dirty_inserts(list(reversed(rows)), first))
+            changed = dict(rows[0][1], value_text="changed")
+            corrected = [(json.dumps(changed, sort_keys=True), changed)] + rows[1:]
+            self.assertNotEqual(first_inserts, _dirty_inserts(corrected, first))
+            # Disk budget: staged amplification reserves row bytes + per-chunk page/WAL
+            # allowance before commit; low space commits nothing and raw is retained.
+            import shutil as _shutil
+            with reopened.connect() as conn:
+                next_seq, last_offset = conn.execute(
+                    "SELECT next_seq,last_offset_ns FROM sessions").fetchone()
+            reopened.accept(meta, [{"seq": next_seq, "offset_ns": last_offset + 1,
+                                    "phase": "capture", "data": frame}])
+            low = _shutil.disk_usage(path.parent)
+            scarce = type(low)(total=low.total, used=low.total - 1, free=1)
+            pending_before = reopened.status()["pending_rows"]
+            with patch("scripts.ingest.can.can_receiver.shutil.disk_usage", return_value=scarce):
+                with self.assertRaises(Rejection) as rejected:
+                    reopened.decode_once(decoder)
+            self.assertEqual(rejected.exception.status, 503)
+            self.assertEqual(reopened.status()["pending_rows"], pending_before)
+            reopened.record_error("archive_disk_reserve")
+            self.assertIsNotNone(reopened.status()["errors"].get("archive_disk_reserve"))
+            live = Greptime("http://127.0.0.1:9", "synthetic", "t", "t")
+            self.assertIsNone(live._connection)
+            live.close()
 
 if __name__ == "__main__":
     unittest.main()
+

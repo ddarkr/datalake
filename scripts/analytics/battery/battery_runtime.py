@@ -131,7 +131,8 @@ import urllib.request
 
 from scripts.analytics.battery import battery_common as bc
 
-RUNTIME_VERSION = "1.0.3"
+RUNTIME_VERSION = "1.0.4"
+BATTERY_SCOPE_WINDOWS_SUPPORTED = True
 ANALYSIS_TABLE = "vehicle_analysis"
 SIGNAL_TABLE = "vehicle_signal"
 EVENT_TABLE = "vehicle_event"
@@ -796,8 +797,208 @@ def _vehicle_filter(vehicle):
     return ""
 
 
-def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows):
-    filt = _vehicle_filter(vehicle)
+def _parse_scope_windows(raw):
+    """Exact (vehicle,source,decode_epoch) -> [(start_ns,end_ns)] inclusive.
+
+    Accepts {(v,s,e): [(s,e),...]} tuple keys, "\\x1f"-joined string keys
+    (empty epoch segment = None epoch), or [{"vehicle","source",
+    "decode_epoch","start_ns","end_ns"}] rows. Every scope part must be a
+    non-empty str (epoch may be None), every bound an exact int ns
+    (bool refused), end >= start. Anything else -> BatteryConfigError
+    (fail closed, never silently widened).
+    """
+    if raw is None:
+        return {}
+    if isinstance(raw, dict):
+        entries = list(raw.items())
+    elif isinstance(raw, (list, tuple)):
+        entries = list(raw)
+    else:
+        raise BatteryConfigError("battery_scope_windows must map "
+                                 "scope -> [(start_ns, end_ns)]")
+    out = {}
+    for entry in entries:
+        if isinstance(raw, dict):
+            scope_key, win_list = entry
+        else:
+            if not isinstance(entry, dict):
+                raise BatteryConfigError("battery_scope_windows entries "
+                                         "must be scope mappings")
+            scope_key = (entry.get("vehicle"), entry.get("source"),
+                         entry.get("decode_epoch"))
+            win_list = [(entry.get("start_ns"), entry.get("end_ns"))]
+        if isinstance(scope_key, str):
+            parts = scope_key.split("\x1f")
+            if len(parts) != 3:
+                raise BatteryConfigError("battery_scope_windows scope "
+                                         "key must be (vehicle, source, "
+                                         "decode_epoch)")
+            vehicle, source, epoch = parts
+            epoch = epoch or None
+            scope = (vehicle, source, epoch)
+        elif isinstance(scope_key, (list, tuple)) and len(scope_key) == 3:
+            scope = tuple(scope_key)
+        else:
+            raise BatteryConfigError("battery_scope_windows scope key "
+                                     "must be (vehicle, source, "
+                                     "decode_epoch)")
+        vehicle, source, epoch = scope
+        if not isinstance(vehicle, str) or not vehicle \
+                or not isinstance(source, str) or not source \
+                or (epoch is not None
+                    and (not isinstance(epoch, str) or not epoch)):
+            raise BatteryConfigError("battery_scope_windows scope needs "
+                                     "non-empty vehicle/source strings "
+                                     "(epoch str or None)")
+        wins = win_list if isinstance(win_list, (list, tuple)) else None
+        if wins is None or (wins and all(
+                isinstance(w, int) and not isinstance(w, bool)
+                for w in wins)):
+            wins = [tuple(wins)] if wins else []
+        parsed = []
+        for win in wins:
+            if not isinstance(win, (list, tuple)) or len(win) != 2:
+                raise BatteryConfigError("battery_scope_windows windows "
+                                         "must be (start_ns, end_ns) pairs")
+            start, end = win
+            if any(isinstance(v, bool) or not isinstance(v, int)
+                   for v in (start, end)) \
+                    or bc.to_ns(start) is None or bc.to_ns(end) is None:
+                raise BatteryConfigError("battery_scope_windows bounds "
+                                         "must be exact int ns")
+            if end < start:
+                raise BatteryConfigError("battery_scope_windows end "
+                                         "must cover start")
+            parsed.append((start, end))
+        if not parsed:
+            raise BatteryConfigError("battery_scope_windows needs at "
+                                     "least one window per scope")
+        out.setdefault(scope, []).extend(parsed)
+    for scope in out:
+        out[scope] = sorted(set(out[scope]))
+    return out
+
+
+def _parse_exclude_scopes(raw):
+    """Exact [(vehicle, source, decode_epoch)] exclusion scopes.
+
+    None/absent/empty -> empty set. Every entry must be an exact
+    3-tuple of non-empty vehicle/source strings with epoch str or None;
+    anything else -> BatteryConfigError (fail closed, never silently
+    narrower or wider).
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, (list, tuple)):
+        entries = list(raw)
+    else:
+        raise BatteryConfigError("battery_exclude_scopes must be a "
+                                 "list of (vehicle, source, decode_epoch)")
+    out = set()
+    for entry in entries:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            raise BatteryConfigError("battery_exclude_scopes entries "
+                                     "must be (vehicle, source, "
+                                     "decode_epoch)")
+        vehicle, source, epoch = tuple(entry)
+        if not isinstance(vehicle, str) or not vehicle \
+                or not isinstance(source, str) or not source \
+                or (epoch is not None
+                    and (not isinstance(epoch, str) or not epoch)):
+            raise BatteryConfigError("battery_exclude_scopes needs "
+                                     "non-empty vehicle/source strings "
+                                     "(epoch str or None)")
+        out.add((vehicle, source, epoch))
+    return out
+
+
+def _required_signal_fields(analysis_cfg):
+    """Exact source_field set over all analyzers, or None (all fields).
+
+    Union of required_fields(config) for every present analyzer module
+    (defaults plus configured overrides for that analyzer's own section).
+    A missing analyzer module keeps its contract unknown, so the run
+    cannot narrow fields at all and returns None. An analyzer raising
+    required_fields (malformed override) propagates its own error type
+    (fail closed, never silently valid). RUL contributes the empty set;
+    alerts without context_source_fields contributes None (all).
+    """
+    needed = set()
+    for module_name, _suffix in MODULE_FILES:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            return None
+        fn = getattr(module, "required_fields", None)
+        if fn is None:
+            return None
+        suffix = dict(MODULE_FILES).get(module_name, "")
+        fields = fn(analysis_cfg.get(suffix, {})
+                    if isinstance(analysis_cfg, dict) else {})
+        if fields is None:
+            return None
+        needed |= set(fields)
+    return needed
+
+
+def _scope_predicate(scopes):
+    """Exact SQL scope predicate; None epoch -> IS NULL (never = NULL)."""
+    parts = []
+    for vehicle, source, epoch in sorted(scopes, key=repr):
+        part = ("vehicle = " + _sql_str(vehicle) + " AND source = "
+                + _sql_str(source) + " AND "
+                + ("decode_epoch IS NULL" if epoch is None
+                   else "decode_epoch = " + _sql_str(epoch)))
+        parts.append("(" + part + ")")
+    return " OR ".join(parts)
+
+
+def _field_predicate(fields):
+    """Exact SQL source_field predicate; None -> no narrowing."""
+    if fields is None:
+        return ""
+    if not fields:
+        return " AND 1 = 0"
+    return " AND source_field IN (" + ", ".join(
+        _sql_str(f) for f in sorted(fields)) + ")"
+
+
+def _merge_intervals(intervals):
+    """Union inclusive int-ns intervals; adjacent (end+1 == start) merge."""
+    ordered = sorted(intervals)
+    out = []
+    for start, end in ordered:
+        if out and start <= out[-1][1] + 1:
+            if end > out[-1][1]:
+                out[-1] = (out[-1][0], end)
+        else:
+            out.append((start, end))
+    return out
+
+
+def _subtract_context(intervals, context):
+    """Parts of requested intervals already covered by context fetch."""
+    out = []
+    for start, end in sorted(intervals):
+        cursor = start
+        for cstart, cend in sorted(context):
+            if cend < cursor or cstart > end:
+                continue
+            if cstart > cursor:
+                out.append((cursor, min(cstart - 1, end)))
+            cursor = max(cursor, cend + 1)
+            if cursor > end:
+                break
+        if cursor <= end:
+            out.append((cursor, end))
+    return [w for w in out if w[0] <= w[1]]
+
+
+def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
+                  fields=None, scopes=None):
+    filt = _vehicle_filter(vehicle) + _field_predicate(fields)
+    if scopes:
+        filt += " AND (" + _scope_predicate(scopes) + ")"
     stmt = ("SELECT " + ", ".join(SIGNAL_COLS) + " FROM " + SIGNAL_TABLE
             + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
             + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -862,8 +1063,53 @@ def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows):
     return out
 
 
-def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows):
+def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
+                        max_rows, scopes=None):
+    """Field-independent scope identities in a bounded interval.
+
+    SELECT DISTINCT vehicle/source/decode_epoch only (no raw
+    materialization): one small tag query per fetched interval. Lets a
+    narrowed source_field predicate drop every raw row of a scope
+    without dropping the scope itself, so value-blind consumers (RUL
+    history/scope binding) and previous-healthy-row invalidation still
+    see it. Missing table -> empty set; other SQL errors propagate.
+    Each query is bounded by the same max_rows fail-closed cap.
+    """
     filt = _vehicle_filter(vehicle)
+    if scopes:
+        filt += " AND (" + _scope_predicate(scopes) + ")"
+    stmt = ("SELECT DISTINCT vehicle, source, decode_epoch FROM "
+            + SIGNAL_TABLE + " WHERE event_time >= '"
+            + ns_to_sql_ts(start_ns) + "' AND event_time <= '"
+            + ns_to_sql_ts(end_ns) + "'" + filt)
+    try:
+        cols, rows, _schema = fetch_raw(base_url, auth, db, stmt,
+                                        max_rows)
+    except BatteryError as exc:
+        if is_missing_table(exc):
+            return set()
+        raise
+    idx = {c: i for i, c in enumerate(cols)}
+    out = set()
+    for record in rows:
+        vehicle_val = record[idx["vehicle"]] if "vehicle" in idx else None
+        source_val = record[idx["source"]] if "source" in idx else None
+        epoch_val = record[idx["decode_epoch"]] \
+            if "decode_epoch" in idx else None
+        if not isinstance(vehicle_val, str) or not vehicle_val \
+                or not isinstance(source_val, str) or not source_val \
+                or (epoch_val is not None
+                    and (not isinstance(epoch_val, str) or not epoch_val)):
+            continue
+        out.add((vehicle_val, source_val, epoch_val))
+    return out
+
+
+def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
+                 scopes=None):
+    filt = _vehicle_filter(vehicle)
+    if scopes:
+        filt += " AND (" + _scope_predicate(scopes) + ")"
     stmt = ("SELECT " + ", ".join(EVENT_COLS) + " FROM " + EVENT_TABLE
             + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
             + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -1015,7 +1261,22 @@ def insert_analysis_rows(base_url, auth, db, rows, batch=500):
 
 
 def run_battery(ctx, cfg, now_ns=None):
-    """One battery pass. Returns rows written. Raises on cap/duplicate."""
+    """One battery pass. Returns rows written. Raises on cap/duplicate.
+
+    Optional coordinator keys (AnalyticsCorrection contract):
+    cfg['battery_scope_windows'] maps exact (vehicle, source,
+    decode_epoch) tuples to inclusive int-ns (start, end) windows. They
+    are unioned with the normal sealed lookback + backfill windows
+    unless cfg['battery_scope_windows_only'] is truthy, which restricts
+    the run to exactly those scopes x windows (+ >=24h context fetch).
+    cfg['battery_exclude_scopes'] lists exact scopes that are never
+    fetched, analyzed, or invalidated. While scope windows are
+    non-empty, any dispatch/module failure persists required
+    invalidation rows first and then raises BatteryError (existing
+    type) so a dirty checkpoint cannot advance; unavailable-only
+    outcomes still return the written count. Legacy calls (keys
+    absent) behave exactly as before.
+    """
     base_url, auth, db = ctx
     vehicle = cfg.get("vehicle") or ""
     try:
@@ -1049,31 +1310,95 @@ def run_battery(ctx, cfg, now_ns=None):
         raise BatteryConfigError("BATTERY_BACKFILL_START/END need both")
     if backfill_start is not None and backfill_end <= backfill_start:
         raise BatteryConfigError("BATTERY_BACKFILL_END must exceed START")
+    scope_windows = _parse_scope_windows(cfg.get("battery_scope_windows"))
+    only_scoped = bool(cfg.get("battery_scope_windows_only"))
+    if only_scoped and not scope_windows:
+        raise BatteryConfigError("battery_scope_windows_only needs "
+                                 "battery_scope_windows")
+    if config_error is None and cfg.get("battery_scope_windows") is not None:
+        try:
+            _required_signal_fields(analysis_cfg)
+        except BatteryError:
+            raise
+        except Exception as exc:
+            raise BatteryConfigError("battery required fields: "
+                                     + type(exc).__name__)
+    exclude_scopes = _parse_exclude_scopes(cfg.get("battery_exclude_scopes"))
+    for scope in scope_windows:
+        if scope in exclude_scopes:
+            raise BatteryConfigError("battery_scope_windows overlaps "
+                                     "battery_exclude_scopes")
     now = now_ns if bc.to_ns(now_ns) is not None else time.time_ns()
     computed_at = now
     seal = floor_hour_ns(now)
     cutoff = seal - lookback_h * HOUR_NS
-    windows = build_windows(cutoff, seal, backfill_start, backfill_end)
-    if not windows:
+    windows = [] if only_scoped else build_windows(
+        cutoff, seal, backfill_start, backfill_end)
+    if only_scoped:
+        scopes = sorted(scope for scope in scope_windows
+                        if scope not in exclude_scopes)
+        if not scopes:
+            return 0
+    elif not windows and not [scope for scope in scope_windows
+                              if scope not in exclude_scopes]:
         return 0
-    fetch_start = min(ws for ws, _ in windows)
-    fetch_end = max(we for _, we in windows)
-    # Pre-window signal context covering the energy analyzer's longest
-    # credited offline gap (max_offline_gap_ns, 24 h) lets the earliest
-    # lookback window anchor meter deltas and parked legs exactly like later
-    # windows, so a sliding lookback never flips its first window's value.
-    signals = fetch_signals(base_url, auth, db,
-                            fetch_start - SIGNAL_CONTEXT_NS,
-                            fetch_end, vehicle, max_rows)
-    events = fetch_events(base_url, auth, db, fetch_start, fetch_end,
-                          vehicle, max_rows)
-    scopes = set()
-    for raw in signals:
-        scopes.add((raw["vehicle"], raw["source"], raw["decode_epoch"]))
-    for raw in events:
-        scopes.add((raw["vehicle"], raw["source"], raw.get("decode_epoch")))
-    if not scopes and isinstance(vehicle, str) and vehicle:
-        scopes.add((vehicle, "fleet", "unknown"))
+    if only_scoped:
+        fetch_start = min(ws for scope in scopes
+                          for ws, _ in scope_windows[scope])
+        fetch_end = max(we for scope in scopes
+                        for _, we in scope_windows[scope])
+        fields = _required_signal_fields(analysis_cfg) \
+            if config_error is None else None
+        signals, events, tag_scopes = _fetch_plan(
+            base_url, auth, db, [], scope_windows, exclude_scopes,
+            fetch_start, fetch_end, vehicle, max_rows, fields)
+        per_scope_windows = {scope: sorted(set(scope_windows[scope]))
+                             for scope in scopes}
+        gate_raise = True
+    else:
+        # Coordinated windows stay per-scope (never merged into the
+        # hourly list): the hourly pass fetches its own bounded range
+        # and each disjoint coordinated interval fetches separately, so
+        # unrelated gaps are never covered by one envelope query. A
+        # non-requested scope runs only the hourly sealed pass; a
+        # requested scope runs the hourly pass plus its own exact
+        # windows.
+        fetch_probe_start = min(
+            [ws for ws, _ in windows] + [ws for scope in scope_windows
+                                         for ws, _ in scope_windows[scope]]
+            ) if (windows or scope_windows) else None
+        if fetch_probe_start is None:
+            return 0
+        fetch_start = fetch_probe_start
+        fetch_end = max(
+            [we for _, we in windows] + [we for scope in scope_windows
+                                         for _, we in scope_windows[scope]])
+        fields = _required_signal_fields(analysis_cfg) \
+            if config_error is None else None
+        signals, events, tag_scopes = _fetch_plan(
+            base_url, auth, db, windows, scope_windows, exclude_scopes,
+            fetch_start, fetch_end, vehicle, max_rows, fields)
+        scopes = set(tag_scopes)
+        for raw in signals:
+            scope = (raw["vehicle"], raw["source"], raw["decode_epoch"])
+            if scope not in exclude_scopes:
+                scopes.add(scope)
+        for raw in events:
+            scope = (raw["vehicle"], raw["source"], raw.get("decode_epoch"))
+            if scope not in exclude_scopes:
+                scopes.add(scope)
+        for scope in scope_windows:
+            if scope not in exclude_scopes:
+                scopes.add(scope)
+        if not scopes and isinstance(vehicle, str) and vehicle:
+            scopes.add((vehicle, "fleet", "unknown"))
+        per_scope_windows = {scope: sorted(
+            set(windows) | set(scope_windows.get(scope, ())))
+            for scope in scopes}
+        gate_raise = bool(scope_windows)
+    previous, prepared, ev_by_scope = _prepare_inputs(
+        base_url, auth, db, signals, events, scopes,
+        per_scope_windows, max_rows)
     analyzers = get_analyzers()
     runnable = []
     missing = []
@@ -1082,20 +1407,139 @@ def run_battery(ctx, cfg, now_ns=None):
             missing.append(key)
         else:
             runnable.append((key, _named(key, fn)))
+    coordinated_failed = config_error is not None
+    all_rows = _dispatch_all(
+        analysis_cfg, config_version, config_error, computed_at,
+        scopes, per_scope_windows, previous, prepared, ev_by_scope,
+        analyzers, runnable, missing)
+    for scope, wins in per_scope_windows.items():
+        for win in wins:
+            if win[0] in previous.get(scope, {}).get("failed", set()):
+                coordinated_failed = True
+    written = _persist_all(
+        base_url, auth, db, all_rows, previous, scopes,
+        per_scope_windows, vehicle, None if only_scoped else fetch_start,
+        config_error=config_error)
+    if gate_raise and coordinated_failed:
+        raise BatteryError(
+            "battery: coordinated pass had failed scope-window(s); "
+            "invalidations persisted, checkpoint must not advance")
+    return written
+
+
+def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
+                fetch_start, fetch_end, vehicle, max_rows, fields):
+    """Bounded disjoint fetches: no envelope over unrelated gaps.
+
+    Hourly windows share one bounded query (contiguous sealed pass);
+    each disjoint coordinated interval is fetched separately with its
+    own >=24h signal context. Cumulative rows fail closed at max_rows.
+    Exact scope predicates apply only in only-mode; union mode fetches
+    the pass scope and filters in memory so discovery cannot miss. The
+    source_field predicate narrows fetched ROWS (exact required set),
+    never scopes: a parallel field-independent DISTINCT tag query per
+    interval preserves scopes whose every raw row was filtered out, so
+    value-blind consumers (RUL history/scope binding) and
+    previous-healthy-row invalidation still see them. Events carry no
+    field predicate (unchanged shape), split per interval.
+    """
+    only = not windows and bool(scope_windows)
+    signals = []
+    events = []
+    tag_scopes = set()
+    total = [0]
+
+    def _take(rows):
+        total[0] += len(rows)
+        if total[0] > max_rows:
+            raise BatteryCapError("row cap exceeded (%d > %d): refusing "
+                                  "partial" % (total[0], max_rows))
+        return rows
+
+    def _take_tags(tags):
+        total[0] += len(tags)
+        if total[0] > max_rows:
+            raise BatteryCapError("row cap exceeded (%d > %d): refusing "
+                                  "partial" % (total[0], max_rows))
+        tag_scopes.update(tags)
+
+    if windows:
+        fetch_start_w = min(ws for ws, _ in windows)
+        fetch_end_w = max(we for _, we in windows)
+        signals.extend(_take(fetch_signals(
+            base_url, auth, db, fetch_start_w - SIGNAL_CONTEXT_NS,
+            fetch_end_w, vehicle, max_rows, fields=fields, scopes=None)))
+        events.extend(_take(fetch_events(
+            base_url, auth, db, fetch_start_w, fetch_end_w, vehicle,
+            max_rows, scopes=None)))
+        if fields is not None:
+            _take_tags(fetch_signal_scopes(
+                base_url, auth, db, fetch_start_w - SIGNAL_CONTEXT_NS,
+                fetch_end_w, vehicle, max_rows, scopes=None))
+        context_cover = [(fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w)]
+    else:
+        context_cover = []
+    for scope in sorted(scope_windows):
+        if scope in exclude_scopes:
+            continue
+        if only:
+            # Scoped queries cannot provide context for another decode epoch.
+            context_cover = []
+        for start, end in _merge_intervals(scope_windows[scope]):
+            extra = _subtract_context([(start, end)], context_cover)
+            for cstart, cend in extra:
+                signals.extend(_take(fetch_signals(
+                    base_url, auth, db, cstart - SIGNAL_CONTEXT_NS, cend,
+                    vehicle, max_rows, fields=fields,
+                    scopes=[scope] if only else None)))
+                if fields is not None:
+                    _take_tags(fetch_signal_scopes(
+                        base_url, auth, db, cstart - SIGNAL_CONTEXT_NS,
+                        cend, vehicle, max_rows,
+                        scopes=[scope] if only else None))
+            if extra or only:
+                events.extend(_take(fetch_events(
+                    base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=[scope] if only else None)))
+            context_cover = _merge_intervals(
+                context_cover + [(start - SIGNAL_CONTEXT_NS, end)])
+    signals = [s for s in signals if (s["vehicle"], s["source"],
+                                      s["decode_epoch"]) not in exclude_scopes]
+    events = [e for e in events if (e["vehicle"], e["source"],
+                                    e.get("decode_epoch")) not in exclude_scopes]
+    tag_scopes -= exclude_scopes
+    return signals, events, tag_scopes
+
+
+def _prepare_inputs(base_url, auth, db, signals, events, scopes,
+                    per_scope_windows, max_rows):
+    """One normalize+group pass; per-scope identity fetch; event split."""
+    prepared = bc.prepare_by_scope(signals)
+    ev_by_scope = {}
+    for raw in events:
+        key = (raw["vehicle"], raw["source"], raw.get("decode_epoch"))
+        if key in scopes:
+            ev_by_scope.setdefault(key, []).append(raw)
     previous = {}
     for scope in sorted(scopes, key=repr):
-        previous[scope] = fetch_previous_identities(
-            base_url, auth, db, scope, windows, max_rows)
+        previous[scope] = {
+            "ids": fetch_previous_identities(
+                base_url, auth, db, scope,
+                per_scope_windows.get(scope, ()), max_rows),
+            "failed": set(),
+        }
+    return previous, prepared, ev_by_scope
+
+
+def _dispatch_all(analysis_cfg, config_version, config_error, computed_at,
+                  scopes, per_scope_windows, previous, prepared,
+                  ev_by_scope, analyzers, runnable, missing):
+    """Per-scope x window isolated dispatch; records failed window starts."""
     all_rows = []
     for scope in sorted(scopes, key=repr):
-        sig_scope = bc.prepare_signals(
-            [s for s in signals
-             if (s["vehicle"], s["source"], s["decode_epoch"])
-             == scope])
-        ev_scope = [e for e in events
-                    if (e["vehicle"], e["source"], e.get("decode_epoch"))
-                    == scope]
-        for ws, we in windows:
+        sig_scope = prepared.get(scope, bc.prepare_signals([]))
+        ev_scope = ev_by_scope.get(scope, [])
+        for ws, we in per_scope_windows.get(scope, ()):
             window_cfg = dict(analysis_cfg)
             window_cfg["window_start_ns"] = ws
             window_cfg["window_end_ns"] = we
@@ -1103,8 +1547,6 @@ def run_battery(ctx, cfg, now_ns=None):
             recovered_modules = set()
             refreshed = set()
             if config_error is not None:
-                # Malformed global config: every module failed, so every
-                # module's previous identities for this window are stale.
                 failed_modules = {key for key, _s, _f in analyzers}
                 for key in sorted(failed_modules):
                     all_rows.append(bc.make_result(
@@ -1132,9 +1574,6 @@ def run_battery(ctx, cfg, now_ns=None):
                         [fn for _, fn in runnable])
                     recovered_modules.add("battery_dispatch")
                 except Exception as exc:
-                    # Whole-dispatch failure (never empty-success): every
-                    # runnable module is affected, so all its previous
-                    # identities for this window are stale.
                     failed_modules = {key for key, _ in runnable}
                     produced = [bc.make_result(
                         metric="battery.dispatch.error", value=None,
@@ -1188,9 +1627,6 @@ def run_battery(ctx, cfg, now_ns=None):
                     if module_base(key) in produced_ok_modules
                     and module_base(key) not in failed_modules)
                 disambiguate_rows(produced)
-                # Re-fill after disambiguation in case episode folding
-                # changed the persisted identity but revision stayed
-                # untouched.
                 for row in produced:
                     if row.get("computed_at_ns") is None:
                         row["computed_at_ns"] = computed_at
@@ -1201,15 +1637,23 @@ def run_battery(ctx, cfg, now_ns=None):
                               r.get("decode_epoch"))
                              for r in produced if isinstance(r, dict)}
             if failed_modules:
+                previous[scope]["failed"].add(ws)
                 all_rows.extend(invalidate_previous(
-                    previous.get(scope, set()), scope, (ws, we),
+                    previous[scope]["ids"], scope, (ws, we),
                     failed_modules, computed_at, config_version,
                     refreshed=refreshed))
             if recovered_modules:
                 all_rows.extend(recover_indicators(
-                    previous.get(scope, set()), scope, (ws, we),
+                    previous[scope]["ids"], scope, (ws, we),
                     recovered_modules, computed_at, config_version,
                     refreshed=refreshed))
+    return all_rows
+
+
+def _persist_all(base_url, auth, db, all_rows, previous, scopes,
+                 per_scope_windows, vehicle, fetch_start,
+                 config_error=None):
+    """Omit fresh unavailable; validate; insert; warn; return count."""
     if config_error is not None and not all_rows:
         raise BatteryConfigError(config_error)
     disambiguate_rows(all_rows)
@@ -1219,31 +1663,28 @@ def run_battery(ctx, cfg, now_ns=None):
         scope = (row.get("vehicle"), row.get("source"), row.get("decode_epoch"))
         identity = (row.get("metric"), row.get("analysis_id"),
                     row.get("window_start_ns"), row.get("decode_epoch"))
-        # Absence is not a measurement. Keep NULL revisions only where
-        # dropping one would leave a previously stored result authoritative.
         if (row.get("status") == "unavailable"
-                and identity not in previous.get(scope, ())):
+                and identity not in previous.get(scope, {}).get("ids", ())):
             reason = (row.get("reason") or "unspecified").split(":", 1)[0]
             omitted[reason] = omitted.get(reason, 0) + 1
         else:
             writable.append(row)
     checked = validate_no_duplicate_pks(writable)
     written, skipped = insert_analysis_rows(base_url, auth, db, checked)
-    oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE,
-                                 vehicle)
-    oldest_event = coverage_min(base_url, auth, db, EVENT_TABLE, vehicle)
-    oldest = None
-    for cand in (oldest_signal, oldest_event):
-        if cand is not None and (oldest is None or cand < oldest):
-            oldest = cand
-    if oldest is not None and oldest < fetch_start:
-        need = "'%s' to '%s'" % (ns_to_sql_ts(oldest),
-                                 ns_to_sql_ts(fetch_start - 1))
-        sys.stdout.write(
-            "battery: older data before fetch_start exists (oldest %s); "
-            "supply BATTERY_BACKFILL_START/END covering %s to recompute; "
-            "normal lookback left it untouched\n"
-            % (ns_to_sql_ts(oldest), need))
+    # Disjoint coordinated windows have no global uncovered-history floor.
+    if fetch_start is not None:
+        oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE, vehicle)
+        oldest_event = coverage_min(base_url, auth, db, EVENT_TABLE, vehicle)
+        oldest = min((ns for ns in (oldest_signal, oldest_event) if ns is not None),
+                     default=None)
+        if oldest is not None and oldest < fetch_start:
+            need = "'%s' to '%s'" % (ns_to_sql_ts(oldest),
+                                     ns_to_sql_ts(fetch_start - 1))
+            sys.stdout.write(
+                "battery: older data before fetch_start exists (oldest %s); "
+                "supply BATTERY_BACKFILL_START/END covering %s to recompute; "
+                "normal lookback left it untouched\n"
+                % (ns_to_sql_ts(oldest), need))
     if skipped:
         sys.stdout.write("battery: skipped %d rows missing NOT NULL "
                          "identity (no vehicle/metric/revision)\n" % skipped)
@@ -1252,19 +1693,19 @@ def run_battery(ctx, cfg, now_ns=None):
                          % (sum(omitted.values()),
                             json.dumps(omitted, sort_keys=True)))
     error_rows = sum(1 for r in checked if r.get("status") == "error")
+    total_windows = sum(len(wins) for wins in per_scope_windows.values())
     if error_rows and error_rows >= len(checked):
         sys.stdout.write("battery: all_error (%d rows, %d scopes x %d "
                          "windows; latest view invalidated, no healthy "
-                         "values)\n" % (written, len(scopes),
-                                        len(windows)))
+                         "values)\n" % (written, len(scopes), total_windows))
     elif error_rows:
         sys.stdout.write("battery: partial_errors (%d rows, %d error, "
                          "%d scopes x %d windows)\n"
                          % (written, error_rows, len(scopes),
-                            len(windows)))
+                            total_windows))
     else:
         sys.stdout.write("battery: ok (%d rows, %d scopes x %d windows)\n"
-                         % (written, len(scopes), len(windows)))
+                         % (written, len(scopes), total_windows))
     return written
 
 

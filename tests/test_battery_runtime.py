@@ -492,9 +492,11 @@ def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
 
         stack.enter_context(patch.object(br, "request_sql", sql_request))
         stack.enter_context(patch.object(
-            br, "fetch_signals", lambda *args: list(signals)))
-        stack.enter_context(patch.object(br, "fetch_events", lambda *args: []))
-        stack.enter_context(patch.object(br, "coverage_min", lambda *args: None))
+            br, "fetch_signals", lambda *args, **kwargs: list(signals)))
+        stack.enter_context(patch.object(
+            br, "fetch_events", lambda *args, **kwargs: []))
+        stack.enter_context(patch.object(
+            br, "coverage_min", lambda *args, **kwargs: None))
         cfg = {"vehicle": "v", "battery_config": "", "battery_lookback_h": 2}
         assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
         assert db.execute("SELECT COUNT(*) FROM vehicle_analysis").fetchone() == (0,)
@@ -547,6 +549,521 @@ def test_prepared_scope_rows_do_not_mutate_across_windows():
     fresh = co.analyze([first, second], [], two)
     assert second_out == fresh
     assert first_out != second_out
+
+
+def test_scope_windows_exact_tuple_only_mode():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    import sqlite3
+    hour = br.HOUR_NS
+    seen = []
+
+    def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
+                     fields=None, scopes=None, **_ignored):
+        seen.append((start, end, tuple(sorted(fields)) if fields
+                     is not None else None,
+                     None if scopes is None else list(scopes)))
+        return []
+
+    def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=None, **_ignored):
+        return []
+
+    def fake_prev(base_url, auth, db, scope, windows, max_rows):
+        return set()
+
+    def fake_insert(base_url, auth, db, rows, batch=500):
+        return 0, 0
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_events", fake_events))
+        stack.enter_context(patch.object(br, "fetch_previous_identities",
+                                         fake_prev))
+        stack.enter_context(patch.object(br, "insert_analysis_rows",
+                                         fake_insert))
+        stack.enter_context(patch.object(br, "coverage_min",
+                                         lambda *args: None))
+        scope = ("v", "fleet", "e1")
+        ws = 8 * hour + 123
+        we = 8 * hour + 456
+        cfg = {"vehicle": "v", "battery_config": "",
+               "battery_lookback_h": 2,
+               "battery_scope_windows": {scope: [(ws, we)]},
+               "battery_scope_windows_only": True}
+        assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
+        # One disjoint signal fetch with exact bounds + >=24h context.
+        assert len(seen) == 1, seen
+        assert seen[0][1] == we, seen
+        assert seen[0][0] == ws - br.SIGNAL_CONTEXT_NS, seen
+        assert seen[0][3] == [scope], seen
+        # Malformed scope windows fail closed (loud, never widened).
+        for bad in ({("v", "fleet"): [(ws, we)]},
+                    {scope: [(we, ws)]},
+                    {scope: [(True, we)]},
+                    "not-a-mapping"):
+            try:
+                br.run_battery(("", "", ""), dict(
+                    cfg, battery_scope_windows=bad), now_ns=10 * hour)
+            except br.BatteryConfigError:
+                pass
+            else:
+                raise AssertionError("must refuse %r" % (bad,))
+        # Only=True without windows is a config error, never an
+        # unbounded whole-lookback run.
+        try:
+            br.run_battery(("", "", ""), {"vehicle": "v",
+                                          "battery_config": "",
+                                          "battery_lookback_h": 2,
+                                          "battery_scope_windows_only": True},
+                           now_ns=10 * hour)
+        except br.BatteryConfigError:
+            pass
+        else:
+            raise AssertionError("only-without-windows must refuse")
+
+
+def test_scope_window_boundary_overlap_and_string_keys():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    seen = []
+
+    def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
+                     fields=None, scopes=None, **_ignored):
+        seen.append((start, end, scopes))
+        return []
+
+    def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=None, **_ignored):
+        return []
+
+    def fake_prev(base_url, auth, db, scope, windows, max_rows):
+        return set()
+
+    def fake_insert(base_url, auth, db, rows, batch=500):
+        return 0, 0
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_events", fake_events))
+        stack.enter_context(patch.object(br, "fetch_previous_identities",
+                                         fake_prev))
+        stack.enter_context(patch.object(br, "insert_analysis_rows",
+                                         fake_insert))
+        stack.enter_context(patch.object(br, "coverage_min",
+                                         lambda *args: None))
+        scope = ("v", "fleet", "e1")
+        first = (8 * hour, 8 * hour + 100)
+        # Adjacent (end+1 == start) merges to one fetch; overlapping
+        # merges too. String keys ("\x1f"-joined, empty epoch = None)
+        # and list-of-dict rows parse to the same exact scope.
+        second = (first[1] + 1, first[1] + 200)
+        str_key = "v\x1ffleet\x1fe1"
+        dict_rows = [{"vehicle": "v", "source": "fleet",
+                      "decode_epoch": "e1", "start_ns": first[0],
+                      "end_ns": first[1]}]
+        for shape in ({scope: [first, second]},
+                      {str_key: [first, second]}):
+            del seen[:]
+            cfg = {"vehicle": "v", "battery_config": "",
+                   "battery_lookback_h": 1,
+                   "battery_scope_windows": shape,
+                   "battery_scope_windows_only": True}
+            br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
+            assert len(seen) == 1, (shape, seen)
+            assert seen[0][1] == second[1], (shape, seen)
+            assert seen[0][0] == first[0] - br.SIGNAL_CONTEXT_NS, (
+                shape, seen)
+        # List-of-dict rows parse to the same exact scope (single
+        # window: end carries the context, start is exact).
+        del seen[:]
+        cfg = {"vehicle": "v", "battery_config": "",
+               "battery_lookback_h": 1,
+               "battery_scope_windows": dict_rows,
+               "battery_scope_windows_only": True}
+        br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
+        assert len(seen) == 1, seen
+        assert seen[0][1] == first[1], seen
+        assert seen[0][0] == first[0] - br.SIGNAL_CONTEXT_NS, seen
+        # None-epoch string key parses to a None epoch scope.
+        none_key = "v\x1ffleet\x1f"
+        parsed = br._parse_scope_windows({none_key: [first]})
+        assert parsed == {("v", "fleet", None): [first]}, parsed
+
+
+def test_scope_cap_fails_closed_across_intervals():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    scope = ("v", "fleet", "e1")
+
+    def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
+                     fields=None, scopes=None, **_ignored):
+        return [_sig("v", "fleet", "e1", end, field="Soc",
+                     value=60.0, unit="%", quality="valid")]
+
+    def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=None, **_ignored):
+        return []
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_events", fake_events))
+        stack.enter_context(patch.object(br, "coverage_min",
+                                         lambda *args: None))
+        old = (4 * hour, 4 * hour + 100)
+        cfg = {"vehicle": "v", "battery_config": "",
+               "battery_lookback_h": 1, "battery_max_rows": 1,
+               "battery_scope_windows": {scope: [old]}}
+        try:
+            br.run_battery(("", "", ""), cfg, now_ns=40 * hour)
+        except br.BatteryCapError:
+            pass
+        else:
+            raise AssertionError("cap must fail closed, never partial")
+
+
+def test_scope_windows_union_and_disjoint_fetches():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    seen = []
+
+    def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
+                     fields=None, scopes=None, **_ignored):
+        seen.append((start, end, scopes))
+        return []
+
+    def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=None, **_ignored):
+        return []
+
+    def fake_prev(base_url, auth, db, scope, windows, max_rows):
+        return set()
+
+    def fake_insert(base_url, auth, db, rows, batch=500):
+        return 0, 0
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_events", fake_events))
+        stack.enter_context(patch.object(br, "fetch_previous_identities",
+                                         fake_prev))
+        stack.enter_context(patch.object(br, "insert_analysis_rows",
+                                         fake_insert))
+        stack.enter_context(patch.object(br, "coverage_min",
+                                         lambda *args: None))
+        scope = ("v", "fleet", "e1")
+        # Far-apart windows force disjoint fetches: hourly pass covers
+        # 9h; the 4h window predates the >=24h context only when the
+        # requested gap exceeds it, so use a 30h-old window instead.
+        old = (4 * hour, 4 * hour + 100)
+        cfg = {"vehicle": "v", "battery_config": "",
+               "battery_lookback_h": 1,
+               "battery_scope_windows": {scope: [old]}}
+        br.run_battery(("", "", ""), cfg, now_ns=40 * hour)
+        # Hourly pass (1) + one disjoint exact fetch (2): the gap
+        # between them is never covered by one envelope query.
+        assert len(seen) == 2, seen
+        assert seen[1] == (old[0] - br.SIGNAL_CONTEXT_NS, old[1],
+                           None), seen
+
+
+def test_same_hour_context_isolated_between_scopes():
+    from unittest.mock import patch
+    scopes = [("v", "can", "e1"), ("v", "can", "e2")]
+    start = 100 * br.HOUR_NS
+    rows = [dict(vehicle=v, source=s, decode_epoch=e, event_time=start,
+                 value_num=value) for (v, s, e), value in zip(scopes, (20, 40))]
+
+    def signals(base_url, auth, db, lower, upper, vehicle, max_rows,
+                fields=None, scopes=None):
+        return [r for r in rows if lower <= r["event_time"] <= upper
+                and (scopes is None or
+                     (r["vehicle"], r["source"], r["decode_epoch"]) in scopes)]
+
+    def tags(*args, scopes=None):
+        return set(scopes or [])
+
+    for fields in (None, {"PackCurrent"}):
+        with patch.object(br, "fetch_signals", signals), \
+                patch.object(br, "fetch_events", return_value=[]), \
+                patch.object(br, "fetch_signal_scopes", tags):
+            fetched, _, tag_scopes = br._fetch_plan(
+                "", "", "", [], {s: [(start, start + 1)] for s in scopes},
+                set(), start, start + 1, "v", 10, fields)
+        assert {(r["decode_epoch"], r["value_num"]) for r in fetched} == {
+            ("e1", 20), ("e2", 40)}, fetched
+        if fields is not None:
+            assert tag_scopes == set(scopes), tag_scopes
+
+
+def test_required_fields_cover_defaults_and_overrides():
+    from scripts.analytics.battery import battery_conditions as co
+    from scripts.analytics.battery import battery_energy as en
+    from scripts.analytics.battery import battery_electrical as el
+    from scripts.analytics.battery import battery_alerts as al
+    from scripts.analytics.battery import battery_rul as ru
+    # Defaults include every documented Fleet literal.
+    assert "PackCurrent" in co.required_fields({})
+    assert "BrickVoltageMax" in co.required_fields({})
+    assert "Soc" in co.required_fields({})
+    assert en.required_fields({}) == set(en.FIELD_DEFAULTS.values())
+    assert {"PackCurrent", "PackVoltage", "Soc",
+            "ModuleTempMin"} <= el.required_fields({})
+    assert al.required_fields({}) is None  # unrestricted context: all
+    assert ru.required_fields({}) == set()
+    # Configured overrides extend (never shrink) the exact set.
+    got = co.required_fields({"conditions": {
+        "current_fields": ["BatteryCurrent"]}})
+    assert {"PackCurrent", "BatteryCurrent"} <= got, got
+    got = en.required_fields({"energy": {"soc_field": "CustomSoc"}})
+    assert "CustomSoc" in got and "Soc" not in got, got
+    got = el.required_fields({"electrical": {
+        "current_fields": ["CustomI"], "dcr_soc_field": "CustomSoc"}})
+    assert {"CustomI", "CustomSoc", "PackVoltage",
+            "ModuleTempMax"} <= got, got
+    assert al.required_fields({"alerts": {
+        "context_source_fields": ["Soc"]}}) == {"Soc"}
+    # Malformed overrides fail closed (never silently valid).
+    for fn, bad in ((co.required_fields, {"conditions": {
+        "current_fields": [""]}}),
+            (en.required_fields, {"energy": {"soc_field": ""}}),
+            (el.required_fields, {"electrical": {"dcr_soc_field": ""}})):
+        try:
+            fn(bad)
+        except Exception:
+            pass
+        else:
+            raise AssertionError("must refuse %r" % (bad,))
+
+
+def test_coordinated_failure_persists_then_raises():
+    import sqlite3
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    scope = ("v", "fleet", "e1")
+    ws = 8 * hour
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE vehicle_analysis ("
+                   + ", ".join(br.ANALYSIS_COLS) + ")")
+
+        def sql_request(base_url, auth, database, statement, timeout=60):
+            cursor = db.execute(statement)
+            if cursor.description is None:
+                return {}
+            return {"output": [{"records": {
+                "schema": {"column_schemas": [
+                    {"name": column[0], "data_type": "String"}
+                    for column in cursor.description]},
+                "rows": cursor.fetchall()}}]}
+
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(br, "request_sql",
+                                             sql_request))
+            stack.enter_context(patch.object(
+                br, "fetch_signals", lambda *args, **kwargs: []))
+            stack.enter_context(patch.object(
+                br, "fetch_events", lambda *args, **kwargs: []))
+            stack.enter_context(patch.object(
+                br, "coverage_min", lambda *args: None))
+
+            def boom(signals, events, config):
+                raise RuntimeError("boom")
+
+            boom.__name__ = "battery_energy"
+            stack.enter_context(patch.object(
+                br, "get_analyzers",
+                lambda: [("battery_energy", "energy", boom)]))
+            cfg = {"vehicle": "v", "battery_config": "",
+                   "battery_lookback_h": 2,
+                   "battery_scope_windows": {scope: [(ws, ws + 10)]},
+                   "battery_scope_windows_only": True}
+            try:
+                br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
+            except br.BatteryError:
+                pass
+            else:
+                raise AssertionError("coordinated failure must raise")
+            # Required invalidation-adjacent error rows persisted first.
+            assert db.execute(
+                "SELECT COUNT(*) FROM vehicle_analysis WHERE "
+                "status='error'").fetchone()[0] >= 1
+            # Legacy path (no scope windows) never raises new: same
+            # failure shape returns a count.
+            try:
+                br.run_battery(("", "", ""),
+                               {"vehicle": "v", "battery_config": "",
+                                "battery_lookback_h": 2},
+                               now_ns=10 * hour)
+            except br.BatteryError:
+                raise AssertionError("legacy path must not raise")
+
+
+def test_exclude_scopes_never_fetched_or_analyzed():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    seen = []
+    scope = ("v", "fleet", "e1")
+    other = ("v", "can", "e1")
+
+    def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
+                     fields=None, scopes=None, **_ignored):
+        seen.append(scopes)
+        return []
+
+    def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=None, **_ignored):
+        return []
+
+    def fake_prev(base_url, auth, db, scope_arg, windows, max_rows):
+        assert scope_arg != scope, scope_arg
+        return set()
+
+    def fake_insert(base_url, auth, db, rows, batch=500):
+        assert all(r.get("source") != "fleet" for r in rows), rows
+        return 0, 0
+
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_events", fake_events))
+        stack.enter_context(patch.object(br, "fetch_previous_identities",
+                                         fake_prev))
+        stack.enter_context(patch.object(br, "insert_analysis_rows",
+                                         fake_insert))
+        stack.enter_context(patch.object(br, "coverage_min",
+                                         lambda *args: None))
+        ws = 8 * hour
+        cfg = {"vehicle": "v", "battery_config": "",
+               "battery_lookback_h": 2,
+               "battery_scope_windows": {other: [(ws, ws + 10)]},
+               "battery_scope_windows_only": True,
+               "battery_exclude_scopes": [list(scope)]}
+        assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
+        assert seen == [[other]], seen
+        # Overlap between requested and excluded scopes fails closed.
+        try:
+            br.run_battery(("", "", ""), dict(
+                cfg, battery_scope_windows={scope: [(ws, ws + 10)]}),
+                now_ns=10 * hour)
+        except br.BatteryConfigError:
+            pass
+        else:
+            raise AssertionError("overlap must refuse")
+
+
+def test_prepare_by_scope_groups_once_with_isolation():
+    rows = [_sig("v", "fleet", "e1", 100, field="Soc", value=60.0,
+                 unit="%", quality="valid"),
+            _sig("v", "fleet", "e1", 200, field="Soc", value=61.0,
+                 unit="%", quality="valid"),
+            _sig("v", "can", "e1", 100, field="Soc", value=62.0,
+                 unit="%", quality="valid"),
+            dict(event_time_ns="bad", vehicle="v", source="fleet",
+                 decode_epoch="e1")]
+    grouped = bc.prepare_by_scope(rows)
+    assert sorted(grouped) == [("v", "can", "e1"),
+                               ("v", "fleet", "e1")]
+    assert [r["value_num"] for r in grouped[("v", "fleet", "e1")]] == [
+        60.0, 61.0]
+    # Detached copies: normalize_signals on prepared input detaches, so
+    # a consumer mutating its copy never corrupts the prepared source.
+    view = bc.normalize_signals(grouped[("v", "fleet", "e1")])
+    view[0]["value_num"] = 9.0
+    assert grouped[("v", "fleet", "e1")][0]["value_num"] == 60.0
+    assert grouped[("v", "can", "e1")][0]["value_num"] == 62.0
+
+
+def test_narrowed_fields_keep_rul_and_previous_scope():
+    # Root consumer-boundary bug: a restrictive alerts context plus
+    # RUL's empty field set narrows the signal fetch so far that a
+    # scope whose only raw field is unrelated vanishes from
+    # discovery; RUL (config history + scope identity) and previous
+    # healthy rows needing invalidation must still see it. The
+    # field-independent DISTINCT tag query preserves it. Sections
+    # come from the battery config FILE (not top-level cfg keys).
+    import json
+    import os
+    import tempfile
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    scope = ("v", "fleet", "e1")
+    ws = 8 * hour
+    seen_fields = []
+
+    def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
+                     fields=None, scopes=None):
+        seen_fields.append(None if fields is None else set(fields))
+        return []  # every raw row filtered out by the narrow predicate
+
+    def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
+                    scopes=None):
+        return []
+
+    def fake_tags(base_url, auth, db, start, end, vehicle, max_rows,
+                  scopes=None):
+        return {scope}
+
+    def fake_prev(base_url, auth, db, scope_arg, windows, max_rows):
+        assert scope_arg == scope, scope_arg
+        return {("battery.rul.cycles_remaining", "battery_rul", ws,
+                 "e1")}
+
+    captured = {}
+
+    def fake_insert(base_url, auth, db, rows, batch=500):
+        captured["rows"] = list(rows)
+        return len(rows), 0
+
+    doc = {"alerts": {"context_source_fields": ["Soc"]},
+           "rul": {"domain": "lab",
+                   "history_scope": {"vehicle": "v", "source": "fleet",
+                                     "decode_epoch": "e1"},
+                   "history": [
+                       {"discharge_cycle": 1, "capacity_ah": 2.0,
+                        "duration_s": 3.0},
+                       {"discharge_cycle": 2, "capacity_ah": 1.9,
+                        "duration_s": 3.1}]},
+           "energy": {}, "electrical": {}, "conditions": {}}
+    handle, path = tempfile.mkstemp(suffix=".json")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            json.dump(doc, stream)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(br, "fetch_signals",
+                                             fake_signals))
+            stack.enter_context(patch.object(br, "fetch_events",
+                                             fake_events))
+            stack.enter_context(patch.object(br, "fetch_signal_scopes",
+                                             fake_tags))
+            stack.enter_context(patch.object(br, "fetch_previous_identities",
+                                             fake_prev))
+            stack.enter_context(patch.object(br, "insert_analysis_rows",
+                                             fake_insert))
+            stack.enter_context(patch.object(br, "coverage_min",
+                                             lambda *args: None))
+            cfg = {"vehicle": "v", "battery_config": path,
+                   "battery_config_explicit": True,
+                   "battery_lookback_h": 2,
+                   "battery_scope_windows": {scope: [(ws, ws + 10)]},
+                   "battery_scope_windows_only": True}
+            try:
+                br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
+            except br.BatteryError:
+                pass  # coordinated failure still proves scope coverage
+            # Field predicate narrowed ROWS (exact set, never all).
+            assert seen_fields and all(
+                f is not None and "UnrelatedField" not in f
+                for f in seen_fields), seen_fields
+            rows = captured.get("rows", [])
+            assert rows, "narrowed scope must still produce rows"
+            assert {r.get("vehicle") for r in rows} == {"v"}, rows
+    finally:
+        os.unlink(path)
 
 
 if __name__ == "__main__":

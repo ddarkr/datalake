@@ -71,9 +71,57 @@ def _put(attrs, key, value):
         attribute.value.string_value = value
 
 
+def _varint_len(value):
+    # Raw protobuf varint length; tag+value framing counted exactly below.
+    length, value = 1, value >> 7
+    while value:
+        length, value = length + 1, value >> 7
+    return length
+
+
+def _body_len(data):
+    # LogRecord field 5 (bytes): 1-byte tag + varint length + exact raw bytes.
+    return 1 + _varint_len(len(data)) + len(data)
+
+
+def _attr_len(key, value):
+    # KeyValue entry: tag + varint inner length, where an int attribute costs its
+    # varint and a UTF-8 string attribute costs its encoded byte length. Overlong
+    # UTF-8 or lone surrogates cannot occur here: surrogates fail encoding exactly
+    # like protobuf, and an explicit preflight type check precedes the codec.
+    if type(value) is int:
+        inner = 1 + _varint_len(len(key)) + len(key) + 2 + _varint_len(value)
+    else:
+        encoded = value.encode("utf-8")
+        inner = (1 + _varint_len(len(key)) + len(key) + 2 + _varint_len(len(encoded))
+                 + len(encoded))
+    return 2 + _varint_len(inner) + inner
+
+
+def encoded_size_estimate(meta, chunks):
+    """Incremental envelope bound: envelope shares plus per-record worst cases.
+
+    Varint/string framing is exact; only outer resource/scope container tags are
+    fixed upper bounds, so the estimate never undercounts protobuf overhead.
+    """
+    _validate_chunks(meta, chunks)
+    total = 4  # Outer repeated resource_logs entry: tag + varint bound.
+    for key in sorted(META_KEYS):
+        total += _attr_len("can." + key, meta[key])
+    total += len("tesla-can") + len("1") + 14  # Scope + fixed container tags.
+    for chunk in chunks:
+        record = 1 + _varint_len(meta["started_ns"] + chunk["offset_ns"])  # Field 1.
+        record += _body_len(chunk["data"])
+        for key in ("seq", "offset_ns", "phase"):
+            record += _attr_len("can." + key, chunk[key])
+        total += 2 + _varint_len(record) + record
+    return total
+
+
 def encode_batch(meta, chunks):
     """Encode exact chunk bytes and integer nanosecond timestamps deterministically."""
-    _validate_chunks(meta, chunks)
+    if encoded_size_estimate(meta, chunks) > MAX_REQUEST_BYTES:
+        raise WireError("CAN request exceeds byte limit.")
     request = ExportLogsServiceRequest()
     resource = request.resource_logs.add()
     for key in sorted(META_KEYS):

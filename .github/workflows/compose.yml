@@ -63,6 +63,8 @@ jobs:
         run: |
           python -m tests.test_trace_privacy
           python -m tests.test_backup
+          python -m tests.test_can_backup
+          python -m tests.test_storage_metrics
           python -m tests.test_storage
           python -m tests.test_database
           python -m tests.test_dashboards
@@ -70,6 +72,8 @@ jobs:
           python -m tests.test_vehicle_aggregate
           python -m tests.test_fleet
           python -m tests.test_can_receiver
+          python -m tests.test_can_decoder
+          python -m tests.test_can_otlp_wire
           python tools/demo.py regressions
           python -m tests.test_vss
           python -m tests.test_vss_setup

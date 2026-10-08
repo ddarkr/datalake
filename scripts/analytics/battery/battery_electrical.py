@@ -1240,6 +1240,47 @@ def _first_field_timeline(rows, fields, expected_unit, field_units,
     return None, []
 
 
+def required_fields(config=None):
+    """Exact source_field set this analyzer may read (defaults + overrides).
+
+    Defaults current/voltage plus dcr SOC/temp fields, union configured
+    overrides (current_fields/voltage_fields/dcr_soc_field/
+    dcr_temp_fields); field_units add no new fields, only unit mappings.
+    Malformed entries -> ElectricalError (fail closed, never silently
+    valid). No calibration/cost semantics.
+    """
+    cfg_all = config if isinstance(config, dict) else {}
+    if config is not None and not isinstance(config, dict):
+        raise ElectricalError("malformed: electrical config dict")
+    ecfg = cfg_all.get("electrical", cfg_all)
+    if ecfg is None:
+        ecfg = {}
+    if not isinstance(ecfg, dict):
+        raise ElectricalError("malformed: electrical dict")
+    currents = _parse_field_list(ecfg.get("current_fields"),
+                                 "current_fields", ["PackCurrent"])
+    voltages = _parse_field_list(ecfg.get("voltage_fields"),
+                                 "voltage_fields", ["PackVoltage"])
+    soc = ecfg.get("dcr_soc_field", "Soc")
+    if not isinstance(soc, str) or not soc:
+        raise ElectricalError("malformed: dcr_soc_field string")
+    temps = ecfg.get("dcr_temp_fields", ["ModuleTempMin", "ModuleTempMax"])
+    if not isinstance(temps, (list, tuple)) or not temps:
+        raise ElectricalError("malformed: dcr_temp_fields non-empty")
+    for item in temps:
+        if not isinstance(item, str) or not item:
+            raise ElectricalError("malformed: dcr_temp_fields strings")
+    units = ecfg.get("field_units", {})
+    if units is None:
+        units = {}
+    if not isinstance(units, dict):
+        raise ElectricalError("malformed: field_units dict")
+    for key in units:
+        if not isinstance(key, str) or not key:
+            raise ElectricalError("malformed: field_units dict")
+    return set(currents + voltages + [soc] + list(temps))
+
+
 def _scope_mismatch_rows(scope, window, cal_ver, cal_scope):
     rows = []
     for metric in SUPPORTED_METRICS:

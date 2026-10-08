@@ -11,6 +11,10 @@
 #   BACKUP_OFFLINE_CONFIRMED=1 docker compose --profile backup run --rm backup restore
 #   docker compose --profile server up -d
 # The tool probes GREPTIME_HTTP_URL and refuses when the DB is reachable.
+# Space preflights (both modes, separate filesystems): backup needs 2x live
+# source bytes + BACKUP_RESERVE_BYTES free on BACKUP_DIR; restore needs tar +
+# members + reserve for staging plus members + reserve on every target fs.
+# Shortfalls refuse before any write; the DB offline gate is preserved.
 # There is no live-backup mode: a tar of a running standalone is torn WAL,
 # not crash-consistent, and no such claim is made here.
 #
@@ -67,7 +71,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "2"
+      datalake.storage-metrics-revision: "3"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -79,10 +83,13 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       S3_REGION: ${S3_REGION:-}
       STORAGE_METRICS_INTERVAL_SEC: ${STORAGE_METRICS_INTERVAL_SEC:-3600}
+      CAN_RECEIVER_ARCHIVE: /can-raw/raw.sqlite3
+      CAN_RECEIVER_DISK_RESERVE_BYTES: "67108864"
     volumes:
       - backup-venv:/opt/venv:ro
       - greptime-data:/greptime-data:ro
       - backup-data:/ops:ro
+      - can-receiver-raw:/can-raw:ro
     configs:
       - source: storage_metrics_py
         target: /app/scripts/storage/storage_metrics.py
@@ -106,6 +113,7 @@ services:
       BACKUP_DIR: /backup
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
       BACKUP_FILE: ${BACKUP_FILE:-}
+      BACKUP_RESERVE_BYTES: ${BACKUP_RESERVE_BYTES:-67108864}
       BACKUP_OFFLINE_CONFIRMED: ${BACKUP_OFFLINE_CONFIRMED:-}
       GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
       GREPTIME_STORAGE_TYPE: ${GREPTIME_STORAGE_TYPE:-S3}
@@ -132,9 +140,64 @@ services:
     command: ["backup"]
     restart: "no"
 
+  # can-backup: `backup` and `restore` are both nondisruptive to the live
+  # receiver (pinned read-only snapshot; restore populates only the fresh
+  # can-restore-raw + can-restore-defs volumes, mounted directly at
+  # /restore/can-raw + /restore/can-definitions so the verified raw volume
+  # can later mount at receiver /data and the defs root at /definitions).
+  # `restore` needs BACKUP_OFFLINE_CONFIRMED=1 plus a free *restore-target*
+  # lock. Cutover is separate: stop the original, keep a single archive
+  # owner per path, start the receiver on the verified copy.
+  can-backup:
+    image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [backup]
+    depends_on:
+      backup-deps:
+        condition: service_completed_successfully
+    user: "0:0"
+    environment:
+      CAN_ARCHIVE_PATH: /source/can-raw/raw.sqlite3
+      CAN_DEFINITIONS_DIR: /source/can-definitions
+      CAN_BACKUP_DIR: /backup/can
+      CAN_RESTORE_RAW_DIR: /restore/can-raw
+      CAN_RESTORE_DEFS_DIR: /restore/can-definitions
+      CAN_BACKUP_FILE: ${CAN_BACKUP_FILE:-}
+      CAN_BACKUP_KEEP: ${CAN_BACKUP_KEEP:-7}
+      CAN_BACKUP_RESERVE_BYTES: ${CAN_BACKUP_RESERVE_BYTES:-67108864}
+      BACKUP_OFFLINE_CONFIRMED: ${BACKUP_OFFLINE_CONFIRMED:-}
+      CAN_STORAGE_TYPE: ${CAN_STORAGE_TYPE:-File}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_REGION: ${S3_REGION:-}
+      CAN_S3_BACKUP_PREFIX: ${CAN_S3_BACKUP_PREFIX:-can-archive-backups}
+    volumes:
+      - can-receiver-raw:/source/can-raw:ro
+      - can-receiver-definitions:/source/can-definitions:ro
+      - can-backup-data:/backup
+      - can-restore-raw:/restore/can-raw
+      - can-restore-defs:/restore/can-definitions
+      - backup-venv:/opt/venv:ro
+    configs:
+      - source: can_backup_py
+        target: /app/scripts/storage/can_backup.py
+        mode: 0444
+      - source: backup_py
+        target: /app/scripts/storage/backup.py
+        mode: 0444
+      - source: greptime_preflight
+        target: /app/scripts/database/greptime_preflight.py
+    working_dir: /app
+    entrypoint: ["/opt/venv/bin/python", "-m", "scripts.storage.can_backup"]
+    command: ["backup"]
+    restart: "no"
+
 configs:
   backup_py:
     x-source: scripts/storage/backup.py
+  can_backup_py:
+    x-source: scripts/storage/can_backup.py
   storage_metrics_py:
     x-source: scripts/storage/storage_metrics.py
 
@@ -143,4 +206,13 @@ volumes:
   backup-data:
     name: ${BACKUP_VOLUME_NAME:-${COMPOSE_PROJECT_NAME}_backup-data}
     external: ${BACKUP_VOLUME_EXTERNAL:-false}
+  can-backup-data:
+    name: ${CAN_BACKUP_VOLUME_NAME:-${COMPOSE_PROJECT_NAME}_can-backup-data}
+    external: ${CAN_BACKUP_VOLUME_EXTERNAL:-false}
+  can-restore-raw:
+    name: ${CAN_RESTORE_RAW_VOLUME:-${COMPOSE_PROJECT_NAME}_can-restore-raw}
+    external: ${CAN_RESTORE_RAW_VOLUME_EXTERNAL:-false}
+  can-restore-defs:
+    name: ${CAN_RESTORE_DEFS_VOLUME:-${COMPOSE_PROJECT_NAME}_can-restore-defs}
+    external: ${CAN_RESTORE_DEFS_VOLUME_EXTERNAL:-false}
   backup-venv:

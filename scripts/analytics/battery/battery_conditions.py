@@ -913,6 +913,29 @@ def _asof_points(points, tstamp, skew_ns):
     return best
 
 
+def required_fields(config=None):
+    """Exact source_field set this analyzer may read (defaults + overrides).
+
+    Fixed Fleet literals plus the configured current_fields override
+    (default ["PackCurrent"]); malformed entries -> ConditionsError
+    (fail closed, never silently valid). No calibration/cost semantics.
+    """
+    ccfg = config if isinstance(config, dict) else {}
+    if config is not None and not isinstance(config, dict):
+        raise ConditionsError("malformed: conditions config dict")
+    sub = ccfg.get("conditions", ccfg)
+    if sub is None:
+        sub = {}
+    if not isinstance(sub, dict):
+        raise ConditionsError("malformed: conditions config dict")
+    fields = _parse_current_fields(sub)
+    return set([BRICK_MAX_FIELD, BRICK_MIN_FIELD, BRICK_MAX_ID_FIELD,
+                BRICK_MIN_ID_FIELD, MOD_MAX_FIELD, MOD_MIN_FIELD,
+                MOD_MAX_ID_FIELD, MOD_MIN_ID_FIELD, ISO_FIELD, SOC_FIELD,
+                PACK_CURR_FIELD] + [f for f in fields
+                                    if f != PACK_CURR_FIELD])
+
+
 def _parse_current_fields(ccfg):
     raw = ccfg.get("current_fields", ["PackCurrent"])
     if raw is None:

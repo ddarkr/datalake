@@ -2,7 +2,7 @@
 import os
 import sys
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from scripts.analytics import aggregate as agg
 
@@ -168,8 +168,9 @@ class GroupingTest(unittest.TestCase):
                  "charge_energy": "P.charge", "power": "", "charging": ""}
         g = agg.group_vehicle_rows(cols, rows, paths)
         grp = g[("v", "s", "e")]
-        self.assertEqual(grp["drive_energy"][dt(10, 0)], (5.0, "kwh"))
-        self.assertEqual(grp["charge_energy"][dt(10, 0)], (7.0, "kwh"))
+        key = agg.parse_ts_ns(dt(10, 0))
+        self.assertEqual(grp["drive_energy"][key], (5.0, "kwh"))
+        self.assertEqual(grp["charge_energy"][key], (7.0, "kwh"))
 
     def test_carry_bounded_by_age(self):
         t0, t1 = dt(10, 0), dt(10, 1)
@@ -217,6 +218,114 @@ class ReconcilePlanTest(unittest.TestCase):
             "trip", key, [seg], [], dt(9, 0), dt(12, 10), 600)
         self.assertFalse(ins[0]["open"])
 
+
+class ExactNsTest(unittest.TestCase):
+    NS0 = 1789977727964984000  # int-ns cell, exact
+
+    def test_int_ns_cells_keep_sub_microsecond_distinct(self):
+        cols = ["event_time", "vehicle", "path", "source", "decode_epoch",
+                "value_num", "value_bool", "unit"]
+        rows = [
+            [self.NS0, "v", "P.speed", "s", "e", 10.0, None, "m/s"],
+            [self.NS0 + 250, "v", "P.speed", "s", "e", 10.0, None, "m/s"],
+        ]
+        paths = {"speed": "P.speed", "soc": "", "drive_energy": "",
+                 "charge_energy": "", "power": "", "charging": ""}
+        g = agg.group_vehicle_rows(cols, rows, paths)
+        self.assertEqual(len(g[("v", "s", "e")]["speed"]), 2)
+
+    def test_iso_string_keeps_nine_digits(self):
+        self.assertEqual(
+            agg.parse_ts_ns("2026-09-20 10:00:00.123456789"),
+            agg.parse_ts_ns("2026-09-20 10:00:00.123456789"))
+        self.assertNotEqual(
+            agg.parse_ts_ns("2026-09-20 10:00:00.123456789"),
+            agg.parse_ts_ns("2026-09-20 10:00:00.123456788"))
+        self.assertIsNone(agg.parse_ts_ns(12.5))
+        self.assertIsNone(agg.parse_ts_ns(True))
+
+    def test_ns_datetime_mixed_segments_agree(self):
+        t0, t1 = self.NS0, self.NS0 + 300_000_000_000
+        by_ns = agg.segment_trips(
+            [(t0, 36.0, None), (t1, 36.0, None)], gap_min=10)
+        by_dt = agg.segment_trips(
+            [(dt(10, 0), 36.0, None), (dt(10, 5), 36.0, None)], gap_min=10)
+        self.assertAlmostEqual(
+            by_ns[0]["duration_s"], by_dt[0]["duration_s"], places=6)
+
+    def test_ns_stable_pk_and_serialization(self):
+        pk = agg._segment_pk(("v", "s", "e"), self.NS0)
+        self.assertIn(str(self.NS0), pk)
+        lit = agg.ns_to_sql_lit(self.NS0)
+        self.assertIn(".964984000", lit)
+        self.assertEqual(agg.ns_to_sql_lit(None), "NULL")
+        self.assertEqual(agg.ns_to_sql_lit(0), "'1970-01-01 00:00:00.000000000'")
+        self.assertEqual(agg.ns_to_sql_lit(-1), "NULL")
+
+    def test_integer_segments_accept_datetime_window_bounds(self):
+        lower = datetime.fromtimestamp(self.NS0 // 1_000_000_000, timezone.utc)
+        upper = lower + timedelta(seconds=1)
+        for kind in ("trip", "charge"):
+            segments = [{"start": self.NS0 + offset,
+                         "end": self.NS0 + offset + 1, "open": False}
+                        for offset in (100, 101)]
+            rows, deletes = agg._plan_group_writes(
+                kind, ("v", "can", "e"), segments, [], lower, upper, 60)
+            self.assertEqual([row["start"] for row in rows],
+                             [self.NS0 + 100, self.NS0 + 101])
+            self.assertNotEqual(rows[0]["_pk"], rows[1]["_pk"])
+            self.assertEqual(deletes, [])
+
+    def test_events_across_windows_stay_separate(self):
+        hour = self.NS0 - (self.NS0 % agg.HOUR_NS)
+        late = hour - 1  # previous window's last ns
+        self.assertEqual(agg.floor_hour_ns(late), hour - agg.HOUR_NS)
+        self.assertEqual(agg.floor_hour_ns(hour), hour)
+
+
+class CoordinatorLogicTest(unittest.TestCase):
+    def test_pending_dirty_needs_current_revision(self):
+        dirty = {(("v", "can", "e"), 100): "gen1"}
+        self.assertEqual(agg._pending_dirty({}, {}, "rev"), {})
+        self.assertEqual(
+            agg._pending_dirty(dirty, {(("v", "can", "e"), 100): ("gen1", "rev")},
+                               "rev"), {})
+        self.assertIn((("v", "can", "e"), 100),
+                      agg._pending_dirty(dirty, {(("v", "can", "e"), 100):
+                                                 ("gen0", "rev")}, "rev"))
+        self.assertIn((("v", "can", "e"), 100),
+                      agg._pending_dirty(dirty, {(("v", "can", "e"), 100):
+                                                 ("gen1", "old")}, "rev"))
+        self.assertIn((("v", "can", "e"), 100),
+                      agg._pending_dirty(dirty, {}, "rev"))
+
+    def test_scope_predicate_and_tuple_are_exact(self):
+        pred = agg._dirty_scope_predicate([("v", "can", "e")])
+        self.assertIn("vehicle = 'v'", pred)
+        self.assertIn("decode_epoch = 'e'", pred)
+        self.assertEqual(agg._scope_tuple(("v", "can", "e")), ("v", "can", "e"))
+        self.assertIsNone(agg._scope_tuple(("v", "can")))
+        self.assertIsNone(agg._scope_tuple(("", "can", "e")))
+        self.assertTrue(agg._is_can_scope(("v", "can", "e")))
+        self.assertFalse(agg._is_can_scope(("v", "fleet", "e")))
+
+    def test_config_revision_covers_tuning_and_battery_code(self):
+        base = {"paths": {"speed": "A"}, "trip_gap_min": 10,
+                "trip_min_speed_kph": 1.0, "charge_gap_min": 30,
+                "signal_max_age_s": 300, "battery_config": "/nonexistent"}
+        changed = dict(base, trip_gap_min=11)
+        self.assertNotEqual(agg._config_revision(base),
+                            agg._config_revision(changed))
+
+    def test_legacy_cfgs_exclude_only_can_scopes(self):
+        cfg = {"exclude_scopes": [], "battery_exclude_scopes": []}
+        coordinated = [("v", "can", "e"), ("w", "fleet", "f")]
+        legacy, trip, bat = agg._legacy_cfgs(cfg, coordinated)
+        self.assertEqual(legacy["exclude_scopes"], [("v", "can", "e")])
+        self.assertEqual(trip["exclude_scopes"], [("v", "can", "e")])
+        self.assertEqual(bat["battery_exclude_scopes"], [("v", "can", "e")])
+        plain, _, _ = agg._legacy_cfgs(cfg, [("w", "fleet", "f")])
+        self.assertEqual(plain["exclude_scopes"], [])
 
 if __name__ == "__main__":
     unittest.main()

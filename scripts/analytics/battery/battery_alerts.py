@@ -266,6 +266,30 @@ def _context_fields(alert_cfg):
     return None
 
 
+def required_fields(config=None):
+    """Exact source_field set this analyzer may read, or None (all).
+
+    Configured context_source_fields override; None/absent means every
+    signal field is eligible context (no narrowing possible). Malformed
+    non-list entries -> None is never returned: a present-but-wrong type
+    falls back to None only when _context_fields does (non-list), while
+    an empty list stays an empty set (no fields wanted). No calibration
+    or cost semantics.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    sub = cfg.get("alerts", cfg)
+    if sub is None:
+        sub = {}
+    if not isinstance(sub, dict):
+        return None
+    raw = sub.get("context_source_fields")
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)):
+        return set(f for f in raw if isinstance(f, str) and f)
+    return None
+
+
 def _ingest_status(row, decision_time):
     """Availability vs decision time: admitted | unknown | late.
 

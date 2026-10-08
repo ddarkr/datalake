@@ -170,9 +170,28 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
 
 CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
 
-디코딩은 한 트랜잭션에 최대 1,000청크를 처리하고, 청크 처리 사이에 경과 시간을 확인하여 50ms를 넘으면 commit하고 쓰기 잠금을 해제합니다. 개별 청크 처리·commit 시간까지 포함한 엄격한 50ms 상한은 아닙니다. parser 상태·decode cursor·outbox는 함께 commit하거나 함께 rollback하며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
+디코딩은 쓰기 잠금 밖에서 최대 1,000청크·2,000출력 행을 준비하고, 청크 사이의 경과 시간이 50ms를 넘으면 다음 commit으로 넘깁니다. 조밀한 청크도 parser 상태와 frame 경계 cursor로 이어서 처리하므로 한 청크의 모든 신호를 메모리에 펼치지 않습니다. commit 전 각 세션의 기존 cursor·상태를 다시 확인하며, parser 상태·decode cursor·outbox는 한 트랜잭션에서 함께 commit하거나 rollback합니다. 개별 frame·commit 시간을 포함한 엄격한 50ms 상한은 아니며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
 
 단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, ingress socket의 `--http-timeout` 기본값 15초와 별개입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 독점 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
+
+signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신까지 ACK되어야 outbox에서 제거합니다. 알림 실패는 `dirty_notify_failure`로 남고 signal 재전송은 같은 event ID로 중복 제거됩니다. 집계기는 완료된 시간창을 scope별 영속 sweep cursor로 순회하므로 알림 이전의 과거 CAN도 처리합니다. 시간창의 raw fingerprint·generation·분석 설정과 코드 revision이 이전 checkpoint와 같으면 재계산하지 않으며, 처리 중 입력이 바뀌거나 분석이 실패하면 checkpoint를 완료하지 않습니다. 이 확인은 해당 scope·시간창의 처리 기록이지 물리 교정 성공 증거가 아닙니다.
+
+`status`는 영속 누적 counter와 indexed cursor를 사용하며 원본 전체를 매번 세지 않습니다. `last_receive_ns`, `last_decode_ns`, `last_full_ack_ns`는 각각 raw 수신·해석·signal 및 dirty 알림 전체 ACK 시각입니다. storage-metrics는 raw volume을 read-only로 읽어 raw/WAL/outbox/파일시스템 여유와 제한된 오류 종류를 노출합니다. 누락·읽기 실패는 unknown이고 빈 정상 큐만 0입니다. 수신·디코드 commit 전 기본 64 MiB 여유에 staged write 예산을 더해 확인하며, 부족하면 `archive_disk_reserve`로 거부하고 기존 raw/outbox를 보존합니다. 이미 ACK된 outbox를 지우는 작업은 공간을 회수할 수 있도록 이 reserve 때문에 막지 않습니다.
+
+#### CAN archive 백업과 새 볼륨 복원
+
+DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE를 GET으로 검증한 뒤 성공하며 원격 자동 GC는 하지 않습니다.
+
+```bash
+docker compose --env-file .env --profile backup run --rm can-backup backup
+# 새 복원 대상 두 볼륨에 writer가 없음을 확인한 뒤 실행합니다.
+BACKUP_OFFLINE_CONFIRMED=1 \
+  docker compose --env-file .env --profile backup run --rm can-backup restore
+```
+
+복원 대상은 `CAN_RESTORE_RAW_VOLUME`과 `CAN_RESTORE_DEFS_VOLUME`의 **별도 빈 볼륨**입니다. 기본 이름은 `${COMPOSE_PROJECT_NAME}_can-restore-raw`와 `${COMPOSE_PROJECT_NAME}_can-restore-defs`이며 각각 receiver의 `/data`, `/definitions`에 직접 연결할 수 있습니다. `CAN_BACKUP_FILE`로 완료 백업을 선택할 수 있습니다. CAN 복원의 offline 확인은 이 두 **대상**에 대한 확인이며 live 원본의 WAL·소유권 lock은 그대로 유지할 수 있습니다. 원본과 같은 대상, 기존 파일이 있는 대상, 사용 중인 대상에는 복원하지 않습니다. 원본의 UID/GID와 `0700` 디렉터리·`0600` 파일 모드를 그대로 복원하며 접근을 위해 권한을 넓히지 않습니다.
+
+복원본의 정의 SHA·연속 seq·epoch·cursor·outbox를 확인한 뒤 별도 receiver로 검증하세요. 운영 receiver를 복원본으로 인계하는 것은 별도 승인된 절차이며, 같은 archive에 두 writer를 시작하지 마세요. `CAN_BACKUP_RESERVE_BYTES`와 `BACKUP_RESERVE_BYTES`는 각각 CAN·DB staging 예산에 추가할 여유 byte이며 기본 64 MiB입니다. 백업은 snapshot과 압축 작업 공간, 복원은 archive와 해제될 파일 및 대상 파일시스템별 공간을 사전 검사합니다. 공간 부족을 발견하면 기존 원본·복원 대상 데이터를 변경하지 않습니다.
 
 `python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
@@ -273,12 +292,14 @@ Compose 관리 도구가 단일 파일만 읽는다면 `.env` 주입 방식을 �
 - 마지막 관측 시각을 누르면 현재 차량·수집 경로·해석 버전을 유지한 채 그 시각 전후 1시간으로 이동합니다. 기본 최근 2일 범위를 자동으로 늘리거나 과거 값을 현재 값처럼 표시하지 않습니다.
 - CAN의 정확한 경로·신호명이 대응하는 잔량, 남은 에너지, 기어, 충전 상태와 외기온은 `reported_unverified`인 **미검증 보고값**으로 표시합니다. 최신 무효 값·단위 불일치·알 수 없는 enum은 과거 정상 값으로 대체하지 않으며, CAN 보고값 표에는 원본 단위·품질·관측 및 수신 시각을 남깁니다. 잔량 그래프는 `%` 단위의 허용된 보고값만 평균에 포함하고 유효 값이 없는 구간은 비웁니다.
 - `CP_CHARGE_ENABLED`는 충전 허용 보고이지 실제 충전 중이라는 판정이 아닙니다. CAN 원시 전압·전류가 있어도 교정과 분석 결과가 없는 전력은 판단 불가로 남고, 대응하는 원본 신호가 없는 온도도 만들어내지 않습니다.
+- 전력·팩 전압 카드의 미분석 입력 검사는 원본 field 이름 override를 놓치지 않도록 같은 `vehicle/source/decode_epoch`의 전체 raw frontier를 사용합니다. 분석과 무관한 새 신호도 이전 숫자를 가릴 수 있는 보수적 제한이며, 서로 다른 scope의 입력은 섞지 않습니다.
 
 ### 운영 health 시각을 구분하기
 
 - Fleet의 `fleet_last_receive_timestamp_seconds{topic=...}`는 대상 차량의 유효 envelope를 로컬에서 받은 시각이며, 중복 재수신도 갱신합니다. VSS의 `vss_last_receive_timestamp_seconds`는 broker update/snapshot의 실제 로컬 수신 시각입니다. 받은 적이 없거나 recorder를 재시작한 뒤 아직 수신하지 않았으면 metric이 없습니다. `datalake_trace_last_received_timestamp_seconds{client=...}`는 trace-privacy가 비어 있지 않은 trace batch를 redaction 후 받은 시각이며 DB 저장 ACK가 아닙니다. 이 시각도 프로세스 재시작 후 첫 수신 전에는 없습니다. AI logs/metrics와 Home raw event 시각은 수신 시각이 아니므로 해당 **마지막 실제 수신은 unknown**입니다.
 - `fleet_outbox[_events]_oldest_enqueue_age_seconds`와 `vss_outbox_oldest_enqueue_age_seconds`는 로컬 수신 시 저장한 `ingest_time` 기준 체류 초입니다. `*_oldest_event_age_seconds`는 원본 `event_time`의 age로, 늦은 재전송은 이벤트가 오래되어도 큐 체류는 짧을 수 있습니다. 빈 큐만 0이고, 읽기 실패는 `*_outbox_metrics_success=0` 및 age 없음입니다(VSS 기존 pending/time metric은 실패 시 -1). 통신·조회 실패를 정상 0으로 해석하지 마세요.
 - aggregate는 기존 `backup-data` 볼륨의 `/ops/aggregate-status.json`을 pass/section 시작과 pass 완료에 atomic 교체합니다. storage-metrics는 같은 볼륨을 read-only로 읽습니다. `datalake_aggregate_running`, `datalake_aggregate_success`(마지막 완료 pass 결과), `last_start_timestamp_seconds`, `last_success_timestamp_seconds`, `last_failure_timestamp_seconds`를 노출하며 실패해도 이전 성공 시각은 보존합니다. `time() - datalake_aggregate_last_success_timestamp_seconds`는 **실행 성공 freshness**이지 데이터 처리 지연이 아닙니다. section이 오래 실행되거나 프로세스가 죽으면 `status_timestamp_seconds`가 오래된 채 남을 수 있으므로 interval/running과 함께 확인합니다. SQL pass 성공은 배터리 분석의 교정·품질 정상 판정과 다릅니다.
+- pass 시작 간격은 monotonic clock으로 유지하며 느린 pass와 다음 pass를 겹치지 않습니다. status의 `section_durations_seconds`, `section_counts`, `vehicle_freshness`를 함께 보면 SQL 실행 성공 시각과 각 section 처리 시간·데이터 frontier를 구분할 수 있습니다. 과거 scope의 분리된 재계산은 일반 lookback 누락 경고를 만들지 않습니다.
 - `datalake_aggregate_vehicle_window_lag_seconds{source=...}`는 DB의 source별 최신 numeric raw event와 최신 `1m` 요약 window 끝 사이 양의 초 차이입니다. 최신 관측 watermark 간의 실제 event-window gap이지만 모든 차량/path의 처리 완전성이나 ingest/DB ack 지연을 증명하지 않습니다. DB 조회 실패는 `vehicle_window_observation_success=0` 및 lag 없음이고, raw/요약 중 하나가 없으면 unknown입니다. observation timestamp가 오래되면 lag도 stale입니다.
 - status/restore 파일이 없거나 파싱 불가하면 `datalake_aggregate_status_known=0` / `datalake_restore_verification_known=0`이며 시각·성공을 만들어내지 않습니다. `datalake_restore_verification_timestamp_seconds`는 마지막 성공한 **오프라인 archive/SST SHA·내용 검증 및 staged 복원 완료** 시각입니다. 이후 DB 재기동·SQL 확인 성공을 뜻하지 않습니다. 오래된 성공, 새 실패, 진행 중, 미관측을 각각 구분하세요.
 

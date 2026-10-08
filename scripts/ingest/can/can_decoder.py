@@ -35,6 +35,16 @@ def _hash(value):
                                      ensure_ascii=True, allow_nan=False).encode()).hexdigest()
 
 
+def _json_atom(value):
+    # Canonical JSON bytes for one event-ID atom: plain ints stay decimal ASCII,
+    # anything else falls back to the exact _hash element encoding (bool stays
+    # true/false, never str(True)); separators/escaping identical to _hash.
+    if type(value) is int:
+        return str(value).encode('ascii')
+    return json.dumps(value, sort_keys=True, separators=(',', ':'),
+                      ensure_ascii=True, allow_nan=False).encode()
+
+
 def _choice_quality(label):
     tokens = re.split(r'[^A-Z0-9]+', label.upper())
     if 'INVALID' in tokens:
@@ -43,6 +53,8 @@ def _choice_quality(label):
         return 'unavailable'
     return 'reported_unverified'
 
+
+UNIT_ALIASES = {'kph': 'km/h', 'C': '°C', 'DegC': '°C', 'rpm': 'RPM', 'KWh': 'kWh'}
 
 class Decoder:
     def __init__(self, dbc_path, definitions_path):
@@ -73,7 +85,8 @@ class Decoder:
             if geometry != expected:
                 raise ValueError('Definition geometry differs from strict DBC.')
             choices = {str(key): str(value) for key, value in (signal.choices or {}).items()}
-            if choices != item['choices'] or signal.unit != item['unit']:
+            unit = signal.unit if signal.unit is not None else ''
+            if choices != item['choices'] or unit != (item['unit'] if item['unit'] is not None else ''):
                 raise ValueError('Definition choices or unit differ from strict DBC.')
             # Evidence supplies actual upstream pins; never substitute content hashes for commits.
             pin = re.search(r'\b' + re.escape(item['source']) + r'@([0-9a-f]{7,40})\b',
@@ -95,6 +108,16 @@ class Decoder:
                             'mapping_revision': self.mapping_revision,
                             'override_version': self.override_version,
                             'decoder_version': DECODER_VERSION})
+        # One-time row-projection cache per DBC message: multiplexed flag plus wanted
+        # data definitions with resolved display units. Built after the epoch so the
+        # mapping hash still covers only the pinned structural definitions.
+        self._muxed = {key: message.is_multiplexed() for key, message in self.messages.items()}
+        self._row_cache = {}
+        for key, definition in self.definitions.items():
+            unit = UNIT_ALIASES.get(definition['source_unit'], definition['source_unit'])
+            reported = any(_choice_quality(choice) == 'reported_unverified'
+                           for choice in definition['choices'].values())
+            self._row_cache[key] = (definition, unit, reported, None)
 
     def decode(self, meta, chunk, state):
         """Decode one sequential raw chunk; return rows, JSON state, and count deltas.
@@ -103,6 +126,25 @@ class Decoder:
         Oversize records are discarded until their CR, never resynchronized mid-record.
         All discarded/unknown bytes remain in the receiver's independent raw archive.
         """
+        rows, state, counts, _done = self._decode_core(meta, chunk, state, None)
+        return rows, state, counts
+
+    def decode_some(self, meta, chunk, state, max_rows):
+        """Decode one bounded row batch; resume with the returned partial state.
+
+        Same validation, ordinals, timestamps, parser tails, row identities and
+        summed counts as decode(). Non-final batches always emit >=1 row and stay
+        frame-atomic (one frame may slightly exceed the budget, never splits).
+        The final batch state is byte-identical to decode() state (resume keys
+        removed, next_seq/last_offset_ns advanced only then). counts deltas carry
+        bytes/chunks only on the first batch; tail_bytes is 0 until the final
+        batch. Receiver persists the partial state and replays only the remainder.
+        """
+        if type(max_rows) is not int or max_rows < 1:
+            raise ValueError('Row budget must be a positive integer.')
+        return self._decode_core(meta, chunk, state, max_rows)
+
+    def _decode_core(self, meta, chunk, state, max_rows):
         identity = {key: meta[key] for key in ('vehicle', 'collector_id', 'session_id', 'started_ns')}
         if state is None:
             state = dict(identity, version=1, epoch=self.epoch, next_seq=0,
@@ -124,14 +166,39 @@ class Decoder:
         tail = bytes.fromhex(state['tail_hex'])
         if len(tail) > BUFFER_LIMIT:
             raise ValueError('Persisted serial tail exceeds its bound.')
+        resume_part = state.get('resume_part')
+        first = resume_part is None
+        if first:
+            start = 0
+            ingest_time = time.time_ns()
+            envelope_id = _hash([meta['vehicle'], meta['collector_id'], meta['session_id'], chunk['seq']])
+        else:
+            # Resume emits only the remainder: same chunk bytes, frozen row times/identities.
+            if type(resume_part) is not int:
+                raise ValueError('Decoder resume cursor is not an integer.')
+            ingest_time = state.get('resume_ingest_ns')
+            envelope_id = state.get('resume_envelope')
+            if (type(ingest_time) is not int or ingest_time < 0 or type(envelope_id) is not str
+                    or not re.fullmatch(r'[0-9a-f]{64}', envelope_id)):
+                raise ValueError('Decoder resume identity is invalid.')
+            tail = b''
+            start = resume_part
         counts = collections.Counter({key: 0 for key in COUNT_KEYS})
-        counts.update(bytes=len(data), chunks=1)
+        if first:
+            counts.update(bytes=len(data), chunks=1)
         rows = []
         event_time = meta['started_ns'] + chunk['offset_ns']
-        ingest_time = time.time_ns()
-        envelope_id = _hash([meta['vehicle'], meta['collector_id'], meta['session_id'], chunk['seq']])
+        # Event-ID prefix: canonical bytes of [vehicle,collector_id,session_id]
+        # computed once per call; the ordinal is appended per frame from its
+        # exact _json_atom encoding. hashlib context per frame + copies per row.
+        identity_prefix = (b'[' + b','.join(_json_atom(meta[key])
+                                           for key in ('vehicle', 'collector_id', 'session_id')))
+        event_time_atom = _json_atom(event_time)
         parts = data.split(b'\r')
-        for index, part in enumerate(parts):
+        if not first and not 0 < start < len(parts):
+            raise ValueError('Decoder resume cursor is out of range.')
+        for index in range(start, len(parts)):
+            part = parts[index]
             complete = index < len(parts) - 1
             if state['discarding']:
                 counts['discarded_bytes'] += len(part)
@@ -191,11 +258,15 @@ class Decoder:
                 decoded = message.decode(payload, decode_choices=False, scaling=False,
                                          allow_truncated=False, allow_excess=False)
             except cantools.database.errors.DecodeError:
-                counts['unsupported_mux' if message.is_multiplexed() else 'decode_errors'] += 1
+                counts['unsupported_mux' if self._muxed[(identifier, extended)] else 'decode_errors'] += 1
                 continue
+            ordinal_atom = _json_atom(ordinal)
+            frame_ctx = hashlib.sha256()
+            frame_ctx.update(identity_prefix + b',' + ordinal_atom)
             counts['decoded_frames'] += 1
             for name, raw in decoded.items():
-                definition = self.definitions[(identifier, extended, name)]
+                cached = self._row_cache[(identifier, extended, name)]
+                definition, unit, has_reported_choice, path_atom = cached
                 if definition['kind'] != 'data':
                     continue
                 value_num = value_text = None
@@ -204,7 +275,7 @@ class Decoder:
                 quality = 'reported_unverified'
                 if label is not None:
                     value_text, quality = label, _choice_quality(label)
-                elif any(_choice_quality(choice) == 'reported_unverified' for choice in choices.values()):
+                elif has_reported_choice:
                     value_text, quality = f'UNKNOWN({raw})', 'unknown_enum'
                     counts['unknown_enum_signals'] += 1
                 else:
@@ -212,14 +283,19 @@ class Decoder:
                     if not math.isfinite(value_num):
                         counts['decode_errors'] += 1
                         continue
-                path = f'Vehicle.CAN.x{identifier:03X}.{name}'
-                unit = {'kph': 'km/h', 'C': '°C', 'DegC': '°C', 'rpm': 'RPM',
-                        'KWh': 'kWh'}.get(definition['source_unit'], definition['source_unit'])
+                if path_atom is None:
+                    # Cached ",<path>,<epoch>" bytes: constant per signal identity.
+                    path = f'Vehicle.CAN.x{identifier:03X}.{name}'
+                    path_atom = b',' + _json_atom(path) + b',' + _json_atom(self.epoch)
+                    self._row_cache[(identifier, extended, name)] = (
+                        definition, unit, has_reported_choice, path_atom)
+                else:
+                    path = f'Vehicle.CAN.x{identifier:03X}.{name}'
+                row_ctx = frame_ctx.copy()
+                row_ctx.update(path_atom + b',' + event_time_atom + b']')
                 rows.append({
                     'event_time': event_time, 'vehicle': meta['vehicle'], 'path': path,
-                    'source': 'can', 'event_id': _hash([
-                        meta['vehicle'], meta['collector_id'], meta['session_id'],
-                        ordinal, path, self.epoch, event_time]),
+                    'source': 'can', 'event_id': row_ctx.hexdigest(),
                     'decode_epoch': self.epoch, 'value_num': value_num,
                     'value_text': value_text, 'value_bool': None, 'unit': unit,
                     'vss_version': None, 'vehicle_firmware': meta['vehicle_firmware'] or None,
@@ -232,7 +308,16 @@ class Decoder:
                     'quality': quality, 'envelope_id': envelope_id,
                     'config_version': self.epoch, 'connectivity': None,
                 })
+            if max_rows is not None and rows and len(rows) >= max_rows and index + 2 < len(parts):
+                # Frame-atomic pause: rows stay whole, parser position persists.
+                state.update(resume_part=index + 1, resume_ingest_ns=ingest_time,
+                             resume_envelope=envelope_id)
+                counts['tail_bytes'] = 0
+                counts['rows'] = len(rows)
+                return rows, state, dict(counts), False
+        for key in ('resume_part', 'resume_ingest_ns', 'resume_envelope'):
+            state.pop(key, None)
         state.update(next_seq=chunk['seq'] + 1, last_offset_ns=chunk['offset_ns'], tail_hex=tail.hex())
         counts['tail_bytes'] = len(tail)
         counts['rows'] = len(rows)
-        return rows, state, dict(counts)
+        return rows, state, dict(counts), True
