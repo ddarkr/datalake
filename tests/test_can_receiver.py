@@ -19,7 +19,7 @@ import urllib.request
 
 from scripts.ingest.can.can_decoder import Decoder
 from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Worker, archive_status, encode_body, render_insert, select_prefix_count
-from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, check_response, decode_batch, encode_batch
+from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, WireError, check_response, decode_batch, encode_batch
 
 
 def synthetic_decoder(directory, revision="synthetic-v1"):
@@ -65,6 +65,27 @@ def wait_for(predicate):
 
 
 class ReceiverBehavior(unittest.TestCase):
+    def test_wire_record_and_byte_boundaries(self):
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "boundary", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        chunks = [{"seq": seq, "offset_ns": seq, "phase": "capture", "data": b"x"}
+                  for seq in range(10000)]
+        payload = encode_batch(meta, chunks)
+        self.assertEqual(decode_batch(payload), (meta, chunks))
+        with self.assertRaisesRegex(WireError, "record count"):
+            encode_batch(meta, chunks + [dict(chunks[-1], seq=10000, offset_ns=10000)])
+        from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import ExportLogsServiceRequest
+        request = ExportLogsServiceRequest.FromString(payload)
+        records = request.resource_logs[0].scope_logs[0].log_records
+        records.add().CopyFrom(records[-1])
+        with self.assertRaisesRegex(WireError, "instrumentation scope"):
+            decode_batch(request.SerializeToString())
+        with self.assertRaisesRegex(WireError, "byte limit"):
+            encode_batch(meta, [dict(chunks[seq], data=b"x" * 65536) for seq in range(32)])
+        with self.assertRaisesRegex(WireError, "request size"):
+            decode_batch(b"x" * (2 * 1024 * 1024 + 1))
+
     def test_archive_rejects_workspace_before_creating_database(self):
         workspace = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory(dir=workspace) as inside, tempfile.TemporaryDirectory() as outside:

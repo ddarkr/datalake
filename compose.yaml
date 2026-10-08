@@ -816,7 +816,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '5'
+      datalake.can-receiver-revision: '6'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -840,7 +840,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '5'
+      datalake.can-receiver-revision: '6'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -26417,7 +26417,7 @@ configs:
       )
 
       MAX_REQUEST_BYTES = 2 * 1024 * 1024
-      MAX_RECORDS = 500
+      MAX_RECORDS = 10000
       MAX_CHUNK_BYTES = 65536
       MAX_INT = 2 ** 63 - 1
       META_KEYS = {"schema_version", "vehicle", "collector_id", "session_id", "started_ns", "vehicle_firmware"}

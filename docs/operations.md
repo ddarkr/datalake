@@ -168,6 +168,8 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
 
 초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps와 receiver **두 서비스의 revision label**을 함께 갱신하세요. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
 
+CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
+
 디코딩은 한 트랜잭션에 최대 1,000청크를 처리하고, 청크 처리 사이에 경과 시간을 확인하여 50ms를 넘으면 commit하고 쓰기 잠금을 해제합니다. 개별 청크 처리·commit 시간까지 포함한 엄격한 50ms 상한은 아닙니다. parser 상태·decode cursor·outbox는 함께 commit하거나 함께 rollback하며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
 
 단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, ingress socket의 `--http-timeout` 기본값 15초와 별개입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 독점 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.

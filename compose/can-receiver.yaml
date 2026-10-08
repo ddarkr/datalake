@@ -3,7 +3,7 @@ services:
     image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [can-receiver]
     labels:
-      datalake.can-receiver-revision: "5"
+      datalake.can-receiver-revision: "6"
     volumes:
       - receiver-venv:/opt/venv
       - receiver-code:/app
@@ -37,7 +37,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: "5"
+      datalake.can-receiver-revision: "6"
     user: "10001:10001"
     read_only: true
     tmpfs:

@@ -7,7 +7,7 @@ from opentelemetry.proto.collector.logs.v1.logs_service_pb2 import (
 )
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
-MAX_RECORDS = 500
+MAX_RECORDS = 10000
 MAX_CHUNK_BYTES = 65536
 MAX_INT = 2 ** 63 - 1
 META_KEYS = {"schema_version", "vehicle", "collector_id", "session_id", "started_ns", "vehicle_firmware"}
