@@ -113,6 +113,12 @@ CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentel
 
 성능 비교는 같은 row 집합·27개 column·event ID·정수 nanosecond를 검증한 뒤 수행하세요. SQL timestamp CAST와 정수 literal, native gRPC의 HTTP/protobuf body 및 encode/ACK 시간을 분리합니다. full ACK, ACK 유실 뒤 재전송 중복 제거, NULL/0/false/빈 문자열/Unicode, 잘못된 인증을 함께 확인하며 backend가 거부한 timestamp 경계는 성공 행 수에서 숨기지 않습니다. 소규모 로컬 fixture의 gRPC 우위나 index/cache query plan은 운영 처리량 증거가 아니며 의존성·운영 query 선택도를 확인하기 전 transport/index 기본값을 바꾸지 않습니다.
 
+## 가벼운 PR 성능 비교
+
+[합성 성능 비교](performance.md)는 관련 코드 PR에서 동일 runner의 base/head를
+짧게 비교합니다. 성능 변화는 advisory, 정답 불일치는 실패입니다. 대량·반복·제어된
+재시작/재전송 검사는 수동 실행만 제공하며 정기 schedule은 없습니다.
+
 ## 합성 런타임 통합 검사
 
 로컬 Docker Engine/Desktop과 Compose 2.24.4 이상에서 아래 명령을 사용합니다. 호스트 CLI에는 Python 3.12 stdlib만 필요합니다. generated `compose.yaml`을 사용하므로 소스를 변경했다면 위 순서대로 재생성한 뒤 실행하세요.
