@@ -37,20 +37,39 @@ for profile in server home mqtt vehicle fleet backup redecode '*'; do
 done
 ```
 
-플러그인을 변경했다면 Node.js 22 이상에서 다음도 실행합니다.
+플러그인을 변경했다면 Node.js 22 이상에서 기존 Node 회귀 suite를 실행합니다.
 
 ```bash
 npm ci --prefix plugins --ignore-scripts --no-audit --no-fund
 node --test tests/test_plugin_*.mjs
+# 선택: 실제 Bun 호출자 검사 (신뢰할 수 있는 절대 경로)
+DATALAKE_TEST_BUN=/absolute/path/to/bun node --test tests/test_plugin_*.mjs
+# 선택: PATH에 없는 실제 Codex CLI로 native 설치 보존 검사
+CODEX_BINARY=/absolute/path/to/codex node --test tests/test_plugin_codex.mjs
 ```
+
+Node suite는 임시 private home/state와 합성 loopback HTTP를 사용합니다. `DATALAKE_TEST_BUN`이 없으면 실제 Bun 호출자 검사가, Codex CLI가 없으면 native 설치 보존 검사가 skip됩니다. skip은 통과가 아니며 결과에 이유를 남기세요. SIGKILL·FIFO·프로세스 소유권·0700/0600 검사는 POSIX/macOS/Linux 경계의 증거이지 Windows 지원 증거가 아닙니다.
+
+이번 검증에서는 macOS Node suite를 실제 Bun 경로와 함께 실행해 skip 없이 통과했습니다. 별도 네트워크 없는 `node:22-bookworm` Linux 컨테이너에서는 plugin/test 소스를 read-only로 마운트해 Node suite가 통과했지만, 이미지에 실제 Codex CLI와 Bun이 없어 그 두 검사는 skip되었습니다. 이 Linux 결과는 다섯 native host의 Linux 실행 증거가 아닙니다.
+
+- HTTP ACK를 의도적으로 보류한 동안 `enqueue()`와 `flushLocal()`, producer 종료·stdio 닫힘, OMP shutdown 및 OpenCode 소비·cleanup이 끝나는지 확인합니다. `enqueue() === true`는 로컬 영속 수락이지 HTTP ACK가 아닙니다.
+- 실제 sender SIGKILL 전후 재전송, 파일/디렉터리 sync 실패, immutable 최초 body/ID/timestamp, pending+done 용량 상한과 tombstone 보존을 확인합니다.
+- 파일 credential 교체를 다음 HTTP 시도에서 읽고, endpoint 변경 시 기존 pending을 다른 목적지로 보내지 않는지 확인합니다.
+- Codex source snapshot/queued receipt, Claude·AGY의 legacy sent ACK 보존과 새 queued receipt, Claude 부분 batch checkpoint를 검사합니다. 로컬 수락 실패는 source checkpoint를 앞당기지 않아야 합니다.
+- 동시 producer/worker의 단일 HTTP 소유권, 죽은 owner 복구, empty-worker handoff, 오래된 live owner 보존을 검사합니다. PID 재사용/이전 boot 사례는 incarnation fixture로 재현하며 실제 OS PID 재사용을 강제한 검사는 아닙니다.
+- canary가 wire/spool에 없고 credential이 spool/진단에 없으며, project PATH의 가짜 Node가 실행되지 않는지 확인합니다. OpenCode는 raw bus를 계속 비우고 bounded sanitized metadata만 보관하며 overflow 시 새 ID를 명시적으로 거절해야 합니다.
+
+이 suite의 callback/installer fixture와 실제 native host smoke는 별도 gate입니다. 별도 macOS smoke에서는 새 home, 실제 설치된 Codex·Claude Code·OMP·OpenCode·AGY와 합성 loopback LLM을 사용하고 실제 사용자 데이터 접근/쓰기 및 외부 socket을 sandbox로 차단했습니다. host(및 소유한 OpenCode server)가 ACK 전에 종료하고 남은 sender가 ACK 후 전달하는 것, 실제 OMP `task` 두 child와 `wait`의 child/subagent span, wire/spool canary 제외를 확인했습니다. 소유한 로컬 Alloy/Greptime에 native payload를 두 번 재생한 검사는 해당 fixture의 raw 중복/ID 기반 집계만 확인합니다. 운영 exactly-once, 실제 provider 청구, 모든 child 실행 경로나 AGY native 정확 token 계측을 증명하지 않습니다.
+
+Node syntax 검사 통과와 LSP 검사는 구분하세요. 이번 검증에서는 변경 Node 파일의 syntax 검사는 통과했지만 LSP가 구성되지 않아 실행하지 않았습니다. Node와 Hermes는 모두 로컬 handoff와 network worker를 분리하지만, Node의 private 파일 outbox/분리된 sender와 Hermes의 SQLite/in-process daemon thread는 저장 형식·종료 수명·route 정책이 서로 다릅니다.
 
 `.env.example`을 사용한 프로필 검사는 실제 자격 증명 없이 수행하는 구조 검사입니다. 실제 S3 연결, 물리 CAN, 운영 서버 배포·데이터 수집을 검증하지 않습니다. 변경한 기능의 런타임 검증은 별도로 수행하세요.
 
 
-Hermes 플러그인을 변경했다면 별도 Python 테스트도 실행합니다. native 호환성 검증에 필요한 외부 체크아웃과 제약은 [Hermes 문서](../plugins/hermes/README.md#tests)를 참고하세요.
+Hermes 플러그인을 변경했다면 별도 Python 테스트도 실행합니다. `HERMES_SOURCE`가 없으면 외부 native Hermes 검사는 skip되며, core/HTTP/multiprocess 및 Node `serializeEvent()` ID oracle 검사 통과와 구분해야 합니다. 이번 검증에서는 외부 verified checkout이 없어 native Hermes gate를 실행하지 않았습니다. 필요한 체크아웃과 제약은 [Hermes 문서](../plugins/hermes/README.md#tests)를 참고하세요.
 
 ```bash
-python3 -m unittest discover -s plugins/hermes/tests -v
+python3 -B -m unittest discover -s plugins/hermes/tests -v
 ```
 
 ## CI와 개인정보 검사

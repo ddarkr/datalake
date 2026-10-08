@@ -21,7 +21,7 @@ The hook's "sanitized" response can still contain assistant text. This exporter 
 
 No messages, prompts, response objects, tools, request bodies, headers, raw base URLs, platform/sender metadata, cost snapshots, MoA references, state.db contents, filesystem paths, or exception text are exported or spooled. Model/provider labels have a restrictive 128-character ASCII identifier grammar; invalid labels, malformed identities, negative/fractional/bool counts, inconsistent totals, and invalid intervals are discarded. Arbitrary text placed by another plugin into an otherwise valid model identifier cannot be distinguished from a real identifier: this is metadata allowlisting, not a content-classification engine.
 
-Session IDs are SHA-256 of `[profile_scope, session_id]`, where profile scope hashes the captured resolved Hermes home. Request IDs are hashed too. `traceId` and `spanId` use the same compact JSON/SHA-256 truncation contract as `plugins/otel.mjs`, with client `hermes`. The event identity is compact JSON `[hook_name, opaque_api_request_id, retry_count_or_zero]`. Do not parse Hermes IDs. Do not add a random process ID: it would defeat multiprocess replay deduplication. Moving a profile directory changes scope for newly observed events, but already-spooled bodies remain unchanged.
+Session IDs are SHA-256 of `[profile_scope, session_id]`, where profile scope hashes the captured resolved Hermes home. Request IDs are hashed too. `traceId` and `spanId` use the same compact JSON/SHA-256 truncation contract as `serializeEvent()` in `plugins/otel.mjs`, with client `hermes`. The event identity is compact JSON `[hook_name, opaque_api_request_id, retry_count_or_zero]`. Do not parse Hermes IDs. Do not add a random process ID: it would defeat multiprocess replay deduplication. Moving a profile directory changes scope.
 
 Spans are `coding_agent.llm.turn`, client `hermes`, service `hermes`, scope `doda-datalake/1.0.0`, `metadata_only`, `datalake-plugin`, successful status. Main and auxiliary hook events are **not necessarily independent provider requests**. There are no additive session snapshots.
 
@@ -52,6 +52,8 @@ Upstream `CanonicalUsage` initializes missing buckets to zero before observer di
 - Capacity defaults to **100,000 ledger identities including tombstones**, configurable up to 1,000,000. At capacity, new events are rejected with a sanitized warning: there is no silent eviction. Monitor capacity and increase deliberately. No automatic tombstone pruning/rotation is provided; deleting the ledger loses dedup history.
 
 Delivery is **at least once**, not exactly once: collector acknowledgment can be lost, or a process can die after HTTP acceptance before SQLite acknowledgment. Replays retain exactly the same IDs/timestamps/body. The collector/database must deduplicate these IDs; that downstream behavior is not proven by this plugin's tests. Permanent 4xx responses are retained for retry, so correcting collector configuration is necessary to resume progress. Changing endpoint routes existing pending bodies to the new endpoint.
+
+Both Hermes and the Node plugins separate local durable handoff from network work; local persistence is not collector acknowledgment. Their runtimes and storage are independent: Hermes keeps this SQLite ledger and an **in-process daemon thread**, not the Node file outbox or detached sender subprocess. The Node sender's ability to survive its producer's exit does not apply to Hermes, nor does Node endpoint pinning change Hermes's existing endpoint behavior above. Hermes deployment, authentication and access requirements are unchanged.
 
 ## Installation (only after separate approval)
 
@@ -104,18 +106,18 @@ Keep the private outbox for later replay. To remove the plugin, first stop its o
 From repository root, Python 3.9+ and Node 22+:
 
 ```sh
-python3 -m unittest discover -s plugins/hermes/tests -v
+python3 -B -m unittest discover -s plugins/hermes/tests -v
 # Core/HTTP/multiprocess suite; three optional native tests skip without HERMES_SOURCE.
 
 HERMES_SOURCE=/path/to/verified/hermes-agent \
-  /path/to/hermes-agent/venv/bin/python -m unittest discover -s plugins/hermes/tests -v
+  /path/to/hermes-agent/venv/bin/python -B -m unittest discover -s plugins/hermes/tests -v
 ```
 
 Native tests use a temporary candidate package and isolated scratch Hermes home, the real manifest scanner/PluginManager/observer dispatcher/unloader and actual installed main/aux usage normalizers. Only fixture metadata is posted to an ephemeral loopback HTTP server. No provider call, production collector, live profile, installed plugin directory, gateway service, credentials or Wiki is touched.
 
-Tests cover malicious/poisoned hook fields, no raw identities/content, unknown versus zero, consistency validation, JavaScript canonical IDs, durable immutable retry, partial successes, independent processes racing on one ledger, stale leases, private permissions, bounded socket behavior, native profile binding and short unload. Provider fixtures separately cover OpenAI Chat, Codex Responses and Anthropic canonical normalizers; these are **adapter-shape tests, not live vendor accounting validation**.
+Tests cover malicious/poisoned hook fields, no raw identities/content, unknown versus zero, consistency validation, JavaScript canonical IDs, durable immutable retry, partial successes, independent processes racing on one ledger, stale leases, private permissions, bounded socket behavior, native profile binding and short unload. The shared ID/timestamp oracle calls only `serializeEvent('hermes', event).body` in Node; it does not create a Node exporter, enqueue records or mock a network fetch. Provider fixtures separately cover OpenAI Chat, Codex Responses and Anthropic canonical normalizers; these are **adapter-shape tests, not live vendor accounting validation**.
 
-For existing repository CI, add `python -m unittest discover -s plugins/hermes/tests -v` alongside the coding-agent plugin privacy tests after Python and Node setup. Native compatibility requires an explicitly supplied, pinned Hermes checkout and its environment; the default CI should not download or activate Hermes implicitly.
+For existing repository CI, add `python -B -m unittest discover -s plugins/hermes/tests -v` alongside the coding-agent plugin privacy tests after Python and Node setup. Native compatibility requires an explicitly supplied, pinned Hermes checkout and its environment; the default CI should not download or activate Hermes implicitly. A missing `HERMES_SOURCE` skips the three native tests; passing core/HTTP/multiprocess and serializer-oracle checks does not satisfy that gate. In the current shared Node verification, those Hermes native gates were skipped because the verified external checkout was unavailable; Hermes runtime was unchanged. Node syntax checks also do not substitute for an LSP check (none was configured) or native Hermes compatibility.
 
 ## Coverage limits
 
