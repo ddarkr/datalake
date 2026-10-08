@@ -109,7 +109,7 @@ def _battery_db():
         event_time TIMESTAMP, vehicle TEXT, source TEXT,
         decode_epoch TEXT, source_field TEXT, value_num REAL,
         unit TEXT, quality TEXT, ingest_time TIMESTAMP,
-        envelope_id TEXT)''')
+        envelope_id TEXT, path TEXT, value_text TEXT, value_bool BOOLEAN)''')
     return db
 
 
@@ -210,25 +210,35 @@ def test_battery_cards_raw_display_latest_valid_only():
     with _battery_db() as db:
         # No reports: no rows (unknown), never a zero fill.
         assert db.execute(query).fetchall() == []
-        db.execute("""INSERT INTO vehicle_signal VALUES
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
             (1500, 'v', 'fleet', 'e1', 'BatteryLevel', 62.5, '%', NULL, 1500, 'env-a')""")
         row = db.execute(query).fetchone()
         assert row[:3] == ('v', 'fleet', 'e1')
         assert row[3] == 1500 and row[4] == 62.5
         # A newer invalid tombstone blocks the stale good value: row stays, reading NULL.
-        db.execute("""INSERT INTO vehicle_signal VALUES
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
             (1600, 'v', 'fleet', 'e1', 'BatteryLevel', NULL, '%', 'invalid', 1600, 'env-b')""")
         rows = db.execute(query).fetchall()
         assert len(rows) == 1 and rows[0][4] is None
         # A newer wrong-unit report is not a percent either: still NULL.
-        db.execute("""INSERT INTO vehicle_signal VALUES
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
             (1700, 'v', 'fleet', 'e1', 'BatteryLevel', 62.5, 'count', NULL, 1700, 'env-c')""")
         rows = db.execute(query).fetchall()
         assert len(rows) == 1 and rows[0][4] is None
         # Other scopes stay separate; the BMS Soc field never leaks into this card.
-        db.execute("""INSERT INTO vehicle_signal VALUES
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
             (1700, 'v', 'fleet', 'e2', 'BatteryLevel', 70.0, '%', 'ok', 1700, 'env-d')""")
-        db.execute("""INSERT INTO vehicle_signal VALUES
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
             (1700, 'v', 'fleet', 'e1', 'Soc', 68.0, '%', NULL, 1700, 'env-e')""")
         rows = {r[2]: r for r in db.execute(query).fetchall()}
         assert set(rows) == {'e1', 'e2'}
@@ -380,13 +390,17 @@ def test_physical_cards_latest_analysis_and_new_raw_barriers():
             assert db.execute(query).fetchone()[4] is None
             insert(3600, "recalibrated", value, "derived", 10003)
             # A newer bad raw leg blocks old analyzed numbers before next job.
-            db.execute("""INSERT INTO vehicle_signal VALUES
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
                 (7500, 'v', 'fleet', 'fleet-v1', 'PackVoltage',
                  NULL, NULL, 'invalid', 9000, 'new-invalid')""")
             assert db.execute(query).fetchone()[4] is None
             db.execute("DELETE FROM vehicle_signal")
             # Late-ingested same-time invalid observations also need reanalysis.
-            db.execute("""INSERT INTO vehicle_signal VALUES
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
                 (7140, 'v', 'fleet', 'fleet-v1', 'PackVoltage',
                  NULL, NULL, 'invalid', 11000, 'late-invalid')""")
             assert db.execute(query).fetchone()[4] is None
@@ -425,7 +439,9 @@ def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
         query = _physical_query(configs, "grafana-dash-battery", panel)
         with _battery_db() as db:
             db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
-            db.execute("""INSERT INTO vehicle_signal VALUES
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
                 (1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
                  'unit_unverified', 1500, 'raw')""", (field,))
             row = db.execute(query).fetchone()
@@ -433,10 +449,87 @@ def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
             assert row[index] is None
             db.execute("UPDATE vehicle_signal SET unit = ?, quality = 'ok'", (unit,))
             assert db.execute(query).fetchone()[index] == 4
-            db.execute("""INSERT INTO vehicle_signal VALUES
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
                 (1600, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
                  'invalid', 1600, 'invalid')""", (field, unit))
             assert db.execute(query).fetchone()[index] is None
+
+
+def test_can_reports_keep_invalid_latest_and_scope_boundaries():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    cases = (
+        (1, "x292.BMS_socUI", "%", 62, None, 4, 62),
+        (2, "x352.BMS_nominalEnergyRemaining", "kWh", 38, None, 3, 38),
+        (7, "x118.DI_gear", None, 4, "DI_GEAR_D", 3, "DI_GEAR_D"),
+        (8, "x13D.CP_hvChargeStatus", None, 5, "CP_CHARGE_ENABLED", 3, "CP_CHARGE_ENABLED"),
+        (9, "x20C.VCRIGHT_tempAmbientRaw", "°C", 18, None, 4, 18),
+    )
+    for panel_id, signal, unit, number, text, index, expected in cases:
+        query = _physical_query(configs, "grafana-dash-vehicle-overview", panel_id)
+        with _battery_db() as db:
+            def insert(event, quality="reported_unverified", epoch="can-v1", path=None):
+                db.execute("""INSERT INTO vehicle_signal
+                    (event_time, vehicle, source, decode_epoch, source_field,
+                     value_num, value_text, unit, quality, ingest_time, envelope_id, path)
+                    VALUES (?, 'can-car', 'can', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           (event, epoch, signal.split(".", 1)[1], number, text,
+                            unit, quality, event, str(event), path or "Vehicle.CAN." + signal))
+            insert(1500)
+            assert db.execute(query).fetchone()[index] == expected
+            # A same-named signal at a different CAN path is not an alias.
+            insert(1550, path="Vehicle.CAN.other." + signal.split(".", 1)[1])
+            assert db.execute(query).fetchone()[index] == expected
+            insert(1600, "invalid")
+            assert db.execute(query).fetchone()[index] is None
+            insert(1650, epoch="can-v2")
+            rows = {row[2]: row[index] for row in db.execute(query)}
+            assert rows == {"can-v1": None, "can-v2": expected}
+            if unit is not None:
+                db.execute("UPDATE vehicle_signal SET unit = 'wrong'")
+                assert all(row[index] is None for row in db.execute(query))
+            else:
+                db.execute("UPDATE vehicle_signal SET value_text = 'UNKNOWN(99)'")
+                assert all(row[index] is None for row in db.execute(query))
+            db.execute("UPDATE vehicle_signal SET source = 'fleet'")
+            assert db.execute(query).fetchall() == []
+
+
+def test_vehicle_coverage_separates_observation_from_receipt():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-vehicle-overview", 92)
+    query = query.replace("$__timeFilter(ingest_time)", "ingest_time BETWEEN 1000 AND 2000")
+    with _battery_db() as db:
+        assert db.execute(query).fetchall() == []
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, ingest_time) VALUES (?, ?, ?, ?, ?)""",
+                       [(500, "can-car", "can", "old", 1500),
+                        (1500, "can-car", "can", "new", 2500),
+                        (1500, "fleet-car", "fleet", "fleet-v1", 1500)])
+        rows = {(row[0], row[2]): row for row in db.execute(query)}
+        assert rows["can-car", "old"][3] == "선택 기간에 관측 없음"
+        assert rows["can-car", "old"][6:] == (0, 1)
+        assert rows["can-car", "new"][3] == "선택 기간에 관측 있음"
+        assert rows["can-car", "new"][6:] == (1, 0)
+        assert rows["fleet-car", "fleet-v1"][6:] == (1, 1)
+
+
+def test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-vehicle-overview", 11)
+    query = query.replace("date_bin(INTERVAL $__interval_ms MILLISECOND, event_time)", "event_time")
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (?, 'can-car', 'can', 'can-v1', 'BMS_socUI',
+             'Vehicle.CAN.x292.BMS_socUI', ?, ?, ?)""",
+                       [(1100, 62, "%", "reported_unverified"),
+                        (1200, 99, "wrong", "reported_unverified"),
+                        (1300, 99, "%", "invalid")])
+        assert [(row[0], row[2]) for row in db.execute(query)] == [(1100, 62), (1200, None), (1300, None)]
 
 
 if __name__ == "__main__":
@@ -449,4 +542,7 @@ if __name__ == "__main__":
     test_physical_cards_latest_analysis_and_new_raw_barriers()
     test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
+    test_can_reports_keep_invalid_latest_and_scope_boundaries()
+    test_vehicle_coverage_separates_observation_from_receipt()
+    test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()
     print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")
