@@ -24,7 +24,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: "1"
+      datalake.can-receiver-revision: "2"
     user: "10001:10001"
     read_only: true
     tmpfs:

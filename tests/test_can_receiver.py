@@ -3,6 +3,7 @@
 Run: python -m unittest discover -s tests -p test_can_receiver.py
 """
 import base64
+import contextlib
 import gzip
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
@@ -12,6 +13,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 import urllib.error
 import urllib.request
 
@@ -81,6 +83,64 @@ class ReceiverBehavior(unittest.TestCase):
             self.assertEqual(list(private.iterdir()), [])
             archive = Archive(Path(outside) / "raw.sqlite", disk_reserve_bytes=0)
             self.assertEqual(archive.status()["raw_chunks"], 0)
+
+    def test_decode_resumes_in_arrival_order_without_rescanning_history(self):
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "old-session", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(meta, [
+                {"seq": seq, "offset_ns": seq, "phase": "capture", "data": b"\r"}
+                for seq in range(6000)
+            ])
+            archive.decode_once(decoder)
+            # A completed, retained prefix with no decoded signals or partial frame.
+            with archive.connect() as conn:
+                state = json.loads(conn.execute("SELECT state_json FROM decode_states").fetchone()[0])
+                state.update(next_seq=6000, last_offset_ns=5999)
+                conn.execute("UPDATE decode_states SET next_seq=6000,state_json=?", (json.dumps(state),))
+                conn.commit()
+            archive.accept(dict(meta, session_id="new-session"), [
+                {"seq": 0, "offset_ns": 7, "phase": "capture", "data": b"t12320200\r"}
+            ])
+            archive.accept(meta, [
+                {"seq": 6000, "offset_ns": 6000, "phase": "capture", "data": b"t12320400\r"}
+            ])
+            connect = archive.connect
+
+            @contextlib.contextmanager
+            def bounded_connect():
+                with connect() as conn:
+                    steps = 0
+
+                    def budget():
+                        nonlocal steps
+                        steps += 1000
+                        return steps > 20000
+
+                    # Bound SQLite work, not wall time or a particular query plan.
+                    conn.set_progress_handler(budget, 1000)
+                    yield conn
+
+            with patch.object(archive, "connect", bounded_connect):
+                self.assertTrue(archive.decode_once(decoder))
+                self.assertTrue(archive.decode_once(decoder))
+                self.assertFalse(archive.decode_once(decoder))
+            with archive.connect() as conn:
+                rows = [json.loads(row[0]) for row in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            self.assertEqual([(row["event_time"], row["value_num"]) for row in rows],
+                             [(meta["started_ns"] + 7, 1.0), (meta["started_ns"] + 6000, 2.0)])
+            replay = synthetic_decoder(directory, revision="synthetic-v2")
+            archive.register_epoch(replay, explicit=True)
+            with patch.object(archive, "connect", bounded_connect):
+                self.assertTrue(archive.decode_once(replay))
+            with archive.connect() as conn:
+                cursor = conn.execute("SELECT next_seq FROM decode_states WHERE epoch=?", (replay.epoch,)).fetchone()[0]
+                self.assertEqual(cursor, 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 6002)
 
     def test_durable_auth_dedup_split_restart_and_downstream_retry(self):
         meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",

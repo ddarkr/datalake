@@ -189,6 +189,8 @@ docker compose --env-file .env --profile can-receiver up -d can-receiver
 
 완전한 OTLP ACK는 **서버 raw SQLite의 durable 수락**이지 Greptime commit이 아닙니다. downstream 장애 시 raw와 outbox가 남으며, ACK는 차량 원본 삭제 허가가 아닙니다. 자동 raw GC를 추가하지 말고 SQLite archive·차량 원본을 보존하세요. epoch·정수 nanosecond·quality를 유지하며 `reported_unverified` 등을 집계 편의를 위해 `valid`로 바꾸지 않습니다.
 
+다음 해석 대상은 세션별 cursor와 기존 `(session, seq)` 인덱스로 찾고, 후보 중 원본 도착 순서가 가장 빠른 chunk를 처리합니다. 보존한 원본 전체를 chunk마다 재검색하지 않습니다. 이 조회 최적화는 decode epoch·cursor 형식·영속 커밋을 바꾸지 않으므로 재해석이나 archive 마이그레이션이 필요하지 않습니다.
+
 Grafana의 기존 **수집 진단 · CAN / VSS** 대시보드는 `vehicle_signal`의 `source='can'`을 조회하므로 custom `Vehicle.CAN.*` 경로 확인에 별도 대시보드가 필요하지 않습니다. FIFO backlog는 과거 `event_time`으로 들어오므로 실제 수집 세션의 시간 범위로 조회하세요. 최근 24시간이 비어 있다는 사실만으로 ingest 실패를 단정하지 않습니다. 이 정의와 custom 경로는 공식 VSS/Fleet 의미나 물리 교정 검증을 보장하지 않습니다. 기존 trip/charge/battery 분석의 표준 경로·quality 조건을 통과한다고 가정하지 마세요.
 
 ### Tesla Fleet Telemetry
