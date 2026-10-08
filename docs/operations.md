@@ -125,6 +125,72 @@ DBC·VSS·펌웨어 pin 변경 시 recorder와 decoder를 먼저 정지하고 `D
 COMPOSE_PROFILES=redecode docker compose --env-file .env run --rm redecode
 ```
 
+### 별도 CAN uploader의 서버 receiver
+
+`can-receiver`는 opt-in 서버 프로필입니다. 이 저장소가 receiver·디코더·배포를 관리하며 차량 측 capture/uploader는 `tesla-obd`에서 관리합니다. 기존 `vehicle`의 SocketCAN/MF4 경로와 혼용하지 않습니다. 공개 Git에는 DBC, companion evidence JSON, 실제 원본·샘플·차량 식별자·자격 증명을 넣지 않습니다.
+
+서버의 비공개 `.env`에 `COMPOSE_PROFILES=server,can-receiver`, `CAN_OTLP_USER`, `CAN_OTLP_PASSWORD`, `CAN_VEHICLE`, `CAN_COLLECTOR_ID`를 설정합니다. 기존 uploader의 인증·identity를 그대로 유지하세요. `GREPTIME_HTTP_URL` 기본값은 컨테이너 네트워크의 `http://greptimedb:4000`이며 `GREPTIME_DB/USER/PASSWORD`는 **서버에만** 둡니다. 차량에는 수신 주소와 CAN 인증만 전달합니다. 빈 인증·identity는 inactive profile의 구조 검사를 허용하지만 실제 receiver 기동은 거부됩니다.
+
+#### 새 볼륨 준비
+
+두 볼륨은 external이므로 Compose가 생성하지 않습니다. 다음은 **새 설치의 기본 이름** 예제입니다. `.env`에서 `CAN_RECEIVER_RAW_VOLUME` 또는 `CAN_RECEIVER_DEFINITIONS_VOLUME`을 변경했다면 명령에도 동일한 이름을 사용하세요. 기존 raw 볼륨을 초기화하는 명령이 아닙니다.
+
+```bash
+docker volume create datalake_can-receiver-raw
+docker volume create datalake_can-receiver-definitions
+docker run --rm --user 0:0 -v datalake_can-receiver-raw:/data \
+  -v datalake_can-receiver-definitions:/definitions \
+  python:3.12.8-slim-bookworm sh -ec \
+  'chown 10001:10001 /data /definitions; chmod 0700 /data /definitions'
+```
+
+운영자가 외부에서 확보한 private DBC와 companion 정의 JSON의 **정확한 원본 바이트**를 각각 `/definitions/observed.dbc`, `/definitions/observed.json`으로 공급합니다. 아래 `/private/path/...`는 실제 비공개 파일 경로로 바꾸되 Git으로 복사하지 마세요. receiver를 시작하기 전에만 실행합니다.
+
+```bash
+docker create --name can-definitions-load --user 0:0 \
+  -v datalake_can-receiver-definitions:/definitions \
+  python:3.12.8-slim-bookworm sh -ec \
+  'chown 10001:10001 /definitions/observed.dbc /definitions/observed.json; chmod 0600 /definitions/observed.dbc /definitions/observed.json'
+docker cp /private/path/observed.dbc can-definitions-load:/definitions/observed.dbc
+docker cp /private/path/observed.json can-definitions-load:/definitions/observed.json
+docker start -a can-definitions-load
+docker rm can-definitions-load
+```
+
+볼륨 루트는 UID/GID `10001:10001`, `0700`, 정의 파일은 같은 소유자의 `0600`입니다. receiver는 UID/GID `10001:10001`로 실행하며 정의 볼륨과 코드 configs는 read-only입니다. raw SQLite `/data/raw.sqlite3`와 관련 WAL/SHM도 비공개로 보존합니다. 내용 정렬·재직렬화·줄바꿈 변경도 epoch를 바꿀 수 있으므로 운영 중 정의를 덮어쓰지 마세요.
+
+```bash
+docker compose --env-file .env --profile can-receiver config --quiet
+docker compose --env-file .env --profile can-receiver up -d can-receiver
+docker compose --env-file .env --profile can-receiver exec can-receiver \
+  /opt/venv/bin/python /app/can_receiver.py status --database /data/raw.sqlite3
+```
+
+초기 `can-receiver-deps`는 PyPI 네트워크가 필요하며 pinned 의존성이 바뀌면 venv를 다시 만듭니다. 코드 configs를 바꿀 때는 해당 receiver의 revision label도 갱신해 재생성을 유도합니다. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
+
+#### 기존 receiver 인계
+
+1. 기존 receiver의 raw volume 이름, identity·인증, 정의 두 파일의 SHA256, 상태·epoch를 비공개로 기록하고 SQLite-consistent 백업을 확보합니다. **온라인 백업은 SQLite backup API 등 일관성 있는 방식으로 수행하세요. WAL이 열린 `.db`만 `cp`하면 안 됩니다.** 오프라인 전체 볼륨 백업도 모든 writer를 먼저 중지해야 합니다.
+2. **기존 receiver만** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. uploader는 기존 로컬 spool·cursor·immutable 요청을 유지한 채 서버 공백 동안 재시도합니다.
+3. `CAN_RECEIVER_RAW_VOLUME`을 기존 raw volume의 정확한 이름으로 지정합니다. 새 빈 raw volume으로 교체하거나 DB를 복사·삭제하지 않습니다. 기존 `/data/raw.sqlite3`와 WAL/SHM, decode cursor·outbox·epoch를 그대로 사용하며 소유자 `10001:10001`와 private 모드를 확인합니다. 필요한 권한 조정은 writer를 멈춘 상태에서만 수행합니다.
+4. 동일한 정의 바이트를 private definitions volume에 공급합니다. 서버 이전을 이유로 새 epoch를 만들거나 `re-decode`를 실행하지 않습니다. 기존 worker가 완전히 종료된 뒤 위 명령으로 새 receiver만 시작합니다. **같은 raw archive에 구·신 worker를 병렬 실행하지 마세요.**
+5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 원본은 어느 쪽에서도 삭제하지 않습니다. rollback도 새 receiver만 종료한 뒤 동일 볼륨·정의로 기존 receiver를 단독 기동합니다.
+
+의도적으로 정의를 변경하는 재해석은 receiver를 먼저 중지하고 새 정의를 검토한 뒤 아래처럼 같은 venv·볼륨의 단독 컨테이너에서 실행합니다. 이 작업은 새 decode epoch를 명시적으로 등록하므로 단순 배포 인계와 구분합니다. 정의 파일 교체는 receiver를 중지한 상태에서만 수행합니다.
+
+```bash
+docker compose --env-file .env --profile can-receiver stop can-receiver
+docker compose --env-file .env --profile can-receiver run --rm --no-deps can-receiver \
+  /opt/venv/bin/python /app/can_receiver.py re-decode \
+  --database /data/raw.sqlite3 --dbc /definitions/observed.dbc \
+  --definitions /definitions/observed.json
+docker compose --env-file .env --profile can-receiver up -d can-receiver
+```
+
+완전한 OTLP ACK는 **서버 raw SQLite의 durable 수락**이지 Greptime commit이 아닙니다. downstream 장애 시 raw와 outbox가 남으며, ACK는 차량 원본 삭제 허가가 아닙니다. 자동 raw GC를 추가하지 말고 SQLite archive·차량 원본을 보존하세요. epoch·정수 nanosecond·quality를 유지하며 `reported_unverified` 등을 집계 편의를 위해 `valid`로 바꾸지 않습니다.
+
+Grafana의 기존 **수집 진단 · CAN / VSS** 대시보드는 `vehicle_signal`의 `source='can'`을 조회하므로 custom `Vehicle.CAN.*` 경로 확인에 별도 대시보드가 필요하지 않습니다. FIFO backlog는 과거 `event_time`으로 들어오므로 실제 수집 세션의 시간 범위로 조회하세요. 최근 24시간이 비어 있다는 사실만으로 ingest 실패를 단정하지 않습니다. 이 정의와 custom 경로는 공식 VSS/Fleet 의미나 물리 교정 검증을 보장하지 않습니다. 기존 trip/charge/battery 분석의 표준 경로·quality 조건을 통과한다고 가정하지 마세요.
+
 ### Tesla Fleet Telemetry
 
 기존 Fleet Telemetry ZMQ 발행자가 있다면 서버에 `fleet` 프로필을 추가해 수신 전용 recorder를 실행할 수 있습니다. 이 저장소는 Fleet Telemetry 서버를 설치하거나 Tesla API로 차량 설정·명령을 전송하지 않습니다.

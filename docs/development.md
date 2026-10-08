@@ -27,12 +27,13 @@ python tools/render.py \
   compose/core.yaml compose/database.yaml compose/ingest.yaml \
   compose/grafana.yaml compose/backup.yaml compose/vehicle-raw.yaml \
   compose/vehicle-vss.yaml compose/tesla-fleet.yaml compose/redecode.yaml \
+  compose/can-receiver.yaml \
   --out compose.yaml
 
 python tools/check_env.py
 python tests/test_render.py
 
-for profile in server home mqtt vehicle fleet backup redecode '*'; do
+for profile in server home mqtt vehicle fleet backup redecode can-receiver '*'; do
   docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
 done
 ```
@@ -87,6 +88,8 @@ python tests/test_trace_privacy.py
 개인 `.env`나 운영 설정이 있는 로컬 디렉터리에서는 `gitleaks dir`가 해당 파일을 읽을 수 있습니다. 공유 가능한 로그만 남기고, 실제 운영 파일을 공개 CI에 업로드하지 마세요. CI의 작업 디렉터리에는 공개 checkout만 있습니다.
 
 서버·운영 자격 증명이 필요 없는 Python 회귀 목록은 workflow의 `Check offline Python regressions` 단계에 명시합니다. CI는 Compose vehicle/redecode와 같은 `python-can==4.6.1`, `asammdf==8.8.27`, `zstd==1.5.6.1`, `cantools==40.7.1`, `py-expression-eval==0.3.14`, `boto3==1.43.98`을 설치합니다. `python tools/demo.py regressions`는 RAW/MF4·재해석·CAN validation 검사 중 하나라도 skip되면 실패합니다. 재해석용 `eclipse-kuksa/kuksa-can-provider`는 태그가 아닌 commit `d03dd7db364dd1ce9f7d0c614d80ebf6642ad167`의 세 `dbcfeederlib` 파일을 내려받아 기존 테스트의 SHA256으로 검증합니다. 이 다운로드 또는 PyPI에 접근할 수 없으면 CI는 실패하며 성공으로 대체하지 않습니다. 선택적 외부 Hermes checkout 호환성은 별도 범위입니다.
+
+CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentelemetry-proto==1.38.0` 후 `python tests/test_can_receiver.py`로 실행합니다. 운영 DBC·원본·자격 증명은 사용하지 않습니다. 기존 wire privacy 런타임의 `opentelemetry-proto==1.39.1`은 별도 감사 컨테이너에 유지하며 receiver의 venv와 섞지 않습니다.
 
 ## 합성 런타임 통합 검사
 
