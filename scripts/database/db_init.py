@@ -483,6 +483,16 @@ def ddl_statements(otel_ttl):
   "deleted_before" TIMESTAMP(9) NOT NULL,
   PRIMARY KEY ("source")
 )"""))
+    # Display/selection alias only: raw vehicle IDs stay the stored
+    # provenance in all signal/event/analysis rows. Mappings use a fixed
+    # mapped_at so re-mapping the same raw vehicle overwrites one row
+    # (default last_row merge, no TTL).
+    ddls.append(("vehicle_identity", """CREATE TABLE IF NOT EXISTS "vehicle_identity" (
+  "mapped_at" TIMESTAMP(9) NOT NULL TIME INDEX,
+  "vehicle" STRING NOT NULL,
+  "canonical_vehicle" STRING NOT NULL,
+  PRIMARY KEY ("vehicle")
+)"""))
     return ddls
 
 

@@ -206,6 +206,20 @@ Grafana의 기존 **수집 진단 · CAN / VSS** 대시보드는 `vehicle_signal
 
 수집 계약과 배터리 분석의 조건·제한은 [Tesla Fleet Telemetry 문서](tesla_fleet.md)를 참고하세요.
 
+### 같은 차량의 Fleet / CAN 식별자 연결
+
+같은 실제 차량이 수집 경로마다 다른 `vehicle`로 저장되었다면 `vehicle_identity`에 두 원본 ID와 공통 표시명을 등록합니다. Grafana의 차량 목록에는 공통 표시명 하나가 나타나며, 선택하면 기존 기록과 이후 같은 원본 ID로 들어오는 기록을 함께 조회합니다. 등록하지 않은 차량은 기존 ID로 표시됩니다. 실제 VIN이나 운영 식별자는 공개 Git에 넣지 마세요.
+
+아래는 합성 ID 예시입니다. 운영 DB에서 각 원본 ID가 같은 차량인지 확인한 뒤 적용하세요. `mapped_at`은 항상 같은 epoch 값을 사용하므로 반복 등록이나 표시명 변경은 같은 키를 갱신합니다. 이 테이블은 보존 기간 만료 대상이 아닙니다.
+
+```sql
+INSERT INTO vehicle_identity (mapped_at, vehicle, canonical_vehicle) VALUES
+  ('1970-01-01 00:00:00', 'demo-can', 'demo-car'),
+  ('1970-01-01 00:00:00', 'demo-fleet', 'demo-car');
+```
+
+연결은 조회용입니다. 원본 데이터·수집기 설정·재전송 ID·분석 교정의 `vehicle/source/decode_epoch`는 바꾸지 않습니다. Fleet/CAN과 해석 버전이 다른 에너지 값은 합산하지 않고 출처별로 표시합니다. 상세 행의 원본 차량 ID는 provenance로 남습니다. 서로 다른 차량을 모델명만 같다는 이유로 연결하지 마세요.
+
 ### 배터리 교정과 모델을 비공개로 주입하기
 
 공개 기본 설정은 미교정 `{}`이며, [설정 구조 예제](../config/battery-analysis.example.json)의 각 모듈도 비어 있습니다. 개인 차량 식별자·교정값·학습 모델을 이 예제나 `compose.yaml`에 추가해 커밋하지 마세요.

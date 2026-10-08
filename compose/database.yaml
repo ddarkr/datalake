@@ -23,7 +23,7 @@ services:
     profiles: [server]
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.schema-revision: "2"
+      datalake.schema-revision: "3"
     depends_on:
       greptimedb:
         condition: service_started

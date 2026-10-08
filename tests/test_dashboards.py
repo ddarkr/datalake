@@ -110,6 +110,8 @@ def _battery_db():
         decode_epoch TEXT, source_field TEXT, value_num REAL,
         unit TEXT, quality TEXT, ingest_time TIMESTAMP,
         envelope_id TEXT, path TEXT, value_text TEXT, value_bool BOOLEAN)''')
+    db.execute('''CREATE TABLE vehicle_identity (
+        mapped_at TIMESTAMP, vehicle TEXT, canonical_vehicle TEXT)''')
     return db
 
 
@@ -532,6 +534,62 @@ def test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps():
         assert [(row[0], row[2]) for row in db.execute(query)] == [(1100, 62), (1200, None), (1300, None)]
 
 
+def test_vehicle_identity_canonical_selection_and_scope_split():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
+    variables = {v["name"]: v for v in dashboard["templating"]["list"]}
+    panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
+
+    def query(sql, source=""):
+        return (sql.replace("$$", "$")
+                .replace("${vehicle:sqlstring}", "'demo-car'")
+                .replace("${source:sqlstring}", repr(source))
+                .replace("${epoch:sqlstring}", "''")
+                .replace("$__timeFilter(window_start)", "window_start BETWEEN 1000 AND 2000")
+                .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000"))
+
+    with _battery_db() as db:
+        db.executemany("INSERT INTO vehicle_identity VALUES ('1970-01-01 00:00:00', ?, ?)",
+                       [("demo-can", "demo-car"), ("demo-fleet", "demo-car")])
+        scopes = [("demo-can", "can", "can-v1"),
+                  ("demo-fleet", "fleet", "fleet-v1"),
+                  ("demo-other", "can", "can-v1")]
+        for vehicle, source, epoch in scopes:
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, ingest_time, path, value_num)
+                VALUES (1500, ?, ?, ?, 1500, 'Vehicle.Speed', ?)""",
+                       (vehicle, source, epoch, 42 if source == "can" else 44))
+            db.execute("""INSERT INTO vehicle_analysis
+                (window_start, window_end, vehicle, metric, source, analysis_id,
+                 revision, value, unit, status, decode_epoch, computed_at)
+                VALUES (1500, 1600, ?, 'battery.energy.discharge_energy_kwh',
+                        ?, 'battery_energy', 'r1', 1.0, 'kWh', 'derived', ?, 10)""",
+                       (vehicle, source, epoch))
+        assert [r[0] for r in db.execute(variables["vehicle"]["query"])] == ["demo-car", "demo-other"]
+        assert {r[0] for r in db.execute(query(variables["source"]["query"]))} == {"", "can", "fleet"}
+        hourly = panels[58]["targets"][0]["rawSql"]
+        rows = db.execute(query(hourly)).fetchall()
+        assert {(r[2], r[3], r[4], r[5]) for r in rows} == {
+            ("demo-can", "can", "can-v1", -1.0),
+            ("demo-fleet", "fleet", "fleet-v1", -1.0)}
+        assert [(r[2], r[3], r[5]) for r in db.execute(query(hourly, "fleet"))] == [
+            ("demo-fleet", "fleet", -1.0)]
+        db.create_function("date_trunc", 2, lambda unit, value: value - value % 60)
+        diagnostics = json.loads(configs["grafana-dash-dbc-health"]["content"])
+        divergence = next(p for p in diagnostics["panels"] if p["id"] == 9)["targets"][0]["rawSql"]
+        assert [(r[1], r[2], r[3], r[9]) for r in db.execute(query(divergence))] == [
+            ("demo-car", "demo-can", "demo-fleet", -2.0)]
+        # A later window under an existing raw ID needs no new mapping.
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start, window_end, vehicle, metric, source, analysis_id,
+             revision, value, unit, status, decode_epoch, computed_at)
+            VALUES (1700, 1800, 'demo-can', 'battery.energy.discharge_energy_kwh',
+                    'can', 'battery_energy', 'r2', 2.0, 'kWh', 'derived', 'can-v1', 20)""")
+        assert sorted((r[0], r[2], r[5]) for r in db.execute(query(hourly))) == [
+            (1500, "demo-can", -1.0), (1500, "demo-fleet", -1.0),
+            (1700, "demo-can", -2.0)]
+
+
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
@@ -539,10 +597,12 @@ if __name__ == "__main__":
     test_battery_dashboard_warning_overlap_keeps_started_before_range()
     test_battery_cards_raw_display_latest_valid_only()
     test_battery_cards_latest_window_energy_not_lifetime()
+    test_battery_period_totals_sum_latest_revision_per_window()
     test_physical_cards_latest_analysis_and_new_raw_barriers()
     test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
     test_can_reports_keep_invalid_latest_and_scope_boundaries()
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()
+    test_vehicle_identity_canonical_selection_and_scope_split()
     print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")
