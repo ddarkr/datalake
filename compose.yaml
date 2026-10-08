@@ -816,7 +816,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '4'
+      datalake.can-receiver-revision: '5'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -840,7 +840,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '4'
+      datalake.can-receiver-revision: '5'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -25720,7 +25720,7 @@ configs:
                   return processed
 
           def record_error(self, kind):
-              if kind not in {"decode_failure", "greptime_failure", "greptime_partial_ack", "archive_disk_reserve"}:
+              if kind not in {"decode_failure", "greptime_failure", "greptime_partial_ack", "greptime_timeout", "greptime_row_too_large", "archive_disk_reserve"}:
                   raise ValueError("invalid error category")
               with self.connect() as conn:
                   conn.execute(
@@ -25729,19 +25729,26 @@ configs:
                   )
                   conn.commit()
 
-          def flush_once(self, greptime, limit=20000):
+          def flush_once(self, greptime, limit=20000, max_body_bytes=None):
+              budget = getattr(greptime, "max_body_bytes", DEFAULT_MAX_BODY_BYTES) if max_body_bytes is None else max_body_bytes
               with self.connect() as conn:
                   batch = conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)).fetchall()
               if not batch:
                   return 0
               rows = [json.loads(record["row_json"]) for record in batch]
-              if greptime.insert(rows) != len(rows):
+              cells = [_render_cell(row) for row in rows]
+              count = select_prefix_count(cells, budget)
+              if not count:
+                  # The oversized head row stays durable; nothing is skipped or deleted.
+                  raise DownstreamError("greptime_row_too_large")
+              payload = encode_body(_SQL_PREFIX + ",".join(cells[:count]))
+              if greptime.send_body(payload) != count:
                   raise DownstreamError("greptime_partial_ack")
               with self.connect() as conn:
                   conn.execute("BEGIN IMMEDIATE")
-                  conn.executemany("DELETE FROM outbox WHERE id=?", [(r["id"],) for r in batch])
+                  conn.executemany("DELETE FROM outbox WHERE id=?", [(r["id"],) for r in batch[:count]])
                   conn.commit()
-              return len(rows)
+              return count
 
           def status(self):
               return archive_status(self.path)
@@ -25788,26 +25795,58 @@ configs:
           if any(not row[key] for key in ("vehicle", "path", "source", "event_id", "decode_epoch")) or row["source"] != "can":
               raise ValueError("invalid canonical row identity")
 
+      DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
+      _SQL_PREFIX = 'INSERT INTO "vehicle_signal" (' + ",".join('"' + c + '"' for c in COLUMNS) + ") VALUES "
+      _COMMA_ENCODED_LEN = len(urllib.parse.quote_plus(",", safe="", encoding="utf-8", errors="strict").encode("ascii"))
+
+
+      def _literal(field, value):
+          if value is None:
+              return "NULL"
+          if field in {"event_time", "ingest_time"}:
+              return str(value)
+          if type(value) is bool:
+              return "TRUE" if value else "FALSE"
+          if type(value) in (int, float):
+              return repr(value)
+          return "'" + value.replace("'", "''") + "'"
+
+
+      def _render_cell(row):
+          validate_row(row)
+          return "(" + ",".join(_literal(c, row[c]) for c in COLUMNS) + ")"
+
 
       def render_insert(rows):
-          """Fixed table/columns, exact integer nanoseconds, standard SQL literals."""
-          def literal(field, value):
-              if value is None:
-                  return "NULL"
-              if field in {"event_time", "ingest_time"}:
-                  return f"CAST({value} AS TIMESTAMP(9))"
-              if type(value) is bool:
-                  return "TRUE" if value else "FALSE"
-              if type(value) in (int, float):
-                  return repr(value)
-              return "'" + value.replace("'", "''") + "'"
-          cells = []
-          for row in rows:
-              validate_row(row)
-              cells.append("(" + ",".join(literal(c, row[c]) for c in COLUMNS) + ")")
+          """Fixed table/columns, plain integer nanoseconds (literal-insert fast path), standard SQL literals."""
+          cells = [_render_cell(row) for row in rows]
           if not cells:
               raise ValueError("cannot insert empty rows")
-          return 'INSERT INTO "vehicle_signal" (' + ",".join('"' + c + '"' for c in COLUMNS) + ") VALUES " + ",".join(cells)
+          return _SQL_PREFIX + ",".join(cells)
+
+
+      def _urlencoded_len(text):
+          """Exact ASCII byte length of the urlencode (quote_plus) encoding of text."""
+          return len(urllib.parse.quote_plus(text, safe="", encoding="utf-8", errors="strict").encode("ascii"))
+
+
+      def select_prefix_count(cells, max_body_bytes):
+          """Largest ordered prefix whose URL-encoded body fits; single O(total) pass."""
+          total = 4 + _urlencoded_len(_SQL_PREFIX)  # "sql=" form field name and separator.
+          count = 0
+          for index, cell in enumerate(cells):
+              if index:
+                  total += _COMMA_ENCODED_LEN
+              total += _urlencoded_len(cell)
+              if total > max_body_bytes:
+                  break
+              count = index + 1
+          return count
+
+
+      def encode_body(sql):
+          """Exact URL-encoded SQL request body bytes sent to Greptime."""
+          return urllib.parse.urlencode({"sql": sql}).encode()
 
 
       class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -25816,7 +25855,7 @@ configs:
 
 
       class Greptime:
-          def __init__(self, base_url, database, user, password, timeout=15):
+          def __init__(self, base_url, database, user, password, timeout=60, max_body_bytes=DEFAULT_MAX_BODY_BYTES):
               parsed = urllib.parse.urlsplit(base_url)
               if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
                   raise ValueError("invalid Greptime base URL")
@@ -25829,13 +25868,27 @@ configs:
                       raise ValueError("remote Greptime requires HTTPS")
               if not database or not user or not password:
                   raise ValueError("Greptime database and credentials are required")
+              if not math.isfinite(timeout) or timeout <= 0:
+                  raise ValueError("Greptime timeout must be finite and positive")
+              if type(max_body_bytes) is bool or not isinstance(max_body_bytes, int) or max_body_bytes < 1:
+                  raise ValueError("Greptime body budget must be a positive integer")
               self.url = base_url.rstrip("/") + "/v1/sql?" + urllib.parse.urlencode({"db": database})
               self.authorization = "Basic " + base64.b64encode((user + ":" + password).encode()).decode()
               self.timeout = timeout
+              self.max_body_bytes = max_body_bytes
               self.opener = urllib.request.build_opener(_NoRedirect())
 
-          def insert(self, rows):
-              request = urllib.request.Request(self.url, data=urllib.parse.urlencode({"sql": render_insert(rows)}).encode(), headers={
+          def body_for(self, rows):
+              """Exact URL-encoded body for exactly these rows; callers enforce the byte budget."""
+              return encode_body(render_insert(rows))
+
+          def fit(self, rows):
+              """Largest ordered prefix within this client's byte budget in one O(total) pass."""
+              return select_prefix_count([_render_cell(row) for row in rows], self.max_body_bytes)
+
+          def send_body(self, payload):
+              """POST an exact body; returns affected rows without weakening ACK semantics."""
+              request = urllib.request.Request(self.url, data=payload, headers={
                   "Authorization": self.authorization, "Content-Type": "application/x-www-form-urlencoded",
               })
               try:
@@ -25843,10 +25896,10 @@ configs:
                       body = response.read(65537)
                       if response.status != 200 or len(body) > 65536:
                           raise DownstreamError("greptime_failure")
-                  payload = json.loads(body)
-                  if not isinstance(payload, dict) or type(payload.get("code", 0)) is not int or payload.get("code", 0) != 0:
+                  payload_json = json.loads(body)
+                  if not isinstance(payload_json, dict) or type(payload_json.get("code", 0)) is not int or payload_json.get("code", 0) != 0:
                       raise DownstreamError("greptime_failure")
-                  output = payload.get("output")
+                  output = payload_json.get("output")
                   if not isinstance(output, list) or not output:
                       raise DownstreamError("greptime_failure")
                   affected = 0
@@ -25858,15 +25911,24 @@ configs:
                           raise DownstreamError("greptime_failure")
                       affected += item[keys[0]]
                   return affected
-              except (urllib.error.URLError, OSError, ValueError, TypeError):
+              except (TimeoutError, socket.timeout):
+                  raise DownstreamError("greptime_timeout") from None
+              except urllib.error.URLError as exc:
+                  if isinstance(getattr(exc, "reason", None), (TimeoutError, socket.timeout)):
+                      raise DownstreamError("greptime_timeout") from None
                   raise DownstreamError("greptime_failure") from None
+              except (OSError, ValueError, TypeError):
+                  raise DownstreamError("greptime_failure") from None
+
+          def insert(self, rows):
+              return self.send_body(self.body_for(rows))
 
 
       class Worker(threading.Thread):
-          def __init__(self, archive, decoder, greptime, interval=1, outbox_limit=20000):
+          def __init__(self, archive, decoder, greptime, interval=1, outbox_limit=20000, max_body_bytes=DEFAULT_MAX_BODY_BYTES):
               super().__init__(name="can-archive-worker", daemon=True)
               self.archive, self.decoder, self.greptime = archive, decoder, greptime
-              self.interval, self.outbox_limit = interval, outbox_limit
+              self.interval, self.outbox_limit, self.max_body_bytes = interval, outbox_limit, max_body_bytes
               self.stop_event = threading.Event()
 
           def _error(self, kind):
@@ -25880,7 +25942,7 @@ configs:
               while not self.stop_event.is_set():
                   progressed = False
                   try:
-                      progressed = bool(self.archive.flush_once(self.greptime, self.outbox_limit))
+                      progressed = bool(self.archive.flush_once(self.greptime, self.outbox_limit, self.max_body_bytes))
                   except DownstreamError as exc:
                       self._error(str(exc))
                   except Exception:
@@ -26054,7 +26116,9 @@ configs:
           serve.add_argument("--port", type=int, default=4319)
           serve.add_argument("--worker-interval", type=float, default=1)
           serve.add_argument("--http-timeout", type=float, default=15)
+          serve.add_argument("--greptime-timeout", type=float, default=60)
           serve.add_argument("--outbox-limit", type=int, default=20000)
+          serve.add_argument("--max-body-bytes", type=int, default=4 * 1024 * 1024)
           args = parser.parse_args(argv)
           try:
               if args.command == "status":
@@ -26064,11 +26128,11 @@ configs:
               if args.disk_reserve_mib < 0:
                   raise ConfigurationError("disk_reserve_must_be_nonnegative")
               if args.command == "serve":
-                  if not 0 <= args.port <= 65535 or not math.isfinite(args.worker_interval) or args.worker_interval <= 0 or not math.isfinite(args.http_timeout) or args.http_timeout <= 0 or not 1 <= args.outbox_limit <= 20000:
+                  if not 0 <= args.port <= 65535 or not math.isfinite(args.worker_interval) or args.worker_interval <= 0 or not math.isfinite(args.http_timeout) or args.http_timeout <= 0 or not math.isfinite(args.greptime_timeout) or args.greptime_timeout <= 0 or not 1 <= args.outbox_limit <= 20000 or args.max_body_bytes < 1:
                       raise ConfigurationError("invalid_receiver_limits")
                   otlp_user, otlp_password = _credentials("CAN_OTLP")
                   db_user, db_password = _credentials("GREPTIME")
-                  greptime = Greptime(args.greptime_url, args.greptime_db, db_user, db_password, args.http_timeout)
+                  greptime = Greptime(args.greptime_url, args.greptime_db, db_user, db_password, args.greptime_timeout, args.max_body_bytes)
               decoder = Decoder(args.dbc, args.definitions)
               archive = Archive(args.database, args.disk_reserve_mib * 1024 * 1024)
               with exclusive_archive(archive.path):
@@ -26079,7 +26143,7 @@ configs:
                       print(_json(archive.status()))
                       return 0
                   server = Receiver((args.bind, args.port), archive, args.vehicle, args.collector_id, otlp_user, otlp_password, args.http_timeout)
-                  worker = Worker(archive, decoder, greptime, args.worker_interval, args.outbox_limit)
+                  worker = Worker(archive, decoder, greptime, args.worker_interval, args.outbox_limit, args.max_body_bytes)
                   worker.start()
                   print(_json({"receiver": "ready", "port": server.server_port}), flush=True)
                   try:

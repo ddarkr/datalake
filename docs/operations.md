@@ -170,7 +170,7 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
 
 디코딩은 한 트랜잭션에 최대 1,000청크를 처리하고, 청크 처리 사이에 경과 시간을 확인하여 50ms를 넘으면 commit하고 쓰기 잠금을 해제합니다. 개별 청크 처리·commit 시간까지 포함한 엄격한 50ms 상한은 아닙니다. parser 상태·decode cursor·outbox는 함께 commit하거나 함께 rollback하며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
 
-단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속되며, 업로드 워커만 최대 20,000행씩 INSERT하고 ACK된 행을 제거합니다. `--outbox-limit`으로 1–20,000행 사이에서 조정할 수 있으며 기본값은 20,000입니다. 배치를 채우려고 기다리지는 않습니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK는 배치 전체를 보존합니다. 정상 종료 시 진행 중인 업로드가 완료되거나 HTTP timeout에 도달하기 전에는 archive의 독점 소유권을 해제하지 않습니다. SQLite 원본의 수신 ACK는 여전히 Greptime 저장 완료를 뜻하지 않습니다.
+단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, ingress socket의 `--http-timeout` 기본값 15초와 별개입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 독점 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
 
 `python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
