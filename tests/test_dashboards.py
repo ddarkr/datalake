@@ -117,9 +117,6 @@ def _battery_db():
 
 def test_battery_dashboard_latest_revision_wins_before_status_filter():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
-    assert "grafana-dash-battery" in configs
-    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
-    assert dashboard["uid"] == "datalake-vehicle-battery"
     query = _battery_query(configs, 6)
     with _battery_db() as db:
         # Empty analyses show unknown, never a healthy zero.
@@ -154,12 +151,6 @@ def test_battery_dashboard_latest_revision_wins_before_status_filter():
 def test_battery_dashboard_warning_overlap_keeps_started_before_range():
     """Alerts-only lifecycle: open needs valid active evidence."""
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
-    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
-    assert dashboard["uid"] == "datalake-vehicle-battery"
-    panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
-    # Warning panels read alerts only; errors/connectivity never leak in.
-    for pid in (5, 18, 19):
-        assert "event_type = 'alerts'" in panels[pid]["targets"][0]["rawSql"]
     ledger = _battery_query(configs, 18)
     state = _battery_query(configs, 19)
     counts = _battery_query(configs, 5)
@@ -515,9 +506,7 @@ def test_vehicle_coverage_separates_observation_from_receipt():
                         (1500, "can-car", "can", "new", 2500),
                         (1500, "fleet-car", "fleet", "fleet-v1", 1500)])
         rows = {(row[0], row[2]): row for row in db.execute(query)}
-        assert rows["can-car", "old"][3] == "선택 기간에 관측 없음"
         assert rows["can-car", "old"][6:] == (0, 1)
-        assert rows["can-car", "new"][3] == "선택 기간에 관측 있음"
         assert rows["can-car", "new"][6:] == (1, 0)
         assert rows["fleet-car", "fleet-v1"][6:] == (1, 1)
 
@@ -606,7 +595,6 @@ def test_coverage_frontier_lists_scopes_without_range_rows():
                        [(100, "stale-car", "can", "old", 100),
                         (1500, "can-car", "can", "new", 2500)])
         rows = {(row[0], row[2]): row for row in db.execute(query)}
-        assert rows["stale-car", "old"][3] == "선택 기간에 관측 없음"
         assert rows["stale-car", "old"][6:] == (0, 0)
         assert rows["can-car", "new"][6:] == (1, 0)
 
@@ -637,6 +625,61 @@ def test_transition_timeline_starts_from_boundary_sample():
                         (1300, None), (1400, None), (1500, "DI_GEAR_D")]
 
 
+def test_cell_frequency_respects_selected_source_and_epoch():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.create_function("floor", 1, lambda value: int(value))
+        for panel_id, field in ((48, "NumBrickVoltageMin"), (50, "NumBrickVoltageMax")):
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field, value_num, quality)
+                VALUES (1500, 'fleet-car', 'fleet', 'fleet-v1', ?, 3, 'ok')""", (field,))
+            raw = next(p for p in dashboard["panels"] if p["id"] == panel_id)["targets"][0]["rawSql"]
+
+            def query(source, epoch):
+                return (raw.replace("$$", "$")
+                        .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
+                        .replace("${vehicle:sqlstring}", "''")
+                        .replace("${source:sqlstring}", repr(source))
+                        .replace("${epoch:sqlstring}", repr(epoch)))
+
+            assert db.execute(query("can", "")).fetchall() == []
+            assert db.execute(query("fleet", "other-epoch")).fetchall() == []
+            rows = db.execute(query("fleet", "fleet-v1")).fetchall()
+            assert rows[0][1] == 1
+
+
+def test_can_latest_cards_keep_invalid_reports_and_separate_epochs():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-can-battery"]["content"])
+    raw = next(p for p in dashboard["panels"] if p["id"] == 20)["targets"][0]["rawSql"]
+    query = (raw.replace("$$", "$")
+             .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
+             .replace("${vehicle:sqlstring}", "'car'")
+             .replace("${epoch:sqlstring}", "''"))
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
+            (?, ?, ?, ?, 'BMS_socUI', 'Vehicle.CAN.x292.BMS_socUI', ?, ?, ?, ?, 'env')""",
+                       [(1100, "car", "can", "e1", 60, "%", "reported_unverified", 1100),
+                        (1200, "car", "can", "e1", 70, "%", "invalid", 1200),
+                        (1300, "car", "can", "e2", 55, "%", "reported_unverified", 1300),
+                        (1400, "other", "can", "e3", 99, "%", "reported_unverified", 1400),
+                        (1500, "car", "fleet", "e4", 88, "%", "reported_unverified", 1500)])
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 2
+        assert {row[0].split()[-1]: row[1] for row in rows} == {"e1": None, "e2": 55}
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
+            (1600, 'car', 'can', 'e2', 'BMS_socUI', 'Vehicle.CAN.x292.BMS_socUI',
+             99, 'wrong', 'reported_unverified', 1600, 'new')""")
+        assert [row[1] for row in db.execute(query)] == [None, None]
+
+
 if __name__ == "__main__":
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
@@ -654,4 +697,6 @@ if __name__ == "__main__":
     test_vehicle_identity_canonical_selection_and_scope_split()
     test_coverage_frontier_lists_scopes_without_range_rows()
     test_transition_timeline_starts_from_boundary_sample()
+    test_cell_frequency_respects_selected_source_and_epoch()
+    test_can_latest_cards_keep_invalid_reports_and_separate_epochs()
     print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")

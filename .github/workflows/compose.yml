@@ -68,6 +68,7 @@ jobs:
           python -m tests.test_storage
           python -m tests.test_database
           python -m tests.test_dashboards
+          python -m tests.test_grafana_folders
           python -m tests.test_activity
           python -m tests.test_vehicle_aggregate
           python -m tests.test_fleet
