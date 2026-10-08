@@ -789,12 +789,22 @@ services:
     image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
     profiles:
     - can-receiver
+    labels:
+      datalake.can-receiver-revision: '3'
     volumes:
     - receiver-venv:/opt/venv
+    - receiver-code:/app
+    configs:
+    - source: can_receiver_py
+      target: /source/can_receiver.py
+    - source: can_decoder_py
+      target: /source/can_decoder.py
+    - source: can_otlp_wire_py
+      target: /source/can_otlp_wire.py
     command:
     - /bin/sh
     - -ec
-    - 'printf ''%s'' ''cantools==40.7.1 opentelemetry-proto==1.38.0'' > /tmp/.can_receiver_want; if test -f /opt/venv/.can_receiver_ready && cmp -s /tmp/.can_receiver_want /opt/venv/.can_receiver_ready; then exit 0; fi; python3 -m venv --clear /opt/venv && /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: cantools==40.7.1 opentelemetry-proto==1.38.0 && cp /tmp/.can_receiver_want /opt/venv/.can_receiver_ready'
+    - 'cp /source/can_receiver.py /source/can_decoder.py /source/can_otlp_wire.py /app/; chmod 0444 /app/can_receiver.py /app/can_decoder.py /app/can_otlp_wire.py; printf ''%s'' ''cantools==40.7.1 opentelemetry-proto==1.38.0'' > /tmp/.can_receiver_want; if test -f /opt/venv/.can_receiver_ready && cmp -s /tmp/.can_receiver_want /opt/venv/.can_receiver_ready; then exit 0; fi; python3 -m venv --clear /opt/venv && /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: cantools==40.7.1 opentelemetry-proto==1.38.0 && cp /tmp/.can_receiver_want /opt/venv/.can_receiver_ready'
     restart: 'no'
   can-receiver:
     image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
@@ -804,7 +814,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '2'
+      datalake.can-receiver-revision: '3'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -813,18 +823,9 @@ services:
     - ALL
     security_opt:
     - no-new-privileges:true
-    configs:
-    - source: can_receiver_py
-      target: /app/can_receiver.py
-      mode: 292
-    - source: can_decoder_py
-      target: /app/can_decoder.py
-      mode: 292
-    - source: can_otlp_wire_py
-      target: /app/can_otlp_wire.py
-      mode: 292
     volumes:
     - receiver-venv:/opt/venv:ro
+    - receiver-code:/app:ro
     - can-receiver-raw:/data
     - can-receiver-definitions:/definitions:ro
     environment:
@@ -26495,6 +26496,7 @@ volumes:
   fleet-data: {}
   redecode-venv: null
   receiver-venv: null
+  receiver-code: null
   can-receiver-raw:
     external: true
     name: ${CAN_RECEIVER_RAW_VOLUME:-datalake_can-receiver-raw}

@@ -157,7 +157,7 @@ docker start -a can-definitions-load
 docker rm can-definitions-load
 ```
 
-볼륨 루트는 UID/GID `10001:10001`, `0700`, 정의 파일은 같은 소유자의 `0600`입니다. receiver는 UID/GID `10001:10001`로 실행하며 정의 볼륨과 코드 configs는 read-only입니다. raw SQLite `/data/raw.sqlite3`와 관련 WAL/SHM도 비공개로 보존합니다. 내용 정렬·재직렬화·줄바꿈 변경도 epoch를 바꿀 수 있으므로 운영 중 정의를 덮어쓰지 마세요.
+볼륨 루트는 UID/GID `10001:10001`, `0700`, 정의 파일은 같은 소유자의 `0600`입니다. receiver는 UID/GID `10001:10001`로 실행하며 루트 파일시스템, 정의·코드·venv 볼륨은 read-only입니다. raw SQLite `/data/raw.sqlite3`와 관련 WAL/SHM도 비공개로 보존합니다. 내용 정렬·재직렬화·줄바꿈 변경도 epoch를 바꿀 수 있으므로 운영 중 정의를 덮어쓰지 마세요.
 
 ```bash
 docker compose --env-file .env --profile can-receiver config --quiet
@@ -166,7 +166,9 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
   /opt/venv/bin/python /app/can_receiver.py status --database /data/raw.sqlite3
 ```
 
-초기 `can-receiver-deps`는 PyPI 네트워크가 필요하며 pinned 의존성이 바뀌면 venv를 다시 만듭니다. 코드 configs를 바꿀 때는 해당 receiver의 revision label도 갱신해 재생성을 유도합니다. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
+초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps와 receiver **두 서비스의 revision label**을 함께 갱신하세요. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
+
+`python tests/test_can_receiver_compose.py`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver 인계
 
