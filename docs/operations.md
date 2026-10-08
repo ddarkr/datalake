@@ -41,6 +41,12 @@ chmod 600 .env
 
 ### 2. 설정 검사와 기동
 
+`storage-metrics`는 CAN 원본 볼륨을 읽기 전용으로 관찰합니다. 외부 볼륨은 Compose가 만들거나 삭제하지 않으므로 첫 기동 전에 준비하세요. CAN 수집을 사용하지 않으면 빈 볼륨이며 해당 지표는 unknown입니다. 아래는 기본 이름입니다. `.env`에서 `CAN_RECEIVER_RAW_VOLUME`을 바꿨다면 그 이름을 사용하세요.
+
+```bash
+docker volume create datalake_can-receiver-raw
+```
+
 ```bash
 docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d

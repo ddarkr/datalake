@@ -222,6 +222,10 @@ def start(directory):
             "restart": "unless-stopped"}
     # JSON mappings are YAML mappings; only native !override port tags need YAML text.
     override += "  demo-wire: " + json.dumps(wire) + "\nvolumes:\n  demo-fixtures: {}\n"
+    # Storage observation must never mount an operator's external CAN archive.
+    override += ("  can-receiver-raw:\n"
+                 "    name: ${COMPOSE_PROJECT_NAME}_can-receiver-raw\n"
+                 "    external: false\n")
     # Override even private bundles that inline their operator calibration.
     override += "configs:\n  battery_analysis_json:\n    content: " + json.dumps(env["BATTERY_ANALYSIS_CONFIG_JSON"]) + "\n"
     private_write(directory / "override.yaml", override)
