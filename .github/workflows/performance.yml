@@ -1,0 +1,187 @@
+name: Synthetic performance
+
+# Keep this job present on every PR so a required check never stays pending.
+# Larger runs are opt-in; this workflow deliberately has no schedule.
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Synthetic workload profile (no production services)
+        type: choice
+        options: [quick, large, soak, fault]
+        default: quick
+      duration:
+        description: Soak target seconds per revision (1–600; other profiles use fixed samples)
+        type: string
+        default: '60'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: synthetic-performance-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  benchmark:
+    name: Paired synthetic benchmark
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Initialize evidence directory
+        run: |
+          mkdir -p "$RUNNER_TEMP/performance"
+          printf '%s\n' 'Synthetic benchmark did not finish. See the job logs and attached evidence.' \
+            > "$RUNNER_TEMP/performance/summary.md"
+
+      - name: Check out candidate code and benchmark harness
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out comparison base
+        uses: actions/checkout@v5
+        with:
+          # Dispatch resolves master once during checkout, then records its full SHA.
+          ref: ${{ github.event.pull_request.base.sha || 'master' }}
+          path: baseline
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Resolve immutable revisions, scope, and bounded inputs
+        id: plan
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+
+          def git(repo, *args):
+              return subprocess.check_output(['git', '-C', repo, *args])
+
+          base = git('baseline', 'rev-parse', 'HEAD').decode().strip()
+          candidate = git('candidate', 'rev-parse', 'HEAD').decode().strip()
+          if not all(re.fullmatch(r'[0-9a-f]{40}', sha) for sha in (base, candidate)):
+              raise SystemExit('Expected full immutable commit SHAs')
+          event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
+          profile, duration, run = 'quick', '60', True
+          if os.environ['EVENT_NAME'] == 'pull_request':
+              # Read objects from the local baseline checkout; never fetch a URL
+              # or execute a ref supplied in a dispatch input.
+              git('candidate', 'fetch', '--no-tags', str(Path('baseline').resolve()), base)
+              paths = git('candidate', 'diff', '--no-renames', '--name-only', '-z', base, candidate).split(b'\0')
+              prefixes = (b'scripts/', b'tests/', b'tools/', b'compose/', b'config/', b'.github/workflows/')
+              run = any(p.startswith(prefixes) or p == b'compose.yaml' for p in paths)
+          else:
+              inputs = event.get('inputs') or {}
+              profile = inputs.get('profile', 'quick')
+              duration = inputs.get('duration', '60')
+          if profile not in {'quick', 'large', 'soak', 'fault'}:
+              raise SystemExit('Unsupported profile')
+          if not isinstance(duration, str) or not re.fullmatch(r'[0-9]{1,3}', duration) or not 1 <= int(duration) <= 600:
+              raise SystemExit('Duration must be an integer from 1 through 600 seconds')
+          plan = dict(base=base, candidate=candidate, profile=profile,
+                      duration=int(duration), run=run)
+          output = Path(os.environ['RUNNER_TEMP']) / 'performance'
+          (output / 'plan.json').write_text(json.dumps(plan, indent=2) + '\n')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as stream:
+              for key, value in plan.items():
+                  stream.write(f'{key}={str(value).lower()}\n')
+          if not run:
+              (output / 'summary.md').write_text(
+                  '## Synthetic performance: skipped\n\n'
+                  'No relevant scripts, tests, tools, Compose, configuration, or workflow paths changed. '
+                  'The required job completed without running a benchmark.\n')
+          PY
+
+      - name: Set up fixed Python
+        if: steps.plan.outputs.run == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12.14'
+
+      - name: Install minimal benchmark dependencies
+        if: steps.plan.outputs.run == 'true'
+        run: |
+          python -m pip install --only-binary=:all: -r candidate/tools/benchmark-requirements.txt
+          {
+            python --version
+            python -m pip freeze
+            uname -a
+            lscpu
+            printf 'Runner image: %s %s\n' "$ImageOS" "$ImageVersion"
+          } > "$RUNNER_TEMP/performance/environment.txt"
+
+      - name: Require synthetic correctness on base and candidate
+        if: steps.plan.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          for revision in baseline candidate; do
+            (
+              cd "$revision"
+              python -m unittest \
+                tests.test_can_receiver tests.test_can_decoder tests.test_can_otlp_wire \
+                tests.test_fleet tests.test_vss tests.test_activity -v
+            ) 2>&1 | tee "$RUNNER_TEMP/performance/correctness-$revision.log"
+          done
+
+      - name: Require candidate harness regressions
+        if: steps.plan.outputs.run == 'true'
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          python -m unittest tests.test_benchmark tests.test_bench_workloads -v \
+            2>&1 | tee "$RUNNER_TEMP/performance/harness-tests.log"
+
+      - name: Run paired workloads with the same candidate harness
+        if: steps.plan.outputs.run == 'true'
+        env:
+          BASE_SHA: ${{ steps.plan.outputs.base }}
+          CANDIDATE_SHA: ${{ steps.plan.outputs.candidate }}
+          PROFILE: ${{ steps.plan.outputs.profile }}
+          DURATION: ${{ steps.plan.outputs.duration }}
+        run: |
+          set -euo pipefail
+          python candidate/tools/benchmark.py run \
+            --repo "$GITHUB_WORKSPACE/baseline" \
+            --output "$RUNNER_TEMP/performance/base.json" \
+            --profile "$PROFILE" --duration "$DURATION" --revision "$BASE_SHA" \
+            2>&1 | tee "$RUNNER_TEMP/performance/base.log"
+          python candidate/tools/benchmark.py run \
+            --repo "$GITHUB_WORKSPACE/candidate" \
+            --output "$RUNNER_TEMP/performance/candidate.json" \
+            --profile "$PROFILE" --duration "$DURATION" --revision "$CANDIDATE_SHA" \
+            2>&1 | tee "$RUNNER_TEMP/performance/candidate.log"
+          # Correctness and incompatible-fixture failures remain hard failures.
+          # Performance deltas are advisory, never a flaky pass/fail threshold.
+          python candidate/tools/benchmark.py compare \
+            --base "$RUNNER_TEMP/performance/base.json" \
+            --candidate "$RUNNER_TEMP/performance/candidate.json" \
+            --output "$RUNNER_TEMP/performance"
+
+      - name: Publish summary even on failure
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/performance/summary.md"; then
+            cat "$RUNNER_TEMP/performance/summary.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Preserve available evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: synthetic-performance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/performance/
+          retention-days: 7
+          if-no-files-found: warn
