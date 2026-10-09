@@ -65,6 +65,11 @@ CREATE TABLE IF NOT EXISTS decode_partial (
  epoch TEXT NOT NULL REFERENCES epochs(epoch), seq INTEGER NOT NULL,
  state_json TEXT NOT NULL, counts_json TEXT NOT NULL, rows_emitted INTEGER NOT NULL,
  PRIMARY KEY(session,epoch));
+CREATE TABLE IF NOT EXISTS decode_pending (
+ session INTEGER NOT NULL REFERENCES sessions(id),
+ epoch TEXT NOT NULL REFERENCES epochs(epoch),
+ PRIMARY KEY(session,epoch));
+CREATE INDEX IF NOT EXISTS decode_pending_epoch ON decode_pending(epoch);
 CREATE TABLE IF NOT EXISTS outbox (
  id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE,
  epoch TEXT NOT NULL REFERENCES epochs(epoch), row_json TEXT NOT NULL);
@@ -155,6 +160,82 @@ def _migrate_counters(conn):
     return True
 
 
+def _refresh_pending_epoch(conn, epoch):
+    """Reconcile one epoch's pending membership from cursors inside the caller's transaction.
+
+    Pending holds exactly sessions with raw beyond the epoch cursor (or no
+    cursor yet): completions delete during decode commit, new arrivals insert
+    during accept. Crash/rollback safety comes free: both run in the same
+    transaction as the cursor/raw write, so a lost commit leaves no phantom.
+    """
+    conn.execute(
+        "DELETE FROM decode_pending WHERE epoch=? AND session NOT IN "
+        "(SELECT s.id FROM sessions s LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
+        "WHERE EXISTS(SELECT 1 FROM raw_chunks c WHERE c.session=s.id AND c.seq>=COALESCE(d.next_seq,0)))",
+        (epoch, epoch),
+    )
+    conn.execute(
+        "INSERT OR IGNORE INTO decode_pending(session,epoch) "
+        "SELECT s.id,? FROM sessions s LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
+        "WHERE EXISTS(SELECT 1 FROM raw_chunks c WHERE c.session=s.id AND c.seq>=COALESCE(d.next_seq,0))",
+        (epoch, epoch),
+    )
+
+
+def candidate_sql(n_progress):
+    """Pending-driven candidate SELECT shared by decode_once and runners.
+
+    Bind 2*n_progress (session, want-seq) progress pairs, then the epoch
+    twice. CROSS JOIN pins decode_pending first so retained completed
+    history is never scanned; ORDER BY c.id LIMIT 1 keeps the global
+    earliest-arrival choice and staged-progress semantics.
+    """
+    placeholders = ",".join("(?,?)" for _ in range(n_progress)) or "(NULL,NULL)"
+    return (
+        "WITH progress(session,next_seq) AS (VALUES " + placeholders + ") "
+        "SELECT c.session AS session, c.seq AS seq, c.offset_ns AS offset_ns, "
+        "c.phase AS phase, c.data AS data, s.meta_json AS meta_json, d.state_json AS state_json, "
+        "d.counts_json AS counts_json, d.rows AS rows FROM decode_pending q "
+        "CROSS JOIN sessions s ON s.id=q.session AND q.epoch=? "
+        "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
+        "LEFT JOIN progress p ON p.session=s.id "
+        "JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(p.next_seq,d.next_seq,0) "
+        "ORDER BY c.id LIMIT 1"
+    )
+
+
+def _reconcile_pending_session(conn, epoch, session_id):
+    """Refresh one session's pending membership inside the caller's transaction.
+
+    Cursor-first: one PK cursor read, then one indexed (session, seq>=bound)
+    probe. Never joins or scans retained history, so commit cost stays
+    bounded no matter how much completed prefix is retained.
+    """
+    row = conn.execute(
+        "SELECT next_seq FROM decode_states WHERE session=? AND epoch=?",
+        (session_id, epoch),
+    ).fetchone()
+    bound = row["next_seq"] if row else 0
+    pending = conn.execute(
+        "SELECT 1 FROM raw_chunks WHERE session=? AND seq>=? LIMIT 1",
+        (session_id, bound),
+    ).fetchone()
+    if pending is None:
+        conn.execute("DELETE FROM decode_pending WHERE epoch=? AND session=?", (epoch, session_id))
+    else:
+        conn.execute("INSERT OR IGNORE INTO decode_pending(session,epoch) VALUES(?,?)", (session_id, epoch))
+
+
+def _migrate_pending(conn):
+    """One-time build of decode_pending for pre-pending archives; later opens are a marker probe."""
+    if conn.execute("SELECT value FROM archive_meta WHERE key='pending_migrated'").fetchone() is not None:
+        return False
+    for (epoch,) in conn.execute("SELECT epoch FROM epochs"):
+        _refresh_pending_epoch(conn, epoch)
+    _meta_set(conn, "pending_migrated", 1)
+    return True
+
+
 HOUR_NS = 3600 * 10**9
 
 
@@ -214,6 +295,7 @@ class Archive:
             conn.executescript(SCHEMA)
             conn.execute("BEGIN IMMEDIATE")
             _migrate_counters(conn)
+            _migrate_pending(conn)
             conn.commit()
 
 
@@ -282,6 +364,8 @@ class Archive:
                 _meta_bump(conn, "raw_chunks", added)
                 _meta_bump(conn, "raw_bytes", new_bytes)
                 _meta_set(conn, "last_receive_ns", time.time_ns())
+                for (epoch,) in conn.execute("SELECT epoch FROM epochs"):
+                    _reconcile_pending_session(conn, epoch, session_id)
             conn.commit()
             return added
 
@@ -296,6 +380,7 @@ class Archive:
                 if not explicit and conn.execute("SELECT 1 FROM epochs LIMIT 1").fetchone():
                     raise ConfigurationError("new_decoder_epoch_requires_re-decode")
                 conn.execute("INSERT INTO epochs VALUES(?,?)", (decoder.epoch, decoder.mapping_revision))
+                _refresh_pending_epoch(conn, decoder.epoch)
             conn.commit()
 
     def decode_once(self, decoder, limit=1000):
@@ -327,19 +412,12 @@ class Archive:
                 progress = {}
                 for entry in staged:
                     progress[entry[0]["session"]] = entry[0]["seq"] + 1
-                placeholders = ",".join("(?,?)" for _ in progress) or "(NULL,NULL)"
                 params = []
                 for session, want in progress.items():
                     params.extend((session, want))
+                # candidate_sql is the single source; bind pairs first, epoch twice.
                 raw = conn.execute(
-                    "WITH progress(session,next_seq) AS (VALUES " + placeholders + ") "
-                    "SELECT c.session AS session, c.seq AS seq, c.offset_ns AS offset_ns, "
-                    "c.phase AS phase, c.data AS data, s.meta_json AS meta_json, d.state_json AS state_json, "
-                    "d.counts_json AS counts_json, d.rows AS rows FROM sessions s "
-                    "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
-                    "LEFT JOIN progress p ON p.session=s.id "
-                    "CROSS JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(p.next_seq,d.next_seq,0) "
-                    "ORDER BY c.id LIMIT 1", (*params, decoder.epoch),
+                    candidate_sql(len(progress)), (*params, decoder.epoch, decoder.epoch),
                 ).fetchone()
                 if raw is None:
                     break
@@ -456,9 +534,20 @@ class Archive:
                 committed[raw["session"]] = prior + work["emitted"] + len(work["rows"])
                 _meta_bump(conn, "outbox_rows", len(work["rows"]))
                 _meta_bump(conn, "decoded_rows_total", len(work["rows"]))
+            for session_id in {raw["session"] for raw, _, _ in staged}:
+                _reconcile_pending_session(conn, decoder.epoch, session_id)
             _meta_set(conn, "last_decode_ns", time.time_ns())
             conn.commit()
         return len(staged)
+
+    def rebuild_pending(self):
+        """Repair path for archives touched by outside writers: rescan all epochs in one transaction."""
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            for (epoch,) in conn.execute("SELECT epoch FROM epochs"):
+                _refresh_pending_epoch(conn, epoch)
+            _meta_set(conn, "pending_migrated", 1)
+            conn.commit()
 
     def record_error(self, kind):
         if kind not in {"decode_failure", "greptime_failure", "greptime_partial_ack", "greptime_timeout", "greptime_row_too_large", "archive_disk_reserve", "dirty_notify_failure"}:
