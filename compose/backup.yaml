@@ -26,9 +26,9 @@
 #   embeds manifest.json incl. the SST record) + .sha256 -> tar + sidecar +
 #   manifest uploaded to s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/ and
 #   GET-and-hash verified -> COMPLETE marker written -> only then old local
-#   generations pruned (never the file just written; remote objects never
-#   pruned, except a failed run's own writes). Overlapping live/backup
-#   prefixes fail closed. File mode keeps the same offline/tar/restore
+#   generations pruned (never the file just written). Remote pruning is
+#   opt-in, requires reviewed dry-run and explicit approval, and keeps pins.
+#   Overlapping live/backup prefixes fail closed. File mode keeps the same offline/tar/restore
 #   contract with no S3 at all.
 # S3 restore: offline check -> missing local archive auto-downloads the
 #   selected (BACKUP_FILE id/name) or newest COMPLETE remote backup and
@@ -112,6 +112,13 @@ services:
     environment:
       BACKUP_DIR: /backup
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      BACKUP_REMOTE_RETENTION_MODE: ${BACKUP_REMOTE_RETENTION_MODE:-off}
+      BACKUP_REMOTE_RETAIN_COUNT: ${BACKUP_REMOTE_RETAIN_COUNT:-7}
+      BACKUP_REMOTE_RETAIN_DAYS: ${BACKUP_REMOTE_RETAIN_DAYS:-0}
+      BACKUP_REMOTE_MIN_RECOVERY: ${BACKUP_REMOTE_MIN_RECOVERY:-1}
+      BACKUP_REMOTE_INCOMPLETE_GRACE_SEC: ${BACKUP_REMOTE_INCOMPLETE_GRACE_SEC:-86400}
+      BACKUP_REMOTE_PINNED: ${BACKUP_REMOTE_PINNED:-}
+      BACKUP_REMOTE_RETENTION_APPROVE: ${BACKUP_REMOTE_RETENTION_APPROVE:-}
       BACKUP_FILE: ${BACKUP_FILE:-}
       BACKUP_RESERVE_BYTES: ${BACKUP_RESERVE_BYTES:-67108864}
       BACKUP_OFFLINE_CONFIRMED: ${BACKUP_OFFLINE_CONFIRMED:-}

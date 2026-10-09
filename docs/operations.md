@@ -345,7 +345,7 @@ docker compose --env-file .env up -d
 - 백업 범위는 `greptime-data`, `greptime-etc`와 S3 모드의 SST 객체입니다. **Grafana 사용자 설정, Alloy 큐, 차량 spool/outbox, `.env`는 이 백업에 포함되지 않습니다.** 별도 보관 정책이 필요합니다.
 - S3 모드는 SST와 archive를 SHA256·크기로 검증하고 완료 표식을 남깁니다. live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
 - inventory JSON(`manifest.json`의 archive 내/원격 사본과 `COMPLETE`)은 **각각 비압축 UTF-8 64 MiB 이하**여야 합니다. 백업 생성과 로컬·원격 복원에 같은 한도를 적용하며 초과한 백업은 성공으로 보고하지 않습니다. 8,000개 이상의 SST도 이 바이트 한도 안이면 복원할 수 있습니다. checksum sidecar는 1 MiB 이하입니다. JSON 읽기는 한도와 chunk 크기로 제한하고 원격 응답 스트림은 성공·실패 모두 닫습니다. **archive 전체나 SST 데이터 총량에는 이 JSON 한도를 적용하지 않습니다.**
-- `BACKUP_KEEP=7`은 로컬 백업 세대 수입니다. 원격 백업의 자동 정리 정책이 아닙니다. 복구에 필요한 prefix에 임의 만료 정책을 설정하지 마세요.
+- `BACKUP_KEEP=7`은 로컬 백업 세대 수입니다. 원격 보존은 기본 `off`이며 별도 승인된 `enforce`에서만 삭제합니다. [원격 보존 정책과 dry-run 절차](backup-retention.md)를 확인하고, 복구에 필요한 prefix에 임의 만료 정책을 설정하지 마세요.
 
 ### 새 프로젝트로 복원
 

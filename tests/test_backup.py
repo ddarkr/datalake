@@ -19,6 +19,20 @@ Behavioral checks (each fails against the named defect, passes fixed):
   (5) Exact download: nested prefix inventory never resolves as the
       archive; downloads stream to .tmp and only atomically appear after
       COMPLETE verification (a failed download leaves no tar behind).
+  (6) Remote retention: off default deletes nothing; dry-run lists the same
+      candidates enforce would delete (with matching bytes); enforce keeps
+      newest/age/min/pinned/current/referenced/retiring, never touches
+      live/outside/incomplete/corrupt prefixes, resumes RETIRING markers
+      first, separates COMPLETE deletion from payload deletion (COMPLETE
+      absence confirmed before payload), refuses active restore refs and
+      concurrent backup/retention races, surfaces per-key partial delete
+      errors, and refuses inside incomplete grace or without approval.
+      Generation race: reader precheck/marker/ref-PUT/postcheck and writer
+      precheck/marker/postcheck interleave deterministically (racing marker
+      refuses the reader; late reader aborts the writer with marker+COMPLETE
+      preserved; aborted-writer resume deletes COMPLETE alone first), 8 real
+      threads hold refs while retire refuses, and local-tar restores hold the
+      ref until the SST snapshot is used (released on all errors).
   Plus the standing contract: offline refusal (live probe), File-mode
   byte roundtrip, matching-live reuse (no out-of-band deletion of intact
   SSTs; missing-only copy; conflict refusal without overwrite; rollback of
@@ -28,7 +42,7 @@ Behavioral checks (each fails against the named defect, passes fixed):
   prune rules, overlap and missing-S3 fail-closed, incomplete prefixes
   ignored.
 
-Real B2 is NOT verified here (no live credentials in this environment);
+Real S3/MinIO runs are the parent's job (native loopback MinIO + Greptime);
 the fake streams chunks like the S3 API and the parent gates real runs.
 """
 
@@ -1441,6 +1455,498 @@ def test_failed_restore_preserves_last_success_marker():
         restore_env()
 
 
+def retention_ids(fake, count=3):
+    """Build `count` real verified generations; return oldest-first backup ids."""
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    ids = []
+    try:
+        setenv(env)
+        for _ in range(count):
+            assert bk.cmd_backup() == 0
+            ids.append(_remote_bid(bdir))
+        return ids, tmp, env
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+        raise
+
+
+def end_retention_run(tmp):
+    shutil.rmtree(tmp, ignore_errors=True)
+    restore_env()
+
+
+def test_retention_off_default_deletes_nothing():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        before = dict(fake.objects)
+        assert bk.cmd_retention() == 0  # mode off: evaluation skipped
+        assert fake.objects == before and bk.remote_complete_ids(
+            fake, "test-bucket", "test-backups/") == sorted(ids)
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retention_dryrun_matches_enforce_selection():
+    import io as _io
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="dry-run",
+                    BACKUP_REMOTE_RETAIN_COUNT="2",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0"))
+        out = _io.StringIO()
+        old, bk.sys.stdout = bk.sys.stdout, out
+        try:
+            assert bk.cmd_retention() == 0
+        finally:
+            bk.sys.stdout = old
+        dry = out.getvalue()
+        assert ("candidate " + ids[0]) in dry and ids[-1] not in dry.split("candidate")[1].split("retention: mode=")[0]
+        expect = [l for l in dry.splitlines() if l.startswith("retention: mode=")][0]
+        assert "delete=1" in expect
+        listed_bytes = int(expect.split("bytes=")[1])
+        assert listed_bytes == sum(len(v) for k, v in fake.objects.items()
+                                   if k.startswith("test-backups/%s/" % ids[0]))
+        assert len(fake.objects) and bk.remote_complete_ids(
+            fake, "test-bucket", "test-backups/") == sorted(ids)  # dry-run deletes nothing
+        # Same selection under enforce+approval deletes exactly that generation.
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="2",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 0
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids[1:])
+        assert not [k for k in fake.objects if k.startswith("test-backups/%s/" % ids[0])]
+        assert [k for k in fake.objects if k.startswith("test-root/")]  # live untouched
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retention_keeps_pinned_age_minimum_current():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="2",
+                    BACKUP_REMOTE_PINNED=ids[0],
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        # count=1 wants only the newest, but pin + min_recovery=2 keep all three.
+        assert bk.cmd_retention(current_bid=ids[-1]) == 0
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids)
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_RETAIN_DAYS="36500",  # everything younger: keep all
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 0
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids)
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retention_fail_closed_faults():
+    import io as _io
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        live_before = {k: v for k, v in fake.objects.items() if k.startswith("test-root/")}
+        # Corrupt COMPLETE: generation is skipped, never counted or deleted.
+        rbase = "test-backups/%s/" % ids[0]
+        fake.objects[rbase + "COMPLETE"] = b'{"backup_id": %s, "bogus": true}' % ids[0].encode()
+        # Incomplete prefix (no COMPLETE) + outside-prefix + live-adjacent keys.
+        fake.objects["test-backups/greptime-backup-20990101T000000.000000000-deadbeef/COMPLETE"] = b"{}"
+        fake.objects["outside-scope/stray"] = b"stray"
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        out = _io.StringIO()
+        old, bk.sys.stdout = bk.sys.stdout, out
+        try:
+            assert bk.cmd_retention() == 0
+        finally:
+            bk.sys.stdout = old
+        assert ("skip " + ids[0]) in out.getvalue()
+        assert fake.objects["outside-scope/stray"] == b"stray"
+        assert {k: v for k, v in fake.objects.items()
+                if k.startswith("test-root/")} == live_before
+        # Prefix misconfiguration fails closed before any deletion.
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce", S3_BACKUP_PREFIX="test-root",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 2
+        assert {k: v for k, v in fake.objects.items()
+                if k.startswith("test-root/")} == live_before
+        # Enforce without explicit approval deletes nothing.
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0"))
+        assert bk.cmd_retention() == 2
+        # Recent incomplete prefix blocks enforce (concurrent run protection).
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 2
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retire_complete_first_and_idempotent():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        victim = next(g for g in gens if g["backup_id"] == ids[0])
+        rbase = "test-backups/%s/" % ids[0]
+        calls = []
+        orig = fake.delete_objects
+        fake.delete_objects = lambda **kw: (calls.append([o["Key"] for o in kw["Delete"]["Objects"]]), orig(**kw))[1]
+        try:
+            assert bk.retire_generation(fake, "test-bucket", "test-backups/", victim) > 0
+        finally:
+            fake.delete_objects = orig
+        # COMPLETE deleted in its own call, confirmed absent before payload.
+        assert calls and calls[0] == [rbase + "COMPLETE"]
+        assert not [c for c in calls[1:] if rbase + "COMPLETE" in c]
+        assert not [k for k in fake.objects if k.startswith(rbase)]
+        assert bk.retire_generation(fake, "test-bucket", "test-backups/", victim) == 0
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids[1:])
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retention_newest_oldest_pinned_restore_hash_match():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        # Newest, oldest, and pinned generations each restore byte-identical
+        # trees into isolated empty roots (full hash comparison; missing
+        # target dirs are a fixture setup step, not a production fallback).
+        before_src = hash_tree(os.path.join(tmp, "src"))
+        for bid in (ids[0], ids[1], ids[-1]):
+            setenv(dict(env, BACKUP_FILE=bid, BACKUP_REMOTE_PINNED=ids[1]))
+            for name in os.listdir(env["BACKUP_DIR"]):  # force remote fetch path
+                os.unlink(os.path.join(env["BACKUP_DIR"], name))
+            reset_targets(env["BACKUP_RESTORE_BASE"])
+            # Wipe the live prefix: restore must repopulate from the snapshot.
+            for key in [k for k in fake.objects if k.startswith("test-root/")]:
+                del fake.objects[key]
+            assert bk.cmd_restore() == 0
+            assert hash_tree(env["BACKUP_RESTORE_BASE"]) == before_src
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retention_refuses_active_reader_and_concurrent_backup():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        ref = bk.acquire_generation_ref(fake, "test-bucket", "test-backups/", ids[0])
+        try:
+            assert bk.cmd_retention() == 0
+            assert ref in fake.objects
+        finally:
+            bk.release_generation_ref(fake, "test-bucket", ref)
+        survivors = sorted([ids[0], ids[-1]])
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == survivors
+        fake.objects["test-backups/greptime-backup-20990101T000000.000000000-deadbef/stray"] = b"x"
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 2
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == survivors
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retirement_interrupt_resumes_and_partial_delete_surfaces():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        rbase = "test-backups/%s/" % ids[0]
+        fake.objects[rbase + "RETIRING"] = (ids[0] + "\n").encode()
+        del fake.objects[rbase + "COMPLETE"]
+        resumed, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        assert next(g for g in resumed if g["backup_id"] == ids[0])["retiring"]
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="3",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 0
+        assert not [k for k in fake.objects if k.startswith(rbase)]
+        class PartialFail(fake.__class__):
+            def delete_objects(self, Bucket, Delete):
+                return {"Errors": [{"Key": o["Key"], "Code": "AccessDenied"}
+                                   for o in Delete["Objects"]]}
+        failing = PartialFail(dict(fake.objects))
+        try:
+            bk.s3_delete_keys(failing, "test-bucket", ["test-backups/nope/x"])
+            assert False, "partial delete must raise"
+        except IOError as e:
+            assert "AccessDenied" in str(e)
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retention_rejects_bad_settings_and_future_complete():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(env)
+        for bad in ("nan", "inf", "-inf"):
+            setenv(dict(env, BACKUP_REMOTE_RETAIN_DAYS=bad))
+            settings, err = bk.retention_settings()
+            assert settings is None and err is not None
+        setenv(dict(env, BACKUP_REMOTE_PINNED="../escape"))
+        settings, err = bk.retention_settings()
+        assert settings is None and "scope" in err
+        rbase = "test-backups/%s/" % ids[0]
+        complete = json.loads(fake.objects[rbase + "COMPLETE"].decode())
+        complete["created_utc"] = "20990101T000000.000000000Z"
+        fake.objects[rbase + "COMPLETE"] = json.dumps(complete, sort_keys=True).encode()
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        assert next(g for g in gens if g["backup_id"] == ids[0])["status"] == "corrupt"
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 0
+        assert rbase + "COMPLETE" in fake.objects
+    finally:
+        end_retention_run(tmp)
+
+def reset_targets(base):
+    """Fresh empty restore targets: label dirs exist and hold nothing."""
+    for label in bk.LABELS:
+        target = os.path.join(base, label)
+        os.makedirs(target, exist_ok=True)
+        bk.clear_dir(target)
+
+
+def test_ref_reader_postcheck_refuses_racing_marker():
+    # Deterministic interleave: reader precheck passes, a writer RETIRING
+    # lands before the reader PUT, so the reader postcheck must release the
+    # just-written ref and refuse (never consume a retiring generation).
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(env)
+        bid = ids[0]
+        rbase = "test-backups/%s/" % bid
+        orig_put = fake.put_object
+
+        def racing_put(Bucket, Key, Body, ContentLength=None, Metadata=None):
+            if Key.startswith(rbase + bk.REFS_DIR):
+                fake.objects[rbase + "RETIRING"] = (bid + "\n").encode("utf-8")
+            return orig_put(Bucket=Bucket, Key=Key, Body=Body,
+                            ContentLength=ContentLength, Metadata=Metadata)
+
+        fake.put_object = racing_put
+        try:
+            bk.acquire_generation_ref(fake, "test-bucket", "test-backups/", bid)
+            assert False, "reader postcheck must refuse a racing RETIRING marker"
+        except IOError as e:
+            assert "retir" in str(e).lower()
+        finally:
+            fake.put_object = orig_put
+        assert not [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)]
+        assert rbase + bk.COMPLETE_NAME in fake.objects
+        assert rbase + "RETIRING" in fake.objects
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retire_postcheck_aborts_on_late_reader():
+    # Deterministic interleave: writer precheck sees no refs, a late reader
+    # PUT lands before the writer marker, so the writer postcheck must abort
+    # with marker+COMPLETE preserved (safe resume state), payload untouched.
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(env)
+        bid = ids[0]
+        rbase = "test-backups/%s/" % bid
+        before = {k for k in fake.objects if k.startswith(rbase)}
+        assert rbase + bk.COMPLETE_NAME in before
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        victim = next(g for g in gens if g["backup_id"] == bid)
+        orig_put = fake.put_object
+
+        def late_reader_put(Bucket, Key, Body, ContentLength=None, Metadata=None):
+            if Key == rbase + "RETIRING":
+                fake.objects[rbase + bk.REFS_DIR + "late-reader"] = b"ref"
+            return orig_put(Bucket=Bucket, Key=Key, Body=Body,
+                            ContentLength=ContentLength, Metadata=Metadata)
+
+        fake.put_object = late_reader_put
+        try:
+            bk.retire_generation(fake, "test-bucket", "test-backups/", victim)
+            assert False, "writer postcheck must abort on a late reader ref"
+        except IOError as e:
+            assert "active reader" in str(e)
+        finally:
+            fake.put_object = orig_put
+        live = {k for k in fake.objects if k.startswith(rbase)}
+        assert live == before | {rbase + "RETIRING", rbase + bk.REFS_DIR + "late-reader"}
+        assert rbase + bk.COMPLETE_NAME in live
+        try:
+            bk.resume_retiring(fake, "test-bucket", "test-backups/", bid)
+            assert False, "resume must refuse while the reader ref is held"
+        except IOError as e:
+            assert "active reader" in str(e)
+        bk.release_generation_ref(fake, "test-bucket", rbase + bk.REFS_DIR + "late-reader")
+        bk.resume_retiring(fake, "test-bucket", "test-backups/", bid)
+        assert not [k for k in fake.objects if k.startswith(rbase)]
+    finally:
+        end_retention_run(tmp)
+
+
+def test_resume_aborted_writer_deletes_complete_first():
+    # Aborted writer left marker+COMPLETE: resume must delete COMPLETE alone,
+    # confirm its absence, and never multi-delete payload before that.
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        setenv(env)
+        bid = ids[0]
+        rbase = "test-backups/%s/" % bid
+        fake.objects[rbase + "RETIRING"] = (bid + "\n").encode("utf-8")
+        assert rbase + bk.COMPLETE_NAME in fake.objects
+        calls = []
+        orig = fake.delete_objects
+
+        def record(**kw):
+            calls.append([o["Key"] for o in kw["Delete"]["Objects"]])
+            return orig(**kw)
+
+        fake.delete_objects = record
+        try:
+            bk.resume_retiring(fake, "test-bucket", "test-backups/", bid)
+        finally:
+            fake.delete_objects = orig
+        assert calls and calls[0] == [rbase + bk.COMPLETE_NAME]
+        assert not [c for c in calls[1:] if rbase + bk.COMPLETE_NAME in c]
+        assert not [k for k in fake.objects if k.startswith(rbase)]
+    finally:
+        end_retention_run(tmp)
+
+
+def test_generation_race_threading_refs():
+    # Actual threads: 8 readers hold refs while a retire attempt must refuse
+    # with COMPLETE intact; after release the retire completes fully.
+    import time as _time
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    hold = threading.Event()
+    try:
+        setenv(env)
+        bid = ids[0]
+        rbase = "test-backups/%s/" % bid
+        srv = threading.Lock()
+
+        def _guarded(fn):
+            def run(*a, **k):
+                with srv:
+                    return fn(*a, **k)
+            return run
+
+        for _op in ("list_objects_v2", "put_object", "delete_objects",
+                    "get_object", "copy_object", "head_object"):
+            setattr(fake, _op, _guarded(getattr(fake, _op)))
+        acquired, failures = [], []
+
+        def reader(i):
+            try:
+                key = bk.acquire_generation_ref(
+                    fake, "test-bucket", "test-backups/", bid, token="thread-%d" % i)
+                acquired.append(key)
+                assert hold.wait(timeout=15)
+                bk.release_generation_ref(fake, "test-bucket", key)
+            except Exception as e:  # noqa: recorded below, never masked
+                failures.append(e)
+
+        threads = [threading.Thread(target=reader, args=(i,), daemon=True) for i in range(8)]
+        for t in threads:
+            t.start()
+        deadline = _time.time() + 15
+        while len(acquired) < 8 and _time.time() < deadline:
+            _time.sleep(0.01)
+        assert len(acquired) == 8 and not failures
+        assert len(set(acquired)) == 8
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        victim = next(g for g in gens if g["backup_id"] == bid)
+        try:
+            bk.retire_generation(fake, "test-bucket", "test-backups/", victim)
+            assert False, "retire must refuse while readers hold refs"
+        except IOError as e:
+            assert "active reader" in str(e)
+        assert rbase + bk.COMPLETE_NAME in fake.objects
+        hold.set()
+        for t in threads:
+            t.join(timeout=15)
+        assert not failures and all(not t.is_alive() for t in threads)
+        assert not [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)]
+        assert bk.retire_generation(fake, "test-bucket", "test-backups/", bid) > 0
+        assert not [k for k in fake.objects if k.startswith(rbase)]
+    finally:
+        hold.set()
+        end_retention_run(tmp)
+
+
+def test_local_tar_restore_holds_ref_until_snapshot_used():
+    # LOCAL archive S3 restore must also hold a generation ref from acquire
+    # until the SST snapshot is verified/used, and release it on all errors.
+    fake = FakeS3(sst_fixture())
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid = _remote_bid(bdir)
+        rbase = "test-backups/%s/" % bid
+        for key in [k for k in fake.objects if k.startswith("test-root/")]:
+            del fake.objects[key]
+        held_during_copy = []
+        orig_copy = fake.copy_object
+
+        def spy_copy(Bucket, CopySource, Key):
+            held_during_copy.append(
+                [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)])
+            return orig_copy(Bucket=Bucket, CopySource=CopySource, Key=Key)
+
+        fake.copy_object = spy_copy
+        try:
+            setenv(dict(env, BACKUP_FILE=bid))
+            reset_targets(env["BACKUP_RESTORE_BASE"])
+            assert bk.cmd_restore() == 0
+        finally:
+            fake.copy_object = orig_copy
+        assert held_during_copy and all(held_during_copy)
+        assert not [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)]
+        manifest = read_manifest(newest_tar(bdir))
+        snap = manifest["sst_snapshot"]
+        victim = "test-root/" + snap["objects"][0]["key"]
+        fake.objects[victim] = b"conflicting-bytes-not-snapshot"
+        reset_targets(env["BACKUP_RESTORE_BASE"])
+        setenv(dict(env, BACKUP_FILE=bid))
+        assert bk.cmd_restore() == 2
+        assert fake.objects[victim] == b"conflicting-bytes-not-snapshot"
+        assert not [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
 if __name__ == "__main__":
     test_backup_refuses_running_db()
     test_backup_requires_offline_confirmation()
@@ -1489,4 +1995,18 @@ if __name__ == "__main__":
     test_backup_preflight_counts_source_bytes_and_refuses()
     test_restore_preflight_checks_each_target_filesystem()
     test_failed_restore_preserves_last_success_marker()
-    print("test_backup: ok (47 tests)")
+    test_retention_off_default_deletes_nothing()
+    test_retention_dryrun_matches_enforce_selection()
+    test_retention_keeps_pinned_age_minimum_current()
+    test_retention_fail_closed_faults()
+    test_retire_complete_first_and_idempotent()
+    test_retention_newest_oldest_pinned_restore_hash_match()
+    test_retention_refuses_active_reader_and_concurrent_backup()
+    test_retirement_interrupt_resumes_and_partial_delete_surfaces()
+    test_retention_rejects_bad_settings_and_future_complete()
+    test_ref_reader_postcheck_refuses_racing_marker()
+    test_retire_postcheck_aborts_on_late_reader()
+    test_resume_aborted_writer_deletes_complete_first()
+    test_generation_race_threading_refs()
+    test_local_tar_restore_holds_ref_until_snapshot_used()
+    print("test_backup: ok (61 tests)")
