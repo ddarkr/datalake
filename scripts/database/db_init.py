@@ -22,6 +22,8 @@ from scripts.telemetry.activity import ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIE
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TTL_RE = re.compile(r"^[0-9]+[smhd]$")
+OTEL_TABLES = ("opentelemetry_traces", "opentelemetry_logs")
+UNLIMITED_TTL = "0s"  # Greptime 0s means no expiry, not immediate expiry.
 # Shared activity count/value fields and trace attribute keys. The raw
 # repository URL is never stored; ingest hashes it into
 # coding_agent.repository.id before the durable queue.
