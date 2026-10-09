@@ -11,6 +11,7 @@ import contextlib
 import datetime
 import fcntl
 import hashlib
+import heapq
 import hmac
 import http.client
 import ipaddress
@@ -135,6 +136,9 @@ def exclusive_archive(path):
         os.close(fd)
 
 DECODE_ROW_BUDGET = 2000
+# Upper bound on raw bytes held by one decode_once prefetch: 1000 full-size
+# 64KiB chunks must never become 64MiB of transient blobs.
+_DECODE_PREFETCH_BYTES = 4 * 1024 * 1024
 
 
 def _meta_bump(conn, key, delta):
@@ -182,26 +186,88 @@ def _refresh_pending_epoch(conn, epoch):
     )
 
 
-def candidate_sql(n_progress):
-    """Pending-driven candidate SELECT shared by decode_once and runners.
+def pending_heads_sql():
+    """Bounded pending next-head SELECT shared by decode_once and runners.
 
-    Bind 2*n_progress (session, want-seq) progress pairs, then the epoch
-    twice. CROSS JOIN pins decode_pending first so retained completed
-    history is never scanned; ORDER BY c.id LIMIT 1 keeps the global
-    earliest-arrival choice and staged-progress semantics.
+    One row per pending session: the next wanted raw head by (session, seq)
+    index, plus its global arrival id so the Python heap merge below keeps
+    exact global earliest-arrival order across interleaved sessions. Heads
+    carry only id/session/seq (never blob data); the chosen streams fetch
+    their bounded prefixes afterwards. Bind the epoch twice.
     """
-    placeholders = ",".join("(?,?)" for _ in range(n_progress)) or "(NULL,NULL)"
     return (
-        "WITH progress(session,next_seq) AS (VALUES " + placeholders + ") "
-        "SELECT c.session AS session, c.seq AS seq, c.offset_ns AS offset_ns, "
-        "c.phase AS phase, c.data AS data, s.meta_json AS meta_json, d.state_json AS state_json, "
-        "d.counts_json AS counts_json, d.rows AS rows FROM decode_pending q "
-        "CROSS JOIN sessions s ON s.id=q.session AND q.epoch=? "
-        "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
-        "LEFT JOIN progress p ON p.session=s.id "
-        "JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(p.next_seq,d.next_seq,0) "
-        "ORDER BY c.id LIMIT 1"
+        "SELECT c.id AS id, c.session AS session, c.seq AS seq "
+        "FROM decode_pending q "
+        "JOIN decode_states d ON d.session=q.session AND d.epoch=q.epoch "
+        "JOIN raw_chunks c ON c.session=q.session AND c.seq=d.next_seq "
+        "WHERE q.epoch=? "
+        "UNION ALL "
+        "SELECT c.id AS id, c.session AS session, c.seq AS seq "
+        "FROM decode_pending q "
+        "JOIN raw_chunks c ON c.session=q.session AND c.seq=0 "
+        "WHERE q.epoch=? AND NOT EXISTS("
+        "SELECT 1 FROM decode_states d WHERE d.session=q.session AND d.epoch=q.epoch) "
+        "ORDER BY id"
     )
+
+
+def _plan_staged(conn, epoch, limit):
+    """Stage up to limit next chunks in global arrival order with bounded reads.
+
+    Two bounded indexed phases, one read connection, no per-chunk candidate
+    query. First the pending next-heads (id/session/seq only, never blob
+    data) ordered by arrival id; then a heap merge keyed by arrival id
+    chains each staged seq forward by one indexed (session, seq) lookup at
+    a time, so chaining probes never exceed the staged limit; only the
+    chosen (session, seq) rows fetch their bounded chunk data. Raw id
+    order is preserved exactly, including interleaved arrivals, without
+    any ORDER BY id LIMIT range join over the retained tail or a growing
+    progress VALUES list.
+    """
+    heads = conn.execute(pending_heads_sql(), (epoch, epoch)).fetchall()
+    if not heads:
+        return []
+    heap = [((row["id"], row["session"]), int(row["seq"])) for row in heads]
+    heapq.heapify(heap)
+    wanted = []
+    while heap and len(wanted) < limit:
+        (_, session), seq = heapq.heappop(heap)
+        wanted.append((session, seq))
+        nxt = conn.execute(
+            "SELECT id FROM raw_chunks WHERE session=? AND seq=?",
+            (session, seq + 1),
+        ).fetchone()
+        if nxt is not None:
+            heapq.heappush(heap, ((nxt["id"], session), seq + 1))
+    wanted_ids = []
+    for session, seq in wanted:
+        found = conn.execute(
+            "SELECT id FROM raw_chunks WHERE session=? AND seq=?",
+            (session, seq),
+        ).fetchone()
+        if found is None:
+            continue
+        wanted_ids.append((found["id"], session, seq))
+    wanted_ids.sort(key=lambda item: item[0])
+    planned, prefetched_bytes = [], 0
+    for _, session, seq in wanted_ids:
+        if prefetched_bytes >= _DECODE_PREFETCH_BYTES:
+            break
+        found = conn.execute(
+            "SELECT c.session AS session, c.seq AS seq, c.offset_ns AS offset_ns, "
+            "c.phase AS phase, c.data AS data, s.meta_json AS meta_json, "
+            "d.state_json AS state_json, d.counts_json AS counts_json, d.rows AS rows "
+            "FROM raw_chunks c JOIN sessions s ON s.id=c.session "
+            "LEFT JOIN decode_states d ON d.session=c.session AND d.epoch=? "
+            "WHERE c.session=? AND c.seq=?",
+            (epoch, session, seq),
+        ).fetchone()
+        if found is None:
+            continue
+        raw = {key: found[key] for key in found.keys()}
+        planned.append(raw)
+        prefetched_bytes += len(raw["data"])
+    return planned
 
 
 def _reconcile_pending_session(conn, epoch, session_id):
@@ -386,70 +452,81 @@ class Archive:
     def decode_once(self, decoder, limit=1000):
         """Decode an ordered multi-chunk batch without holding the writer lock during CPU work.
 
-        Chunks and parser cursors are read briefly, decoded outside any SQLite
-        transaction via Decoder.decode_some(meta,chunk,state,max_rows), then
-        committed ONCE (cursor CAS + all rows + partial state + counters). A
-        failure anywhere in the batch commits nothing: cursors, outbox rows,
-        counters, and freshness stay exactly as before the call. A partial
-        chunk still survives crashes via durable decode_partial state committed
-        with its batch; rows stay under plain INSERT (re-emit fails loudly via
-        UNIQUE instead of silently duplicating).
+        One read connection serves the whole bounded read (plain autocommit
+        SELECTs, never an open transaction), then closes before any CPU
+        decode runs; one writer connection commits once. The read stages at
+        most limit chunks or 4MiB raw via pending next-heads merged in
+        global arrival order; retained history is never scanned. Only the
+        committed processed prefix advances the persistent cursors.
+        Chunks retain their original shape and global arrival order. The
+        50ms soft budget applies to decode work after the bounded read
+        closes. Commit is a single BEGIN IMMEDIATE: cursor/partial CAS
+        first, then all outbox rows (plain INSERT, event_id UNIQUE) in
+        staged order, then per session only the last completed cursor and
+        the trailing partial, then one batch-sum counter update per key. A
+        failure anywhere commits nothing: cursors, outbox rows, counters,
+        and freshness stay exactly as before the call. A partial chunk
+        still survives crashes via durable decode_partial state committed
+        with its batch; rows stay under plain INSERT (re-emit fails loudly
+        via UNIQUE instead of silently duplicating). An advanced cursor
+        with a trailing partial keeps both: the cursor reflects the last
+        completed chunk while the partial carries only its own remainder,
+        so the next turn resumes instead of re-emitting the completed
+        prefix.
         """
         decode_some = decoder.decode_some
         # Release the writer lock between batches so raw ingestion can proceed.
         # Global row budget across the batch: a dense chunk that does not finish
         # within budget stages alone and commits its resume state; later chunks
         # wait for the next call so no remaining frames are skipped.
+        anchors, partials = {}, {}
+        with self.connect() as conn:
+            # One read connection, plain autocommit SELECTs, closed before
+            # any CPU decode runs. Staged rows carry their session snapshots;
+            # anchors/partials are read once per staged session for the
+            # commit-time CAS.
+            planned = _plan_staged(conn, decoder.epoch, limit)
+            for raw in planned:
+                session = raw["session"]
+                if session not in anchors:
+                    state_row = conn.execute(
+                        "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
+                        (session, decoder.epoch),
+                    ).fetchone()
+                    anchors[session] = {key: state_row[key] for key in state_row.keys()} if state_row else None
+                    part_row = conn.execute(
+                        "SELECT seq,state_json,counts_json,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
+                        (session, decoder.epoch),
+                    ).fetchone()
+                    partials[session] = {key: part_row[key] for key in part_row.keys()} if part_row else None
+            self.reserve(sum(len(raw["data"]) for raw in planned))
+        if not planned:
+            return 0
         deadline = time.monotonic() + 0.05
-        staged = []
+        staged, latest = [], {}
         emitted_rows = 0
-        while len(staged) < limit:
-            with self.connect() as conn:
-                # Indexed candidate kept in its original shape; staged seqs
-                # override the persisted cursor through an in-memory CTE.
-                # Invariant: staged holds exactly seqs [cursor, cursor+n) per
-                # session in order, so the next wanted seq is anchor+n.
-                progress = {}
-                for entry in staged:
-                    progress[entry[0]["session"]] = entry[0]["seq"] + 1
-                params = []
-                for session, want in progress.items():
-                    params.extend((session, want))
-                # candidate_sql is the single source; bind pairs first, epoch twice.
-                raw = conn.execute(
-                    candidate_sql(len(progress)), (*params, decoder.epoch, decoder.epoch),
-                ).fetchone()
-                if raw is None:
-                    break
-                partial = conn.execute(
-                    "SELECT seq,state_json,counts_json,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
-                    (raw["session"], decoder.epoch),
-                ).fetchone()
-                anchor = conn.execute(
-                    "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
-                    (raw["session"], decoder.epoch),
-                ).fetchone()
-            self.reserve()
+        for raw in planned:
+            session = raw["session"]
             meta = json.loads(raw["meta_json"])
             chunk = {key: raw[key] for key in ("seq", "offset_ns", "phase", "data")}
+            partial = partials[session]
             if partial is not None and partial["seq"] == raw["seq"]:
                 state = json.loads(partial["state_json"])
-                carried, emitted = json.loads(partial["counts_json"]), partial["rows_emitted"]
-            elif raw["session"] in progress:
+                carried, emitted, resumed = json.loads(partial["counts_json"]), partial["rows_emitted"], True
+            elif session in latest:
                 # Continue from the staged predecessor's output state: it has
                 # not committed yet, so the persisted cursor still points at it.
-                state = next(e[2]["state"] for e in reversed(staged) if e[0]["session"] == raw["session"])
-                carried, emitted = {}, 0
+                state, carried, emitted, resumed = latest[session]["state"], {}, 0, False
             else:
                 state = json.loads(raw["state_json"]) if raw["state_json"] else None
-                carried, emitted = {}, 0
+                carried, emitted, resumed = {}, 0, False
             rows, state, counts, done = decode_some(meta, chunk, state, max(1, DECODE_ROW_BUDGET - emitted_rows))
             if type(done) is not bool:
                 raise ValueError("invalid decode batch completion flag")
-            if raw["session"] in progress:
+            if session in latest:
                 # Continue totals from the staged predecessor: the persisted
                 # cursor still holds pre-batch counts.
-                totals = dict(next(w["totals"] for r, c, w in reversed(staged) if r["session"] == raw["session"]))
+                totals = dict(latest[session]["totals"])
             else:
                 totals = json.loads(raw["counts_json"]) if raw["counts_json"] else {}
             for deltas in ([carried] if carried else []) + [counts]:
@@ -463,9 +540,9 @@ class Archive:
                     raise ValueError("decoder row identity mismatch")
             if not done and not rows:
                 raise ValueError("decoder partial batch must emit rows")
-            staged.append((raw, chunk, {"state": state, "counts": counts, "done": done, "totals": totals,
-                                        "carried": carried, "emitted": emitted, "rows": rows,
-                                        "partial": partial, "anchor": anchor}))
+            latest[session] = {"state": state, "totals": totals}
+            staged.append((raw, chunk, {"state": state, "counts": counts, "done": done,
+                                        "carried": carried, "emitted": emitted, "resumed": resumed, "rows": rows}))
             emitted_rows += len(rows)
             if not done or emitted_rows >= DECODE_ROW_BUDGET or time.monotonic() >= deadline:
                 break
@@ -475,67 +552,93 @@ class Archive:
             work["canonicals"] = [_json(row) for row in work["rows"]]
         staged_bytes = sum(len(c.encode()) for _, _, work in staged for c in work["canonicals"])
         self.reserve(staged_bytes + len(staged) * 512 + staged_bytes // 4)
+        order, groups = [], {}
+        for raw, chunk, work in staged:
+            if raw["session"] not in groups:
+                order.append(raw["session"])
+                groups[raw["session"]] = []
+            groups[raw["session"]].append((raw, chunk, work))
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             # Validate each session's anchor ONCE before any writes: staged
             # same-session writes are ours, not an external race.
-            seen = set()
-            for raw, chunk, work in staged:
-                if raw["session"] in seen:
-                    continue
-                seen.add(raw["session"])
+            for session in order:
+                raw = groups[session][0][0]
                 anchor = conn.execute(
                     "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
-                    (raw["session"], decoder.epoch),
+                    (session, decoder.epoch),
                 ).fetchone()
-                before = work["anchor"]
+                before = anchors[session]
                 if (anchor["next_seq"] if anchor else 0) != (before["next_seq"] if before else 0) or \
                         (anchor["state_json"] if anchor else None) != (before["state_json"] if before else None) or \
                         (anchor["counts_json"] if anchor else None) != (before["counts_json"] if before else None) or \
                         (anchor["rows"] if anchor else 0) != (before["rows"] if before else 0):
                     raise ValueError("decode cursor moved during decode")
-                if work["partial"] is not None:
+                partial = partials[session]
+                if partial is not None:
                     current = conn.execute(
                         "SELECT seq,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
-                        (raw["session"], decoder.epoch),
+                        (session, decoder.epoch),
                     ).fetchone()
-                    if work["partial"]["seq"] == raw["seq"]:
-                        if current is None or current["seq"] != raw["seq"] or current["rows_emitted"] != work["emitted"]:
+                    if partial["seq"] == raw["seq"]:
+                        if current is None or current["seq"] != raw["seq"] or \
+                                current["rows_emitted"] != groups[session][0][2]["emitted"]:
                             raise ValueError("decode partial moved during decode")
                     elif current is not None and current["seq"] != raw["seq"]:
                         conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
-                                     (raw["session"], decoder.epoch))
-            committed = {}
-            for raw, chunk, work in staged:
-                conn.executemany(
-                    "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-                    [(row["event_id"], decoder.epoch, canonical) for row, canonical in zip(work["rows"], work["canonicals"])],
-                )
-                # Chain within the batch: later chunks of the same session build
-                # on this commit, not on the pre-batch persisted cursor.
-                prior = committed.get(raw["session"], (raw["rows"] or 0))
-                if work["done"]:
+                                     (session, decoder.epoch))
+            conn.executemany(
+                "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
+                [(row["event_id"], decoder.epoch, canonical)
+                 for _, _, work in staged for row, canonical in zip(work["rows"], work["canonicals"])],
+            )
+            # Chain within the batch: later chunks of the same session build
+            # on the last completed commit, not on the pre-batch cursor.
+            for session in order:
+                items = groups[session]
+                anchor = anchors[session]
+                running = dict(json.loads(anchor["counts_json"]) if anchor and anchor["counts_json"] else {})
+                rows_acc = (anchor["rows"] if anchor else 0) + \
+                    (items[0][2]["emitted"] if items[0][2]["resumed"] else 0)
+                if items[0][2]["resumed"]:
+                    for key, value in items[0][2]["carried"].items():
+                        running[key] = value if key == "tail_bytes" else running.get(key, 0) + value
+                completed = None
+                for raw, _, work in items:
+                    for key, value in work["counts"].items():
+                        running[key] = value if key == "tail_bytes" else running.get(key, 0) + value
+                    # Every staged row counts, including rows of a middle
+                    # partial chunk: the cursor reflects all rows emitted for
+                    # the session through the last completed chunk.
+                    rows_acc += len(work["rows"])
+                    if work["done"]:
+                        completed = (raw, work, dict(running), rows_acc)
+                if completed is not None:
+                    raw, work, ctotals, crows = completed
                     conn.execute(
                         "INSERT INTO decode_states VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
                         "next_seq=excluded.next_seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows=excluded.rows",
-                        (raw["session"], decoder.epoch, raw["seq"] + 1, _json(work["state"]), _json(work["totals"]), prior + work["emitted"] + len(work["rows"])),
+                        (session, decoder.epoch, raw["seq"] + 1, _json(work["state"]), _json(ctotals), crows),
                     )
-                    conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
-                                 (raw["session"], decoder.epoch))
-                else:
-                    merged = dict(work["carried"])
-                    for key, value in work["counts"].items():
+                last_raw, last_work = items[-1][0], items[-1][2]
+                if not last_work["done"]:
+                    merged = dict(last_work["carried"]) if last_work["resumed"] else {}
+                    for key, value in last_work["counts"].items():
                         merged[key] = value if key == "tail_bytes" else merged.get(key, 0) + value
                     conn.execute(
                         "INSERT INTO decode_partial VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
                         "seq=excluded.seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows_emitted=excluded.rows_emitted",
-                        (raw["session"], decoder.epoch, raw["seq"], _json(work["state"]), _json(merged), work["emitted"] + len(work["rows"])),
+                        (session, decoder.epoch, last_raw["seq"], _json(last_work["state"]), _json(merged),
+                         (last_work["emitted"] if last_work["resumed"] else 0) + len(last_work["rows"])),
                     )
-                committed[raw["session"]] = prior + work["emitted"] + len(work["rows"])
-                _meta_bump(conn, "outbox_rows", len(work["rows"]))
-                _meta_bump(conn, "decoded_rows_total", len(work["rows"]))
-            for session_id in {raw["session"] for raw, _, _ in staged}:
-                _reconcile_pending_session(conn, decoder.epoch, session_id)
+                else:
+                    conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
+                                 (session, decoder.epoch))
+            total_rows = sum(len(work["rows"]) for _, _, work in staged)
+            _meta_bump(conn, "outbox_rows", total_rows)
+            _meta_bump(conn, "decoded_rows_total", total_rows)
+            for session in order:
+                _reconcile_pending_session(conn, decoder.epoch, session)
             _meta_set(conn, "last_decode_ns", time.time_ns())
             conn.commit()
         return len(staged)
@@ -919,21 +1022,6 @@ class Receiver(HTTPServer):
                 pass
             self._slots.release()
 
-    def finish_request(self, request, client_address):
-        # A whole-request deadline also bounds clients trickling headers/body.
-        def expire():
-            try:
-                request.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        deadline = threading.Timer(self.read_timeout, expire)
-        deadline.daemon = True
-        deadline.start()
-        try:
-            self.RequestHandlerClass(request, client_address, self)
-        finally:
-            deadline.cancel()
-
     def server_close(self):
         self._shutdown.set()
         super().server_close()
@@ -948,8 +1036,49 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def setup(self):
+        self._deadline_lock = threading.Lock()
+        self._deadline_token = None
         self.request.settimeout(self.server.read_timeout)
         super().setup()
+
+    def handle_one_request(self):
+        # Absolute per-request deadline: socket timeout alone can be postponed
+        # indefinitely by trickled bytes, so a timer bounds the whole request.
+        # Token check and socket shutdown run atomically under the
+        # handler-local lock so a preempted timer N cannot close request N+1;
+        # cancel stays outside the lock so it never waits on a callback.
+        token = object()
+        expired = False
+        with self._deadline_lock:
+            self._deadline_token = token
+
+        def expire():
+            nonlocal expired
+            with self._deadline_lock:
+                if self._deadline_token is not token:
+                    return
+                expired = True
+                # Expired request must not keep the connection (and its slot)
+                # alive for buffered pipelined requests after the shutdown.
+                self.close_connection = True
+                try:
+                    self.request.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        deadline = threading.Timer(self.server.read_timeout, expire)
+        deadline.daemon = True
+        deadline.start()
+        try:
+            super().handle_one_request()
+        finally:
+            with self._deadline_lock:
+                if self._deadline_token is token:
+                    self._deadline_token = None
+                    if expired:
+                        # A success reply racing the shutdown reopens
+                        # keep-alive; re-assert the expiry close after it.
+                        self.close_connection = True
+            deadline.cancel()
 
     def log_message(self, *args):
         pass

@@ -14,8 +14,8 @@ true idle decode_once; otherwise one executed candidate probe per repeat
 without draining the tail. Detection, lock contention, and equivalence run on
 both sides with the same protocol.
 
-Run: /tmp/datalake-issues-20261009-venv/bin/python tools/benchmark_can_pending.py \
-       --matrix --baseline-root /tmp/datalake-issues-20261009-baseline --repeats 20
+Run: python tools/benchmark_can_pending.py \
+       --matrix --baseline-root /path/to/pristine-checkout --repeats 20
 Single cell: ... tools/benchmark_can_pending.py --sessions 1000 --pending 5
 Without --baseline-root every side is labeled current-only (no honest baseline).
 """
@@ -35,21 +35,26 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.ingest.can.can_receiver import Archive  # noqa: E402
 try:
-    from scripts.ingest.can.can_receiver import candidate_sql as _shipped_candidate_sql  # noqa: E402
-except ImportError:  # sibling FixPendingQueryPlan not landed yet; fallback below
-    _shipped_candidate_sql = None
+    from scripts.ingest.can.can_receiver import pending_heads_sql as _shipped_heads_sql  # noqa: E402
+except ImportError:
+    _shipped_heads_sql = None
 
 SCHEMA = "can-pending-benchmark/2"
 MATRIX_SESSIONS = (1000, 10000, 100000)
 MATRIX_PENDING = (0, 5, 1000)
-# Must match the candidate SELECT inside Archive.decode_once in this tree
-CURRENT_CANDIDATE_BODY = ("FROM decode_pending q "
-                          "JOIN sessions s ON s.id=q.session AND q.epoch=? "
-                          "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
-                          "LEFT JOIN progress p ON p.session=s.id "
-                          "JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(p.next_seq,d.next_seq,0) ")
-CANDIDATE_SELECT = ("SELECT c.session AS session, c.seq AS seq ")
-CANDIDATE_TAIL = "ORDER BY c.id LIMIT 1"
+# Must match the pending heads SELECT inside Archive.decode_once in this tree
+CURRENT_HEADS_BODY = ("FROM decode_pending q "
+                      "JOIN decode_states d ON d.session=q.session AND d.epoch=q.epoch "
+                      "JOIN raw_chunks c ON c.session=q.session AND c.seq=d.next_seq "
+                      "WHERE q.epoch=? "
+                      "UNION ALL "
+                      "SELECT c.id AS id, c.session AS session, c.seq AS seq "
+                      "FROM decode_pending q "
+                      "JOIN raw_chunks c ON c.session=q.session AND c.seq=0 "
+                      "WHERE q.epoch=? AND NOT EXISTS("
+                      "SELECT 1 FROM decode_states d WHERE d.session=q.session AND d.epoch=q.epoch) ")
+HEADS_SELECT = "SELECT c.id AS id, c.session AS session, c.seq AS seq "
+HEADS_TAIL = "ORDER BY id"
 EPOCHS_PER_BODY = {"current": 2, "legacy": 1}
 FRAME = b"t12320200\r"
 META_BASE = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
@@ -75,18 +80,17 @@ def _stats(walls):
 
 
 def _candidate_sql(side):
-    # Current side measures the shipped query: sibling FixPendingQueryPlan owns
-    # candidate_sql(n) as the single source; inline is fallback until it lands.
-    if side == "current" and _shipped_candidate_sql is not None:
-        return _shipped_candidate_sql(0)
+    # Current side measures the shipped query: pending_heads_sql() is the
+    # single source; inline mirrors it verbatim as fallback.
+    if side == "current" and _shipped_heads_sql is not None:
+        return _shipped_heads_sql()
     if side == "current":
-        return ("WITH progress(session,next_seq) AS (VALUES (NULL,NULL)) "
-                + CANDIDATE_SELECT + CURRENT_CANDIDATE_BODY + CANDIDATE_TAIL)
+        return HEADS_SELECT + CURRENT_HEADS_BODY + HEADS_TAIL
     return FULL_BASELINE_CANDIDATE
 
 def _candidate_source(side):
     if side == "current":
-        return "candidate_sql" if _shipped_candidate_sql is not None else "inline-fallback"
+        return "pending_heads_sql" if _shipped_heads_sql is not None else "inline-fallback"
     return "inline-legacy-baseline"
 
 

@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 
 from scripts.ingest.can.can_decoder import Decoder
-from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Rejection, Worker, _dirty_inserts, _ns_timestamp, archive_status, candidate_sql, encode_body, render_insert
+from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Rejection, Worker, _dirty_inserts, _ns_timestamp, archive_status, encode_body, pending_heads_sql, render_insert
 from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, WireError, check_response, decode_batch, encode_batch
 
 
@@ -778,28 +778,28 @@ class ReceiverBehavior(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
                                               (decoder.epoch,)).fetchone()[0], 2)
                 # Pending-driven, not plan-text: hiding one member from the
-                # shipped candidate SQL must divert the pick to the survivor
+                # shipped heads query must divert the pick to the survivor
                 # without touching any raw row.
-                full = conn.execute(candidate_sql(0), (decoder.epoch, decoder.epoch)).fetchone()
-                self.assertIsNotNone(full)
+                heads = conn.execute(pending_heads_sql(), (decoder.epoch, decoder.epoch)).fetchall()
+                self.assertEqual(len(heads), 2)
                 victim = conn.execute("SELECT session FROM decode_pending WHERE epoch=? LIMIT 1",
                                       (decoder.epoch,)).fetchone()[0]
                 survivor = conn.execute("SELECT session FROM decode_pending WHERE epoch=? AND session!=?",
                                         (decoder.epoch, victim)).fetchone()[0]
                 conn.execute("DELETE FROM decode_pending WHERE epoch=? AND session=?", (decoder.epoch, victim))
-                picked = conn.execute(candidate_sql(0), (decoder.epoch, decoder.epoch)).fetchone()
-                self.assertIsNotNone(picked)
-                self.assertEqual(picked["session"], survivor)
+                picked = conn.execute(pending_heads_sql(), (decoder.epoch, decoder.epoch)).fetchall()
+                self.assertEqual(len(picked), 1)
+                self.assertEqual(picked[0]["session"], survivor)
                 conn.execute("INSERT OR IGNORE INTO decode_pending(session,epoch) VALUES(?,?)", (victim, decoder.epoch))
                 # Operational boundedness: actual VM steps of the shipped
-                # candidate lookup, not plan wording that shifts with aliases.
+                # heads lookup, not plan wording that shifts with aliases.
                 steps = {"n": 0}
 
                 def counter():
                     steps["n"] += 1
                     return False
                 conn.set_progress_handler(counter, 1000)
-                conn.execute(candidate_sql(0), (decoder.epoch, decoder.epoch)).fetchall()
+                conn.execute(pending_heads_sql(), (decoder.epoch, decoder.epoch)).fetchall()
                 conn.set_progress_handler(None, 0)
                 self.assertLessEqual(steps["n"], 5)
             # All sessions complete, so the pending set drains to empty.
@@ -904,6 +904,331 @@ class ReceiverBehavior(unittest.TestCase):
             with reopened.connect() as conn:
                 again = {(r[0], r[1]) for r in conn.execute("SELECT session,epoch FROM decode_pending")}
                 self.assertEqual(again, want)
+    def test_interleaved_tails_completed_partial_restart_and_parity(self):
+        """Global arrival order, parser tails, same-batch complete→partial restart, batch-shape parity."""
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "started_ns": 1800000000000000000, "vehicle_firmware": "synthetic"}
+        meta_a = dict(base, session_id="tail-a")
+        meta_b = dict(base, session_id="tail-b")
+        chunks_a = [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": b"t12320"},
+                    {"seq": 1, "offset_ns": 1, "phase": "capture", "data": b"200\r"}]
+        chunks_b = [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": b"t12320400\r"}]
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            # Global arrival order: A0, B0, A1. A0 leaves only a parser tail.
+            archive.accept(meta_a, chunks_a[:1])
+            archive.accept(meta_b, chunks_b)
+            archive.accept(meta_a, chunks_a[1:])
+            while archive.decode_once(decoder):
+                pass
+            with archive.connect() as conn:
+                rows = [json.loads(r[0]) for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            # Staged commit order follows global arrival: B0 before A1; A0 emits nothing.
+            self.assertEqual([(r["value_num"], r["event_time"] - base["started_ns"]) for r in rows],
+                             [(2.0, 0), (1.0, 1)])
+            # Same chunks decoded one-at-a-time must reproduce event IDs and cursors exactly.
+            other_dir = Path(directory) / "parity"
+            other_dir.mkdir()
+            solo = synthetic_decoder(str(other_dir), revision="synthetic-v1")
+            if solo.epoch != decoder.epoch:
+                self.skipTest("parity decoder epoch diverged")
+            narrow = Archive(Path(directory) / "narrow.sqlite", disk_reserve_bytes=0)
+            narrow.register_epoch(solo)
+            narrow.accept(meta_a, chunks_a[:1])
+            narrow.accept(meta_b, chunks_b)
+            narrow.accept(meta_a, chunks_a[1:])
+            while narrow.decode_once(solo, limit=1):
+                pass
+
+            def snapshot(store):
+                with store.connect() as conn:
+                    events = [json.loads(r[0])["event_id"] for r in
+                              conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                    cursors = {r[0]: (r[1], r[2], r[3]) for r in conn.execute(
+                        "SELECT s.session_id,d.next_seq,d.counts_json,d.rows FROM decode_states d "
+                        "JOIN sessions s ON s.id=d.session WHERE d.epoch=?", (decoder.epoch,))}
+                return events, cursors
+            self.assertEqual(snapshot(archive), snapshot(narrow))
+            # Same batch completes one chunk then stages a dense partial: the
+            # cursor advances past the completed chunk while the partial keeps
+            # only its own remainder; a restart resumes without re-emitting.
+            frame = b"t12320200\r"
+            dense_meta = dict(base, session_id="dense")
+            archive.accept(dense_meta, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame},
+                                        {"seq": 1, "offset_ns": 1, "phase": "capture", "data": frame * 2100}])
+            self.assertEqual(archive.decode_once(decoder, limit=10), 2)
+            with archive.connect() as conn:
+                cursor = conn.execute(
+                    "SELECT next_seq,rows FROM decode_states WHERE session="
+                    "(SELECT id FROM sessions WHERE session_id='dense') AND epoch=?",
+                    (decoder.epoch,)).fetchone()
+                partial = conn.execute(
+                    "SELECT seq,rows_emitted,counts_json FROM decode_partial WHERE session="
+                    "(SELECT id FROM sessions WHERE session_id='dense') AND epoch=?",
+                    (decoder.epoch,)).fetchone()
+                # Completed prefix is durable in the cursor; the partial keeps
+                # only its own remainder on the trailing chunk.
+                self.assertEqual(tuple(cursor), (1, 1))
+                self.assertEqual(partial["seq"], 1)
+                self.assertGreater(partial["rows_emitted"], 0)
+                self.assertEqual(partial["rows_emitted"] + tuple(cursor)[1], 2000)
+            reopened = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            while reopened.decode_once(decoder):
+                pass
+            with reopened.connect() as conn:
+                dense_ids = [json.loads(r[0])["event_id"] for r in conn.execute(
+                    "SELECT row_json FROM outbox WHERE epoch=? ORDER BY id", (decoder.epoch,)).fetchall()[-2101:]]
+                final = conn.execute(
+                    "SELECT next_seq,rows FROM decode_states WHERE session="
+                    "(SELECT id FROM sessions WHERE session_id='dense') AND epoch=?",
+                    (decoder.epoch,)).fetchone()
+                leftover = conn.execute("SELECT COUNT(*) FROM decode_partial WHERE session="
+                                        "(SELECT id FROM sessions WHERE session_id='dense')").fetchone()[0]
+            self.assertEqual(len(dense_ids), 2101)
+            self.assertEqual(len(set(dense_ids)), 2101)
+            self.assertEqual(tuple(final), (2, 2101))
+            self.assertEqual(leftover, 0)
+
+    def test_emit_conflict_and_cursor_race_roll_back_batch(self):
+        """Commit-time failures (UNIQUE emit, concurrent cursor move) commit nothing."""
+        import sqlite3
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "rollback", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        frame = b"t12320200\r"
+        chunks = [{"seq": seq, "offset_ns": seq, "phase": "capture", "data": frame} for seq in range(2)]
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(base, chunks)
+            preview, _, _, done = decoder.decode_some(base, chunks[0], None, 2000)
+            self.assertTrue(done and preview)
+            with archive.connect() as conn:
+                conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
+                             (preview[0]["event_id"], decoder.epoch, json.dumps(preview[0])))
+                conn.commit()
+            before = archive.status()
+            with self.assertRaises(sqlite3.IntegrityError):
+                archive.decode_once(decoder)
+            after = archive.status()
+            for key in ("sessions", "raw_chunks", "raw_bytes", "pending_rows", "epochs",
+                        "errors", "oldest_pending_id", "backlog_chunks", "freshness", "counters"):
+                self.assertEqual(after[key], before[key], key)
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_states").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(base, chunks[:1])
+            real = decoder.decode_some
+
+            def race(meta_arg, chunk, state, budget):
+                with archive.connect() as conn:
+                    sid = conn.execute("SELECT id FROM sessions WHERE session_id='rollback'").fetchone()[0]
+                    conn.execute("INSERT INTO decode_states VALUES(?,?,?,?,?,?)",
+                                 (sid, decoder.epoch, 999, "{}", "{}", 0))
+                    conn.commit()
+                return real(meta_arg, chunk, state, budget)
+            before = archive.status()
+            with patch.object(decoder, "decode_some", race):
+                with self.assertRaisesRegex(ValueError, "decode cursor moved during decode"):
+                    archive.decode_once(decoder)
+            after = archive.status()
+            # The injected cursor row itself persists (external write); the
+            # batch commits nothing: no rows, no partial, counters/freshness kept.
+            for key in ("sessions", "raw_chunks", "raw_bytes", "pending_rows", "errors",
+                        "oldest_pending_id", "freshness", "counters"):
+                self.assertEqual(after[key], before[key], key)
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
+    def test_prefetch_byte_bound(self):
+        """Prefetch never holds a full limit of 64KiB chunks; the remainder drains on later turns."""
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "prefetch", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        pad = b"t12320200\r" + b" " * 100
+        big = b"x" * 65536
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            sid_holder = {}
+            with archive.connect() as conn:
+                conn.execute("INSERT INTO sessions(vehicle,collector_id,session_id,meta_json) VALUES(?,?,?,?)",
+                             (base["vehicle"], base["collector_id"], base["session_id"], json.dumps(base)))
+                sid_holder["id"] = conn.execute("SELECT id FROM sessions").fetchone()[0]
+                conn.executemany("INSERT INTO raw_chunks(session,seq,offset_ns,phase,data) VALUES(?,?,?,?,?)",
+                                 [(sid_holder["id"], seq, seq, "capture",
+                                   big if seq < 100 else pad) for seq in range(101)])
+                conn.execute("INSERT OR IGNORE INTO decode_pending(session,epoch) VALUES(?,?)",
+                             (sid_holder["id"], decoder.epoch))
+                for key, value in (("raw_chunks", 101), ("raw_bytes", 100 * 65536 + len(pad)),
+                                   ("outbox_rows", 0), ("decoded_rows_total", 0), ("acked_rows_total", 0)):
+                    conn.execute("INSERT OR IGNORE INTO archive_meta(key,value) VALUES(?,?)", (key, value))
+                conn.execute("INSERT OR IGNORE INTO archive_meta(key,value) VALUES(?,?)", ("pending_migrated", 1))
+                conn.commit()
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 101)
+            # Byte bound is consumer-visible: a wide turn stages only a
+            # bounded prefix (4MiB / 64KiB = 64), never a full limit of
+            # full-size chunks; the remainder drains on later turns. Freeze
+            # the clock so the byte cap, not the soft 50ms budget, drives it.
+            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                self.assertEqual(archive.decode_once(decoder, limit=1000), 64)
+            with archive.connect() as conn:
+                cursor = conn.execute("SELECT next_seq FROM decode_states WHERE epoch=?",
+                                      (decoder.epoch,)).fetchone()[0]
+            self.assertEqual(cursor, 64)
+            while archive.decode_once(decoder):
+                pass
+            with archive.connect() as conn:
+                ids = [json.loads(r[0])["event_id"] for r in
+                       conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                tail_cursor = conn.execute("SELECT next_seq FROM decode_states WHERE epoch=?",
+                                           (decoder.epoch,)).fetchone()[0]
+            self.assertEqual(len(ids), len(set(ids)))
+            self.assertEqual(tail_cursor, 101)
+
+    def test_single_session_limit_never_skips_earlier_arrival(self):
+        """A per-session limit=1 turn still serves the globally earliest arrival first."""
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "started_ns": 1800000000000000000, "vehicle_firmware": "synthetic"}
+        meta_early = dict(base, session_id="early")
+        meta_late = dict(base, session_id="late")
+        frame = b"t12320200\r"
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(meta_late, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            archive.accept(meta_early, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            # Even one-at-a-time turns keep global arrival order: late first.
+            self.assertEqual(archive.decode_once(decoder, limit=1), 1)
+            with archive.connect() as conn:
+                lone = json.loads(conn.execute("SELECT row_json FROM outbox").fetchone()[0])
+                self.assertEqual(lone["event_time"], base["started_ns"])
+            while archive.decode_once(decoder, limit=1):
+                pass
+            with archive.connect() as conn:
+                rows = [json.loads(r[0]) for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                cursors = {r[0]: r[1] for r in conn.execute(
+                    "SELECT s.session_id,d.next_seq FROM decode_states d JOIN sessions s ON s.id=d.session "
+                    "WHERE d.epoch=?", (decoder.epoch,))}
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(cursors, {"late": 1, "early": 1})
+            # A wide turn after catch-up drains only what exists, in seq order.
+            archive.accept(meta_early, [{"seq": 1, "offset_ns": 1, "phase": "capture", "data": frame}])
+            self.assertEqual(archive.decode_once(decoder, limit=1000), 1)
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute(
+                    "SELECT next_seq FROM decode_states WHERE session="
+                    "(SELECT id FROM sessions WHERE session_id='early') AND epoch=?",
+                    (decoder.epoch,)).fetchone()[0], 2)
+
+    def test_many_pending_sessions_bound_work_keep_order_and_state(self):
+        """Many pending sessions: bounded read work, arrival order, same output/state."""
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "started_ns": 1800000000000000000, "vehicle_firmware": "synthetic"}
+        frame = b"t12320200\r"
+        sessions, per_session = 400, 5
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            for seq in range(per_session):
+                for index in range(sessions):
+                    archive.accept(dict(base, session_id="many-%d" % index), [
+                        {"seq": seq, "offset_ns": seq * 1000 + index, "phase": "capture", "data": frame}])
+            # Bounded read work for the whole turn: count real SQLite VM
+            # steps on a read-phase connection proxy (not plan text, not a
+            # wall clock). Freeze the clock so the 50ms soft budget cannot
+            # cut the turn short and hide staged work.
+            counts = {"steps": 0}
+            import scripts.ingest.can.can_receiver as receiver_mod
+            real_plan = receiver_mod._plan_staged
+
+            def counting_plan(conn, epoch, limit):
+                def counter():
+                    counts["steps"] += 1
+                    return False
+                conn.set_progress_handler(counter, 1)
+                try:
+                    return real_plan(conn, epoch, limit)
+                finally:
+                    conn.set_progress_handler(None, 0)
+            with patch("scripts.ingest.can.can_receiver._plan_staged", counting_plan):
+                with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                    staged = archive.decode_once(decoder, limit=1000)
+            self.assertEqual(staged, 1000)
+            # Read steps stay proportional to staged chunks plus one indexed
+            # probe per pending head, never pending sessions x staged.
+            self.assertLessEqual(counts["steps"], 200000)
+            with archive.connect() as conn:
+                cursors = {r[0]: r[1] for r in conn.execute(
+                    "SELECT s.session_id,d.next_seq FROM decode_states d "
+                    "JOIN sessions s ON s.id=d.session WHERE d.epoch=?", (decoder.epoch,))}
+                rows = [json.loads(r[0]) for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            # Round-robin arrival: earliest 1000 raw ids are seq0 of all 400
+            # sessions, seq1 of all 400, then seq2 of sessions 0..199.
+            want_cursors = {"many-%d" % i: 3 if i < 200 else 2 for i in range(sessions)}
+            self.assertEqual(cursors, want_cursors)
+            self.assertEqual(len(rows), 1000)
+            self.assertEqual(len({r["event_id"] for r in rows}), 1000)
+            # Global arrival order: the staged rows decode exactly the 1000
+            # earliest raw arrivals. Narrow one-at-a-time turns over the
+            # same layout must reproduce the identical full output.
+            with archive.connect() as conn:
+                arrival = [(r[0], r[1]) for r in conn.execute(
+                    "SELECT c.session, c.seq FROM raw_chunks c ORDER BY c.id LIMIT 1000")]
+            self.assertEqual(len(arrival), 1000)
+            narrow_dir = Path(directory) / "narrow"
+            narrow_dir.mkdir()
+            narrow_dec = synthetic_decoder(str(narrow_dir), revision="synthetic-v1")
+            if narrow_dec.epoch != decoder.epoch:
+                self.skipTest("parity decoder epoch diverged")
+            narrow = Archive(Path(directory) / "narrow.sqlite", disk_reserve_bytes=0)
+            narrow.register_epoch(narrow_dec)
+            for seq in range(per_session):
+                for index in range(sessions):
+                    narrow.accept(dict(base, session_id="many-%d" % index), [
+                        {"seq": seq, "offset_ns": seq * 1000 + index, "phase": "capture", "data": frame}])
+            # Narrow one-at-a-time turns over the same layout must produce
+            # the identical full output and cursors (global order parity).
+            while narrow.decode_once(narrow_dec, limit=1):
+                pass
+            with narrow.connect() as conn:
+                narrow_all = [json.loads(r[0]) for r in
+                              conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                narrow_final = {r[0]: (r[1], r[2]) for r in conn.execute(
+                    "SELECT s.session_id,d.next_seq,d.rows FROM decode_states d "
+                    "JOIN sessions s ON s.id=d.session WHERE d.epoch=?", (narrow_dec.epoch,))}
+            self.assertEqual([r["event_id"] for r in narrow_all][:1000],
+                             [r["event_id"] for r in rows])
+            while archive.decode_once(decoder):
+                pass
+            with archive.connect() as conn:
+                all_rows = [json.loads(r[0]) for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                final = {r[0]: (r[1], r[2]) for r in conn.execute(
+                    "SELECT s.session_id,d.next_seq,d.rows FROM decode_states d "
+                    "JOIN sessions s ON s.id=d.session WHERE d.epoch=?", (decoder.epoch,))}
+                leftover = conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0]
+                pending = conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                       (decoder.epoch,)).fetchone()[0]
+            self.assertEqual([r["event_id"] for r in all_rows], [r["event_id"] for r in narrow_all])
+            self.assertEqual(final, narrow_final)
+            self.assertEqual(len(all_rows), sessions * per_session)
+            self.assertEqual(len({r["event_id"] for r in all_rows}), sessions * per_session)
+            self.assertEqual(final, {"many-%d" % i: (per_session, per_session) for i in range(sessions)})
+            self.assertEqual(leftover, 0)
+            self.assertEqual(pending, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

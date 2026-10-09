@@ -113,7 +113,7 @@ python -m tests.test_trace_privacy
 
 서버·운영 자격 증명이 필요 없는 Python 회귀 목록은 workflow의 `Check offline Python regressions` 단계에 명시합니다. CI는 Compose vehicle/redecode와 같은 `python-can==4.6.1`, `asammdf==8.8.27`, `zstd==1.5.6.1`, `cantools==40.7.1`, `py-expression-eval==0.3.14`, `boto3==1.43.98`을 설치합니다. `python tools/demo.py regressions`는 RAW/MF4·재해석·CAN validation 검사 중 하나라도 skip되면 실패합니다. 재해석용 `eclipse-kuksa/kuksa-can-provider`는 태그가 아닌 commit `d03dd7db364dd1ce9f7d0c614d80ebf6642ad167`의 세 `dbcfeederlib` 파일을 내려받아 기존 테스트의 SHA256으로 검증합니다. 이 다운로드 또는 PyPI에 접근할 수 없으면 CI는 실패하며 성공으로 대체하지 않습니다. 선택적 외부 Hermes checkout 호환성은 별도 범위입니다.
 
-CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentelemetry-proto==1.38.0` 후 `python -m tests.test_can_receiver`, `python -m tests.test_can_decoder`, `python -m tests.test_can_otlp_wire`로 실행합니다. 조밀한 frame의 bounded decode·부분 cursor 재개·중복 event ID, 10,000레코드/2 MiB wire 경계와 엄격한 metadata 검증을 포함합니다. `python -m tests.test_can_backup`과 `python -m tests.test_storage_metrics`는 일관 snapshot·fresh target·공간 부족·private mode 및 cached counter/unknown 지표를 확인합니다. 운영 DBC·원본·자격 증명은 사용하지 않습니다. 기존 wire privacy 런타임의 `opentelemetry-proto==1.39.1`은 별도 감사 컨테이너에 유지하며 receiver의 venv와 섞지 않습니다.
+CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentelemetry-proto==1.38.0` 후 `python -m tests.test_can_receiver`, `python -m tests.test_can_decoder`, `python -m tests.test_can_otlp_wire`로 실행합니다. 조밀한 frame의 bounded decode·부분 cursor 재개·중복 event ID, 10,000레코드/2 MiB wire 경계와 엄격한 metadata 검증을 포함합니다. `decode_once` 배치는 읽기 연결 재사용·bounded chunk prefix·원본 경계 보존·세션 map 증분 진행·최종 단일 atomic checkpoint를, HTTP ingress는 request lifecycle 기한·keep-alive 연속 요청·trickle 종료를 각각의 분리된 테스트 파일에서 확인합니다. `python -m tests.test_can_backup`과 `python -m tests.test_storage_metrics`는 일관 snapshot·fresh target·공간 부족·private mode 및 cached counter/unknown 지표를 확인합니다. 운영 DBC·원본·자격 증명은 사용하지 않습니다. 프로필·환경변수·CLI 변경은 없으며, 합성 측정치는 운영 처리량 보장이 아닙니다. 기존 wire privacy 런타임의 `opentelemetry-proto==1.39.1`은 별도 감사 컨테이너에 유지하며 receiver의 venv와 섞지 않습니다.
 
 성능 비교는 같은 row 집합·27개 column·event ID·정수 nanosecond를 검증한 뒤 수행하세요. SQL timestamp CAST와 정수 literal, native gRPC의 HTTP/protobuf body 및 encode/ACK 시간을 분리합니다. full ACK, ACK 유실 뒤 재전송 중복 제거, NULL/0/false/빈 문자열/Unicode, 잘못된 인증을 함께 확인하며 backend가 거부한 timestamp 경계는 성공 행 수에서 숨기지 않습니다. 소규모 로컬 fixture의 gRPC 우위나 index/cache query plan은 운영 처리량 증거가 아니며 의존성·운영 query 선택도를 확인하기 전 transport/index 기본값을 바꾸지 않습니다.
 
@@ -121,7 +121,7 @@ CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentel
 
 AI 집계의 native Flight 경로는 `grpcio==1.84.0`, `pyarrow==25.0.1`, `protobuf==6.33.6`을 사용합니다. `aggregate-deps`가 Python ABI와 고정 버전을 확인해 전용 venv를 준비하며, 수집기 venv와 공유하지 않습니다. 로컬 AI 회귀에는 같은 버전을 설치하고 `python -m tests.test_ai_incremental`을 실행하세요.
 
-측정 조건·복구 경계·재현 명령은 [AI 증분 집계](ai-incremental.md), [Fleet/VSS 배치 저장](outbox-batching.md), [CAN pending 조회](can-pending.md), [RAW 메모리·임시 디스크](raw-memory.md), [백업 세대 보존](backup-retention.md), [OTel 보존·용량 정책](otel-retention.md)에 정리되어 있습니다. 합성 비교는 전체 재계산·원본 hash·빈 대상 복원을 먼저 확인하고, 운영 처리량이나 물리 장치 내구성으로 확대 해석하지 않습니다.
+측정 조건·복구 경계·재현 명령은 [AI 증분 집계](ai-incremental.md), [Fleet/VSS 배치 저장](outbox-batching.md), [CAN pending 조회](can-pending.md), [RAW 메모리·임시 디스크](raw-memory.md), [백업 세대 보존](backup-retention.md), [OTel 보존·용량 정책](otel-retention.md)에 정리되어 있습니다. 합성 비교는 전체 재계산·원본 hash·빈 대상 복원을 먼저 확인하고, 운영 처리량이나 물리 장치 내구성으로 확대 해석하지 않습니다. CAN `decode_once`·HTTP ingress 합성 프로필 측정치도 같은 취급이며 operating guarantee가 아닙니다.
 
 ## 합성 런타임 통합 검사
 
