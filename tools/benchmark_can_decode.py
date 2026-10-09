@@ -15,13 +15,23 @@ dense (3000-frame chunks forcing decode_some partial resume), large
 (~59KB chunks near the decoder's 65536-byte datum cap; a single datum
 above that is rejected by contract so >128KiB arrives as chunk streams,
 not one datum), many_sessions (sessions x 5 chunks, candidate-query
-scaling). Fails on any outbox / decode_states / decode_partial / counter
-content mismatch (full compare, never length-only), or when a
-case's current median wall time exceeds its baseline median by
-more than --max-slowdown (default 0.25). Repeats alternate
-baseline-first / current-first order to reduce runner drift.
---json-out writes the same report to a file even on failure for
-artifact publishing.
+scaling), xsession_contig/roundrobin/uneven (1/4/100/400-session
+long-backlog matrix derived from --chunks: contiguous, round-robin, and
+skewed-depth arrival; the round-robin corner reproduces the #8
+1000-read/16-commit shape). An un-timed second pass per side wraps the
+DB-API connection (seed excluded): every sqlite3.Row pulled from a
+raw_chunks SELECT counts as one observed materialized fetch with its data
+bytes, identically for both trees (no _decode_prefetch_stats trust, no
+staged-as-fetched fallback); other SELECTs count as read queries and
+commit() calls as commits. The report compares observed
+fetched/staged amplification, read queries, fetched bytes and commits
+alongside wall/CPU time. Fails on any outbox / decode_states /
+decode_partial / counter content mismatch (full compare, never
+length-only), or when a case's current median wall time exceeds its
+baseline median by more than --max-slowdown (default 0.25). Repeats
+alternate baseline-first / current-first order to reduce runner drift.
+--json-out writes the same report to a file even on failure for artifact
+publishing.
 
 One runnable command, e.g.::
 
@@ -51,7 +61,8 @@ CURRENT_ROOT = Path(__file__).resolve().parents[1]
 
 
 CASES = ("tiny", "single", "sparse", "interleaved", "dense", "large",
-         "many_sessions")
+         "many_sessions", "xsession_contig", "xsession_roundrobin",
+         "xsession_uneven")
 
 _CHILD = r"""
 import json, sqlite3, sys, tempfile, time
@@ -91,6 +102,23 @@ def meta(session):
 
 def chunk(seq, offset, data):
     return dict(seq=seq, offset_ns=offset, phase="capture", data=data)
+
+def _xshape(default_sessions):
+    # Cross-session backlog matrix for 1/4/100/400 sessions: derive the
+    # session count from --chunks so small CI runs stay small and large runs
+    # reproduce the deep-backlog shape. Thresholds chosen so --chunks 2000
+    # (CI) yields the default session count per case, --chunks 12000+ scales
+    # to the 400-session corner.
+    total = max(default_sessions, n_chunks // 5)
+    if total >= 2000:
+        sessions = 400
+    elif total >= 500:
+        sessions = 100
+    elif total >= 20:
+        sessions = 4
+    else:
+        sessions = 1
+    return sessions, max(1, total // sessions)
 
 def plan():
     # Accept batches in arrival order: [(session, [chunk, ...])].
@@ -135,6 +163,34 @@ def plan():
         for s in range(5):
             for k in range(sessions):
                 order.append(("syn-many-%d" % k, [chunk(s, s * 1000 + k, GOOD)]))
+        return order
+    if case == "xsession_contig":
+        # N-session long-backlog matrix, contiguous per-session arrival:
+        # sessions derived from n_chunks so --chunks scales total work.
+        sessions, per = _xshape(1)
+        return [("syn-xs-%d" % k, [chunk(s, s * 1000 + k, GOOD)
+                                   for s in range(per)]) for k in range(sessions)]
+    if case == "xsession_roundrobin":
+        # Same totals, seq-outer round-robin arrival: 100x64-style interleave
+        # that triggered the #8 1000-read/16-commit waste.
+        sessions, per = _xshape(100)
+        order = []
+        for s in range(per):
+            for k in range(sessions):
+                order.append(("syn-xs-%d" % k, [chunk(s, s * 1000 + k, GOOD)]))
+        return order
+    if case == "xsession_uneven":
+        # Same totals, skewed per-session depths (half get 1 chunk, rest share
+        # the remainder) in round-robin arrival order.
+        sessions, per = _xshape(4)
+        depths = [1 if k < sessions // 2 else 1 + (per * sessions - sessions // 2) // ((sessions + 1) // 2)
+                  for k in range(sessions)]
+        depths[-1] += per * sessions - sum(depths)
+        order = []
+        for s in range(max(depths)):
+            for k in range(sessions):
+                if s < depths[k]:
+                    order.append(("syn-xs-%d" % k, [chunk(s, s * 1000 + k, GOOD)]))
         return order
     raise ValueError("unknown case")
 
@@ -187,25 +243,120 @@ try:
         peak *= 1024
 except Exception:
     peak = None
+# Separate un-timed pass, seed excluded: count what the tree REALLY fetches
+# by wrapping the cursor, never by trusting _decode_prefetch_stats (absent
+# on the baseline tree) and never by falling back to staged/committed.
+# Materialized raw SELECT rows and their data bytes are counted per fetched
+# cursor row, including a byte-cap overflow row the receiver discards after
+# the length check (labeled overflow, not retained). Read queries, refill
+# lookups and write commits are counted from execute() text; the snapshot()
+# SELECTs above run before wrapping, so they never pollute the counts.
 conns = None
-if instrument:  # separate un-timed pass: decode-drain connects, seed excluded
+io = None
+if instrument:
     with tempfile.TemporaryDirectory() as tmp:
         archive2, decoder2, _, _ = seed(str(Path(tmp) / "i.db"))
-        n = {"n": 0}
+        counts = {"conns": 0, "fetched_rows": 0, "fetched_bytes": 0,
+                  "read_queries": 0, "commits": 0}
         real = archive2.connect
+        # Wrap rows at the cursor level: every sqlite3.Row the receiver pulls
+        # from a raw_chunks SELECT is one materialized fetch with its data
+        # bytes. A page row read but discarded by the 1MiB byte-cap check is
+        # still fetched off the cursor (not retained); the receiver-side
+        # _decode_prefetch_stats on the current tree labels retained vs
+        # discarded, while this connection-level counter reports the observed
+        # cursor total identically for both trees. Non-raw SELECTs (pending
+        # heads, cursor/partial probes, refill id lookups) count as read
+        # queries without row bytes. Commits counted via commit().
+        class RowIter:
+            # Cursor facade: iteration, fetchone/fetchall/fetchmany, close
+            # and contextlib.closing() all route here, so every raw row the
+            # receiver materializes is counted exactly once however it reads.
+            def __init__(self, cursor, counts, raw):
+                self._cursor, self._counts, self._raw = cursor, counts, raw
+            def _count(self, row):
+                if self._raw and row is not None:
+                    try:
+                        data = row["data"]
+                    except Exception:
+                        data = None
+                    if data is not None:
+                        self._counts["fetched_rows"] += 1
+                        self._counts["fetched_bytes"] += len(data)
+                return row
+            def __iter__(self):
+                return self
+            def __next__(self):
+                return self._count(next(self._cursor))
+            next = __next__
+            def fetchone(self):
+                return self._count(self._cursor.fetchone())
+            def fetchall(self):
+                rows = self._cursor.fetchall()
+                for row in rows:
+                    self._count(row)
+                return rows
+            def fetchmany(self, size=None):
+                rows = self._cursor.fetchmany(size) if size is not None else self._cursor.fetchmany()
+                for row in rows:
+                    self._count(row)
+                return rows
+            def close(self):
+                return self._cursor.close()
+            def __enter__(self):
+                self._cursor.__enter__()
+                return self
+            def __exit__(self, *exc):
+                return self._cursor.__exit__(*exc)
+            def __getattr__(self, name):
+                return getattr(self._cursor, name)
+        class ConnWrap:
+            # Connection facade: `with self.connect()` needs __enter__/__exit__
+            # on the type (special-method lookup bypasses __getattr__), so
+            # delegate explicitly; __enter__ returns the wrapper to keep
+            # execute() counting inside the block.
+            def __init__(self, conn, counts):
+                self._conn, self._counts = conn, counts
+            def execute(self, sql, *args):
+                text = sql if isinstance(sql, str) else ""
+                upper = text.upper()
+                if upper.lstrip().startswith("SELECT") and "FROM RAW_CHUNKS" in upper:
+                    self._counts["read_queries"] += 1
+                    return RowIter(self._conn.execute(sql, *args), self._counts, True)
+                if upper.lstrip().startswith("SELECT"):
+                    self._counts["read_queries"] += 1
+                return self._conn.execute(sql, *args)
+            def __enter__(self):
+                self._conn.__enter__()
+                return self
+            def __exit__(self, *exc):
+                return self._conn.__exit__(*exc)
+            def __getattr__(self, name):
+                if name == "commit":
+                    counts = self._counts
+                    real_commit = self._conn.commit
+                    def commit():
+                        counts["commits"] += 1
+                        return real_commit()
+                    return commit
+                return getattr(self._conn, name)
         def counting():
-            n["n"] += 1
-            return real()
+            counts["conns"] += 1
+            return ConnWrap(real(), counts)
         archive2.connect = counting
         while archive2.decode_once(decoder2, limit=1000):
             pass
-        conns = n["n"]
+        conns = counts["conns"]
+        io = {"fetched_rows": counts["fetched_rows"],
+              "fetched_bytes": counts["fetched_bytes"],
+              "read_queries": counts["read_queries"],
+              "commit_statements": counts["commits"]}
 print(json.dumps({"wall_s": wall, "cpu_s": cpu, "calls": calls,
                   "staged_chunks": staged, "total_chunks": total_chunks,
                   "total_bytes": total_bytes, "outbox_rows": len(snap["outbox"]),
+                  "read_io": io,
                   "peak_rss_bytes": peak, "connections": conns, "snapshot": snap}))
 """
-
 
 def _run_side(side_root, case, chunks, fixed_ns, instrument):
     with tempfile.TemporaryDirectory(prefix="can-decode-%s-" % case) as tmp:
@@ -228,12 +379,19 @@ def _digest(snapshot):
 
 def _rates(side):
     wall = max(side["wall_s"], 1e-9)
+    io = side.get("read_io") or {}
+    fetched = io.get("fetched_rows")
+    staged = side["staged_chunks"]
     return {"wall_s": side["wall_s"], "cpu_s": side["cpu_s"],
             "chunks_per_s": side["total_chunks"] / wall,
             "bytes_per_s": side["total_bytes"] / wall,
             "rows_per_s": side["outbox_rows"] / wall,
             "decode_calls": side["calls"],
-            "staged_chunks": side["staged_chunks"],
+            "staged_chunks": staged,
+            "fetched_chunks": fetched,
+            "read_queries": io.get("read_queries"),
+            "fetched_bytes": io.get("fetched_bytes"),
+            "commit_statements": io.get("commit_statements"),
             "connections": side["connections"],
             "peak_rss_bytes": side["peak_rss_bytes"],
             "total_chunks": side["total_chunks"],

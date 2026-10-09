@@ -530,6 +530,113 @@ def _native_ts_query(configs, dashboard, panel, start=1000, end=2000):
     return query, ns_timestamp, ts_display
 
 
+
+def _graph_cal_query(configs, panel_id, target=1, start=1000, end=2000, epoch="''"):
+    """Panel 47/49/54 calibrated target: latest revision per window first."""
+    import json as _json
+    dashboard = _json.loads(configs["grafana-dash-battery"]["content"])
+    panel = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == panel_id)
+    assert panel["targets"][0]["format"] == "time_series"
+    target_def = panel["targets"][target]
+    assert target_def["format"] == "time_series"
+    assert "$$__interval" not in target_def["rawSql"]
+    query = target_def["rawSql"].replace("$$", "$")
+    # sqlite CAST(x AS TIMESTAMP(6)) is lossy (leading-integer cast); the
+    # native backend parses these. Select the source column directly here.
+    query = query.replace("CAST(value_text AS TIMESTAMP(6))", "value_text")
+    query = query.replace("CAST(window_start AS TIMESTAMP(6))", "window_start")
+    return (query.replace("$__timeFilter(window_start)", f"window_start BETWEEN {start} AND {end}")
+            .replace("${vehicle:sqlstring}", "''")
+            .replace("${vehicle_ids:sqlstring}", "''")
+            .replace("${source:sqlstring}", "''")
+            .replace("${epoch:sqlstring}", epoch))
+
+
+
+
+def test_calibrated_graphs_render_hourly_samples_beside_verified_raw():
+    """Panels 47/49/54: verified raw series stay; hourly calibrated samples
+    render when raw units are NULL. Extrema use the actual observation
+    timestamp (value_text); the spread uses the completed window_start
+    bucket scaled V->mV. Bad latest revisions stay NULL (no resurrection);
+    scope and time filters are honored."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
+    panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
+    assert panels[47]["targets"][1]["refId"] == "B"
+    assert panels[49]["targets"][1]["refId"] == "B"
+    assert panels[54]["targets"][1]["refId"] == "B"
+    assert panels[54]["targets"][2]["refId"] == "C"
+    cases = ((47, 1, ("battery.conditions.brick_max_v", "battery.conditions.brick_min_v"),
+              "V", 1.0, "1970-01-01 00:00:01.000000500"),
+             (54, 2, ("battery.conditions.module_temp_max_c", "battery.conditions.module_temp_min_c"),
+              "celsius", 1.0, "1970-01-01 00:00:01.000000500"))
+    for panel, target, metrics, unit, scale, observed in cases:
+        cal = _graph_cal_query(configs, panel, target=target)
+        with _battery_db() as db:
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            assert db.execute(cal).fetchall() == []
+            for metric in metrics:
+                db.execute("""INSERT INTO vehicle_analysis
+                    (window_start, window_end, vehicle, metric, source,
+                     analysis_id, revision, value, value_text, unit, status,
+                     reason, decode_epoch, computed_at) VALUES
+                    (1500, 1500, 'v', ?, 'fleet', 'battery_conditions', 'r1',
+                     ?, ?, ?, 'derived',
+                     'latest_calibrated_sample domain=d scope=v/fleet/fleet-v1;asof_ns=1500000000500',
+                     'fleet-v1', 1600)""", (metric, scale, observed, unit))
+            rows = db.execute(cal).fetchall()
+            assert len(rows) == 2, (panel, rows)
+            assert {row[0] for row in rows} == {observed}
+            assert sorted(row[2] for row in rows) == [scale, scale]
+            # Time filter honored: rows outside the window disappear.
+            assert db.execute(cal.replace(
+                "window_start BETWEEN 1000 AND 2000",
+                "window_start BETWEEN 1000 AND 1400")).fetchall() == []
+            # Scope filter honored: another epoch never leaks in.
+            scoped = _graph_cal_query(configs, panel, target=target, epoch="'other'")
+            assert db.execute(scoped).fetchall() == []
+            # A bad newest revision never resurrects the older good sample.
+            db.execute("""INSERT INTO vehicle_analysis
+                (window_start, window_end, vehicle, metric, source,
+                 analysis_id, revision, value, value_text, unit, status,
+                 reason, decode_epoch, computed_at) VALUES
+                (1500, 1500, 'v', ?, 'fleet', 'battery_conditions', 'r2',
+                 NULL, ?, ?, 'unavailable',
+                 'terminal_invalid:latest_sample_unmeasurable',
+                 'fleet-v1', 1700)""", (metrics[0], observed, unit))
+            rows = db.execute(cal).fetchall()
+            assert len(rows) == 2
+            assert [row[2] is None for row in rows] == [True, False]
+    # Panel 49: spread renders mV at the completed window_start bucket.
+    cal = _graph_cal_query(configs, 49, target=1)
+    assert "window_start" in cal and "* 1000" in cal
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        assert db.execute(cal).fetchall() == []
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start, window_end, vehicle, metric, source,
+             analysis_id, revision, value, value_text, unit, status,
+             reason, decode_epoch, computed_at) VALUES
+            (1500, 1500, 'v', 'battery.conditions.brick_spread_v', 'fleet',
+             'battery_conditions', 'r1', 0.02, NULL, 'V', 'derived',
+             'calibrated domain=d scope=v/fleet/fleet-v1',
+             'fleet-v1', 1600)""")
+        rows = db.execute(cal).fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == 1500 and abs(rows[0][2] - 20.0) < 1e-9
+        # Wrong-unit newest revision never revives the older good spread.
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start, window_end, vehicle, metric, source,
+             analysis_id, revision, value, value_text, unit, status,
+             reason, decode_epoch, computed_at) VALUES
+            (1500, 1500, 'v', 'battery.conditions.brick_spread_v', 'fleet',
+             'battery_conditions', 'r2', 9.9, NULL, 'wrong', 'derived',
+             'calibrated domain=d scope=v/fleet/fleet-v1',
+             'fleet-v1', 1700)""")
+        assert db.execute(cal).fetchone()[2] is None
+
+
 def test_calibrated_extrema_fallback_and_frontier():
     """Panels 44/45/51/52: explicit-unit raw wins; unit-NULL raw falls back
     to the scoped calibrated conditions metric only while the newest raw of
@@ -1001,6 +1108,7 @@ if __name__ == "__main__":
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
     test_calibrated_extrema_fallback_and_frontier()
     test_calibrated_extrema_retained_without_raw_join()
+    test_calibrated_graphs_render_hourly_samples_beside_verified_raw()
     test_can_reports_keep_invalid_latest_and_scope_boundaries()
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()

@@ -22,17 +22,25 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
 - `candidate_sql()` returns `(id, session, seq)` for every pending session's
   persisted next chunk, ordered by raw ID. It binds the epoch twice and uses
   `CROSS JOIN` to keep `decode_pending` first; heads contain no raw BLOBs.
-- A heap merges indexed `(session, seq)` pages of at most 64 chunks. Exhausted
-  pages refill before advancing to later heads. Unpaged heads remain in the
-  merge, so page, byte and chunk limits cannot reorder sessions.
+- A heap merges demand-sized indexed `(session, seq)` pages: each cold fetch
+  takes the fair share of the remaining prefix need across frontier sessions
+  without a buffered run (at most 64 chunks), so interleaved round-robin
+  reads ~need/frontier rows per session instead of 64 each, while a lone
+  contiguous session still gets full 64-row pages. Hot runs are reused
+  without new queries. Exhausted pages refill before advancing to later
+  heads. Unpaged heads remain in the merge, so page, byte and chunk limits
+  cannot reorder sessions.
 - One read snapshot prefetches at most 1 MiB of raw bytes and `limit` chunks
   across all sessions; the iterator may hold one additional wire-capped
   64 KiB row while checking the byte limit. Lightweight head memory scales
   with the number of pending sessions, not retained raw history.
-- Prefetch starts at 1,000 chunks and adapts to the successfully committed
-  batch: a deadline/row-budget stop shrinks the next window to useful work;
-  consuming the whole window grows it again. Explicit smaller caller limits
-  do not train the hint. The hint is nondurable; cursors remain authoritative.
+- Prefetch starts at 1,000 chunks and adapts to successfully committed work
+  including pre-prefix speculative waste: a staged shortfall, a byte-cap stop,
+  or fetched rows beyond staged chunks shrink the next window to useful work.
+  Fully useful completed work allows growth even when more work remains.
+  Explicit smaller caller limits do not train the hint. The hint is nondurable;
+  cursors remain authoritative. Per-call `archive._decode_prefetch_stats`
+  reports fetched/prefix/staged chunks, fetched bytes and read queries.
 - The read connection closes before decoding. Session metadata and parser
   state are reused within the batch; raw chunks are not concatenated, so
   completion timestamps, envelope IDs and frame ordinals remain unchanged.
@@ -79,6 +87,10 @@ cursors. Restart needs no replay beyond opening the archive.
   `python -m unittest tests.test_can_receiver.ReceiverBehavior.test_prefetch_page_and_byte_boundaries_preserve_order_and_partial_completion`
   compares every ordered output field, parser state and counter with a
   sequential decoder across 64-row pages, 64 KiB chunks and dense resumes.
+- Demand-driven prefetch: `python -m unittest tests.test_can_prefetch -v`
+  covers the 100x64 round-robin waste shape (no 1000-read/16-commit
+  repetition), contiguous single-session full pages, byte-cap adaptive
+  shrink, and boundary/order/partial/new-session/CAS/restart in one module.
 - Split-frame merge and cursor-race rollback:
   `python -m unittest tests.test_can_receiver.ReceiverBehavior.test_prefetch_merge_keeps_arrival_order_split_resume_and_conflict`.
 - Throughput: `python tools/benchmark_can_decode.py --baseline-root
@@ -86,9 +98,15 @@ cursors. Restart needs no replay beyond opening the archive.
   own receiver/decoder in an isolated subprocess. Seeding is outside timed
   decoding, wall-clock nanoseconds are fixed, and full ordered rows (including
   ingest timestamps), cursors, partials and persisted counters must match.
-  Reports use median wall/CPU time; connection counting is a separate pass.
+  Reports use median wall/CPU time; a separate instrumented pass observes
+  cursor-fetched raw rows/bytes, read queries, connections and commits in both
+  source trees. Retained-prefetch statistics are not baseline I/O evidence.
   Fixtures cover small fragments, whole frames, sparse/control traffic,
-  interleaved and many sessions, and dense/near-maximum-size chunks.
+  interleaved and many sessions, dense/near-maximum-size chunks, and the
+  1/4/100/400-session contiguous/round-robin/uneven long-backlog matrix
+  (`xsession_contig`, `xsession_roundrobin`, `xsession_uneven`) with
+  fetched/staged amplification, read-query counts and fetched bytes
+  alongside wall/CPU time.
 - A separate native CLI smoke uploaded synthetic OTLP over HTTP, verified
   unauthorized 401 and replay deduplication, killed the receiver during work,
   then restarted it to drain 121,001 chunks into 30,200 rows. Original raw

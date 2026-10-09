@@ -146,6 +146,12 @@ ACK 유실 후 원본 중복 제거를 검사합니다. deadline은 연결 전�
 --rows 1,2000,20000 --repeats 3`은 두 실제 flush 경로를 교차 실행해 본문
 SHA-256, CPU/wall 시간과 전체 child peak RSS를 비교합니다.
 
+`python -m unittest tests.test_can_prefetch`는 세션 간 도착 순서, byte/page 경계,
+부분 decode 재개와 cursor 충돌 시 rollback을 검사합니다.
+`python tools/benchmark_can_decode.py --baseline-root <변경 전 checkout>
+--cases xsession_contig,xsession_roundrobin,xsession_uneven --chunks 12000
+--repeats 3`으로 1/4/100/400개 세션의 실제 읽기 증폭과 처리 시간을 비교합니다.
+
 ### 성능·보존 정책 검사
 
 AI 집계의 native Flight 경로는 `grpcio==1.84.0`, `pyarrow==25.0.1`, `protobuf==6.33.6`을 사용합니다. `aggregate-deps`가 Python ABI와 고정 버전을 확인해 전용 venv를 준비하며, 수집기 venv와 공유하지 않습니다. 로컬 AI 회귀에는 같은 버전을 설치하고 `python -m tests.test_ai_incremental`을 실행하세요.
