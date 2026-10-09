@@ -296,12 +296,85 @@ def sidecar_key(mf4_key):
     return mf4_key[:-len(".mf4")] + ".ingress.jsonl.gz"
 
 
+def _preflight_chunk_bytes():
+    raw = os.environ.get("RAW_PREFLIGHT_CHUNK_BYTES", "")
+    try:
+        n = int(raw) if raw else (1 << 20)
+    except ValueError:
+        raise SystemExit("invalid integer RAW_PREFLIGHT_CHUNK_BYTES=%r"
+                         % (raw,))
+    return max(4096, n)
+
+
+def gunzip_compare(sidecar_path, want_digest, closed_path=None,
+                   chunk_bytes=None):
+    """Streamed sidecar verification with bounded chunks: incremental
+    gunzip + SHA-256, never a proportional bytes object. Multi-member
+    gzip verifies every member (GzipFile streams members in order);
+    truncated members raise and fail closed. When closed_path is present,
+    the gunzipped stream must equal the closed JSONL byte-for-byte,
+    compared chunk-by-chunk. Returns (ok, reason); ok only on full-stream
+    digest equality."""
+    import gzip as _gzip
+    if chunk_bytes is None:
+        chunk_bytes = _preflight_chunk_bytes()
+    h = hashlib.sha256()
+    closed_fh = None
+    if closed_path is not None:
+        try:
+            closed_fh = open(closed_path, "rb")
+        except OSError as ex:
+            return False, "closed unreadable: %s" % (ex,)
+    closed_len = 0
+    try:
+        with open(sidecar_path, "rb") as raw:
+            try:
+                with _gzip.GzipFile(fileobj=raw, mode="rb") as gz:
+                    while True:
+                        plain = gz.read(chunk_bytes)
+                        if not plain:
+                            break
+                        h.update(plain)
+                        if closed_fh is not None:
+                            pos = 0
+                            while pos < len(plain):
+                                have = closed_fh.read(len(plain) - pos)
+                                if not have:
+                                    return False, ("closed JSONL drifted"
+                                                   " from sidecar")
+                                if plain[pos:pos + len(have)] != have:
+                                    return False, ("closed JSONL drifted"
+                                                   " from sidecar")
+                                pos += len(have)
+                                closed_len += len(have)
+            except (OSError, EOFError) as ex:
+                return False, "sidecar gunzip failed: %s" % (ex,)
+    finally:
+        if closed_fh is not None:
+            try:
+                closed_fh.close()
+            except OSError:
+                pass
+    if h.hexdigest() != want_digest:
+        return False, "sidecar content drifted from ingress pin"
+    if closed_path is not None:
+        try:
+            with open(closed_path, "rb") as fh:
+                fh.seek(closed_len)
+                if fh.read(1):
+                    return False, "closed JSONL drifted from sidecar"
+        except OSError as ex:
+            return False, "closed unreadable: %s" % (ex,)
+    return True, ""
+
+
 def fail_closed_check(mf4_path, sidecar_path, manifest_path, closed_path):
     """Verify sealed bytes against the manifest pin BEFORE any upload.
     Returns (ok, reason): ok only when MF4 == mf4_sha256, sidecar ==
     ingress_sidecar_sha256, and sidecar gunzips to bytes == ingress_sha256
-    (and to the closed JSONL on disk when still present)."""
-    import gzip
+    (and to the closed JSONL on disk when still present). The sidecar leg
+    streams with bounded chunks (gunzip_compare); no proportional bytes
+    object is ever built."""
     try:
         man = _load_manifest(manifest_path)
     except (OSError, ValueError) as ex:
@@ -313,25 +386,7 @@ def fail_closed_check(mf4_path, sidecar_path, manifest_path, closed_path):
         return False, "sealed MF4 drifted from manifest pin"
     if sha256_file(sidecar_path) != man["ingress_sidecar_sha256"]:
         return False, "sealed sidecar drifted from manifest pin"
-    try:
-        with open(sidecar_path, "rb") as fh:
-            raw = fh.read()
-        body = gzip.decompress(raw)
-    except (OSError, EOFError) as ex:
-        return False, "sidecar gunzip failed: %s" % (ex,)
-    h = hashlib.sha256()
-    h.update(body)
-    if h.hexdigest() != man["ingress_sha256"]:
-        return False, "sidecar content drifted from ingress pin"
-    if closed_path is not None:
-        try:
-            with open(closed_path, "rb") as fh:
-                closed_bytes = fh.read()
-        except OSError as ex:
-            return False, "closed unreadable: %s" % (ex,)
-        if closed_bytes != body:
-            return False, "closed JSONL drifted from sidecar"
-    return True, ""
+    return gunzip_compare(sidecar_path, man["ingress_sha256"], closed_path)
 
 
 def quarantine(spool, paths):

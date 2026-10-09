@@ -527,6 +527,8 @@ class EndpointGateTest(unittest.TestCase):
                 os.environ.pop("RAW_S3_ENDPOINT_URL", None)
             else:
                 os.environ["RAW_S3_ENDPOINT_URL"] = old
+
+
 class ReplayGateTest(unittest.TestCase):
     def test_gate(self):
         old = os.environ.get("RAW_REPLAY_ALLOW")
@@ -544,6 +546,322 @@ class ReplayGateTest(unittest.TestCase):
                 os.environ.pop("RAW_REPLAY_ALLOW", None)
             else:
                 os.environ["RAW_REPLAY_ALLOW"] = old
+
+
+class BoundedMemoryTest(unittest.TestCase):
+    def _frames(self, n, start=1):
+        out = []
+        for i in range(n):
+            out.append({"seq": start + i,
+                        "twall_ns": 1_700_000_000_000_000_000
+                        + (n - 1 - i) * 1_000_000,
+                        "tcan": 1700000000.0 + i * 0.001, "bus": "can0",
+                        "id": 0x100 + (i % 3), "ext": bool(i % 2),
+                        "rtr": False, "err": False, "fd": False,
+                        "brs": False, "esi": False, "dlc": 8,
+                        "data": bytes([(i + b) % 256 for b in range(8)])})
+        return out
+
+    def test_stream_torn_tail_only(self):
+        with tempfile.TemporaryDirectory() as spool:
+            cp = os.path.join(spool, "s.jsonl")
+            good = [json.dumps(rec.encode_frame(
+                f["seq"], f["twall_ns"], f["tcan"], f["bus"], f["id"],
+                f["ext"], f["rtr"], f["err"], f["fd"], f["brs"], f["esi"],
+                f["dlc"], f["data"]), separators=(",", ":")) for f in SYN[:3]]
+            with open(cp, "wb") as fh:
+                fh.write(("\n".join(good) + "\n{truncated").encode())
+            stream = rec.IngressStream(cp)
+            self.assertEqual(len(list(stream)), 3)
+            self.assertTrue(stream.torn)
+            with open(cp, "wb") as fh:
+                fh.write(("\n".join(good) + "\n{bad}\n").encode())
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write(good[0] + "\n{bad}\n" + good[1] + "\n")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            # Chunk-split multibyte UTF-8 decodes, it never fails a split.
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write(good[0] + "\n" + good[1] + "\n")
+            self.assertEqual(len(list(rec.IngressStream(cp))), 2)
+
+    def test_stream_rejects_non_utf8(self):
+        with tempfile.TemporaryDirectory() as spool:
+            cp = os.path.join(spool, "s.jsonl")
+            with open(cp, "wb") as fh:
+                fh.write(b"\xff\xfe\n")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+
+    def test_finalize_spills_and_verifies(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(300)
+            stem = "m3_20260921T000010Z_deadbeef_010"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=50)
+            with open(out + ".manifest.json", encoding="utf-8") as fh:
+                man = json.load(fh)
+            self.assertEqual(man["frames"], 300)
+            # Shuffled arrival, chronological manifest bounds.
+            self.assertEqual(man["twall_ns_first"],
+                             1_700_000_000_000_000_000)
+            self.assertEqual(man["twall_ns_last"],
+                             1_700_000_000_000_000_000 + 299 * 1_000_000)
+            self.assertEqual((man["seq_first"], man["seq_last"]), (300, 1))
+            # No temp runs leak after success.
+            for n in os.listdir(dirs["sealed"]):
+                self.assertFalse(n.endswith(".tmp") and ".run-" in n, n)
+                p = os.path.join(dirs["sealed"], n)
+                if os.path.isdir(p):
+                    self.assertFalse(any(
+                        x.startswith("run-") for x in os.listdir(p)), n)
+            rec.verify_sealed_mf4(out, frames)  # list path parity
+
+    def test_duplicate_frames_match_chronologically(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            base = {"tcan": 1700000000.0, "bus": "can0", "id": 0x100,
+                    "ext": False, "rtr": False, "err": False, "fd": False,
+                    "brs": False, "esi": False, "dlc": 8,
+                    "data": b"\x01" * 8}
+            frames = [dict(base, seq=i + 1,
+                           twall_ns=1_700_000_000_000_000_000 + i * 1_000)
+                      for i in range(10)]
+            stem = "m3_20260921T000011Z_deadbeef_011"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=3)
+            seen = [f["seq"] for _m, f in rec.matched_mf4_frames(out, frames)]
+            self.assertEqual(sorted(seen), [f["seq"] for f in frames])
+
+    def test_tmp_budget_fails_closed(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(100)
+            stem = "m3_20260921T000012Z_deadbeef_012"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            with self.assertRaises(rec.NoSpace):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     mem_frames=5, tmp_max_bytes=10)
+            self.assertTrue(os.path.exists(cp))  # ingress kept, retry later
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".mf4")))
+
+    def test_many_runs_single_fd_and_small_budget(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(2500)
+            stem = "m3_20260921T000014Z_deadbeef_014"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            stats = {}
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=50, stats=stats)
+            self.assertTrue(os.path.exists(out))
+            # One sqlite file, never a run-file list: FD count cannot grow.
+            leftovers = [n for n in os.listdir(dirs["sealed"])
+                         if n.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+            with open(out + ".manifest.json", encoding="utf-8") as fh:
+                man = json.load(fh)
+            self.assertEqual(man["frames"], 2500)
+            self.assertLessEqual(stats["peak_resident_frames"], 50)
+            self.assertEqual(stats["budget_frames"], 50)
+            self.assertGreaterEqual(stats["peak_temp_bytes"], 0)
+            # Chronological identity match still wins on the real path.
+            seen = [f["seq"] for _m, f in
+                    rec.matched_mf4_frames(out, frames)]
+            self.assertEqual(sorted(seen), [f["seq"] for f in frames])
+
+    def test_match_disk_budget_enforced(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(200)
+            stem = "m3_20260921T000015Z_deadbeef_015"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            store = rec.SortedFrameStore(dirs["sealed"], stem, 50, 2 << 30)
+            try:
+                for f in frames:
+                    store.add(f)
+                store.max_bytes = 10  # shrink only for the match stage
+                with self.assertRaises(rec.NoSpace):
+                    list(rec._matched_mf4_store(
+                        os.path.join(dirs["sealed"], stem + ".missing.mf4"),
+                        store))
+            finally:
+                store.destroy()
+
+    def test_budgets_reject_nonpositive(self):
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                rec.SortedFrameStore(tempfile.gettempdir(), "stem", bad,
+                                     2 << 30)
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            stem = "m3_20260921T000016Z_deadbeef_016"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, self._frames(2))
+            with self.assertRaises(ValueError):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     mem_frames=0)
+            with self.assertRaises(ValueError):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     tmp_max_bytes=0)
+
+    def test_oversize_line_quarantines_and_whitespace_passes(self):
+        with tempfile.TemporaryDirectory() as spool:
+            cp = os.path.join(spool, "s.jsonl")
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write(" " * (rec._LINE_MAX_BYTES + 8) + "\n")
+                fh.write(json.dumps(rec.encode_frame(
+                    1, 1_700_000_000_000_000_000, 1700000000.0, "can0",
+                    0x100, False, False, False, False, False, False, 8,
+                    b"\x01" * 8), separators=(",", ":")) + "\n")
+            self.assertEqual(len(list(rec.IngressStream(cp))), 1)
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write("x" * (rec._LINE_MAX_BYTES + 8) + "\n")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            # Damaged unterminated tail still quarantines, never salvages.
+            with open(cp, "wb") as fh:
+                fh.write(b"\xff\xfe")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            stream = rec.IngressStream(cp)
+            try:
+                list(stream)
+            except rec.CorruptSegment:
+                pass
+            self.assertFalse(stream.torn)
+
+    def test_interrupted_tmp_swept_and_restarted(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(120)
+            stem = "m3_20260921T000013Z_deadbeef_013"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            stale = os.path.join(dirs["sealed"], stem + ".xyz")
+            os.makedirs(stale)
+            with open(os.path.join(stale, "run-00000.tmp"), "w") as fh:
+                fh.write("interrupted")
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=10)
+            self.assertTrue(os.path.exists(out))
+            self.assertFalse(os.path.exists(stale))
+            # Restart recovery sweeps sort dirs too, keeping the JSONL.
+            stale2 = os.path.join(dirs["sealed"], stem + ".abc")
+            os.makedirs(stale2)
+            with open(os.path.join(stale2, "frames.sqlite3"), "w") as fh:
+                fh.write("interrupted")
+            _recovered, swept = rec.recover_spool(spool)
+            self.assertGreaterEqual(swept, 1)
+            self.assertFalse(os.path.exists(stale2))
+            self.assertTrue(os.path.exists(cp))
+
+    def test_gunzip_chunk_boundaries(self):
+        import gzip
+        import hashlib
+        with tempfile.TemporaryDirectory() as spool:
+            body = b'{"v":1}\n' * 500
+            sc = os.path.join(spool, "s.gz")
+            with open(sc, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                                   mtime=0) as gz:
+                    gz.write(body)
+            want = hashlib.sha256(body).hexdigest()
+            ok, _ = upl.gunzip_compare(sc, want, None, chunk_bytes=7)
+            self.assertTrue(ok)
+            ok, reason = upl.gunzip_compare(sc, "0" * 64, None,
+                                            chunk_bytes=7)
+            self.assertFalse(ok)
+            self.assertIn("drifted", reason)
+            # Truncated member fails closed, never a partial pass.
+            with open(sc, "r+b") as fh:
+                fh.truncate(os.path.getsize(sc) - 5)
+            ok, reason = upl.gunzip_compare(sc, want, None, chunk_bytes=7)
+            self.assertFalse(ok)
+            self.assertIn("gunzip failed", reason)
+            # Multi-member gzip: every member verified.
+            mm = os.path.join(spool, "m.gz")
+            with open(mm, "wb") as fh:
+                fh.write(gzip.compress(b"AAA\n", mtime=0)
+                         + gzip.compress(b"BBB\n", mtime=0))
+            ok, _ = upl.gunzip_compare(
+                mm, hashlib.sha256(b"AAA\nBBB\n").hexdigest(), None,
+                chunk_bytes=3)
+            self.assertTrue(ok)
+            # Closed comparison is byte-exact across chunk splits.
+            cp = os.path.join(spool, "c.jsonl")
+            with open(cp, "wb") as fh:
+                fh.write(body)
+            sc2 = os.path.join(spool, "s2.gz")
+            with open(cp, "rb") as src, open(sc2, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                                   mtime=0) as gz:
+                    gz.write(body)
+            ok, _ = upl.gunzip_compare(sc2, want, cp, chunk_bytes=11)
+            self.assertTrue(ok)
+            with open(cp, "r+b") as fh:
+                fh.seek(10)
+                fh.write(b"\xff")
+            ok, reason = upl.gunzip_compare(sc2, want, cp, chunk_bytes=11)
+            self.assertFalse(ok)
+            self.assertIn("drifted", reason)
+
+    def test_preflight_drift_never_uploads_never_deletes(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = UploadTest()._triple(spool)
+            with open(s, "r+b") as fh:  # post-seal sidecar corruption
+                fh.seek(20)
+                fh.write(b"\xff")
+            cli = FakeS3()
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, {})
+            for kept_moved in (p, s, m, cp):
+                self.assertFalse(os.path.exists(kept_moved))
+                self.assertTrue(os.path.exists(
+                    os.path.join(spool, "quarantine",
+                                 os.path.basename(kept_moved))))
 
 
 if __name__ == "__main__":
