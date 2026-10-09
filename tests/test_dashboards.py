@@ -439,6 +439,7 @@ def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
         query = _physical_query(configs, "grafana-dash-battery", panel)
         with _battery_db() as db:
             db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            db.create_function("FROM_UNIXTIME", 1, lambda value: value)
             db.execute("""INSERT INTO vehicle_signal
                 (event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
@@ -455,6 +456,132 @@ def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
                 (1600, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
                  'invalid', 1600, 'invalid')""", (field, unit))
             assert db.execute(query).fetchone()[index] is None
+
+
+def _native_ts_query(configs, dashboard, panel, start=1000, end=2000):
+    """_physical_query plus the native TIMESTAMP(9) transform.
+
+    Greptime compares native timestamps; sqlite CAST is a no-op, so the
+    harness translates CAST(x AS TIMESTAMP(9)) to NS_TIMESTAMP(x) backed by
+    the real backend time parser (same transform, not a repinned result).
+    """
+    from scripts.analytics.battery import battery_runtime as battery_runtime
+
+    query = _physical_query(configs, dashboard, panel, start=start, end=end)
+    for alias, column in (("f", "raw_event_time"), ("c", "value_text"),
+                          ("fmax", "raw_event_time"), ("cm", "value_text"),
+                          ("fmin", "raw_event_time"), ("cn", "value_text")):
+        query = query.replace(
+            "CAST(%s.%s AS TIMESTAMP(9))" % (alias, column),
+            "NS_TIMESTAMP(%s.%s)" % (alias, column))
+    assert "TIMESTAMP(9)" not in query
+
+    def ns_timestamp(value):
+        if value is None or isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        return battery_runtime.parse_time_bound(value)
+
+    return query, ns_timestamp
+
+
+def test_calibrated_extrema_fallback_and_frontier():
+    """Panels 44/45/51/52: explicit-unit raw wins; unit-NULL raw falls back
+    to the scoped calibrated conditions metric only while the newest raw of
+    that field stays calibratable and already analyzed; stale analysis
+    behind newer raw, wrong units, bad revisions, same-timestamp tombstones,
+    and unknown ingest stay NULL (no resurrection)."""
+    from scripts.analytics.battery import battery_runtime as battery_runtime
+
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    cases = ((44, "BrickVoltageMax", "battery.conditions.brick_max_v", "V", 3, 4.02),
+             (45, "BrickVoltageMin", "battery.conditions.brick_min_v", "V", 3, 3.92),
+             (51, "ModuleTempMax", "battery.conditions.module_temp_max_c", "celsius", 3, 25.5),
+             (52, "ModuleTempMin", "battery.conditions.module_temp_min_c", "celsius", 4, 20.5))
+    for panel, field, metric, unit, index, calibrated in cases:
+        query, ns_timestamp = _native_ts_query(
+            configs, "grafana-dash-battery", panel)
+        observed = battery_runtime.ns_to_sql_ts(1500)
+        with _battery_db() as db:
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+            assert db.execute(query).fetchall() == []
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
+                 'unit_unverified', 1500, 'raw')""", (field,))
+            # Unit-unverified raw alone never renders a physical value.
+            assert db.execute(query).fetchone()[index] is None
+            db.execute("""INSERT INTO vehicle_analysis
+                (window_start, window_end, vehicle, metric, source,
+                 analysis_id, revision, value, value_text, unit, status,
+                 reason, decode_epoch, computed_at) VALUES
+                (1500, 1500, 'v', ?, 'fleet', 'battery_conditions', 'r1',
+                 ?, ?, ?, 'derived',
+                 'latest_calibrated_sample domain=d scope=v/fleet/fleet-v1;asof_ns=1500',
+                 'fleet-v1', 1600)""", (metric, calibrated, observed, unit))
+            row = db.execute(query).fetchone()
+            assert row[index] == calibrated
+            assert row[6] == observed
+            # Explicit-unit raw wins over calibration.
+            db.execute("UPDATE vehicle_signal SET unit = ?, quality = 'ok'", (unit,))
+            row = db.execute(query).fetchone()
+            assert row[index] == 4 and row[6] == "raw"
+            db.execute("UPDATE vehicle_signal SET unit = NULL, quality = 'unit_unverified'")
+            # 1ns-newer raw of the same field blocks stale calibration until reanalysis.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (1501, 'v', 'fleet', 'fleet-v1', ?, 5, NULL,
+                 'unit_unverified', 1501, 'newer')""", (field,))
+            assert db.execute(query).fetchone()[index] is None
+            db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'newer'")
+            # A wrong-unit newest raw never revives calibration.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (1600, 'v', 'fleet', 'fleet-v1', ?, 4100, 'mV',
+                 'ok', 1600, 'wrong-unit')""", (field,))
+            assert db.execute(query).fetchone()[index] is None
+            db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'wrong-unit'")
+            # A same-timestamp late tombstone blocks calibration until reanalysis.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (1500, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
+                 'invalid', 1700, 'tombstone')""", (field, unit))
+            assert db.execute(query).fetchone()[index] is None
+            db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'tombstone'")
+            # Unknown ingest is fail-closed: analysis may not have seen this raw.
+            db.execute("UPDATE vehicle_signal SET ingest_time = NULL")
+            assert db.execute(query).fetchone()[index] is None
+            db.execute("UPDATE vehicle_signal SET ingest_time = 1500")
+            assert db.execute(query).fetchone()[index] == calibrated
+            # Raw beyond the selected range end never blocks the historical view.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (2500, 'v', 'fleet', 'fleet-v1', ?, 9, NULL,
+                 'unit_unverified', 2500, 'future')""", (field,))
+            assert db.execute(query).fetchone()[index] == calibrated
+            db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'future'")
+            # A bad newest revision (invalid/conflict/mismatch) never resurrects older goods.
+            for revision, status, value, rev_unit in (
+                    ("r2", "unavailable", None, unit),
+                    ("r3", "error", None, None),
+                    ("r4", "derived", 9.9, "wrong")):
+                db.execute("""INSERT INTO vehicle_analysis
+                    (window_start, window_end, vehicle, metric, source,
+                     analysis_id, revision, value, value_text, unit, status,
+                     reason, decode_epoch, computed_at) VALUES
+                    (1500, 1500, 'v', ?, 'fleet', 'battery_conditions', ?,
+                     ?, ?, ?, ?,
+                     'terminal_invalid:latest_extreme_unmeasurable',
+                     'fleet-v1', 1700)""",
+                           (metric, revision, value, observed, rev_unit, status))
+                assert db.execute(query).fetchone()[index] is None
 
 
 def test_can_reports_keep_invalid_latest_and_scope_boundaries():
@@ -706,6 +833,7 @@ if __name__ == "__main__":
     test_physical_cards_latest_analysis_and_new_raw_barriers()
     test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
+    test_calibrated_extrema_fallback_and_frontier()
     test_can_reports_keep_invalid_latest_and_scope_boundaries()
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()

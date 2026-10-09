@@ -50,12 +50,17 @@ Config contract (config is a plain dict):
       requires an explicit config entry. Battery temperature uses raw
       ``ModuleTempMax`` / ``ModuleTempMin`` mapped to celsius by
       ``module_temp_calibration`` (high exposure and conditioning join
-      use Max, low exposure uses Min). Latest-value outputs are terminal:
-      when the newest timestamp for a field is invalid/conflicting (a
-      terminal tombstone), latest raw/ID rows report unavailable with an
+      use Max, low exposure uses Min, terminal extrema map each field
+      point-wise ``raw * scale + offset``). Latest-value outputs are
+      terminal: when the newest timestamp for a field is
+      invalid/conflicting (a terminal tombstone), latest raw/ID rows
+      and the calibrated terminal extrema report unavailable with an
       explicit reason and no older value is resurrected as current;
-      historical trend/exposure legs use only bounded valid segments
-      with coverage/asof stated.
+      a wrong-unit newest extrema row also fails closed. Calibrated
+      extrema carry the observation timestamp as the energy-module UTC
+      ``value_text`` with ``asof_ns`` in the reason. Historical
+      trend/exposure legs use only bounded valid segments with
+      coverage/asof stated.
     Physical calibrations (inline dicts, never global chemistry
     inference; missing means physical metrics report unavailable):
       ``brick_voltage_calibration`` (expected unit ``V``),
@@ -99,9 +104,11 @@ Public numerical helpers (pure, stdlib):
 """
 
 
+from datetime import datetime, timezone
 from scripts.analytics.battery import battery_common as bc
 
-ALGORITHM_VERSION = "1.2.0"
+
+ALGORITHM_VERSION = "1.3.0"
 ANALYSIS_ID = "battery_conditions"
 
 BRICK_MAX_FIELD = "BrickVoltageMax"
@@ -132,6 +139,10 @@ SUPPORTED_METRICS = (
     "battery.conditions.module_temp_max_raw",
     "battery.conditions.module_temp_min_raw",
     "battery.conditions.isolation_raw",
+    "battery.conditions.brick_max_v",
+    "battery.conditions.brick_min_v",
+    "battery.conditions.module_temp_max_c",
+    "battery.conditions.module_temp_min_c",
     "battery.conditions.brick_max_id",
     "battery.conditions.brick_min_id",
     "battery.conditions.module_temp_max_id",
@@ -164,10 +175,14 @@ SUPPORTED_METRICS = (
 
 CAL_SPECS = {
     "brick_voltage_calibration": ("V", False,
-                                  ("battery.conditions.brick_spread_v",)),
+                                  ("battery.conditions.brick_spread_v",
+                                   "battery.conditions.brick_max_v",
+                                   "battery.conditions.brick_min_v")),
     "module_temp_calibration": ("celsius", False,
                                 ("battery.conditions.thermal_spread_c",
-                                 "battery.conditions.thermal_slope_c_per_h")),
+                                 "battery.conditions.thermal_slope_c_per_h",
+                                 "battery.conditions.module_temp_max_c",
+                                 "battery.conditions.module_temp_min_c")),
     "isolation_calibration": ("ohm", False,
                               ("battery.conditions.isolation_ohm",
                                "battery.conditions.isolation_trend_ohm_per_h")),
@@ -1100,9 +1115,13 @@ def _unavailable_rows(scopes, window, ccfg, reason="no_signals"):
         vehicle, source, epoch = scope
         for metric in SUPPORTED_METRICS:
             unit = None
-            if metric == "battery.conditions.brick_spread_v":
+            if metric in ("battery.conditions.brick_spread_v",
+                          "battery.conditions.brick_max_v",
+                          "battery.conditions.brick_min_v"):
                 unit = "V"
-            elif metric == "battery.conditions.thermal_spread_c":
+            elif metric in ("battery.conditions.thermal_spread_c",
+                            "battery.conditions.module_temp_max_c",
+                            "battery.conditions.module_temp_min_c"):
                 unit = "celsius"
             elif metric == "battery.conditions.thermal_slope_c_per_h":
                 unit = "celsius/h"
@@ -1266,6 +1285,69 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
             scope, window, evidence=0, sample=nrows,
             revision=rev(metric, reason)))
 
+    def _terminal_extrema(field, metric, cal_key, cal_metric):
+        """Terminal calibrated latest of one raw extrema field.
+        Only the newest timestamp counts; terminal invalid/conflict
+        stays NULL with no older fallback. Wrong-unit terminal rows
+        fail closed. Calibration gates ride _phys_cal like spreads."""
+        state, rep = _latest_state(ordered, field)
+        nrows = len(_field_rows(ordered, field))
+        scal, err_status, err_reason = _phys_cal(cal_key, cal_metric)
+        phys_unit = ("V" if cal_key == "brick_voltage_calibration"
+                     else "celsius")
+        if err_status is not None:
+            rows.append(_row(metric, None,
+                             None if err_status == "error" else phys_unit,
+                             err_status, err_reason, scope, window,
+                             evidence=0, sample=nrows,
+                             revision=rev(metric, "cal_error")))
+            return
+        if scal is None:
+            rows.append(_row(
+                metric, None, phys_unit, "unavailable",
+                "missing_calibration:%s" % cal_key, scope, window,
+                evidence=0, sample=nrows,
+                revision=rev(metric, "no_cal")))
+            return
+        if state != "ok":
+            if state == "empty":
+                reason = "sparse:no_unambiguous_valid_sample"
+            elif state == "tombstone":
+                reason = "terminal_invalid:latest_sample_unmeasurable"
+            else:
+                reason = "terminal_conflict:latest_samples_disagree"
+            rows.append(_row(metric, None, scal["unit"], "unavailable",
+                             reason, scope, window, evidence=0,
+                             sample=nrows,
+                             revision=rev(metric, reason)))
+            return
+        if rep.get("unit") is not None:
+            rows.append(_row(
+                metric, None, scal["unit"], "unavailable",
+                "terminal_invalid:wrong_unit_expected_raw", scope, window,
+                evidence=0, sample=nrows,
+                revision=rev(metric, "wrong_unit")))
+            return
+        val = apply_calibration(float(rep["value_num"]), scal)
+        if val is None:
+            rows.append(_row(metric, None, scal["unit"], "unavailable",
+                             "non_finite:calibrated_extrema", scope, window,
+                             evidence=0, sample=nrows,
+                             revision=rev(metric, "non_finite")))
+            return
+        stamp = rep["event_time_ns"]
+        seconds, nanos = divmod(stamp, 1000000000)
+        text = (datetime.fromtimestamp(seconds, timezone.utc)
+                .strftime("%Y-%m-%d %H:%M:%S") + ".%09d" % nanos)
+        rows.append(_row(
+            metric, val, scal["unit"], "derived",
+            "latest_calibrated_sample domain=%s scope=%s;asof_ns=%d" % (
+                scal["domain"], _scope_text(scal["scope"]), stamp),
+            scope, window, evidence=1, sample=nrows,
+            calibration_version=scal["version"], value_text=text,
+            revision=rev(metric, stamp, rep["value_num"], scal["version"])))
+
+
     # --- Raw extrema and IDs (reported, unit NULL, raw preserved) ---
     for field, metric in (
             (BRICK_MAX_FIELD, "battery.conditions.brick_max_raw"),
@@ -1319,6 +1401,20 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
                 "module_temp_calibration": mod_cal,
                 "isolation_calibration": iso_cal,
                 "pack_current_calibration": pack_cal}[cal_key], None, None
+
+    # --- Calibrated terminal extrema (explicit scoped cal only) ---
+    _terminal_extrema(BRICK_MAX_FIELD, "battery.conditions.brick_max_v",
+                      "brick_voltage_calibration",
+                      "battery.conditions.brick_max_v")
+    _terminal_extrema(BRICK_MIN_FIELD, "battery.conditions.brick_min_v",
+                      "brick_voltage_calibration",
+                      "battery.conditions.brick_min_v")
+    _terminal_extrema(MOD_MAX_FIELD, "battery.conditions.module_temp_max_c",
+                      "module_temp_calibration",
+                      "battery.conditions.module_temp_max_c")
+    _terminal_extrema(MOD_MIN_FIELD, "battery.conditions.module_temp_min_c",
+                      "module_temp_calibration",
+                      "battery.conditions.module_temp_min_c")
 
     def _spread_rows(points, terminal, unsync, amb, raw_metric, cal_key,
                      cal_metric, cal_unit_hint):

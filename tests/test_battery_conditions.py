@@ -843,6 +843,107 @@ def test_skew_and_wrong_unit_barriers_across_paths():
     assert by(out, "battery.conditions.brick_spread_raw")["status"] == \
         "derived"
 
+def test_calibrated_terminal_extrema_offset_scale():
+    rows = ([raw(T0, "BrickVoltageMax", 4.0),
+             raw(T0, "BrickVoltageMin", 3.9),
+             batt_max(T0, 20.0), batt_min(T0, 18.0)]
+            + [raw(T0 + HOUR, "BrickVoltageMax", 4.1),
+               raw(T0 + HOUR, "BrickVoltageMin", 4.0),
+               batt_max(T0 + HOUR, 21.0),
+               batt_min(T0 + HOUR, 19.0)])
+    out = co.analyze(rows, [], cfg(
+        brick_voltage_calibration=cal("V", 2.0, offset=1.0),
+        module_temp_calibration=mod_cal(scale=3.0, offset=-2.0),
+        **GAP2H))
+    got_max = by(out, "battery.conditions.brick_max_v")
+    assert got_max["status"] == "derived" and got_max["unit"] == "V"
+    assert abs(got_max["value"] - 9.2) < 1e-9
+    assert got_max["calibration_version"] == "synth-1"
+    assert "asof_ns=%d" % (T0 + HOUR) in got_max["reason"]
+    assert got_max["value_text"] == "2023-11-14 23:13:20.000000000"
+    got_min = by(out, "battery.conditions.brick_min_v")
+    assert abs(got_min["value"] - 9.0) < 1e-9
+    assert by(out, "battery.conditions.module_temp_max_c")["value"] == 61.0
+    assert by(out, "battery.conditions.module_temp_min_c")["value"] == 55.0
+    assert by(out, "battery.conditions.module_temp_max_c")["unit"] == \
+        "celsius"
+
+
+def test_calibrated_extrema_missing_and_wrong_scope_fail_closed():
+    rows = brick_pair(T0, 4.2, 4.0) + therm_pair(T0, 25.0, 24.0)
+    out = co.analyze(rows, [], cfg())
+    for metric in ("battery.conditions.brick_max_v",
+                   "battery.conditions.brick_min_v",
+                   "battery.conditions.module_temp_max_c",
+                   "battery.conditions.module_temp_min_c"):
+        got = by(out, metric)
+        assert got["status"] == "unavailable" and got["value"] is None
+        assert "missing_calibration" in got["reason"]
+    scoped = cal("V", 1.0)
+    scoped["scope"] = {"vehicle": "other", "source": "*",
+                       "decode_epoch": "*"}
+    out2 = co.analyze(rows, [], cfg(brick_voltage_calibration=scoped,
+                                    module_temp_calibration=mod_cal()))
+    for metric in ("battery.conditions.brick_max_v",
+                   "battery.conditions.brick_min_v"):
+        got = by(out2, metric)
+        assert got["status"] == "unavailable"
+        assert "scope_mismatch" in got["reason"]
+    assert by(out2, "battery.conditions.module_temp_max_c")[
+        "status"] == "derived"
+    out3 = co.analyze(rows, [], cfg(
+        domain="pack-A",
+        brick_voltage_calibration=cal("V", 1.0, domain="pack-B"),
+        module_temp_calibration=mod_cal()))
+    assert "domain_mismatch" in by(
+        out3, "battery.conditions.brick_max_v")["reason"]
+    bad = cal("kWh", 1.0)
+    out4 = co.analyze(rows, [], cfg(brick_voltage_calibration=bad,
+                                    module_temp_calibration=mod_cal()))
+    err = by(out4, "battery.conditions.brick_max_v")
+    assert err["status"] == "error" and "unit" in err["reason"]
+    assert by(out4, "battery.conditions.brick_max_raw")[
+        "status"] == "reported"
+
+
+def test_calibrated_extrema_terminal_tombstone_conflict_no_fallback():
+    t0, t1 = T0, T0 + 1000000000
+    rows = [raw(t0, "BrickVoltageMax", 4.2),
+            raw(t0, "BrickVoltageMin", 4.0),
+            raw(t0, "ModuleTempMax", 25.0),
+            raw(t0, "ModuleTempMin", 24.0),
+            raw(t1, "BrickVoltageMax", 4.3),
+            sig(t1, field="BrickVoltageMin", num=None, unit=None,
+                quality="invalid"),
+            raw(t1, "ModuleTempMax", 26.0),
+            raw(t1, "ModuleTempMax", 27.0),
+            raw(t1, "ModuleTempMin", 24.0)]
+    out = co.analyze(rows, [], cfg(
+        brick_voltage_calibration=cal("V", 2.0, offset=1.0),
+        module_temp_calibration=mod_cal(), **GAP2H))
+    # Terminal-invalid min stays NULL: no older 4.0*2+1 fallback.
+    assert by(out, "battery.conditions.brick_min_v")["value"] is None
+    assert "terminal_invalid" in by(
+        out, "battery.conditions.brick_min_v")["reason"]
+    assert abs(by(out, "battery.conditions.brick_max_v")["value"]
+               - 9.6) < 1e-9
+    # Terminal-conflicting max stays NULL even with an older valid 25.0.
+    assert by(out, "battery.conditions.module_temp_max_c")["value"] is None
+    assert "terminal_conflict" in by(
+        out, "battery.conditions.module_temp_max_c")["reason"]
+    assert by(out, "battery.conditions.module_temp_min_c")["value"] == 24.0
+
+
+def test_calibrated_extrema_wrong_unit_terminal_fails_closed():
+    rows = [dict(r, unit="V")
+            if r.get("source_field") == "BrickVoltageMax" else r
+            for r in brick_pair(T0, 4.2, 4.0)]
+    out = co.analyze(rows, [], cfg(
+        brick_voltage_calibration=cal("V", 2.0, offset=1.0)))
+    got = by(out, "battery.conditions.brick_max_v")
+    assert got["status"] == "unavailable" and got["value"] is None
+    assert "wrong_unit" in got["reason"]
+    assert by(out, "battery.conditions.brick_min_v")["value"] == 9.0
 
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
