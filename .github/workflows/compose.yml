@@ -67,6 +67,8 @@ jobs:
           python -m tests.test_storage_metrics
           python -m tests.test_storage
           python -m tests.test_database
+          python -m tests.test_otel_retention
+          python -m tests.test_retention_capacity
           python -m tests.test_ai_incremental
           python -m tests.test_dashboards
           python -m tests.test_grafana_folders
