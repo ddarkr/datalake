@@ -16,7 +16,7 @@ via `gunzip_compare`) never build proportional bytes/frame objects.
   This bounds application frame staging, not total process RSS: SQLite,
   Python and MF4 libraries have their own buffers. Measure RSS separately.
 - `RAW_TMP_MAX_BYTES` (default 2 GiB, must be > 0): ONE aggregate over the
-  simultaneously live sort dir (`frames.sqlite3` + journal/WAL/index),
+  simultaneously live sort dir (`frames.sqlite3` + journal/WAL/shm/index),
   match DB/files (`match.sqlite3*`), and the staged MF4
   (`<stem>.stage.tmp`) living beside the dir, enforced via
   `store._note_live` after staging and on every match batch/index, and
@@ -36,7 +36,7 @@ via `gunzip_compare`) never build proportional bytes/frame objects.
   quarantines via `CorruptSegment` (never salvaged, `.torn` stays False).
   Only an unterminated decodable tail sets `.torn`.
 
-- Temp dirs are `sealed/<stem>.*` holding `frames.sqlite3` (+ journals)
+- Temp dirs are `sealed/<stem>.*` holding `frames.sqlite3` (+ journal/WAL/shm)
   and `match.sqlite3` during verify, plus the staged MF4
   (`<stem>.stage.tmp`) living beside the dir until the sealed rename.
   `finalize_segment` sweeps stale ones for its stem on entry (legacy

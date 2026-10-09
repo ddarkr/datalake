@@ -544,7 +544,7 @@ services:
     profiles:
     - vehicle
     labels:
-      datalake.raw-recorder-revision: '1'
+      datalake.raw-recorder-revision: '2'
     working_dir: /app
     command:
     - /opt/venv/bin/python
@@ -23838,8 +23838,9 @@ configs:
           return any(
               (n.startswith("run-") and n.endswith(".tmp"))  # legacy run files
               or n in ("frames.sqlite3", "frames.sqlite3-journal",
-                       "frames.sqlite3-wal", "match.sqlite3",
-                       "match.sqlite3-journal", "match.sqlite3-wal")
+                       "frames.sqlite3-wal", "frames.sqlite3-shm",
+                       "match.sqlite3", "match.sqlite3-journal",
+                       "match.sqlite3-wal", "match.sqlite3-shm")
               for n in entries)
 
 
@@ -31903,8 +31904,9 @@ configs:
           return any(
               (n.startswith("run-") and n.endswith(".tmp"))  # legacy run files
               or n in ("frames.sqlite3", "frames.sqlite3-journal",
-                       "frames.sqlite3-wal", "match.sqlite3",
-                       "match.sqlite3-journal", "match.sqlite3-wal")
+                       "frames.sqlite3-wal", "frames.sqlite3-shm",
+                       "match.sqlite3", "match.sqlite3-journal",
+                       "match.sqlite3-wal", "match.sqlite3-shm")
               for n in entries)
 
 

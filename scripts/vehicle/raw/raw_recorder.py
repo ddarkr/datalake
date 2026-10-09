@@ -825,8 +825,9 @@ def _is_stale_tmp_dir(entries):
     return any(
         (n.startswith("run-") and n.endswith(".tmp"))  # legacy run files
         or n in ("frames.sqlite3", "frames.sqlite3-journal",
-                 "frames.sqlite3-wal", "match.sqlite3",
-                 "match.sqlite3-journal", "match.sqlite3-wal")
+                 "frames.sqlite3-wal", "frames.sqlite3-shm",
+                 "match.sqlite3", "match.sqlite3-journal",
+                 "match.sqlite3-wal", "match.sqlite3-shm")
         for n in entries)
 
 

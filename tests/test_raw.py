@@ -962,6 +962,79 @@ class BoundedMemoryTest(unittest.TestCase):
                     os.path.join(spool, "quarantine",
                                  os.path.basename(kept_moved))))
 
+    def test_stale_shm_tmp_swept(self):
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            stem = "m3_20260921T000018Z_deadbeef_018"
+            stale = os.path.join(dirs["sealed"], stem + ".crash")
+            os.makedirs(stale)
+            with open(os.path.join(stale, "frames.sqlite3-shm"),
+                      "w") as fh:
+                fh.write("interrupted")
+            self.assertEqual(rec._sweep_stale_tmp(dirs["sealed"], stem), 1)
+            self.assertFalse(os.path.exists(stale))
+            stale2 = os.path.join(dirs["sealed"], "other." + stem)
+            os.makedirs(stale2)
+            with open(os.path.join(stale2, "match.sqlite3-shm"),
+                      "w") as fh:
+                fh.write("interrupted")
+            _recovered, swept = rec.recover_spool(spool)
+            self.assertGreaterEqual(swept, 1)
+            self.assertFalse(os.path.exists(stale2))
+
+    def test_identical_timestamps_match_by_seq(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            base = {"tcan": 1700000000.0, "bus": "can0", "id": 0x100,
+                    "ext": False, "rtr": False, "err": False, "fd": False,
+                    "brs": False, "esi": False, "dlc": 8,
+                    "data": b"\x02" * 8,
+                    "twall_ns": 1_700_000_000_000_000_000}
+            frames = [dict(base, seq=i + 1) for i in range(10)]
+            stem = "m3_20260921T000019Z_deadbeef_019"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=3)
+            with open(out + ".manifest.json", encoding="utf-8") as fh:
+                man = json.load(fh)
+            self.assertEqual(man["frames"], 10)
+            self.assertEqual(man["twall_ns_first"], man["twall_ns_last"])
+            seen = [f["seq"] for _m, f in rec.matched_mf4_frames(out, frames)]
+            self.assertEqual(seen, [f["seq"] for f in frames])
+
+    def test_temp_dir_enospc_fails_closed(self):
+        import errno
+        from unittest.mock import patch
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            stem = "m3_20260921T000020Z_deadbeef_020"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, self._frames(10))
+            with self.assertRaises(rec.NoSpace):
+                with patch.object(rec.tempfile, "mkdtemp", side_effect=OSError(
+                        errno.ENOSPC, "No space left on device")):
+                    rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                         mem_frames=5)
+            self.assertTrue(os.path.exists(cp))  # ingress kept, retry later
+            sealed = os.listdir(dirs["sealed"])
+            self.assertFalse(any(n.endswith(".mf4") for n in sealed), sealed)
+            self.assertFalse(any(n.endswith(".manifest.json")
+                                 for n in sealed), sealed)
+            self.assertFalse(any(os.path.isdir(os.path.join(dirs["sealed"], n))
+                                 for n in sealed), sealed)
+
 
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)
