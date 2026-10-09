@@ -938,7 +938,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '11'
+      datalake.can-receiver-revision: '12'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -962,7 +962,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '11'
+      datalake.can-receiver-revision: '12'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -33181,20 +33181,19 @@ configs:
           def flush_once(self, greptime, limit=20000, max_body_bytes=None):
               """Send one fitting ordered prefix; dirty-notify after full ACK, delete only then."""
               budget = getattr(greptime, "max_body_bytes", DEFAULT_MAX_BODY_BYTES) if max_body_bytes is None else max_body_bytes
-              prefix = "sql=" + urllib.parse.quote_plus(_SQL_PREFIX, safe="", encoding="utf-8", errors="strict")
-              total = len(prefix.encode("ascii"))
-              chosen, count, texts = [], 0, []
+              total = len(_FORM_PREFIX_BYTES)
+              chosen, count, encoded = [], 0, []
               with self.connect() as conn:
                   for record in conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)):
                       canonical = record["row_json"]
                       row = json.loads(canonical)
-                      cell = _render_cell(row)
-                      addition = _urlencoded_len(cell) + (0 if count == 0 else _COMMA_ENCODED_LEN)
+                      cell_enc = _encode_text(_render_cell(row))
+                      addition = len(cell_enc) + (0 if count == 0 else _COMMA_ENCODED_LEN)
                       if total + addition > budget:
                           break
                       total += addition
                       chosen.append((record["id"], canonical, row))
-                      texts.append(cell)
+                      encoded.append(cell_enc)
                       count += 1
                       if count >= limit:
                           break
@@ -33205,7 +33204,7 @@ configs:
                   # The oversized head row stays durable; nothing is skipped or deleted.
                   raise DownstreamError("greptime_row_too_large")
               rows = [(canonical, row) for _, canonical, row in chosen]
-              payload = encode_body(_SQL_PREFIX + ",".join(texts))
+              payload = _FORM_PREFIX_BYTES + _COMMA_ENCODED.join(encoded)
               if greptime.send_body(payload) != count:
                   raise DownstreamError("greptime_partial_ack")
               received_at = _ns_timestamp(time.time_ns())
@@ -33302,7 +33301,9 @@ configs:
 
       DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
       _SQL_PREFIX = 'INSERT INTO "vehicle_signal" (' + ",".join('"' + c + '"' for c in COLUMNS) + ") VALUES "
-      _COMMA_ENCODED_LEN = len(urllib.parse.quote_plus(",", safe="", encoding="utf-8", errors="strict").encode("ascii"))
+      _COMMA_ENCODED = urllib.parse.quote_plus(",", safe="", encoding="utf-8", errors="strict").encode("ascii")
+      _COMMA_ENCODED_LEN = len(_COMMA_ENCODED)
+      _FORM_PREFIX_BYTES = b"sql=" + urllib.parse.quote_plus(_SQL_PREFIX, safe="", encoding="utf-8", errors="strict").encode("ascii")
 
 
       def _literal(field, value):
@@ -33322,6 +33323,11 @@ configs:
           return "(" + ",".join(_literal(c, row[c]) for c in COLUMNS) + ")"
 
 
+      def _encode_text(text):
+          """Single quote_plus/UTF-8 encoding pass; reused for budget fit and final body."""
+          return urllib.parse.quote_plus(text, safe="", encoding="utf-8", errors="strict").encode("ascii")
+
+
       def render_insert(rows):
           """Fixed table/columns, plain integer nanoseconds (literal-insert fast path), standard SQL literals."""
           cells = [_render_cell(row) for row in rows]
@@ -33329,15 +33335,10 @@ configs:
               raise ValueError("cannot insert empty rows")
           return _SQL_PREFIX + ",".join(cells)
 
-
-      def _urlencoded_len(text):
-          """Exact ASCII byte length of the urlencode (quote_plus) encoding of text."""
-          return len(urllib.parse.quote_plus(text, safe="", encoding="utf-8", errors="strict").encode("ascii"))
-
-
       def encode_body(sql):
           """Exact URL-encoded SQL request body bytes sent to Greptime."""
           return urllib.parse.urlencode({"sql": sql}).encode()
+
 
       _REDIRECT_CODES = {301, 302, 303, 307, 308}
 

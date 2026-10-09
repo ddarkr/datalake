@@ -139,6 +139,13 @@ ACK 유실 후 원본 중복 제거를 검사합니다. deadline은 연결 전�
 
 성능 비교는 같은 row 집합·27개 column·event ID·정수 nanosecond를 검증한 뒤 수행하세요. SQL timestamp CAST와 정수 literal, native gRPC의 HTTP/protobuf body 및 encode/ACK 시간을 분리합니다. full ACK, ACK 유실 뒤 재전송 중복 제거, NULL/0/false/빈 문자열/Unicode, 잘못된 인증을 함께 확인하며 backend가 거부한 timestamp 경계는 성공 행 수에서 숨기지 않습니다. 소규모 로컬 fixture의 gRPC 우위나 index/cache query plan은 운영 처리량 증거가 아니며 의존성·운영 query 선택도를 확인하기 전 transport/index 기본값을 바꾸지 않습니다.
 
+`python -m tests.test_can_encoding`은 실제 flush의 SQL/form bytes, UTF-8·특수문자,
+정수 timestamp, byte budget 경계와 full signal/dirty ACK 이전 outbox 보존을
+검사합니다. SQL cell은 한 번 인코딩하고 크기 판단과 최종 본문에 재사용합니다.
+`python tools/benchmark_can_encoding.py --baseline-root <변경 전 checkout>
+--rows 1,2000,20000 --repeats 3`은 두 실제 flush 경로를 교차 실행해 본문
+SHA-256, CPU/wall 시간과 전체 child peak RSS를 비교합니다.
+
 ### 성능·보존 정책 검사
 
 AI 집계의 native Flight 경로는 `grpcio==1.84.0`, `pyarrow==25.0.1`, `protobuf==6.33.6`을 사용합니다. `aggregate-deps`가 Python ABI와 고정 버전을 확인해 전용 venv를 준비하며, 수집기 venv와 공유하지 않습니다. 로컬 AI 회귀에는 같은 버전을 설치하고 `python -m tests.test_ai_incremental`을 실행하세요.

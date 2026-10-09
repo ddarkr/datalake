@@ -77,6 +77,7 @@ jobs:
           python -m tests.test_fleet
           python -m tests.test_can_receiver
           python -m tests.test_can_http_deadline
+          python -m tests.test_can_encoding
           python -m tests.test_can_decoder
           python -m tests.test_can_otlp_wire
           python tools/demo.py regressions
