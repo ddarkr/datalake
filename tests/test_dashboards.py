@@ -474,22 +474,41 @@ def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
 
 
 def _native_ts_query(configs, dashboard, panel, start=1000, end=2000):
-    """_physical_query plus the native TIMESTAMP(9) transform.
+    """_physical_query plus the native TIMESTAMP(9)/TIMESTAMP(6) transforms.
 
-    Greptime compares native timestamps; sqlite CAST is a no-op, so the
-    harness translates CAST(x AS TIMESTAMP(9)) to NS_TIMESTAMP(x) backed by
-    the real backend time parser (same transform, not a repinned result).
+    Greptime compares native timestamps; sqlite CAST is a no-op for the
+    TIMESTAMP(9) safety comparisons but applies NUMERIC affinity to the
+    TIMESTAMP(6) display projections, mangling UTC strings ('1970-...' ->
+    1970) while native returns a real timestamp. The harness translates
+    both to backend-time functions: NS_TIMESTAMP for the (9) comparisons
+    and TS_DISPLAY for the (6) projections, both backed by the real
+    backend time parser (same transforms, not repinned results).
     """
     from scripts.analytics.battery import battery_runtime as battery_runtime
 
     query = _physical_query(configs, dashboard, panel, start=start, end=end)
     for alias, column in (("f", "raw_event_time"), ("c", "value_text"),
                           ("fmax", "raw_event_time"), ("cm", "value_text"),
-                          ("fmin", "raw_event_time"), ("cn", "value_text")):
+                          ("fmin", "raw_event_time"), ("cn", "value_text"),
+                          ("fvmax", "raw_event_time"), ("cvmax", "value_text"),
+                          ("fvmin", "raw_event_time"), ("cvmin", "value_text"),
+                          ("ftmax", "raw_event_time"), ("ctmax", "value_text"),
+                          ("ftmin", "raw_event_time"), ("ctmin", "value_text")):
         query = query.replace(
             "CAST(%s.%s AS TIMESTAMP(9))" % (alias, column),
             "NS_TIMESTAMP(%s.%s)" % (alias, column))
     assert "TIMESTAMP(9)" not in query
+    for alias, column in (("r", "raw_time"), ("c", "value_text"),
+                          ("r", "raw_max_time"), ("cm", "value_text"),
+                          ("r", "raw_min_time"), ("cn", "value_text"),
+                          ("r", "max_time"), ("r", "min_time"),
+                          ("r", "tmax_time"), ("r", "tmin_time"),
+                          ("cvmax", "value_text"), ("cvmin", "value_text"),
+                          ("ctmax", "value_text"), ("ctmin", "value_text")):
+        query = query.replace(
+            "CAST(%s.%s AS TIMESTAMP(6))" % (alias, column),
+            "TS_DISPLAY(%s.%s)" % (alias, column))
+    assert "TIMESTAMP(6)" not in query
 
     def ns_timestamp(value):
         if value is None or isinstance(value, int):
@@ -498,7 +517,17 @@ def _native_ts_query(configs, dashboard, panel, start=1000, end=2000):
             return int(value)
         return battery_runtime.parse_time_bound(value)
 
-    return query, ns_timestamp
+    def ts_display(value):
+        """Native TIMESTAMP(6) projection: typed time at µs precision."""
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value // 1000 * 1000
+        if isinstance(value, float):
+            return int(value) // 1000 * 1000
+        return battery_runtime.parse_time_bound(value) // 1000 * 1000
+
+    return query, ns_timestamp, ts_display
 
 
 def test_calibrated_extrema_fallback_and_frontier():
@@ -515,12 +544,13 @@ def test_calibrated_extrema_fallback_and_frontier():
              (51, "ModuleTempMax", "battery.conditions.module_temp_max_c", "celsius", 3, 25.5),
              (52, "ModuleTempMin", "battery.conditions.module_temp_min_c", "celsius", 4, 20.5))
     for panel, field, metric, unit, index, calibrated in cases:
-        query, ns_timestamp = _native_ts_query(
+        query, ns_timestamp, ts_display = _native_ts_query(
             configs, "grafana-dash-battery", panel)
         observed = battery_runtime.ns_to_sql_ts(1500)
         with _battery_db() as db:
             db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
             db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+            db.create_function("TS_DISPLAY", 1, ts_display)
             assert db.execute(query).fetchall() == []
             db.execute("""INSERT INTO vehicle_signal
                 (event_time, vehicle, source, decode_epoch, source_field,
@@ -539,6 +569,7 @@ def test_calibrated_extrema_fallback_and_frontier():
                  'fleet-v1', 1600)""", (metric, calibrated, observed, unit))
             row = db.execute(query).fetchone()
             assert row[index] == calibrated
+            assert row[5] == ts_display(observed)
             assert row[6] == observed
             # Explicit-unit raw wins over calibration.
             db.execute("UPDATE vehicle_signal SET unit = ?, quality = 'ok'", (unit,))
@@ -611,14 +642,15 @@ def test_calibrated_extrema_retained_without_raw_join():
              (51, "ModuleTempMax", "battery.conditions.module_temp_max_c", "celsius", 3, 25.5),
              (52, "ModuleTempMin", "battery.conditions.module_temp_min_c", "celsius", 4, 20.5))
     for panel, field, metric, unit, index, calibrated in cases:
-        query, ns_timestamp = _native_ts_query(
+        query, ns_timestamp, ts_display = _native_ts_query(
             configs, "grafana-dash-battery", panel)
-        narrow_query, _ = _native_ts_query(
+        narrow_query, _, _ = _native_ts_query(
             configs, "grafana-dash-battery", panel, start=1000, end=1400)
         observed = battery_runtime.ns_to_sql_ts(1200)
         with _battery_db() as db:
             db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
             db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+            db.create_function("TS_DISPLAY", 1, ts_display)
             # Retained-only: valid calibration, no raw rows at all.
             db.execute("""INSERT INTO vehicle_analysis
                 (window_start, window_end, vehicle, metric, source,
@@ -630,6 +662,7 @@ def test_calibrated_extrema_retained_without_raw_join():
                  'fleet-v1', 1300)""", (metric, calibrated, observed, unit))
             row = db.execute(query).fetchone()
             assert row[index] == calibrated
+            assert row[5] == ts_display(observed)
             assert row[6] == observed
             # A same-scope newer raw frontier outside the initial narrow
             # selection blocks the stale value when the range widens.
@@ -880,6 +913,80 @@ def test_can_latest_cards_keep_invalid_reports_and_separate_epochs():
         assert [row[1] for row in db.execute(query)] == [None, None]
 
 
+def test_provenance_table_matches_card_eligibility():
+    """Panel 94: one row per scope/measurement with the card value, actual
+    observed_at (never window_start), reported-vs-calibrated basis and
+    calibration_version; direct and calibrated rows carry different
+    timestamps/bases, latest-invalid stays NULL, no-raw retained stays visible."""
+    from scripts.analytics.battery import battery_runtime as battery_runtime
+
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query, ns_timestamp, ts_display = _native_ts_query(
+        configs, "grafana-dash-battery", 94, start=1000, end=1700000000)
+    observed = battery_runtime.ns_to_sql_ts(1500000000)
+    observed_late = battery_runtime.ns_to_sql_ts(1550000000)
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+        db.create_function("TS_DISPLAY", 1, ts_display)
+        assert db.execute(query).fetchall() == []
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
+            (1500000000, 'v', 'fleet', 'fleet-v1', 'BrickVoltageMax', 4.1,
+             'V', 'ok', 1500000000, 'raw-max')""")
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start, window_end, vehicle, metric, source,
+             analysis_id, revision, value, value_text, unit, status,
+             reason, decode_epoch, computed_at, calibration_version) VALUES
+            (1550000000, 1550000000, 'v', 'battery.conditions.module_temp_min_c', 'fleet',
+             'battery_conditions', 'r1', 20.5, ?, 'celsius', 'derived',
+             'latest_calibrated_sample domain=d scope=v/fleet/fleet-v1;asof_ns=1550000000',
+             'fleet-v1', 1600000000, 'cal-t1')""", (observed_late,))
+        rows = {row[3]: row for row in db.execute(query)}
+        assert set(rows) == {'최고 셀 전압', '최저 셀 전압', '배터리 최고 온도', '배터리 최저 온도'}
+        assert rows['최고 셀 전압'][5] == 4.1
+        assert rows['최고 셀 전압'][6] == ts_display(1500000000) and rows['최고 셀 전압'][7] == 'raw'
+        assert rows['최고 셀 전압'][8] is None
+        assert rows['배터리 최저 온도'][5] == 20.5
+        assert rows['배터리 최저 온도'][6] == ts_display(observed_late)
+        assert rows['배터리 최저 온도'][7] == 'derived'
+        assert rows['배터리 최저 온도'][8] == 'cal-t1'
+        assert (rows['최고 셀 전압'][6], rows['최고 셀 전압'][7]) != (rows['배터리 최저 온도'][6], rows['배터리 최저 온도'][7])
+        card, _, _ = _native_ts_query(configs, "grafana-dash-battery", 44)
+        with _battery_db() as card_db:
+            card_db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            card_db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+            card_db.create_function("TS_DISPLAY", 1, ts_display)
+            card_db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (1500, 'v', 'fleet', 'fleet-v1', 'BrickVoltageMax', 4.1,
+                 'V', 'ok', 1500, 'raw-max')""")
+            assert card_db.execute(card).fetchone()[3] == rows['최고 셀 전압'][5]
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field,
+             value_num, unit, quality, ingest_time, envelope_id) VALUES
+            (1600000000, 'v', 'fleet', 'fleet-v1', 'BrickVoltageMax', NULL,
+             'V', 'invalid', 1600000000, 'tombstone')""")
+        rows = {row[3]: row for row in db.execute(query)}
+        assert rows['최고 셀 전압'][5] is None
+        assert rows['최고 셀 전압'][7] is None
+        db.execute("DELETE FROM vehicle_signal WHERE envelope_id IN ('raw-max', 'tombstone')")
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start, window_end, vehicle, metric, source,
+             analysis_id, revision, value, value_text, unit, status,
+             reason, decode_epoch, computed_at, calibration_version) VALUES
+            (1500000000, 1500000000, 'v', 'battery.conditions.brick_max_v', 'fleet',
+             'battery_conditions', 'r1', 4.02, ?, 'V', 'derived',
+             'latest_calibrated_sample domain=d scope=v/fleet/fleet-v1;asof_ns=1500000000',
+             'fleet-v1', 1600000000, 'cal-v1')""", (observed,))
+        rows = {row[3]: row for row in db.execute(query)}
+        assert rows['최고 셀 전압'][5] == 4.02
+        assert rows['최고 셀 전압'][6] == ts_display(observed)
+        assert rows['최고 셀 전압'][8] == 'cal-v1'
+
+
 if __name__ == "__main__":
     test_dashboard_and_folder_uids_are_disjoint()
     test_coverage_distinguishes_absence_from_observed_zero()
@@ -901,5 +1008,6 @@ if __name__ == "__main__":
     test_coverage_frontier_lists_scopes_without_range_rows()
     test_transition_timeline_starts_from_boundary_sample()
     test_cell_frequency_respects_selected_source_and_epoch()
+    test_provenance_table_matches_card_eligibility()
     test_can_latest_cards_keep_invalid_reports_and_separate_epochs()
     print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")

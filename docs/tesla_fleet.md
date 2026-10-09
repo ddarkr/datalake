@@ -161,6 +161,9 @@ docker compose --profile server --profile fleet up -d
 - 기존 상세 표·그래프는 접힌 전문가 행(분석 기록·전압/온도·에너지/용량·전기 특성·경고·근거) 아래에 그대로 있으며, 펼치면 계산 근거·버전·경고 생명주기를 볼 수 있습니다.
 - 헤더에서는 차량만 직접 고릅니다. 수집 경로·해석 버전·지표·상태는 숨겨진 고급 필터로 URL(`var-source`, `var-epoch`, `var-metric`, `var-status`)로 지정합니다.
 
+### 셀 전압·온도 근거 표 (패널 94)
+- 카드 44/45/51/52의 값과 같은 선택·유효 조건으로 `(vehicle, source, decode_epoch)`별 네 측정 항목(최고/최저 셀 전압, 배터리 최고/최저 온도)의 값·실제 관측 시각·근거·교정 버전을 한 표에 보여줍니다. 관측 시각은 실제 관측(`event_time`) 또는 교정 분석의 UTC `value_text`이며 완료 구간 시작(`window_start`)이 아닙니다. 근거가 `raw`면 직접 보고, `reported`/`derived`/`estimated`면 해당 교정 분석이며, 값이 비면 카드와 같이 판단 불가(NULL)입니다.
+
 ### 입력 품질과 스코프
 - `invalid:true`는 측정 불가이며 0이 아닙니다. 디코딩 불가/`invalid`/non-finite는 NULL tombstone(`quality='invalid'`)으로, 물리 범위 초과는 NULL tombstone(`quality='range_rejected'`)으로 보존됩니다. 미지의 단위는 원시값 + `quality='unit_unverified'`(unit NULL)로 유지되며 물리량으로 주장하지 않습니다.
 - `PackVoltage`/`PackCurrent`는 현재 원시값 + unit NULL + `unit_unverified`이며 권위 있는 A/V로 주장하지 않습니다.
