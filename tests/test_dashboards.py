@@ -599,6 +599,49 @@ def test_calibrated_extrema_fallback_and_frontier():
                 assert db.execute(query).fetchone()[index] is None
 
 
+def test_calibrated_extrema_retained_without_raw_join():
+    """Panels 44/45/51/52: calibration-only scopes (no raw_latest row, so
+    r.* is NULL) still render the retained value; a same-scope newer raw
+    frontier outside the initial selection then blocks the stale value."""
+    from scripts.analytics.battery import battery_runtime as battery_runtime
+
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    cases = ((44, "BrickVoltageMax", "battery.conditions.brick_max_v", "V", 3, 4.02),
+             (45, "BrickVoltageMin", "battery.conditions.brick_min_v", "V", 3, 3.92),
+             (51, "ModuleTempMax", "battery.conditions.module_temp_max_c", "celsius", 3, 25.5),
+             (52, "ModuleTempMin", "battery.conditions.module_temp_min_c", "celsius", 4, 20.5))
+    for panel, field, metric, unit, index, calibrated in cases:
+        query, ns_timestamp = _native_ts_query(
+            configs, "grafana-dash-battery", panel)
+        narrow_query, _ = _native_ts_query(
+            configs, "grafana-dash-battery", panel, start=1000, end=1400)
+        observed = battery_runtime.ns_to_sql_ts(1200)
+        with _battery_db() as db:
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+            # Retained-only: valid calibration, no raw rows at all.
+            db.execute("""INSERT INTO vehicle_analysis
+                (window_start, window_end, vehicle, metric, source,
+                 analysis_id, revision, value, value_text, unit, status,
+                 reason, decode_epoch, computed_at) VALUES
+                (1200, 1200, 'v', ?, 'fleet', 'battery_conditions', 'r1',
+                 ?, ?, ?, 'derived',
+                 'latest_calibrated_sample domain=d scope=v/fleet/fleet-v1;asof_ns=1200',
+                 'fleet-v1', 1300)""", (metric, calibrated, observed, unit))
+            row = db.execute(query).fetchone()
+            assert row[index] == calibrated
+            assert row[6] == observed
+            # A same-scope newer raw frontier outside the initial narrow
+            # selection blocks the stale value when the range widens.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id) VALUES
+                (1500, 'v', 'fleet', 'fleet-v1', ?, 5, NULL,
+                 'unit_unverified', 1500, 'newer')""", (field,))
+            assert db.execute(narrow_query).fetchone()[index] == calibrated
+            assert db.execute(query).fetchone()[index] is None
+
+
 def test_can_reports_keep_invalid_latest_and_scope_boundaries():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     cases = (
@@ -850,6 +893,7 @@ if __name__ == "__main__":
     test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
     test_calibrated_extrema_fallback_and_frontier()
+    test_calibrated_extrema_retained_without_raw_join()
     test_can_reports_keep_invalid_latest_and_scope_boundaries()
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()
