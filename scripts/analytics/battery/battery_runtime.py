@@ -131,7 +131,7 @@ import urllib.request
 
 from scripts.analytics.battery import battery_common as bc
 
-RUNTIME_VERSION = "1.0.4"
+RUNTIME_VERSION = "1.0.5"
 BATTERY_SCOPE_WINDOWS_SUPPORTED = True
 ANALYSIS_TABLE = "vehicle_analysis"
 SIGNAL_TABLE = "vehicle_signal"
@@ -912,7 +912,7 @@ def _parse_exclude_scopes(raw):
     return out
 
 
-def _required_signal_fields(analysis_cfg):
+def _required_signal_fields(analysis_cfg, events=None):
     """Exact source_field set over all analyzers, or None (all fields).
 
     Union of required_fields(config) for every present analyzer module
@@ -922,7 +922,21 @@ def _required_signal_fields(analysis_cfg):
     required_fields (malformed override) propagates its own error type
     (fail closed, never silently valid). RUL contributes the empty set;
     alerts without context_source_fields contributes None (all).
+    Dependency-aware: alerts signal context only surrounds real alert
+    observations, so with explicitly supplied events proving zero
+    alerts-type observations in an offline run (no top-level
+    decision_time_ns), the alerts contribution is excluded. events=None
+    means unknown and preserves the original requirements; a present
+    decision_time_ns keeps existing online exclusion-diagnostics
+    semantics (alerts stays fully required).
     """
+    exclude_alerts = (
+        events is not None
+        and isinstance(analysis_cfg, dict)
+        and analysis_cfg.get("decision_time_ns") is None
+        and not any(isinstance(raw, dict)
+                    and raw.get("event_type") == "alerts"
+                    for raw in events))
     needed = set()
     for module_name, _suffix in MODULE_FILES:
         try:
@@ -933,8 +947,12 @@ def _required_signal_fields(analysis_cfg):
         if fn is None:
             return None
         suffix = dict(MODULE_FILES).get(module_name, "")
+        # Still called when excluded: malformed alerts config must fail
+        # closed, never silently narrow.
         fields = fn(analysis_cfg.get(suffix, {})
                     if isinstance(analysis_cfg, dict) else {})
+        if exclude_alerts and _suffix == "alerts":
+            continue
         if fields is None:
             return None
         needed |= set(fields)
@@ -1351,7 +1369,8 @@ def run_battery(ctx, cfg, now_ns=None):
             if config_error is None else None
         signals, events, tag_scopes = _fetch_plan(
             base_url, auth, db, [], scope_windows, exclude_scopes,
-            fetch_start, fetch_end, vehicle, max_rows, fields)
+            fetch_start, fetch_end, vehicle, max_rows, fields,
+            analysis_cfg=analysis_cfg if config_error is None else None)
         per_scope_windows = {scope: sorted(set(scope_windows[scope]))
                              for scope in scopes}
         gate_raise = True
@@ -1377,7 +1396,8 @@ def run_battery(ctx, cfg, now_ns=None):
             if config_error is None else None
         signals, events, tag_scopes = _fetch_plan(
             base_url, auth, db, windows, scope_windows, exclude_scopes,
-            fetch_start, fetch_end, vehicle, max_rows, fields)
+            fetch_start, fetch_end, vehicle, max_rows, fields,
+            analysis_cfg=analysis_cfg if config_error is None else None)
         scopes = set(tag_scopes)
         for raw in signals:
             scope = (raw["vehicle"], raw["source"], raw["decode_epoch"])
@@ -1428,7 +1448,8 @@ def run_battery(ctx, cfg, now_ns=None):
 
 
 def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
-                fetch_start, fetch_end, vehicle, max_rows, fields):
+                fetch_start, fetch_end, vehicle, max_rows, fields,
+                analysis_cfg=None):
     """Bounded disjoint fetches: no envelope over unrelated gaps.
 
     Hourly windows share one bounded query (contiguous sealed pass);
@@ -1442,8 +1463,42 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
     value-blind consumers (RUL history/scope binding) and
     previous-healthy-row invalidation still see them. Events carry no
     field predicate (unchanged shape), split per interval.
+    Dependency-aware (analysis_cfg supplied): complete events for the
+    same windows/scopes are fetched BEFORE signal planning, and signal
+    fields are recomputed event-dependently (alerts context is only
+    required when alert observations exist or online). The passed
+    fields value is then ignored; analysis_cfg=None keeps legacy
+    behavior exactly (passed fields used, existing callers unchanged).
     """
     only = not windows and bool(scope_windows)
+    # Pure interval enumeration first so both stages cover the same
+    # queries (no envelope over unrelated gaps, no double planning).
+    signal_q = []
+    event_q = []
+    if windows:
+        fetch_start_w = min(ws for ws, _ in windows)
+        fetch_end_w = max(we for _, we in windows)
+        signal_q.append((fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w,
+                         None))
+        event_q.append((fetch_start_w, fetch_end_w, None))
+        context_cover = [(fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w)]
+    else:
+        context_cover = []
+    for scope in sorted(scope_windows):
+        if scope in exclude_scopes:
+            continue
+        if only:
+            # Scoped queries cannot provide context for another decode epoch.
+            context_cover = []
+        for start, end in _merge_intervals(scope_windows[scope]):
+            extra = _subtract_context([(start, end)], context_cover)
+            for cstart, cend in extra:
+                signal_q.append((cstart - SIGNAL_CONTEXT_NS, cend,
+                                 [scope] if only else None))
+            if extra or only:
+                event_q.append((start, end, [scope] if only else None))
+            context_cover = _merge_intervals(
+                context_cover + [(start - SIGNAL_CONTEXT_NS, end)])
     signals = []
     events = []
     tag_scopes = set()
@@ -1463,46 +1518,25 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
                                   "partial" % (total[0], max_rows))
         tag_scopes.update(tags)
 
-    if windows:
-        fetch_start_w = min(ws for ws, _ in windows)
-        fetch_end_w = max(we for _, we in windows)
-        signals.extend(_take(fetch_signals(
-            base_url, auth, db, fetch_start_w - SIGNAL_CONTEXT_NS,
-            fetch_end_w, vehicle, max_rows, fields=fields, scopes=None)))
+    for start, end, scopes in event_q:
         events.extend(_take(fetch_events(
-            base_url, auth, db, fetch_start_w, fetch_end_w, vehicle,
-            max_rows, scopes=None)))
+            base_url, auth, db, start, end, vehicle, max_rows,
+            scopes=scopes)))
+    if analysis_cfg is not None:
+        # Excluded scopes never analyze, so their events cannot require
+        # context. Malformed config propagates (fail closed).
+        proven = [e for e in events
+                  if (e["vehicle"], e["source"], e.get("decode_epoch"))
+                  not in exclude_scopes]
+        fields = _required_signal_fields(analysis_cfg, events=proven)
+    for cstart, cend, scopes in signal_q:
+        signals.extend(_take(fetch_signals(
+            base_url, auth, db, cstart, cend, vehicle, max_rows,
+            fields=fields, scopes=scopes)))
         if fields is not None:
             _take_tags(fetch_signal_scopes(
-                base_url, auth, db, fetch_start_w - SIGNAL_CONTEXT_NS,
-                fetch_end_w, vehicle, max_rows, scopes=None))
-        context_cover = [(fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w)]
-    else:
-        context_cover = []
-    for scope in sorted(scope_windows):
-        if scope in exclude_scopes:
-            continue
-        if only:
-            # Scoped queries cannot provide context for another decode epoch.
-            context_cover = []
-        for start, end in _merge_intervals(scope_windows[scope]):
-            extra = _subtract_context([(start, end)], context_cover)
-            for cstart, cend in extra:
-                signals.extend(_take(fetch_signals(
-                    base_url, auth, db, cstart - SIGNAL_CONTEXT_NS, cend,
-                    vehicle, max_rows, fields=fields,
-                    scopes=[scope] if only else None)))
-                if fields is not None:
-                    _take_tags(fetch_signal_scopes(
-                        base_url, auth, db, cstart - SIGNAL_CONTEXT_NS,
-                        cend, vehicle, max_rows,
-                        scopes=[scope] if only else None))
-            if extra or only:
-                events.extend(_take(fetch_events(
-                    base_url, auth, db, start, end, vehicle, max_rows,
-                    scopes=[scope] if only else None)))
-            context_cover = _merge_intervals(
-                context_cover + [(start - SIGNAL_CONTEXT_NS, end)])
+                base_url, auth, db, cstart, cend, vehicle, max_rows,
+                scopes=scopes))
     signals = [s for s in signals if (s["vehicle"], s["source"],
                                       s["decode_epoch"]) not in exclude_scopes]
     events = [e for e in events if (e["vehicle"], e["source"],
@@ -1543,6 +1577,7 @@ def _dispatch_all(analysis_cfg, config_version, config_error, computed_at,
             window_cfg = dict(analysis_cfg)
             window_cfg["window_start_ns"] = ws
             window_cfg["window_end_ns"] = we
+            window_cfg["scope_hint"] = scope
             failed_modules = set()
             recovered_modules = set()
             refreshed = set()

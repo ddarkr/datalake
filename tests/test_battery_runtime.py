@@ -493,6 +493,7 @@ def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
         stack.enter_context(patch.object(br, "request_sql", sql_request))
         stack.enter_context(patch.object(
             br, "fetch_signals", lambda *args, **kwargs: list(signals)))
+        stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(
             br, "fetch_events", lambda *args, **kwargs: []))
         stack.enter_context(patch.object(
@@ -577,6 +578,7 @@ def test_scope_windows_exact_tuple_only_mode():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(br, "fetch_events", fake_events))
         stack.enter_context(patch.object(br, "fetch_previous_identities",
                                          fake_prev))
@@ -646,6 +648,7 @@ def test_scope_window_boundary_overlap_and_string_keys():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(br, "fetch_events", fake_events))
         stack.enter_context(patch.object(br, "fetch_previous_identities",
                                          fake_prev))
@@ -709,6 +712,7 @@ def test_scope_cap_fails_closed_across_intervals():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(br, "fetch_events", fake_events))
         stack.enter_context(patch.object(br, "coverage_min",
                                          lambda *args: None))
@@ -747,6 +751,7 @@ def test_scope_windows_union_and_disjoint_fetches():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(br, "fetch_events", fake_events))
         stack.enter_context(patch.object(br, "fetch_previous_identities",
                                          fake_prev))
@@ -865,6 +870,7 @@ def test_coordinated_failure_persists_then_raises():
                                              sql_request))
             stack.enter_context(patch.object(
                 br, "fetch_signals", lambda *args, **kwargs: []))
+            stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
             stack.enter_context(patch.object(
                 br, "fetch_events", lambda *args, **kwargs: []))
             stack.enter_context(patch.object(
@@ -929,6 +935,7 @@ def test_exclude_scopes_never_fetched_or_analyzed():
 
     with ExitStack() as stack:
         stack.enter_context(patch.object(br, "fetch_signals", fake_signals))
+        stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(br, "fetch_events", fake_events))
         stack.enter_context(patch.object(br, "fetch_previous_identities",
                                          fake_prev))
@@ -1064,6 +1071,91 @@ def test_narrowed_fields_keep_rul_and_previous_scope():
             assert {r.get("vehicle") for r in rows} == {"v"}, rows
     finally:
         os.unlink(path)
+
+
+def test_no_alert_fetch_does_not_spend_cap_on_unrelated_signals():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    from scripts.analytics.battery import battery_alerts as alerts
+    ws = 100 * br.HOUR_NS
+    scope = ("v", "can", "e1")
+    with sqlite3.connect(":memory:") as store:
+        for table, cols in (("vehicle_signal", br.SIGNAL_COLS),
+                            ("vehicle_event", br.EVENT_COLS)):
+            store.execute("CREATE TABLE " + table + " ("
+                          + ", ".join(cols) + ")")
+        for epoch, count in (("e1", 25), ("e2", 7)):
+            for offset in range(count):
+                row = dict(zip(br.SIGNAL_COLS, [None] * len(br.SIGNAL_COLS)))
+                row.update(event_time=br.ns_to_sql_ts(ws + offset + 1),
+                           vehicle="v", path="Vehicle.Unrelated",
+                           source="can", decode_epoch=epoch, value_num=3.0,
+                           source_field="UnrelatedField", quality="valid")
+                store.execute("INSERT INTO vehicle_signal VALUES ("
+                              + ",".join("?" for _ in br.SIGNAL_COLS) + ")",
+                              [row[c] for c in br.SIGNAL_COLS])
+
+        def sql_request(_url, _auth, _db, statement, timeout=60):
+            cursor = store.execute(statement)
+            return {"output": [{"records": {
+                "schema": {"column_schemas": [
+                    {"name": c[0], "data_type": "String"}
+                    for c in cursor.description]},
+                "rows": cursor.fetchall()}}]}
+
+        def run(cap, oracle=False):
+            captured = []
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(br, "request_sql", sql_request))
+                stack.enter_context(patch.object(
+                    br, "fetch_previous_identities",
+                    return_value={(alerts.METRIC_ACTIVE, "battery_alerts", ws, "e1")}))
+                stack.enter_context(patch.object(
+                    br, "coverage_min", return_value=None))
+                def persist(_url, _auth, _db, rows, batch=500):
+                    captured.extend(rows)
+                    return len(rows), 0
+                stack.enter_context(patch.object(br, "insert_analysis_rows", persist))
+                if oracle:
+                    stack.enter_context(patch.object(
+                        br, "_required_signal_fields", return_value=None))
+                cfg = {"battery_config": "", "battery_max_rows": cap,
+                       "battery_scope_windows": {scope: [(ws, ws + br.HOUR_NS - 1)]},
+                       "battery_scope_windows_only": True}
+                br.run_battery(("", "", ""), cfg, now_ns=ws + 2 * br.HOUR_NS)
+            return captured
+
+        expected = run(100, oracle=True)
+        narrowed = run(3)
+        # Conditions diagnostics describe the selected input rows, not raw
+        # capture coverage. Alert invalidation must match the full oracle.
+        assert [r for r in narrowed if r["metric"] == alerts.METRIC_ACTIVE] == [
+            r for r in expected if r["metric"] == alerts.METRIC_ACTIVE]
+        invalidated = [r for r in narrowed if r["metric"] == alerts.METRIC_ACTIVE]
+        assert len(invalidated) == 1
+        assert invalidated[0]["status"] == "unavailable"
+        assert invalidated[0]["value"] is None
+        assert (invalidated[0]["vehicle"], invalidated[0]["source"],
+                invalidated[0]["decode_epoch"]) == scope
+
+        event = dict(zip(br.EVENT_COLS, [None] * len(br.EVENT_COLS)))
+        event.update(event_time=br.ns_to_sql_ts(ws + 10), vehicle="v",
+                     event_type="alerts", name="SyntheticWarning", source="can",
+                     event_id="synthetic-alert", decode_epoch="e1",
+                     started_at=br.ns_to_sql_ts(ws + 1), quality="valid")
+        store.execute("INSERT INTO vehicle_event VALUES ("
+                      + ",".join("?" for _ in br.EVENT_COLS) + ")",
+                      [event[c] for c in br.EVENT_COLS])
+        complete = run(100)
+        context = [r for r in complete if r["metric"] == alerts.METRIC_CONTEXT]
+        assert len(context) == 1 and context[0]["value"] == 25.0
+        assert context[0]["decode_epoch"] == "e1"
+        try:
+            run(3)
+        except br.BatteryCapError:
+            pass
+        else:
+            raise AssertionError("required alert context must never be truncated")
 
 
 if __name__ == "__main__":
