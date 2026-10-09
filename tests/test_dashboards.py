@@ -8,6 +8,21 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 
 
+
+def test_dashboard_and_folder_uids_are_disjoint():
+    from scripts.database.grafana_folders import FOLDERS
+
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    providers = yaml.safe_load(configs["grafana-dashboards"]["content"])["providers"]
+    folder_uids = {uid for uid, _, _ in FOLDERS}
+    folder_uids.update(p["folderUid"] for p in providers if p.get("folderUid"))
+    dashboards = [json.loads(config["content"]) for name, config in configs.items()
+                  if name.startswith("grafana-dash-")]
+    dashboard_uids = [dashboard["uid"] for dashboard in dashboards]
+    assert len(dashboard_uids) == len(set(dashboard_uids)), "Duplicate dashboard UID"
+    # Grafana's browse tree indexes both resource types by UID.
+    assert not folder_uids.intersection(dashboard_uids), "Folder/dashboard UID collision"
+
 def test_coverage_distinguishes_absence_from_observed_zero():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     queries = []
@@ -823,6 +838,7 @@ def test_can_latest_cards_keep_invalid_reports_and_separate_epochs():
 
 
 if __name__ == "__main__":
+    test_dashboard_and_folder_uids_are_disjoint()
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
     test_battery_dashboard_latest_revision_wins_before_status_filter()
