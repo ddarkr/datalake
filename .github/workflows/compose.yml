@@ -43,7 +43,7 @@ jobs:
           python -m pip install --only-binary=:all: PyYAML==6.0.2 \
             python-can==4.6.1 asammdf==8.8.27 zstd==1.5.6.1 \
             cantools==40.7.1 py-expression-eval==0.3.14 boto3==1.43.98 \
-            opentelemetry-proto==1.38.0
+            opentelemetry-proto==1.38.0 grpcio==1.84.0 pyarrow==25.0.1 protobuf==6.33.6
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -67,6 +67,7 @@ jobs:
           python -m tests.test_storage_metrics
           python -m tests.test_storage
           python -m tests.test_database
+          python -m tests.test_ai_incremental
           python -m tests.test_dashboards
           python -m tests.test_grafana_folders
           python -m tests.test_activity

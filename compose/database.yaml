@@ -5,13 +5,11 @@
 # x-source (no external file refs in the final bundle).
 #
 # Backup owns backup-data; aggregate shares it only for operational status.
-# No new service or volume is declared here.
 #
-# Battery analytics ride on the existing aggregate service (profile: server,
-# no new service/volumes). All battery Python modules mount read-only via
-# x-source configs; the aggregate image stays stdlib-only (no scipy:
-# battery_reference .mat loading needs scipy and is unavailable in aggregate,
-# its stdlib record/JSON helpers stay importable). Analysis JSON mounts
+# Battery analytics ride on the existing aggregate service (profile: server).
+# The cached aggregate venv adds Flight transport dependencies, not scipy:
+# battery_reference .mat loading remains unavailable; its stdlib record/JSON
+# helpers stay importable. Analysis JSON mounts
 # read-only from a native Compose config. Public defaults are {}; operator
 # calibration/model JSON comes from the private .env or Compose override.
 # x-source paths are constrained to the repository, not checked against Git;
@@ -23,7 +21,7 @@ services:
     profiles: [server]
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.schema-revision: "6"
+      datalake.schema-revision: "7"
     depends_on:
       greptimedb:
         condition: service_started
@@ -45,27 +43,50 @@ services:
     command: ["python", "-m", "scripts.database.db_init"]
     restart: "no"
 
+  aggregate-deps:
+    image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [server]
+    volumes:
+      - aggregate-venv:/opt/venv
+    command:
+      - /bin/sh
+      - -ec
+      - >-
+        printf '%s\n' 'grpcio==1.84.0' 'pyarrow==25.0.1' 'protobuf==6.33.6' > /tmp/.aggregate_requirements;
+        python3 -c 'import sys; print(sys.implementation.cache_tag)' > /tmp/.aggregate_want;
+        cat /tmp/.aggregate_requirements >> /tmp/.aggregate_want;
+        if test -f /opt/venv/.aggregate_ready &&
+        cmp -s /tmp/.aggregate_want /opt/venv/.aggregate_ready; then exit 0; fi;
+        python3 -m venv --clear /opt/venv &&
+        /opt/venv/bin/pip install --no-cache-dir --only-binary=:all: -r /tmp/.aggregate_requirements &&
+        cp /tmp/.aggregate_want /opt/venv/.aggregate_ready
+    restart: "no"
+
   aggregate:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.aggregate-revision: "15"
+      datalake.aggregate-revision: "16"
     depends_on:
       greptimedb:
         condition: service_started
       db-schema:
+        condition: service_completed_successfully
+      aggregate-deps:
         condition: service_completed_successfully
     environment:
       # Pass progress must reach docker logs immediately; block-buffered
       # stdout hid a 17-minute backfill pass behind an empty log.
       PYTHONUNBUFFERED: "1"
       GREPTIME_HTTP_URL: http://greptimedb:4000
+      GREPTIME_GRPC_URL: ${GREPTIME_GRPC_URL:-grpc://greptimedb:4001}
       GREPTIME_DB: ${GREPTIME_DB:-datalake}
       GREPTIME_USER: ${GREPTIME_USER:-datalake}
       GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
       AGG_INTERVAL_SECONDS: ${AGG_INTERVAL_SECONDS:-300}
       AGG_LOOKBACK_HOURS: ${AGG_LOOKBACK_HOURS:-30}
       AGG_MAX_ROWS: ${AGG_MAX_ROWS:-200000}
+      AGG_AI_FULL_REBUILD: ${AGG_AI_FULL_REBUILD:-}
       BATTERY_ANALYSIS_CONFIG: ${BATTERY_ANALYSIS_CONFIG:-/app/battery-analysis.json}
       BATTERY_LOOKBACK_HOURS: ${BATTERY_LOOKBACK_HOURS:-}
       BATTERY_MAX_ROWS: ${BATTERY_MAX_ROWS:-}
@@ -88,6 +109,9 @@ services:
     configs:
       - source: aggregate_py
         target: /app/scripts/analytics/aggregate.py
+        mode: 0444
+      - source: greptime_flight_py
+        target: /app/scripts/database/greptime_flight.py
         mode: 0444
       - source: activity_py
         target: /app/scripts/telemetry/activity.py
@@ -121,8 +145,9 @@ services:
         mode: 0444
     volumes:
       - backup-data:/ops
+      - aggregate-venv:/opt/venv:ro
     working_dir: /app
-    command: ["python", "-m", "scripts.analytics.aggregate"]
+    command: ["/opt/venv/bin/python", "-m", "scripts.analytics.aggregate"]
     restart: unless-stopped
     stop_grace_period: 30s
 
@@ -131,6 +156,8 @@ configs:
     x-source: scripts/database/db_init.py
   aggregate_py:
     x-source: scripts/analytics/aggregate.py
+  greptime_flight_py:
+    x-source: scripts/database/greptime_flight.py
   activity_py:
     x-source: scripts/telemetry/activity.py
   battery_common_py:
@@ -151,3 +178,6 @@ configs:
     x-source: scripts/analytics/battery/battery_runtime.py
   battery_analysis_json:
     content: ${BATTERY_ANALYSIS_CONFIG_JSON:-{}}
+
+volumes:
+  aggregate-venv:

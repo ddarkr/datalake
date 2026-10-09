@@ -13,11 +13,31 @@ Stdlib only. Reads GREPTIME_* connection env plus:
   BATTERY_LOOKBACK_HOURS/BATTERY_MAX_ROWS (empty = fall back to the AGG
   values) and BATTERY_BACKFILL_START/END (both-or-neither explicit older
   recompute range). Battery rides AGG_INTERVAL_SECONDS; no new schedule.
+  AGG_AI_FULL_REBUILD (exact "1"): force the full AI rebuild every pass
+  (explicit recovery/backfill procedure). Incremental discovery is a
+  per-region sequence fence over Arrow Flight DoGet
+  (x-greptime-flow-extensions: return_region_seq + memtable_only +
+  incremental_after_seqs): the pass returns only rows committed after the
+  stored upper watermark and checkpoints the returned upper watermark
+  after derived writes. No timestamp HOLD exists (server DEFAULT stamps
+  predate visibility, so no finite hold is sound). Any fence signal that
+  cannot prove completeness (missing grpc/pyarrow/protobuf, missing or
+  unproved watermarks, STALE_CURSOR below the flushed frontier, digest
+  or revision mismatch, AGG_AI_FULL_REBUILD=1) rebuilds instead of
+  skipping.
 
 Retention policy (fail-closed; DELETE only drops obsolete same-session starts):
-  AI summaries rebuild from the full retained raw range each pass, so there
-  is no mid-window cutoff to partially overwrite. Writes are guarded by the
-  explicit configured OTEL_TTL (empty = unbounded raw retention): a session,
+  AI summaries default to a bounded fenced pass and fall back to the
+  full retained-range rebuild (see docs/ai-incremental.md) whenever the
+  sequence fence is unproved: missing Flight deps/grpc endpoint/state
+  table, STALE_CURSOR below the flushed frontier, generation reset,
+  metric-registry/price-digest or logic revision mismatch, or
+  AGG_AI_FULL_REBUILD=1. Price
+  policy: a changed LiteLLM table digest rebuilds every cost cell (new
+  estimates apply to all retained history); missing estimates stay NULL
+  and unpriced counts are recomputed, never carried forward. The full
+  path below is unchanged: writes stay guarded by the explicit configured
+  OTEL_TTL (empty = unbounded raw retention): a session,
   day, or tool window starting before the raw retention boundary is left
   alone, so raw TTL expiry can never turn a full aggregate into a partial
   one. A late earlier span moves a session's TIME INDEX start, which lands
@@ -27,15 +47,6 @@ Retention policy (fail-closed; DELETE only drops obsolete same-session starts):
   the same row). Same session_id under another client is a different row.
   Daily/tool windows keep stable day keys and overwrite in place; log scans
   start at floor_day so the first written day is fed by full-day data.
-  Vehicle/home SQL pushdowns and trip/charge/log scans use bounded sealed
-  windows only (window end <= sealed now); the open bucket is never written.
-  Re-segmentation may leave superseded trip/charge rows (DELETE is never
-  used there); dashboards order by started_at and take the latest per vehicle.
-
-// ponytail: AI sections re-scan retained spans every pass and trip/charge
-// re-scan AGG_LOOKBACK_HOURS of signals; fine for agent/vehicle scale here.
-// If raw rows routinely hit AGG_MAX_ROWS, tighten lookback or move the sums
-// into SQL pushdown instead of raising the cap.
 
 Idempotent: summary rows share keys with existing rows, so re-running
 overwrites the same (key, time) rows. Missing source tables are skipped
@@ -1891,6 +1902,7 @@ def load_cfg():
     battery_max_rows = env("BATTERY_MAX_ROWS", "").strip() or max_rows
     return {
         "base_url": env("GREPTIME_HTTP_URL", "http://greptimedb:4000"),
+        "grpc_url": env("GREPTIME_GRPC_URL", "").strip(),
         "db": env("GREPTIME_DB", "datalake"),
         "user": env("GREPTIME_USER", "datalake"),
         "password": env("GREPTIME_PASSWORD", ""),
@@ -1898,6 +1910,7 @@ def load_cfg():
         "interval_s": interval_s,
         "max_rows": max_rows,
         "otel_ttl": otel_ttl,
+        "ai_full_rebuild": env("AGG_AI_FULL_REBUILD", "") == "1",
         "home_raw_ttl": home_raw_ttl,
         "battery_lookback_h": battery_lookback_h,
         "battery_max_rows": battery_max_rows,
@@ -1988,6 +2001,17 @@ ACTIVITY_INSTRUMENTS = frozenset({
 ACTIVITY_FIELDS = ACTIVITY_COUNT_FIELDS + ACTIVITY_VALUE_FIELDS
 
 
+def _ai_metric_unit(instrument, meta, value):
+    """Native active-time unit translation (shared oracle + fenced paths)."""
+    if instrument != "claude_code.active_time.total":
+        return value
+    unit = (meta or {}).get("greptime.semantic.metric.unit", "")
+    factor = {"s": 1, "ms": .001, "us": .000001, "ns": .000000001,
+              "min": 60, "h": 3600}.get(unit)
+    # Missing/unsupported units cannot establish seconds.
+    return value * factor if value is not None and factor is not None else None
+
+
 def activity_metric_rows(ctx, cfg):
     """Discover declared OTLP names; Prometheus unit/suffix translation varies.
     Client mapping mirrors activity.py: explicit columns win verbatim,
@@ -2049,14 +2073,298 @@ def activity_metric_rows(ctx, cfg):
     return out
 
 
+AI_LOGIC_REVISION = "ai:fence-v1"
+AI_STATE_SCOPE = "ai"
+AI_STATE_TABLE = "ai_aggregate_state"
+AI_SPAN_SESSION_COLS = (SESSION, "span_attributes.session.id",
+                         "span_attributes.conversation.id", CONV_ID)
+AI_LOG_SESSION_COLS = ("coding_agent.session.id", "session.id",
+                        "conversation.id", "gen_ai.conversation.id")
+
+
+def _ai_quote_ident(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+
+
+def _ai_state_rows(ctx):
+    """Stored (fence, price, revision, input) or None when unusable."""
+    base_url, auth, db = ctx
+    try:
+        _, rows = fetch_rows(base_url, auth, db,
+                             "SELECT fence, price_digest,"
+                             " config_revision, input_digest FROM " + AI_STATE_TABLE +
+                             " WHERE scope = " + str_lit(AI_STATE_SCOPE))
+    except SqlError as e:
+        if is_missing_table(e):
+            return None
+        raise
+    if not rows or not rows[0]:
+        return None
+    return tuple(rows[0][:4])
+
+
+def _ai_metric_tables(ctx, cfg):
+    """[(table, instrument)] backing activity_metric_rows, via catalog."""
+    base_url, auth, db = ctx
+    _ = cfg
+    try:
+        _, catalog = fetch_rows(base_url, auth, db,
+            "SELECT table_name, create_options FROM information_schema.tables"
+            " WHERE table_schema = " + str_lit(db) +
+            " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+    except SqlError:
+        return None
+    out = []
+    for table, options in catalog:
+        meta = dict(part.split("=", 1) for part in (options or "").split() if "=" in part)
+        instrument = meta.get("greptime.semantic.metric.original_name")
+        if instrument not in ACTIVITY_INSTRUMENTS or not isinstance(table, str):
+            continue
+        out.append((table, instrument))
+    return sorted(out)
+
+
+def _ai_price_digest(prices):
+    if prices is None:
+        return "none"
+    material = json.dumps(sorted(
+        (k, [None if v is None else v for v in vals]) for k, vals in prices.items()),
+        sort_keys=True, default=str)
+    return hashlib.sha256(material.encode()).hexdigest()[:32]
+
+AI_FENCE_TABLES = ("opentelemetry_traces", "opentelemetry_logs")
+AI_FENCE_REVISION = AI_LOGIC_REVISION
+
+
+def _ai_flight():
+    """Lazy Flight helper module, or None when its deps are missing."""
+    try:
+        from scripts.database import greptime_flight as flight
+    except ImportError:
+        return None
+    try:
+        if not flight.available():
+            return None
+    except Exception:
+        return None
+    return flight
+
+
+def _ai_parse_fence(text):
+    """Stored fence JSON -> {table: {region: seq}}; None when unusable."""
+    try:
+        data = json.loads(text) if isinstance(text, str) else None
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    out = {}
+    for table, regions in data.items():
+        if not isinstance(table, str) or not table or not isinstance(regions, dict):
+            return None
+        clean = {}
+        for region, seq in regions.items():
+            try:
+                key, val = int(region), int(seq)
+            except (TypeError, ValueError):
+                return None
+            if isinstance(key, bool) or isinstance(val, bool) or val < 0:
+                return None
+            clean[key] = val
+        out[table] = clean
+    return out
+
+
+def _ai_encode_fence(fence):
+    return json.dumps({t: {str(k): v for k, v in sorted(regions.items())}
+                       for t, regions in sorted(fence.items())}, sort_keys=True)
+
+
+def _ai_table_sql(table):
+    cols = SPAN_COLS if table == "opentelemetry_traces" else LOG_COLS
+    return "SELECT " + ", ".join(_ai_quote_ident(c) for c in cols) + " FROM " + table
+
+
+def _ai_fenced_scan(ctx, cfg, fence):
+    """One fenced delta per table. Returns (frames, upper) or raises.
+
+    Frames are (table, cols, rows); upper is {table: {region: seq}} from
+    the drained terminal watermarks. ANY returned region missing from the
+    stored per-table fence (not only the fully-disjoint case) is a
+    generation reset: new/repartitioned/recreated regions may hold
+    already-flushed history the memtable-only bound cannot see, so the
+    caller must fully recover before committing, never assume seq 0.
+    StaleFence propagates for the caller to rebuild; missing endpoint,
+    missing deps, or unproved watermarks raise FlightUnavailable (caller
+    rebuilds explicitly, never skips).
+    """
+    flight = _ai_flight()
+    if flight is None:
+        raise _ai_no_flight()
+    endpoint = (cfg.get("grpc_url") or "").strip()
+    if not endpoint:
+        raise _ai_no_flight()
+    user = cfg.get("user") or ""
+    password = cfg.get("password") or ""
+    db = ctx[2]
+    frames = []
+    upper = {}
+    for table in AI_FENCE_TABLES:
+        lower = (fence or {}).get(table) or None
+        try:
+            cols, rows, marks = flight.flight_query(
+                _ai_table_sql(table), endpoint=endpoint, db=db,
+                user=user, password=password, lower=lower,
+                max_rows=cfg["max_rows"])
+        except Exception as exc:
+            name = type(exc).__name__
+            text = str(exc)
+            if name in ("StaleFence", "FlightUnavailable", "RowCapExceeded",
+                        "FlightError"):
+                raise
+            raise SqlError("ai fence read failed: " + text[:200])
+        if lower:
+            fresh = [r for r in marks if r not in lower]
+            if fresh:
+                raise SqlError("ai fence generation reset on " + table
+                               + ": fresh region needs full recovery")
+        frames.append((table, cols, rows))
+        upper[table] = dict(marks)
+    return frames, upper
+
+
+def _ai_no_flight():
+    try:
+        from scripts.database.greptime_flight import FlightUnavailable
+        return FlightUnavailable("flight deps or grpc endpoint unproved")
+    except ImportError:
+        return SqlError("flight deps unavailable")
+
+
+
+def _ai_session_pred(table, col, values):
+    seen = [];
+    [seen.append(v) for v in values if v and v not in seen]
+    if not seen:
+        raise SqlError("ai incremental: empty dirty session set")
+    if table == "opentelemetry_traces":
+        ors = [" OR ".join(_ai_quote_ident(c) + " = " + str_lit(v)
+                           for c in AI_SPAN_SESSION_COLS) for v in seen]
+        return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in SPAN_COLS) +
+                " FROM " + table + " WHERE " +
+                " OR ".join("(" + o + ")" for o in ors))
+    # GreptimeDB 1.2.1 native JSONB: json_get_string(log_attributes,
+    # '$."dotted.key"'). Verified: '$."session.id"' reads dotted keys.
+    ors = []
+    for v in seen:
+        ors.append(" OR ".join(
+            "json_get_string(log_attributes, '$.\"" +
+            c.replace('"', '""').replace("'", "''") + "\"') = " + str_lit(v)
+            for c in AI_LOG_SESSION_COLS))
+    return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in LOG_COLS) +
+            " FROM " + table + " WHERE " +
+            " OR ".join("(" + o + ")" for o in ors))
+
+
+def _ai_filter_logs(cols, rows, wanted):
+    """Defense-in-depth recheck of SQL-matched log rows (same alias set).
+
+    The session predicate already scope-filters server-side with native
+    json_get_string; this drops any row whose attrs disagree (malformed
+    body polymorphism, non-string values), preserving body/scope/severity.
+    Empty wanted keeps nothing."""
+    if not wanted:
+        return []
+    idx = {c: i for i, c in enumerate(cols)}
+    if "log_attributes" not in idx:
+        return []
+    pos = idx["log_attributes"]
+    out = []
+    for row in rows:
+        attrs = {}
+        if pos < len(row):
+            try:
+                attrs = attrs_of({"log_attributes": row[pos]})
+            except Exception:
+                attrs = {}
+        hit = False
+        for col in AI_LOG_SESSION_COLS:
+            val = attrs.get(col)
+            if isinstance(val, str) and val in wanted:
+                hit = True
+                break
+        if hit:
+            out.append(row)
+    return out
+
+
+def _ai_day_pred(table, cols, day, nxt):
+    names = [];
+    [names.append(c) for c in cols if c not in names]
+    return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in names) +
+            " FROM " + table + " WHERE timestamp >= " + ts_lit(day) +
+            " AND timestamp < " + ts_lit(nxt))
+
+
+def _ai_span_keys(spans):
+    out = set()
+    for s in spans:
+        if s.get("session"):
+            out.add((s.get("client") or "unknown", s["session"]))
+    return out
+
+
+def _ai_ensure_schema(ctx):
+    """Lazy CREATE for the fence checkpoint (Main owns DDL in db_init).
+
+    Only the state table is ensured here; raw ingest_time columns are
+    retired (fence discovery needs no timestamp checkpoint). Returns
+    False when the state table is missing so the caller rebuilds."""
+    base_url, auth, db = ctx
+    try:
+        request_sql(base_url, auth, db,
+                    'CREATE TABLE IF NOT EXISTS "ai_aggregate_state" ('
+                    ' "state_mark" TIMESTAMP(9) NOT NULL TIME INDEX,'
+                    ' "scope" STRING NOT NULL,'
+                    ' "fence" STRING NULL,'
+                    ' "price_digest" STRING NULL,'
+                    ' "config_revision" STRING NULL,'
+                    ' "input_digest" STRING NULL,'
+                    ' "committed_at" TIMESTAMP(9) NOT NULL,'
+                    ' PRIMARY KEY ("scope"))')
+    except SqlError as e:
+        if is_missing_table(e):
+            return False
+        raise
+    for col in ("fence", "price_digest", "config_revision",
+                "input_digest"):
+        try:
+            request_sql(base_url, auth, db,
+                        'ALTER TABLE "ai_aggregate_state" ADD COLUMN IF NOT EXISTS ' +
+                        _ai_quote_ident(col) + " STRING")
+        except SqlError as e:
+            if not is_missing_table(e):
+                raise
+            return False
+    return True
+
+
+
 def ai_section(ctx, cfg):
+    if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
+        return _ai_incremental(ctx, cfg)
+    return _ai_full(ctx, cfg)
+
+
+def _ai_full(ctx, cfg):
     base_url, auth, db = ctx
     ttl = cfg.get("otel_ttl", "")
     cols, rows = guarded_fetch(
         base_url, auth, db,
         "SELECT " + ", ".join('"' + c + '"' for c in SPAN_COLS) +
         " FROM opentelemetry_traces", cfg["max_rows"])
-    spans = dedupe_spans(cols, rows)
     # Native log usage (Codex sse_event completed, Claude api_request) is
     # folded in here so dashboards count real billed calls, not traces-only
     # usage. Same stable (client, session, call) id on both signals bills
@@ -2074,18 +2382,661 @@ def ai_section(ctx, cfg):
             raise
         logs = []
         raw_logs = []
-    billed = billable(spans)
-    merged, _ = merge_native(billed, logs)
-    bset = {id(s) for s in billed}
-    spans = [s for s in spans if id(s) not in bset] + merged
+    spans = _ai_merge(cols, rows, logs)
     now = utcnow()
     bound = retention_boundary(ctx, "otel", ttl, now)
-    total = 0
     # One registry fetch per pass at most (itself daily-cached in memory):
     # aggregation never fails for pricing; None keeps legacy NULLs.
     prices = load_price_table()
+    sessions, activity_days = _ai_compute(spans, cols, rows, raw_logs,
+                                          activity_metric_rows(ctx, cfg), prices)
+    return _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now)
+
+
+def _ai_incremental(ctx, cfg):
+    """Fenced delta pass; any unproved signal -> explicit full rebuild."""
+    base_url, auth, db = ctx
+    _ = (base_url, auth, db)
+    stored = _ai_state_rows(ctx)
+    prices = load_price_table()
+    price_digest = _ai_price_digest(prices)
+    tables = _ai_metric_tables(ctx, cfg)
+    if tables is None:
+        return _ai_full(ctx, cfg)
+    metric_registry = json.dumps(sorted(tables), sort_keys=True,
+                                 default=str)
+    if stored is None:
+        # Cold bootstrap: full oracle, then commit the unfenced upper
+        # fence (zero-input watermarks included) so pass 2 engages.
+        return _ai_fenced_full(ctx, cfg, metric_registry, price_digest,
+                               prices)
+    fence_text, old_price, old_rev, old_input = stored
+    fence = _ai_parse_fence(fence_text) if fence_text else {}
+    if fence_text and fence is None:
+        return _ai_fenced_full(ctx, cfg, metric_registry, price_digest,
+                               prices)
+    if old_price != price_digest or old_rev != AI_FENCE_REVISION:
+        return _ai_fenced_full(ctx, cfg, metric_registry, price_digest,
+                               prices)
+    if old_input is not None and old_input != metric_registry:
+        return _ai_fenced_full(ctx, cfg, metric_registry, price_digest,
+                               prices)
+    try:
+        frames, upper = _ai_fenced_scan(ctx, cfg, fence or None)
+    except Exception as exc:
+        if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
+            return _ai_fenced_full(ctx, cfg, metric_registry, price_digest,
+                                   prices)
+        raise
+    try:
+        metric_rows, upper = _ai_delta_metrics(
+            ctx, cfg, tables, fence or None, upper)
+    except Exception as exc:
+        if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
+            return _ai_fenced_full(ctx, cfg, metric_registry, price_digest,
+                                   prices)
+        raise
+    new_spans, new_logs, rows_by_table = _ai_delta_rows(frames)
+    keys = _ai_span_keys(new_spans)
+    for log in new_logs:
+        if log.get("session"):
+            keys.add((log.get("client") or "unknown", log["session"]))
+    keys |= _ai_metric_keys(metric_rows)
+    # Sessionless rows are valid raw (daily/tool/activity semantics, not
+    # validation errors): seed dirty days from ALL delta timestamps even
+    # when no session key exists. Only a truly row-empty delta no-ops.
+    if not keys and not _ai_delta_days(new_spans, new_logs, metric_rows):
+        _ai_commit_state(ctx, _ai_encode_fence(upper), metric_registry,
+                         price_digest)
+        return 0
+    now = utcnow()
+    bound = retention_boundary(ctx, "otel", cfg.get("otel_ttl", ""), now)
+    sessions, act_days, day_spans, dirty_days = _ai_dirty_recompute(
+        ctx, cfg, keys, prices, metric_rows=metric_rows,
+        delta_rows=rows_by_table)
+    return _ai_write(ctx, cfg, sessions, act_days, day_spans, prices,
+                     bound, now, dirty_days=dirty_days,
+                     commit=(_ai_encode_fence(upper), metric_registry,
+                             price_digest))
+
+
+def _ai_delta_rows(frames):
+    """Fenced frames -> (new_spans, new_logs, rows_by_table)."""
+    rows_by_table = {}
+    new_spans, new_logs = [], []
+    for table, cols, rows in frames:
+        rows_by_table[table] = (cols, rows)
+        fixed = _ai_flight_ns_rows(table, cols, rows)
+        if table == "opentelemetry_traces":
+            new_spans = dedupe_spans(cols, fixed)
+        else:
+            new_logs = dedupe_logs(cols, fixed)
+    return new_spans, new_logs, rows_by_table
+
+
+def _ai_delta_days(new_spans, new_logs, metric_rows):
+    """Dirty days from ALL delta rows (sessionless rows included)."""
+    days = set()
+    for s in new_spans:
+        try:
+            stamp = parse_ts(s.get("ts"))
+            if stamp is not None:
+                days.add(floor_day(stamp))
+        except Exception:
+            pass
+    for log in new_logs:
+        try:
+            stamp = parse_ts(log.get("ts"))
+            if stamp is not None:
+                days.add(floor_day(stamp))
+        except Exception:
+            pass
+    for row in metric_rows or []:
+        try:
+            stamp = (row or {}).get("timestamp")
+            if stamp is not None:
+                days.add(floor_day(stamp))
+        except Exception:
+            pass
+    return days
+
+
+def _ai_flight_ns(value):
+    """Known-ns Flight int -> datetime (microsecond floor, HTTP parity).
+
+    Flight timestamp columns arrive as exact int64 ns. The generic
+    magnitude guesser maps near-epoch ns (e.g. 1000ns) to seconds, so
+    typed fenced rows normalize here: _from_us(ns // 1000), the same
+    microsecond floor the HTTP path applies. Non-int cells pass through
+    to the legacy parsers (backfill ISO strings, datetimes)."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return _from_us(value // 1000)
+    return value
+
+
+def _ai_flight_ns_rows(table, cols, rows):
+    """Normalize known timestamp cells of one fenced frame to datetime."""
+    if table == "opentelemetry_traces":
+        wanted = {"timestamp", "timestamp_end"}
+    elif table == "opentelemetry_logs":
+        wanted = {"timestamp"}
+    else:
+        wanted = {"greptime_timestamp"}
+    idx = {c for c in cols if c in wanted}
+    if not idx:
+        return rows
+    pos = [i for i, c in enumerate(cols) if c in idx]
+    out = []
+    for row in rows:
+        row = list(row)
+        for i in pos:
+            if i < len(row):
+                row[i] = _ai_flight_ns(row[i])
+        out.append(row)
+    return out
+
+
+def _ai_delta_metrics(ctx, cfg, tables, fence, upper):
+    """Per-logical-table fenced metric rows. Returns (rows, metric_upper).
+
+    Each metric logical table carries its own fence (native proof: two
+    logical tables on one physical table expose distinct logical region
+    IDs under one shared physical sequence; lower=2 on the edited table
+    returns the one changed row while the untouched table returns zero
+    rows with its own watermark). Raises on ANY gap: stale fence, fresh
+    logical region absent from the stored map, or transport/row-cap
+    failure. The caller fully recovers before any checkpoint, even when
+    the raw delta is empty; metric-only changes dirty their sessions and
+    reach the same full-history recompute as span/log deltas."""
+    flight = _ai_flight()
+    if flight is None:
+        raise _ai_no_flight()
+    endpoint = (cfg.get("grpc_url") or "").strip()
+    if not endpoint:
+        raise _ai_no_flight()
+    stored = fence or {}
+    fresh_upper = dict(upper or {})
+    out = []
+    metas = _ai_metric_metas(ctx)
+    for table, instrument in tables:
+        lower = stored.get(table) or None
+        meta = (metas or {}).get(table)
+        try:
+            cols, rows, marks = flight.flight_query(
+                'SELECT * FROM "' + table.replace('"', '""') + '"',
+                endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
+                password=cfg.get("password") or "", lower=lower,
+                max_rows=cfg["max_rows"])
+        except Exception as exc:
+            name = type(exc).__name__
+            text = str(exc)
+            if name in ("StaleFence", "FlightUnavailable", "RowCapExceeded",
+                        "FlightError"):
+                raise
+            raise SqlError("ai metric fence read failed: " + text[:200])
+        if lower:
+            fresh = [r for r in marks if r not in lower]
+            if fresh:
+                raise SqlError("ai metric fence generation reset on "
+                               + table + ": fresh region needs full recovery")
+        fresh_upper[table] = dict(marks)
+        for values in rows:
+            norm = _ai_norm_metric_row(dict(zip(cols, values)), instrument,
+                                       meta)
+            if norm is not None:
+                out.append(norm)
+    return out, fresh_upper
+
+
+def _ai_metric_metas(ctx):
+    """{metric table: create_options meta} for unit translation."""
+    base_url, auth, db = ctx
+    try:
+        _, catalog = fetch_rows(base_url, auth, db,
+            "SELECT table_name, create_options FROM information_schema.tables"
+            " WHERE table_schema = " + str_lit(db) +
+            " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+    except SqlError:
+        return None
+    out = {}
+    for table, options in catalog:
+        if isinstance(table, str):
+            out[table] = dict(part.split("=", 1) for part in (options or "").split()
+                              if "=" in part)
+    return out
+
+
+def _ai_metric_keys(metric_rows):
+    """Dirty (client, session) keys from fenced metric rows."""
+    out = set()
+    for row in metric_rows or []:
+        sid = row.get("session_id")
+        if sid:
+            out.add((row.get("client") or "unknown", sid))
+    return out
+
+def _ai_fenced_full(ctx, cfg, metric_registry, price_digest, prices):
+    """Explicit full recovery: unfenced snapshot + upper fence commit."""
+    _ = prices
+    try:
+        _frames, upper = _ai_fenced_scan(ctx, cfg, None)
+    except Exception as exc:
+        if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
+            total = _ai_full(ctx, cfg)
+            _ai_commit_state(ctx, "", metric_registry, price_digest)
+            return total
+        raise
+    try:
+        _mrows, upper = _ai_fenced_metrics_bootstrap(ctx, cfg, upper)
+    except Exception as exc:
+        if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
+            total = _ai_full(ctx, cfg)
+            _ai_commit_state(ctx, "", metric_registry, price_digest)
+            return total
+        raise
+    total = _ai_full(ctx, cfg)
+    _ai_commit_state(ctx, _ai_encode_fence(upper), metric_registry,
+                     price_digest)
+    return total
+
+
+def _ai_fenced_metrics_bootstrap(ctx, cfg, upper):
+    """Unfenced per-metric snapshot for bootstrap/recovery. Never fenced."""
+    flight = _ai_flight()
+    if flight is None:
+        raise _ai_no_flight()
+    endpoint = (cfg.get("grpc_url") or "").strip()
+    if not endpoint:
+        raise _ai_no_flight()
+    tables = _ai_metric_tables(ctx, cfg) or []
+    fresh = dict(upper or {})
+    rows = []
+    for table, _instrument in tables:
+        try:
+            _cols, _rows, marks = flight.flight_query(
+                'SELECT * FROM "' + table.replace('"', '""') + '"',
+                endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
+                password=cfg.get("password") or "", lower=None,
+                max_rows=cfg["max_rows"])
+        except Exception as exc:
+            name = type(exc).__name__
+            text = str(exc)
+            if name in ("StaleFence", "FlightUnavailable", "RowCapExceeded",
+                        "FlightError"):
+                raise
+            raise SqlError("ai metric bootstrap failed: " + text[:200])
+        fresh[table] = dict(marks)
+        rows.extend(_rows)
+    return rows, fresh
+
+
+
+
+
+def _ai_dirty_recompute(ctx, cfg, keys, prices, metric_rows=None,
+                        delta_rows=None):
+    """Refetch dirty sessions' full event history + whole days; recompute."""
+    base_url, auth, db = ctx
+    sids = sorted({sid for _, sid in keys})
+    if sids:
+        scols, srows = guarded_fetch(
+            base_url, auth, db,
+            _ai_session_pred("opentelemetry_traces", None, sids), cfg["max_rows"])
+        try:
+            lcols, lrows = guarded_fetch(
+                base_url, auth, db,
+                _ai_session_pred("opentelemetry_logs", None, sids), cfg["max_rows"])
+        except SqlError as e:
+            if not is_missing_table(e):
+                raise
+            lcols, lrows = list(LOG_COLS), []
+        lrows = _ai_filter_logs(lcols, lrows, set(sids))
+    else:
+        # Sessionless delta (valid daily/tool usage, no session key):
+        # skip the session predicate (empty set is an error there) and
+        # let the dirty-day + cohort scans below supply the rows.
+        scols, srows = list(SPAN_COLS), []
+        lcols, lrows = list(LOG_COLS), []
+    days = set()
+    for cols, rows, is_log in ((scols, srows, False), (lcols, lrows, True)):
+        idx = {c: i for i, c in enumerate(cols)}
+        tpos = idx.get("timestamp")
+        for row in rows:
+            stamp = None
+            if tpos is not None and tpos < len(row):
+                stamp = parse_ts(row[tpos])
+            if stamp is not None:
+                days.add(floor_day(stamp))
+    for row in metric_rows or []:
+        stamp = (row or {}).get("timestamp")
+        try:
+            if stamp is not None:
+                days.add(floor_day(stamp))
+        except Exception:
+            pass
+    if delta_rows:
+        for table in ("opentelemetry_traces", "opentelemetry_logs"):
+            cols, rows = delta_rows.get(table, (None, []))
+            if not cols:
+                continue
+            idx = {c: i for i, c in enumerate(cols)}
+            tpos = idx.get("timestamp")
+            if tpos is None:
+                continue
+            for row in rows or []:
+                try:
+                    stamp = parse_ts(row[tpos]) if tpos < len(row) else None
+                    if stamp is not None:
+                        days.add(floor_day(stamp))
+                except Exception:
+                    pass
+    # Cohort: every session with rows on a dirty day needs its full
+    # cross-day history too (native-over-trace applies per session, not
+    # per day). Discover cohort ids from the dirty-day trace/log scans,
+    # then fetch their complete history before the single global merge.
+    day_trace_rows, day_log_rows = [], []
+    for day in sorted(days):
+        nxt = day + dt.timedelta(days=1)
+        dcols, drows = guarded_fetch(
+            base_url, auth, db,
+            _ai_day_pred("opentelemetry_traces", SPAN_COLS, day, nxt),
+            cfg["max_rows"])
+        try:
+            gcols, grows = guarded_fetch(
+                base_url, auth, db,
+                _ai_day_pred("opentelemetry_logs", LOG_COLS, day, nxt),
+                cfg["max_rows"])
+        except SqlError as e:
+            if not is_missing_table(e):
+                raise
+            gcols, grows = list(LOG_COLS), []
+        day_trace_rows.append((dcols, drows))
+        day_log_rows.append((gcols, grows))
+    cohort = set(sids)
+    for dcols, drows in day_trace_rows:
+        idx = {c: i for i, c in enumerate(dcols)}
+        for col in AI_SPAN_SESSION_COLS:
+            pos = idx.get(col)
+            if pos is None:
+                continue
+            for row in drows:
+                if pos < len(row) and row[pos]:
+                    cohort.add(row[pos])
+    for gcols, grows in day_log_rows:
+        idx = {c: i for i, c in enumerate(gcols)}
+        pos = idx.get("log_attributes")
+        if pos is None:
+            continue
+        for row in grows:
+            try:
+                attrs = attrs_of({"log_attributes": row[pos]}) if pos < len(row) else {}
+            except Exception:
+                attrs = {}
+            for col in AI_LOG_SESSION_COLS:
+                val = attrs.get(col)
+                if isinstance(val, str) and val:
+                    cohort.add(val)
+    if set(cohort) != set(sids):
+        extra = sorted(set(cohort) - set(sids))
+        scols, srows = _ai_union_session_rows(
+            base_url, auth, db, cfg, "opentelemetry_traces", scols, srows,
+            extra)
+        lcols, lrows = _ai_union_session_rows(
+            base_url, auth, db, cfg, "opentelemetry_logs", lcols, lrows,
+            extra)
+        lrows = _ai_filter_logs(lcols, lrows, set(cohort))
+    # Single global merge over the union of session history + dirty-day
+    # rows: per-day remerges overwrite cross-day native matches (an Aug
+    # trace matched to a Sep native log loses its usage when the Aug day
+    # re-merges day-only). Union raw rows first, dedupe once globally.
+    trace_rows = list(srows)
+    for dcols, drows in day_trace_rows:
+        pos = {c: i for i, c in enumerate(dcols)}
+        for row in drows:
+            trace_rows.append([row[pos[c]] if c in pos and pos[c] < len(row) else None
+                               for c in scols])
+    log_rows = list(lrows)
+    for gcols, grows in day_log_rows:
+        pos = {c: i for i, c in enumerate(gcols)}
+        for row in grows:
+            log_rows.append([row[pos[c]] if c in pos and pos[c] < len(row) else None
+                             for c in lcols])
+    logs = dedupe_logs(lcols, log_rows)
+    spans = _ai_merge(scols, trace_rows, logs)
+    day_spans = list(spans)
+    day_raw = [dict(zip(lcols, r)) for r in log_rows]
+    sessions, activity_days = _ai_compute(
+        day_spans, scols, trace_rows, day_raw,
+        _ai_scoped_metrics(ctx, cfg, tables=None, keys=keys,
+                           metric_rows=metric_rows, days=days),
+        prices)
+    kept = {k: v for k, v in sessions.items() if k in keys}
+    return (kept or sessions), activity_days, day_spans, set(days)
+
+
+def _ai_union_session_rows(base_url, auth, db, cfg, table, cols, rows,
+                           extra):
+    """Append full history for cohort session ids to fetched rows."""
+    if not extra:
+        return cols, rows
+    try:
+        ecols, erows = guarded_fetch(
+            base_url, auth, db,
+            _ai_session_pred(table, None, sorted(extra)), cfg["max_rows"])
+    except SqlError as e:
+        if is_missing_table(e) and table == "opentelemetry_logs":
+            return cols, rows
+        raise
+    if table == "opentelemetry_logs":
+        erows = _ai_filter_logs(ecols, erows, set(extra))
+    pos = {c: i for i, c in enumerate(ecols)}
+    out = list(rows)
+    for row in erows:
+        out.append([row[pos[c]] if c in pos and pos[c] < len(row) else None
+                    for c in cols])
+    return cols, out
+
+
+def _ai_metric_where(table, cols, sids, day_list):
+    """Scoped WHERE for one metric table (native columns only).
+
+    Session-id alias columns are per-table (DESCRIBE-driven): only aliases
+    present in cols are used, so no assumed column ever reaches SQL.
+    Day ranges use the native greptime_timestamp column. Returns "" when
+    neither scope applies (caller then reads nothing for this table)."""
+    session_aliases = ("coding_agent_session_id", "session_id",
+                       "conversation_id", "gen_ai_conversation_id")
+    present = [c for c in session_aliases if c in cols]
+    ors = []
+    for sid in sorted(sids):
+        if not sid:
+            continue
+        for col in present:
+            ors.append(_ai_quote_ident(col) + " = " + str_lit(sid))
+    for day in day_list or []:
+        try:
+            nxt = day + dt.timedelta(days=1)
+            ors.append("greptime_timestamp >= " + ts_lit(day) +
+                       " AND greptime_timestamp < " + ts_lit(nxt))
+        except Exception:
+            continue
+    if not ors:
+        return ""
+    return " WHERE " + " OR ".join("(" + o + ")" for o in ors)
+
+
+def _ai_metric_columns(ctx, table):
+    """Native column names of one metric table, or None when unprovable."""
+    base_url, auth, db = ctx
+    try:
+        cols, _rows = fetch_rows(
+            base_url, auth, db,
+            "SELECT column_name FROM information_schema.columns"
+            " WHERE table_schema = " + str_lit(db) +
+            " AND table_name = " + str_lit(table))
+    except SqlError:
+        return None
+    names = [r[0] for r in (_rows or []) if r and isinstance(r[0], str)]
+    return names or None
+
+
+def _ai_scoped_metrics(ctx, cfg, tables=None, keys=None, metric_rows=None,
+                       days=None):
+    """Dirty-scoped metric rows: session history + dirty days, all counters.
+
+    The fenced delta carries only changed rows, but cumulative counters
+    need their session history (prior points difference the deltas) and
+    every dirty day needs ALL its instruments (an untouched counter on a
+    dirty day must survive, not NULL out). Each table is refetched with a
+    native WHERE (session-id aliases present in that table OR dirty-day
+    greptime_timestamp ranges): session/day scoping only -- never an
+    unbounded full-table read, never delta-add. Row-cap failures
+    propagate (no partial commit); Flight gaps propagate to full
+    recovery via the caller (never a hidden oracle fallback inside the
+    committed path)."""
+    if metric_rows is None:
+        return activity_metric_rows(ctx, cfg)
+    if not keys and not days:
+        return list(metric_rows)
+    sids = {sid for _, sid in (keys or set()) if sid}
+    day_set = set(days or [])
+    for row in metric_rows or []:
+        stamp = (row or {}).get("timestamp")
+        try:
+            if stamp is not None:
+                day_set.add(floor_day(stamp))
+        except Exception:
+            pass
+    day_list = sorted(day_set)
+    flight = _ai_flight()
+    endpoint = (cfg.get("grpc_url") or "").strip() if flight else ""
+    if not flight or not endpoint:
+        raise _ai_no_flight()
+    scoped = list(metric_rows)
+    seen = set()
+    for row in scoped:
+        seen.add((row.get("instrument"), row.get("client"),
+                  row.get("session_id"), str(row.get("timestamp")),
+                  str(row.get("value")), str(row.get("stream"))))
+    tables = _ai_metric_tables(ctx, cfg) or []
+    metas = _ai_metric_metas(ctx)
+    for table, instrument in tables:
+        cols = _ai_metric_columns(ctx, table)
+        if cols is None:
+            raise SqlError("ai metric columns unprovable for " + table)
+        where = _ai_metric_where(table, cols, sids, day_list)
+        if not where:
+            continue
+        cols, rows, _marks = flight.flight_query(
+            'SELECT * FROM "' + table.replace('"', '""') + '"' + where,
+            endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
+            password=cfg.get("password") or "", lower=None,
+            max_rows=cfg["max_rows"])
+        for values in rows:
+            raw = dict(zip(cols, values))
+            norm = _ai_norm_metric_row(raw, instrument,
+                                       (metas or {}).get(table))
+            if norm is None:
+                continue
+            sid = norm.get("session_id")
+            stamp = norm.get("timestamp")
+            try:
+                day = floor_day(stamp) if stamp is not None else None
+            except Exception:
+                day = None
+            if sid not in sids and day not in day_list:
+                continue
+            key = (norm.get("instrument"), norm.get("client"),
+                   norm.get("session_id"), str(norm.get("timestamp")),
+                   str(norm.get("value")), str(norm.get("stream")))
+            if key in seen:
+                continue
+            seen.add(key)
+            scoped.append(norm)
+    return scoped
+
+
+def _ai_norm_metric_row(row, instrument, meta=None):
+    """Normalize one raw metric row dict (shared delta + scoped paths)."""
+    explicit = row.get("coding_agent_client") or row.get("client")
+    service = row.get("service_name")
+    if explicit:
+        client = explicit
+    elif str(instrument).startswith(_CODEX_PREFIX):
+        client = "codex"
+    elif service in _NATIVE_SERVICE_CLIENTS:
+        client = _NATIVE_SERVICE_CLIENTS[service]
+    else:
+        client = "unknown"
+    stamp = _ai_flight_ns(row.get("greptime_timestamp"))
+    if not isinstance(stamp, dt.datetime):
+        stamp = parse_ts(stamp)
+    return {
+        "instrument": instrument, "client": client,
+        "client_explicit": bool(explicit),
+        "session_id": row.get("coding_agent_session_id") or row.get("session_id")
+            or row.get("conversation_id") or row.get("gen_ai_conversation_id"),
+        "timestamp": stamp,
+        "value": _ai_metric_unit(instrument, meta, row.get("greptime_value")),
+        "temporality": to_int(row.get("datalake_temporality")),
+        "start_ns": to_int(row.get("datalake_start_time_unix_nano")),
+        "type": row.get("type"), "decision": row.get("decision"),
+        "tool_name": row.get("tool_name") or row.get("gen_ai_tool_name"),
+        "coding_agent.repository.id": row.get("coding_agent_repository_id"),
+        "vcs.ref.head.name": row.get("vcs_ref_head_name"),
+        "stream": tuple(sorted((k, v) for k, v in row.items()
+                               if k not in ("greptime_timestamp",
+                                            "greptime_value",
+                                            "datalake_temporality",
+                                            "datalake_start_time_unix_nano"))),
+    }
+
+
+def _ai_day_of(row):
+    stamp = parse_ts(row.get("ts"))
+    return floor_day(stamp) if stamp is not None else None
+
+
+def _ai_day_of_raw(row):
+    stamp = parse_ts(row.get("timestamp"))
+    return floor_day(stamp) if stamp is not None else None
+
+
+
+def _ai_span_identity(s):
+    """Stable union identity mirroring dedupe_logs namespaces.
+
+    Span rows (trace/span present) key on ("span", trace, span). Merged
+    native rows carry trace/span None, so key on the native stable id:
+    ("native", billed_source/client, session, call id) when a call id
+    exists, ("native", client, tool, ts, session) otherwise. Two copies
+    of one redelivered native call share the id, so the day-union carry
+    never double-bills; distinct calls/sessions never collide."""
+    trace, span = s.get("trace"), s.get("span")
+    if trace is not None and span is not None:
+        return ("span", trace, span)
+    call = s.get("call_id")
+    if call:
+        return ("native", s.get("billed_source"), s.get("client"),
+                s.get("session"), call)
+    return ("native", s.get("client"), s.get("tool"), s.get("ts"),
+            s.get("session"))
+
+
+def _ai_merge(cols, rows, logs):
+    spans = dedupe_spans(cols, rows)
+    billed = billable(spans)
+    merged, _ = merge_native(billed, logs)
+    bset = {id(s) for s in billed}
+    return [s for s in spans if id(s) not in bset] + merged
+
+
+def _ai_compute(spans, cols, rows, raw_logs, metric_rows, prices):
+    """(sessions, activity_days): same merge of span + activity summaries."""
     activity_sessions, activity_days = summarize_activity(
-        [dict(zip(cols, row)) for row in rows], raw_logs, activity_metric_rows(ctx, cfg))
+        [dict(zip(cols, row)) for row in rows], raw_logs, metric_rows)
     sessions = {(s["client"], s["session_id"]): s for s in summarize_sessions(spans, prices)}
     for key, activity in activity_sessions.items():
         s = sessions.setdefault(key, {"client": key[0], "session_id": key[1]})
@@ -2100,6 +3051,25 @@ def ai_section(ctx, cfg):
         s.update({field: activity.get(field) for field in ACTIVITY_FIELDS})
         s.update({field: activity.get(field) for field in (
             "repo", "branch", "outcome", "activity_sources")})
+    return sessions, activity_days
+
+
+def _ai_commit_state(ctx, fence_text, metric_registry, price_digest):
+    base_url, auth, db = ctx
+    insert_rows(base_url, auth, db, AI_STATE_TABLE,
+                ["state_mark", "scope", "fence", "price_digest",
+                 "config_revision", "input_digest", "committed_at"],
+                [[ts_lit(dt.datetime(1970, 1, 1)), str_lit(AI_STATE_SCOPE),
+                  str_lit(fence_text), str_lit(price_digest),
+                  str_lit(AI_FENCE_REVISION), str_lit(metric_registry),
+                  ts_lit(utcnow())]])
+
+
+def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
+              commit=None, dirty_days=None):
+    base_url, auth, db = ctx
+    ttl = cfg.get("otel_ttl", "")
+    total = 0
     _, old_rows = guarded_fetch(base_url, auth, db,
         "SELECT client, session_id, session_start FROM ai_session_summary", cfg["max_rows"])
     expired = {(client, sid) for client, sid, start in old_rows
@@ -2143,6 +3113,8 @@ def ai_section(ctx, cfg):
     activity_cols = ["day_start", "client"] + list(ACTIVITY_FIELDS) + ["activity_sources"]
     activity_rows = []
     for day in activity_days:
+        if dirty_days is not None and day["day_start"] not in dirty_days:
+            continue
         if bound and day["day_start"] < bound:
             continue
         activity_rows.append([ts_lit(day["day_start"]), str_lit(day["client"])] +
@@ -2159,6 +3131,8 @@ def ai_section(ctx, cfg):
                      "llm_spans", "tool_calls", "active_sessions", "error_count"]
     daily_rows = []
     for d in summarize_daily(spans, prices):
+        if dirty_days is not None and d["day"] not in dirty_days:
+            continue
         if bound and d["day"] < bound:
             continue  # partly expired day: keep the old row
         daily_rows.append([ts_lit(d["day"]), str_lit(d["client"]), str_lit(d["provider"]),
@@ -2176,6 +3150,8 @@ def ai_section(ctx, cfg):
     tool_cols = ["day_start", "tool_name", "client", "calls", "errors", "avg_duration_ms"]
     tool_rows = []
     for t in summarize_tools(spans):
+        if dirty_days is not None and t["day"] not in dirty_days:
+            continue
         if bound and t["day"] < bound:
             continue  # partly expired day: keep the old row
         tool_rows.append([ts_lit(t["day"]), str_lit(t["tool"]), str_lit(t["client"]),
@@ -2184,6 +3160,8 @@ def ai_section(ctx, cfg):
         insert_rows(base_url, auth, db, "ai_tool_daily",
                     tool_cols, tool_rows)
         total += len(tool_rows)
+    if commit is not None:
+        _ai_commit_state(ctx, commit[0], commit[1], commit[2])
     return total
 
 
