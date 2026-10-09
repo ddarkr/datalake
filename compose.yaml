@@ -100,7 +100,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '18'
+      datalake.aggregate-revision: '19'
     depends_on:
       greptimedb:
         condition: service_started
@@ -296,7 +296,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.dashboard-revision: '18'
+      datalake.dashboard-revision: '19'
     depends_on:
       db-schema:
         condition: service_completed_successfully
@@ -8959,9 +8959,11 @@ configs:
             ``module_temp_calibration`` (high exposure and conditioning join
             use Max, low exposure uses Min, terminal extrema map each field
             point-wise ``raw * scale + offset``). Latest-value outputs are
-            terminal: when the newest timestamp for a field is
-            invalid/conflicting (a terminal tombstone), latest raw/ID rows
-            and the calibrated terminal extrema report unavailable with an
+            terminal: every member at the newest timestamp for a field must
+            be measurable with a consistent unit, otherwise latest raw/ID
+            rows and the calibrated terminal extrema report unavailable
+            (terminal tombstone for any unmeasurable member, terminal
+            conflict for disagreeing or mixed-unit siblings) with an
             explicit reason and no older value is resurrected as current;
             a wrong-unit newest extrema row also fails closed. Calibrated
             extrema carry the observation timestamp as the energy-module UTC
@@ -9015,7 +9017,7 @@ configs:
       from scripts.analytics.battery import battery_common as bc
 
 
-      ALGORITHM_VERSION = "1.3.0"
+      ALGORITHM_VERSION = "1.3.1"
       ANALYSIS_ID = "battery_conditions"
 
       BRICK_MAX_FIELD = "BrickVoltageMax"
@@ -9702,11 +9704,15 @@ configs:
           """Terminal state of one field: ("ok", rep) | ("tombstone", None) |
           ("conflict", None) | ("empty", None).
 
-          The newest timestamp decides: a terminal invalid/unmeasurable group
-          is a tombstone and a terminal conflicting group is a conflict, even
-          when older valid samples exist (no resurrection of stale values as
-          current). Identity use is stricter than raw preservation: raw rows
-          keep reported IDs, but ID matching/slopes/persistence use
+          The newest timestamp decides: every member at that timestamp must
+          be measurable (non-None finite value_num with valid quality) and
+          carry a consistent unit, otherwise no canonically-first member may
+          mask an invalid or wrong-unit sibling. A terminal group with any
+          unmeasurable member is a tombstone; a terminal group whose members
+          disagree on payload or unit is a conflict, even when older valid
+          samples exist (no resurrection of stale values as current).
+          Identity use is stricter than raw preservation: raw rows keep
+          reported IDs, but ID matching/slopes/persistence use
           ``_valid_id`` (positive integers; NumBrick IDs are official
           1-indexed) and treat fractional/zero/negative IDs as barriers.
           """
@@ -9720,12 +9726,14 @@ configs:
           members = groups[latest]
           if len({_payload(r) for r in members}) != 1:
               return ("conflict", None)
-          rep = members[0]
-          if rep.get("value_num") is None \
-                  or not bc.is_valid_quality(rep.get("quality")) \
-                  or _finite(rep.get("value_num")) is None:
-              return ("tombstone", None)
-          return ("ok", rep)
+          for member in members:
+              if member.get("value_num") is None \
+                      or not bc.is_valid_quality(member.get("quality")) \
+                      or _finite(member.get("value_num")) is None:
+                  return ("tombstone", None)
+          if len({member.get("unit") for member in members}) != 1:
+              return ("conflict", None)
+          return ("ok", members[0])
 
 
       def _valid_id(value, field):
@@ -19610,7 +19618,7 @@ configs:
       ]}
   grafana-dash-home:
     content: |
-      {"uid":"datalake-home","title":"홈","tags":["datalake","home"],"timezone":"Asia/Seoul","schemaVersion":39,"version":3,"time":{"from":"now-24h","to":"now"},"panels":[
+      {"uid":"datalake-home-overview","title":"홈","tags":["datalake","home"],"timezone":"Asia/Seoul","schemaVersion":39,"version":3,"time":{"from":"now-24h","to":"now"},"panels":[
       {"id":1,"type":"text","title":"홈 데이터 출처","fieldConfig":{"defaults":{},"overrides":[]},"options":{"content":"HOME_AGG_SOURCES를 `테이블/시각컬럼/주체컬럼/값컬럼` 매핑의 JSON 목록으로 두면 HA와 MQTT 요약을 동시에 만듭니다. 각 출처는 `테이블.값컬럼`입니다. 원시 TTL은 설정된 테이블 전체에 적용되므로 장기 요약이 필요한 필드는 빠짐없이 넣으세요. 늘린 TTL로는 만료된 기록을 되살릴 수 없습니다. mqtt_consumer 프로토콜 컬럼은 부트스트랩 때 만들고, 숫자 페이로드 컬럼은 실제 입력이 들어오면 생깁니다. MQTT는 최소 1회 전달이므로 재시작 복구에는 발행자 QoS1, 브로커 영속화, 고정 클라이언트 ID가 필요하며 중복이 생길 수 있습니다.","mode":"markdown"},"gridPos":{"h":4,"w":24,"x":0,"y":0}},
       {"id":2,"type":"stat","title":"mqtt_consumer 행 수 (선택 기간)","description":"관측된 MQTT 수신만 보며, 입력이 없으면 기록 없음이지 정상 게시자나 측정된 0이 아닙니다.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT NULLIF(COUNT(*), 0) AS rows FROM mqtt_consumer WHERE $$__timeFilter(greptime_timestamp)","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true,"queryText":"SELECT NULLIF(COUNT(*), 0) AS rows FROM mqtt_consumer WHERE $$__timeFilter(greptime_timestamp)"}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"rows"},"properties":[{"id":"displayName","value":"저장 행"}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":12,"x":0,"y":4}},
       {"id":3,"type":"table","title":"최근 MQTT 수신","description":"프로토콜 정보만 보이며, JSON 값 필드는 토픽마다 다릅니다. 숫자 값은 아래 설정된 홈 요약에서 보고, 원시 페이로드 필드는 mqtt_consumer에 그대로 있습니다.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT CAST(greptime_timestamp AS TIMESTAMP(6)) AS event_time, topic, host FROM mqtt_consumer WHERE $$__timeFilter(greptime_timestamp) ORDER BY greptime_timestamp DESC LIMIT 200","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true,"queryText":"SELECT CAST(greptime_timestamp AS TIMESTAMP(6)) AS event_time, topic, host FROM mqtt_consumer WHERE $$__timeFilter(greptime_timestamp) ORDER BY greptime_timestamp DESC LIMIT 200"}],"fieldConfig":{"defaults":{},"overrides":[{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"host"},"properties":[{"id":"displayName","value":"수집 호스트"}]},{"matcher":{"id":"byName","options":"topic"},"properties":[{"id":"displayName","value":"토픽"}]}]},"options":{"showHeader":true},"gridPos":{"h":8,"w":12,"x":12,"y":4}},
@@ -33173,20 +33181,19 @@ configs:
           def flush_once(self, greptime, limit=20000, max_body_bytes=None):
               """Send one fitting ordered prefix; dirty-notify after full ACK, delete only then."""
               budget = getattr(greptime, "max_body_bytes", DEFAULT_MAX_BODY_BYTES) if max_body_bytes is None else max_body_bytes
-              prefix = "sql=" + urllib.parse.quote_plus(_SQL_PREFIX, safe="", encoding="utf-8", errors="strict")
-              total = len(prefix.encode("ascii"))
-              chosen, count, texts = [], 0, []
+              total = len(_FORM_PREFIX_BYTES)
+              chosen, count, encoded = [], 0, []
               with self.connect() as conn:
                   for record in conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)):
                       canonical = record["row_json"]
                       row = json.loads(canonical)
-                      cell = _render_cell(row)
-                      addition = _urlencoded_len(cell) + (0 if count == 0 else _COMMA_ENCODED_LEN)
+                      cell_enc = _encode_cell(_render_cell(row))
+                      addition = len(cell_enc) + (0 if count == 0 else _COMMA_ENCODED_LEN)
                       if total + addition > budget:
                           break
                       total += addition
                       chosen.append((record["id"], canonical, row))
-                      texts.append(cell)
+                      encoded.append(cell_enc)
                       count += 1
                       if count >= limit:
                           break
@@ -33294,7 +33301,9 @@ configs:
 
       DEFAULT_MAX_BODY_BYTES = 4 * 1024 * 1024
       _SQL_PREFIX = 'INSERT INTO "vehicle_signal" (' + ",".join('"' + c + '"' for c in COLUMNS) + ") VALUES "
-      _COMMA_ENCODED_LEN = len(urllib.parse.quote_plus(",", safe="", encoding="utf-8", errors="strict").encode("ascii"))
+      _COMMA_ENCODED = urllib.parse.quote_plus(",", safe="", encoding="utf-8", errors="strict").encode("ascii")
+      _COMMA_ENCODED_LEN = len(_COMMA_ENCODED)
+      _FORM_PREFIX_BYTES = b"sql=" + urllib.parse.quote_plus(_SQL_PREFIX, safe="", encoding="utf-8", errors="strict").encode("ascii")
 
 
       def _literal(field, value):
@@ -33530,21 +33539,6 @@ configs:
                       pass
                   self._slots.release()
 
-          def finish_request(self, request, client_address):
-              # A whole-request deadline also bounds clients trickling headers/body.
-              def expire():
-                  try:
-                      request.shutdown(socket.SHUT_RDWR)
-                  except OSError:
-                      pass
-              deadline = threading.Timer(self.read_timeout, expire)
-              deadline.daemon = True
-              deadline.start()
-              try:
-                  self.RequestHandlerClass(request, client_address, self)
-              finally:
-                  deadline.cancel()
-
           def server_close(self):
               self._shutdown.set()
               super().server_close()
@@ -33559,8 +33553,49 @@ configs:
           protocol_version = "HTTP/1.1"
 
           def setup(self):
+              self._deadline_lock = threading.Lock()
+              self._deadline_token = None
               self.request.settimeout(self.server.read_timeout)
               super().setup()
+
+          def handle_one_request(self):
+              # Absolute per-request deadline: socket timeout alone can be postponed
+              # indefinitely by trickled bytes, so a timer bounds the whole request.
+              # Token check and socket shutdown run atomically under the
+              # handler-local lock so a preempted timer N cannot close request N+1;
+              # cancel stays outside the lock so it never waits on a callback.
+              token = object()
+              expired = False
+              with self._deadline_lock:
+                  self._deadline_token = token
+
+              def expire():
+                  nonlocal expired
+                  with self._deadline_lock:
+                      if self._deadline_token is not token:
+                          return
+                      expired = True
+                      # Expired request must not keep the connection (and its slot)
+                      # alive for buffered pipelined requests after the shutdown.
+                      self.close_connection = True
+                      try:
+                          self.request.shutdown(socket.SHUT_RDWR)
+                      except OSError:
+                          pass
+              deadline = threading.Timer(self.server.read_timeout, expire)
+              deadline.daemon = True
+              deadline.start()
+              try:
+                  super().handle_one_request()
+              finally:
+                  with self._deadline_lock:
+                      if self._deadline_token is token:
+                          self._deadline_token = None
+                          if expired:
+                              # A success reply racing the shutdown reopens
+                              # keep-alive; re-assert the expiry close after it.
+                              self.close_connection = True
+                  deadline.cancel()
 
           def log_message(self, *args):
               pass

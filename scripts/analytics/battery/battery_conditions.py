@@ -52,9 +52,11 @@ Config contract (config is a plain dict):
       ``module_temp_calibration`` (high exposure and conditioning join
       use Max, low exposure uses Min, terminal extrema map each field
       point-wise ``raw * scale + offset``). Latest-value outputs are
-      terminal: when the newest timestamp for a field is
-      invalid/conflicting (a terminal tombstone), latest raw/ID rows
-      and the calibrated terminal extrema report unavailable with an
+      terminal: every member at the newest timestamp for a field must
+      be measurable with a consistent unit, otherwise latest raw/ID
+      rows and the calibrated terminal extrema report unavailable
+      (terminal tombstone for any unmeasurable member, terminal
+      conflict for disagreeing or mixed-unit siblings) with an
       explicit reason and no older value is resurrected as current;
       a wrong-unit newest extrema row also fails closed. Calibrated
       extrema carry the observation timestamp as the energy-module UTC
@@ -108,7 +110,7 @@ from datetime import datetime, timezone
 from scripts.analytics.battery import battery_common as bc
 
 
-ALGORITHM_VERSION = "1.3.0"
+ALGORITHM_VERSION = "1.3.1"
 ANALYSIS_ID = "battery_conditions"
 
 BRICK_MAX_FIELD = "BrickVoltageMax"
@@ -795,11 +797,15 @@ def _latest_state(ordered, field):
     """Terminal state of one field: ("ok", rep) | ("tombstone", None) |
     ("conflict", None) | ("empty", None).
 
-    The newest timestamp decides: a terminal invalid/unmeasurable group
-    is a tombstone and a terminal conflicting group is a conflict, even
-    when older valid samples exist (no resurrection of stale values as
-    current). Identity use is stricter than raw preservation: raw rows
-    keep reported IDs, but ID matching/slopes/persistence use
+    The newest timestamp decides: every member at that timestamp must
+    be measurable (non-None finite value_num with valid quality) and
+    carry a consistent unit, otherwise no canonically-first member may
+    mask an invalid or wrong-unit sibling. A terminal group with any
+    unmeasurable member is a tombstone; a terminal group whose members
+    disagree on payload or unit is a conflict, even when older valid
+    samples exist (no resurrection of stale values as current).
+    Identity use is stricter than raw preservation: raw rows keep
+    reported IDs, but ID matching/slopes/persistence use
     ``_valid_id`` (positive integers; NumBrick IDs are official
     1-indexed) and treat fractional/zero/negative IDs as barriers.
     """
@@ -813,12 +819,14 @@ def _latest_state(ordered, field):
     members = groups[latest]
     if len({_payload(r) for r in members}) != 1:
         return ("conflict", None)
-    rep = members[0]
-    if rep.get("value_num") is None \
-            or not bc.is_valid_quality(rep.get("quality")) \
-            or _finite(rep.get("value_num")) is None:
-        return ("tombstone", None)
-    return ("ok", rep)
+    for member in members:
+        if member.get("value_num") is None \
+                or not bc.is_valid_quality(member.get("quality")) \
+                or _finite(member.get("value_num")) is None:
+            return ("tombstone", None)
+    if len({member.get("unit") for member in members}) != 1:
+        return ("conflict", None)
+    return ("ok", members[0])
 
 
 def _valid_id(value, field):
