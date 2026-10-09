@@ -137,3 +137,14 @@ t.test_retention_refuses_active_reader_and_concurrent_backup()
 print("retention resume smoke: ok")
 EOF
 ```
+
+## 이슈 #6 재검증
+
+기존 구현을 변경하지 않고 `python3 -m tests.test_backup`과
+`python3 tools/benchmark_backup_retention.py --baseline-root <현재 변경 전 checkout>`
+을 실행했습니다. 격리된 counting-fake에서 동일 데이터 2회·소량 변경·대량
+변경의 백업을 만들고, 최신·가장 오래된 보존·pin 세대를 빈 대상에 복원해
+파일과 SST SHA-256이 모두 일치했습니다. dry-run의 삭제 예상 9,474 bytes는
+실제 저장량 감소(366,524 → 357,050 bytes)와 같았습니다.
+이는 기존 보존 구현의 재검증이며 새로운 복사 I/O 개선이나 실제 S3 공급자,
+운영 bucket 삭제·복구 검증이 아닙니다.
