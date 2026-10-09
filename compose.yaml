@@ -938,7 +938,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '12'
+      datalake.can-receiver-revision: '13'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -962,7 +962,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '12'
+      datalake.can-receiver-revision: '13'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -32965,40 +32965,68 @@ configs:
               # Merge a bounded prefix while reading, then release the snapshot before
               # decoding. Unpaged heads remain in the heap: exhausting a page or the
               # byte budget must never let a later session bypass the earliest chunk.
+              # Cold pages are demand-sized: fair share of the remaining prefix need
+              # across frontier sessions lacking a buffered run (at most
+              # DECODE_PAGE_ROWS), so interleaved round-robin fetches ~need/frontier
+              # rows per session instead of 64 each and stops the repeated
+              # 1000-read/16-commit waste; a lone contiguous session still gets full
+              # 64-row pages. Buffered (hot) runs are reused without new queries.
+              stats = {"fetched_chunks": 0, "fetched_bytes": 0, "prefix_chunks": 0,
+                       "staged_chunks": 0, "read_queries": 0}
+              self._decode_prefetch_stats = stats
+              has_more = False
               with self.connect() as conn:
                   conn.execute("BEGIN")
+                  stats["read_queries"] += 1
                   heap = [(head["id"], head["session"], head["seq"]) for head in
                           conn.execute(candidate_sql(), (decoder.epoch, decoder.epoch))]
                   heapq.heapify(heap)
                   pages, anchors, partials, metadata = {}, {}, {}, {}
                   prefix = []
                   prefetched_bytes = fetched_rows = 0
+                  # Incremental count of heap heads without a buffered run: every
+                  # seed head starts cold (no pages yet); pop/push transitions keep
+                  # it exact in O(1), instead of rescanning the heap per fetch.
+                  cold = len(heap)
                   while heap and len(prefix) < prefetch_limit:
                       _, session, want = heapq.heappop(heap)
                       run = pages.get(session)
                       if not run:
-                          if fetched_rows >= prefetch_limit or prefetched_bytes >= DECODE_PREFETCH_BYTES:
+                          cold -= 1
+                          if prefetched_bytes >= DECODE_PREFETCH_BYTES:
+                              has_more = True
+                              cold += 1
+                              break
+                          if fetched_rows >= prefetch_limit:
+                              cold += 1
                               break
                           run = deque()
+                          need = prefetch_limit - len(prefix)
+                          fetch_rows = min(DECODE_PAGE_ROWS, max(1, -(-need // (cold + 1))))
+                          stats["read_queries"] += 1
                           with contextlib.closing(conn.execute(
                               "SELECT c.id,c.session,c.seq,c.offset_ns,c.phase,c.data,s.meta_json "
                               "FROM raw_chunks c JOIN sessions s ON s.id=c.session "
                               "WHERE c.session=? AND c.seq>=? ORDER BY c.seq LIMIT ?",
-                              (session, want, min(DECODE_PAGE_ROWS, prefetch_limit - fetched_rows)),
+                              (session, want, min(fetch_rows, prefetch_limit - fetched_rows)),
                           )) as cursor:
                               for row in cursor:
                                   if row["seq"] != want + len(run):
                                       break
                                   if prefetched_bytes + len(row["data"]) > DECODE_PREFETCH_BYTES:
+                                      has_more = True
                                       break
                                   run.append(row)
                                   prefetched_bytes += len(row["data"])
                                   fetched_rows += 1
                           if not run:
+                              has_more = True
+                              cold += 1
                               break
                           pages[session] = run
                           if session not in anchors:
                               metadata[session] = json.loads(run[0]["meta_json"])
+                              stats["read_queries"] += 2
                               anchors[session] = conn.execute(
                                   "SELECT next_seq,state_json,counts_json,rows FROM decode_states "
                                   "WHERE session=? AND epoch=?", (session, decoder.epoch),
@@ -33014,12 +33042,22 @@ configs:
                       if run:
                           next_head = run[0]
                       else:
+                          stats["read_queries"] += 1
                           next_head = conn.execute(
                               "SELECT id,seq FROM raw_chunks WHERE session=? AND seq=?",
                               (session, raw["seq"] + 1),
                           ).fetchone()
                       if next_head is not None:
                           heapq.heappush(heap, (next_head["id"], session, next_head["seq"]))
+                          if not pages.get(session):
+                              cold += 1
+                  # Read-side cap only: a full window consumed with heap/buffered rows
+                  # left is normal steady state (more pending work), not waste, so it
+                  # must still allow window growth below.
+                  stats["prefix_chunks"] = len(prefix)
+                  stats["fetched_chunks"] = fetched_rows
+                  stats["fetched_bytes"] = prefetched_bytes
+                  stats["staged_chunks"] = 0
               # Only the prefix is needed now; discard speculative page rows before
               # allocating decoded rows. Raw bytes are capped at 1MiB, fetched chunks
               # at `limit`, with at most one transient wire-capped row during reading.
@@ -33028,6 +33066,8 @@ configs:
               staged = []
               emitted_rows = 0
               if not prefix:
+                  if limit >= window and (has_more or fetched_rows):
+                      self._decode_prefetch_limit = 1
                   return 0
               self.reserve()
               for raw in prefix:
@@ -33071,6 +33111,8 @@ configs:
                   if not done or emitted_rows >= DECODE_ROW_BUDGET or time.monotonic() >= deadline:
                       break
               if not staged:
+                  if limit >= window and (has_more or fetched_rows):
+                      self._decode_prefetch_limit = 1
                   return 0
               for _, _, work in staged:
                   work["canonicals"] = [_json(row) for row in work["rows"]]
@@ -33150,13 +33192,13 @@ configs:
                       _reconcile_pending_session(conn, decoder.epoch, session)
                   _meta_set(conn, "last_decode_ns", time.time_ns())
                   conn.commit()
-              # A deadline/row-budget stop leaves speculative rows unused. Match the
-              # next read to actual progress; grow again after consuming a full window.
-              # This is an in-memory hint only: rollback/restart cannot move cursors.
+              # Train only after a durable commit; fetched-but-unstaged pages are waste
+              # even when the entire shortened prefix committed. The hint is nondurable.
+              stats["staged_chunks"] = len(staged)
               if limit >= window:
-                  if len(staged) < len(prefix):
+                  if len(staged) < len(prefix) or has_more or fetched_rows > len(staged):
                       self._decode_prefetch_limit = max(1, len(staged))
-                  elif len(prefix) == prefetch_limit and staged[-1][2]["done"] and emitted_rows < DECODE_ROW_BUDGET:
+                  elif staged[-1][2]["done"] and emitted_rows < DECODE_ROW_BUDGET:
                       self._decode_prefetch_limit = min(limit, window * 2)
               return len(staged)
 
