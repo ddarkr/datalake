@@ -81,6 +81,7 @@ def _battery_query(configs, panel_id):
             .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
             .replace("$__unixEpochTo()", "2000").replace("$__unixEpochFrom()", "1000")
             .replace("${vehicle:sqlstring}", "''").replace("${source:sqlstring}", "''")
+            .replace("${vehicle_ids:sqlstring}", "''")
             .replace("${epoch:sqlstring}", "''").replace("${status:sqlstring}", "''")
             .replace("${metric:sqlstring}", "'battery.electrical.soc_ekf_pct'"))
 
@@ -348,6 +349,7 @@ def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
             .replace("$__timeFilter(event_time)", f"event_time BETWEEN {start} AND {end}")
             .replace("$__unixEpochTo()", str(end))
             .replace("${vehicle:sqlstring}", "''")
+            .replace("${vehicle_ids:sqlstring}", "''")
             .replace("${source:sqlstring}", "''")
             .replace("${epoch:sqlstring}", "''"))
 
@@ -533,10 +535,12 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     variables = {v["name"]: v for v in dashboard["templating"]["list"]}
     panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
+    raw_ids_sql = "'demo-car'"
 
     def query(sql, source=""):
         return (sql.replace("$$", "$")
                 .replace("${vehicle:sqlstring}", "'demo-car'")
+                .replace("${vehicle_ids:sqlstring}", raw_ids_sql)
                 .replace("${source:sqlstring}", repr(source))
                 .replace("${epoch:sqlstring}", "''")
                 .replace("$__timeFilter(window_start)", "window_start BETWEEN 1000 AND 2000")
@@ -560,6 +564,15 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
                         ?, 'battery_energy', 'r1', 1.0, 'kWh', 'derived', ?, 10)""",
                        (vehicle, source, epoch))
         assert [r[0] for r in db.execute(variables["vehicle"]["query"])] == ["demo-car", "demo-other"]
+        raw_ids = [r[0] for r in db.execute(query(variables["vehicle_ids"]["query"]))]
+        assert set(raw_ids) == {"demo-car", "demo-can", "demo-fleet"}
+        raw_ids_sql = ", ".join(repr(v) for v in raw_ids)
+        unmapped = variables["vehicle_ids"]["query"].replace("$$", "$").replace(
+            "${vehicle:sqlstring}", "'demo-other'")
+        assert [r[0] for r in db.execute(unmapped)] == ["demo-other"]
+        db.execute("INSERT INTO vehicle_identity VALUES (0, 'demo-new', 'demo-car')")
+        refreshed = [r[0] for r in db.execute(query(variables["vehicle_ids"]["query"]))]
+        assert set(refreshed) == {"demo-car", "demo-can", "demo-fleet", "demo-new"}
         assert {r[0] for r in db.execute(query(variables["source"]["query"]))} == {"", "can", "fleet"}
         hourly = panels[58]["targets"][0]["rawSql"]
         rows = db.execute(query(hourly)).fetchall()
@@ -641,6 +654,7 @@ def test_cell_frequency_respects_selected_source_and_epoch():
                 return (raw.replace("$$", "$")
                         .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
                         .replace("${vehicle:sqlstring}", "''")
+                        .replace("${vehicle_ids:sqlstring}", "''")
                         .replace("${source:sqlstring}", repr(source))
                         .replace("${epoch:sqlstring}", repr(epoch)))
 
@@ -657,6 +671,7 @@ def test_can_latest_cards_keep_invalid_reports_and_separate_epochs():
     query = (raw.replace("$$", "$")
              .replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
              .replace("${vehicle:sqlstring}", "'car'")
+             .replace("${vehicle_ids:sqlstring}", "'car'")
              .replace("${epoch:sqlstring}", "''"))
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))

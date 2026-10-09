@@ -291,7 +291,7 @@ def battery_dashboard_check(state):
                     expected = 400
                 else:
                     continue
-                for variable, value in (("vehicle", "'demo-car'"), ("source", "''"), ("epoch", "''")):
+                for variable, value in (("vehicle", "'demo-car'"), ("vehicle_ids", "'demo-car'"), ("source", "''"), ("epoch", "''")):
                     query = query.replace("${" + variable + ":sqlstring}", value)
                 rows = grafana_query(state, query, from_ms, to_ms, target.get("format", "table"))
                 values = ([row["reading"] for row in rows] if panel["type"] == "stat" else
