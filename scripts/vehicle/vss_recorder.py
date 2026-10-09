@@ -254,6 +254,63 @@ def make_row(vehicle, path, event_time_ns, event_id, meta, units,
         "ingest_time": ingest_time_ns}
 
 
+def _insert_update(conn, last, path, row):
+    """Stage one update in the caller's transaction; no commit, no last touch.
+
+    Returns (stored, committable_key): stored True stages a new row;
+    committable_key marks last[path] only after the batch commits (new
+    rows, rowcontention duplicates, and seen duplicates alike), so a
+    rolled-back batch never poisons retry."""
+    key = row["event_id"]
+    if last.get(path) == key:
+        return False, key
+    seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?",
+                        (key,)).fetchone()
+    if seen is not None:
+        return False, key
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
+        " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
+        [row[c] for c in COLUMNS])
+    conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
+                 " VALUES(?,?)", (key, now_ns()))
+    return (cur.rowcount > 0), key
+
+
+def store_updates(conn, last, items):
+    """Store one already-received batch in a single commit.
+
+    items = [(path, row), ...] from one snapshot dict fetch or one
+    subscribe update. Returns stored count; last[path] marks only after
+    the batch is durable. Errors roll back and raise with no last side
+    effects. Pure redelivery (nothing staged) rolls back instead of
+    committing, so resnapshots cost no durable write; seen-only progress
+    still commits via total_changes."""
+    staged = []
+    before = conn.total_changes
+    try:
+        for path, row in items:
+            staged.append((path,) + _insert_update(conn, last, path, row))
+    except Exception:
+        conn.rollback()
+        raise
+    if conn.total_changes == before:
+        conn.rollback()
+        for path, _, key in staged:
+            last[path] = key
+        return 0
+    try:
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    stored = 0
+    for path, is_new, key in staged:
+        last[path] = key
+        stored += 1 if is_new else 0
+    return stored
+
+
 def store_update(conn, last, path, row):
     """Dedupe by deterministic event_id. Returns True when the row was
     new. event_id derives from (vehicle, path, source time, epoch,
@@ -261,30 +318,9 @@ def store_update(conn, last, path, row):
     can never duplicate; the same value at a different timestamp is a
     different sample and keeps its own row. `last` is an in-memory
     same-tick shortcut only; seen_ids persists across ack-delete and
-    restarts."""
-    key = row["event_id"]
-    if last.get(path) == key:
-        return False
-    seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?",
-                        (key,)).fetchone()
-    if seen is not None:
-        last[path] = key
-        return False
-    cur = conn.execute(
-        "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
-        " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
-        [row[c] for c in COLUMNS])
-    if cur.rowcount == 0:
-        conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
-                     " VALUES(?,?)", (key, now_ns()))
-        conn.commit()
-        last[path] = key
-        return False
-    conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
-                 " VALUES(?,?)", (key, now_ns()))
-    conn.commit()
-    last[path] = key
-    return True
+    restarts. Single-update batches go through store_updates; pure
+    redelivery commits nothing."""
+    return store_updates(conn, last, [(path, row)]) == 1
 
 
 def prune_seen(conn, older_than_ns, limit=5000):
@@ -639,23 +675,15 @@ def run():
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
 
-    def handle(conn, path, dp, snapshot=False):
+    def _build_update(path, dp, snapshot=False):
+        """Pure (path, row) constructor for one broker datapoint (no DB/stats)."""
         received_ns = now_ns()
-        with lock:
-            stats["last_receive_timestamp_seconds"] = received_ns / 1e9
-        if not snapshot:
-            nonlocal_last_recv[0] = received_ns / 1e9
         try:
             got = classify(dp.value)
         except UnsupportedValue as ex:
-            with lock:
-                stats["unsupported"] += 1
-                dropped = stats["unsupported"]
-            if dropped <= 5:
-                print(f"vss_recorder: unsupported value for {path}: {ex}")
-            return
+            return ("unsupported", path, ex, received_ns, snapshot)
         if got is None:
-            return
+            return ("skip", path, None, received_ns, snapshot)
         num, text, boolean = got
         ets = dt_to_ns(dp.timestamp)
         row = make_row(vehicle, path, ets,
@@ -663,12 +691,39 @@ def run():
                            vehicle, path, ets, meta["decode_epoch"],
                            num, text, boolean),
                        meta, units, num, text, boolean, received_ns)
-        if store_update(conn, last, path, row):
+        return ("row", path, row, received_ns, snapshot)
+
+
+    def _apply_built(built, conn):
+        rows = [b[2] for b in built if b[0] == "row"]
+        paths = [b[1] for b in built if b[0] == "row"]
+        stored = deduped = 0
+        if rows:
+            stored = store_updates(conn, last, list(zip(paths, rows)))
+            deduped = len(rows) - stored
+        for kind, path, extra, received_ns, snapshot in built:
             with lock:
-                stats["stored"] += 1
-        else:
-            with lock:
-                stats["snap_deduped"] += 1
+                stats["last_receive_timestamp_seconds"] = max(
+                    stats.get("last_receive_timestamp_seconds", 0.0),
+                    received_ns / 1e9)
+            if kind == "unsupported":
+                with lock:
+                    stats["unsupported"] += 1
+                    dropped = stats["unsupported"]
+                if dropped <= 5:
+                    print(f"vss_recorder: unsupported value for {path}: {extra}")
+            elif kind == "row" and not snapshot:
+                nonlocal_last_recv[0] = max(nonlocal_last_recv[0],
+                                            received_ns / 1e9)
+        with lock:
+            stats["stored"] += stored
+            stats["snap_deduped"] += deduped
+
+
+    def handle(conn, path, dp, snapshot=False):
+        _apply_built([_build_update(path, dp, snapshot=snapshot)], conn)
+
+
 
     nonlocal_last_recv = [0.0]
 
@@ -692,20 +747,22 @@ def run():
                         print(f"vss_recorder: stream gap "
                               f"[{gap_start:.0f},{time.time():.0f}] resnapshotted "
                               f"(intermediate changes lost by broker design)")
-                    for path, dp in snap.items():
-                        if stop.is_set():
-                            return
-                        if dp is not None:
-                            handle(conn, path, dp, snapshot=True)
+                    built = [_build_update(p, dp, snapshot=True)
+                             for p, dp in snap.items()
+                             if not stop.is_set() and dp is not None]
+                    if built:
+                        _apply_built(built, conn)
                     backoff = 5
                     if stop.is_set():
                         return
                     for updates in client.subscribe_current_values(paths):
                         if stop.is_set():
                             return
-                        for path, dp in updates.items():
-                            if dp is not None:
-                                handle(conn, path, dp)
+                        built = [_build_update(p, dp)
+                                 for p, dp in updates.items()
+                                 if dp is not None]
+                        if built:
+                            _apply_built(built, conn)
                 except Exception as ex:
                     if stop.is_set():
                         return

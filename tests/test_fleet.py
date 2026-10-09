@@ -32,6 +32,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.parse
 from datetime import datetime, timezone
@@ -464,6 +465,197 @@ class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):
         count = conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0]
         self.assertLessEqual(count, 10)
         conn.close()
+
+
+class EnvelopeBatchCommitTest(unittest.TestCase):
+    """One already-received envelope commits once; counters only land on
+    commit, rollback retries cleanly, and commit-then-exit stays durable."""
+    META = OutboxNonDestructiveOverflowAndBoundedTest.META
+
+    def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.tmp_dir.name, "outbox.sqlite")
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
+
+    def _multi_payload(self):
+        return json.dumps({
+            "vin": "V1", "createdAt": "2026-09-26T13:00:00Z",
+            "data": [{"key": "VehicleSpeed",
+                      "value": {"floatValue": float(40 + i)}}
+                     for i in range(5)],
+        }).encode()
+
+    def test_multi_signal_envelope_is_one_commit(self):
+        conn = fr.open_outbox(self.db_path)
+        stats = fr.default_stats()
+        commits = [0]
+
+        def tracer(stmt):
+            if stmt.lstrip().upper().startswith("COMMIT"):
+                commits[0] += 1
+        conn.set_trace_callback(tracer)
+        try:
+            stored = fr.process_message(conn, self._multi_payload(), self.META,
+                                        stats, max_rows=50000)
+        finally:
+            conn.set_trace_callback(None)
+        self.assertEqual(stored, 5)
+        self.assertEqual(commits[0], 1)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 5)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0], 5)
+        conn.close()
+
+    def test_partial_overflow_counts_once_without_recount(self):
+        conn = fr.open_outbox(self.db_path)
+        stats = fr.default_stats()
+        self.assertEqual(fr.process_message(conn, self._multi_payload(), self.META,
+                                            stats, max_rows=3), 3)
+        self.assertEqual(stats["signals_stored"], 3)
+        self.assertEqual(stats["dropped_signals"], 2)
+        self.assertEqual(stats["outbox_overflow_drops"], 2)
+        kept = [r[0] for r in conn.execute(
+            "SELECT event_id FROM outbox ORDER BY event_time, event_id").fetchall()]
+        self.assertEqual(len(kept), 3)
+        seen_before = set(r[0] for r in conn.execute(
+            "SELECT event_id FROM seen_ids").fetchall())
+        self.assertEqual(seen_before, set(kept))
+        # Rejected tail skipped seen_ids: redelivery after drain lands exactly
+        # the 2 rejected rows (speeds 43, 44 mph scaled), first 3 dedupe.
+        conn.execute("DELETE FROM outbox")
+        conn.commit()
+        retry = fr.default_stats()
+        self.assertEqual(fr.process_message(conn, self._multi_payload(), self.META,
+                                            retry, max_rows=3), 2)
+        self.assertEqual(retry["signals_stored"], 2)
+        self.assertEqual(retry["deduped"], 3)
+        landed = [r[0] for r in conn.execute(
+            "SELECT event_id FROM outbox ORDER BY event_time, event_id").fetchall()]
+        self.assertEqual(len(landed), 2)
+        self.assertEqual(set(landed) & set(kept), set())
+        seen_after = set(r[0] for r in conn.execute(
+            "SELECT event_id FROM seen_ids").fetchall())
+        self.assertEqual(seen_after, set(kept) | set(landed))
+        vals = sorted(r[0] for r in conn.execute(
+            "SELECT value_num FROM outbox").fetchall())
+        self.assertEqual(vals, [43 * fr.MPH_TO_KPH, 44 * fr.MPH_TO_KPH])
+        conn.close()
+
+    def test_envelope_rollback_reports_zero_and_retries(self):
+        conn = fr.open_outbox(self.db_path)
+        stats = fr.default_stats()
+        payload = self._multi_payload()
+        real_insert = fr._insert_row
+        calls = [0]
+
+        def flaky(c, table, columns, row, pending, max_rows):
+            calls[0] += 1
+            if calls[0] == 3:
+                raise sqlite3.OperationalError("synthetic stage failure")
+            return real_insert(c, table, columns, row, pending, max_rows)
+        with patch.object(fr, "_insert_row", side_effect=flaky):
+            with self.assertRaises(sqlite3.OperationalError):
+                fr.process_message(conn, payload, self.META, stats, max_rows=50000)
+        self.assertEqual(stats["signals_stored"], 0)
+        self.assertEqual(stats["deduped"], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+        retry = fr.default_stats()
+        self.assertEqual(fr.process_message(conn, payload, self.META, retry,
+                                            max_rows=50000), 5)
+        self.assertEqual(retry["signals_stored"], 5)
+        # Duplicate redelivery dedupes without new rows.
+        dup = fr.default_stats()
+        self.assertEqual(fr.process_message(conn, payload, self.META, dup,
+                                            max_rows=50000), 0)
+        self.assertEqual(dup["deduped"], 5)
+        conn.close()
+
+    def test_commit_failure_rolls_back_cache_and_counters(self):
+        state = {"fail": False}
+
+        class FailOnceConn(sqlite3.Connection):
+            def commit(self):
+                if state["fail"]:
+                    state["fail"] = False
+                    raise sqlite3.OperationalError("synthetic commit failure")
+                return super().commit()
+
+        real_connect = fr.sqlite3.connect
+
+        def factory(*a, **k):
+            k["factory"] = FailOnceConn
+            return real_connect(*a, **k)
+        with patch.object(fr.sqlite3, "connect", side_effect=factory):
+            conn = fr.open_outbox(self.db_path)
+        state["fail"] = True  # Arm only the envelope commit below.
+        stats = fr.default_stats()
+        with self.assertRaises(sqlite3.OperationalError):
+            fr.process_message(conn, self._multi_payload(), self.META,
+                               stats, max_rows=50000)
+        self.assertEqual(stats["signals_stored"], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+        retry = fr.default_stats()
+        self.assertEqual(fr.process_message(conn, self._multi_payload(), self.META,
+                                            retry, max_rows=50000), 5)
+        self.assertEqual(retry["signals_stored"], 5)
+        conn.close()
+
+    def test_killed_before_commit_reports_nothing_durable(self):
+        # Child stages one envelope then SIGKILLs itself before commit can
+        # land; parent must find zero committed rows (no success claimed).
+        child = (
+            "import json, os, signal, sys; sys.path.insert(0, %r);"
+            "from scripts.ingest import fleet_recorder as fr;"
+            "conn = fr.open_outbox(%r);"
+            "payload = json.dumps({'vin': 'V1',"
+            " 'createdAt': '2026-09-26T13:00:00Z',"
+            " 'data': [{'key': 'VehicleSpeed',"
+            " 'value': {'floatValue': float(40 + i)}} for i in range(4)]}).encode();"
+            "meta, sigs = fr.extract_protojson_records(payload, target_vin='V1',"
+            " configured_vehicle_id='c1', salt='');"
+            "rows = [fr._build_signal_row(%r, f, v, meta, fr.now_ns(),"
+            " fr.envelope_id(fr.TOPIC_V, payload))[0] for f, v in sigs];"
+            "b = fr.outbox_pending_total(conn);"
+            "[fr._insert_row(conn, 'outbox', fr.COLUMNS, r, b + i, 50000)"
+            " for i, r in enumerate(rows)];"
+            "os.kill(os.getpid(), signal.SIGKILL)" % (REPO, self.db_path, self.META))
+        import signal as _sig
+        import subprocess
+        proc = subprocess.run([sys.executable, "-c", child], timeout=60)
+        self.assertEqual(proc.returncode, -_sig.SIGKILL)
+        conn = fr.open_outbox(self.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+        finally:
+            conn.close()
+
+    def test_commit_then_exit_reports_durable_on_restart(self):
+        # Executable subprocess proof: child commits one envelope then exits
+        # without cleanup (os._exit); parent reopens and finds every row.
+        # This covers process termination only, never power failure.
+        child = (
+            "import json, os, sys; sys.path.insert(0, %r);"
+            "from scripts.ingest import fleet_recorder as fr;"
+            "conn = fr.open_outbox(%r); stats = fr.default_stats();"
+            "payload = json.dumps({'vin': 'V1',"
+            " 'createdAt': '2026-09-26T13:00:00Z',"
+            " 'data': [{'key': 'VehicleSpeed',"
+            " 'value': {'floatValue': float(40 + i)}} for i in range(4)]}).encode();"
+            "assert fr.process_message(conn, payload, %r, stats, max_rows=50000) == 4;"
+            "os._exit(0)" % (REPO, self.db_path, self.META))
+        import subprocess
+        proc = subprocess.run([sys.executable, "-c", child], timeout=60)
+        self.assertEqual(proc.returncode, 0)
+        conn = fr.open_outbox(self.db_path)
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 4)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0], 4)
+        finally:
+            conn.close()
 
 
 class FakeGreptimeServer(http.server.BaseHTTPRequestHandler):
@@ -963,5 +1155,134 @@ class OfficialFixtureAndEndToEndSmokeTest(unittest.TestCase):
         self.assertEqual(fleet_speed_val, 75.0)
 
 
+def _percentile(sorted_ns, pct):
+    if not sorted_ns:
+        return 0
+    idx = min(len(sorted_ns) - 1, int(pct / 100 * len(sorted_ns)))
+    return sorted_ns[idx]
+
+
+def _bench_unit_payload(unit, size):
+    # VehicleSpeed range is 0..350 km/h AFTER mph->km/h scaling: keep raw
+    # mph small (1..50) so every row stores; raw values stay distinct per
+    # unit so event_ids never collide across units.
+    return json.dumps({
+        "vin": "V1",
+        "createdAt": "2026-09-26T13:%02d:%02dZ" % ((unit // 60) % 60, unit % 60),
+        "data": [{"key": "VehicleSpeed",
+                  "value": {"floatValue": float(1 + (unit + i) % 50)}}
+                 for i in range(size)],
+    }).encode()
+
+
+def _rss_kb():
+    import resource
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":  # macOS reports bytes, Linux reports KB
+        rss //= 1024
+    return rss
+
+
+def run_outbox_benchmark(sizes=(10, 50), repeats=3, rates=(50, 500), units=20):
+    """Paced file-backed WAL/FULL benchmark: each repeat schedules `units`
+    distinct received V envelopes at `rate` envelopes/s (0 = back-to-back);
+    each envelope carries `size` rows and commits on its own (no
+    cross-message accumulation). Latency is real monotonic
+    receive-to-commit ns per envelope; t_recv is never backdated."""
+    import statistics
+    meta = dict(OutboxNonDestructiveOverflowAndBoundedTest.META)
+    report = []
+    for size in sizes:
+        for rate in rates:
+            lat, cpus, rss = [], [], 0
+            commits_per_1000, rates_out = [], []
+            for _ in range(repeats):
+                with tempfile.TemporaryDirectory() as d:
+                    conn = fr.open_outbox(os.path.join(d, "bench.sqlite"))
+                    stats = fr.default_stats()
+                    commits = [0]
+
+                    def tracer(stmt):
+                        if stmt.lstrip().upper().startswith("COMMIT"):
+                            commits[0] += 1
+                    conn.set_trace_callback(tracer)
+                    t0 = time.perf_counter_ns()
+                    c0 = time.process_time_ns()
+                    try:
+                        for u in range(units):
+                            if rate:
+                                target = t0 + int(u * 1_000_000_000 / rate)
+                                now = time.perf_counter_ns()
+                                if target > now:
+                                    time.sleep((target - now) / 1e9)
+                            t_recv = time.perf_counter_ns()
+                            stored = fr.process_message(
+                                conn, _bench_unit_payload(u, size), meta,
+                                stats, max_rows=10 * size * units)
+                            lat.append(time.perf_counter_ns() - t_recv)
+                            assert stored == size
+                    finally:
+                        conn.set_trace_callback(None)
+                    wall_s = (time.perf_counter_ns() - t0) / 1e9
+                    cpu_s = (time.process_time_ns() - c0) / 1e9
+                    total = units * size
+                    cpus.append(cpu_s)
+                    rss = max(rss, _rss_kb())
+                    commits_per_1000.append(commits[0] * 1000 / total)
+                    rates_out.append(units / wall_s if wall_s > 0 else 0)
+                    backlog = conn.execute(
+                        "SELECT COUNT(*) FROM outbox").fetchone()[0]
+                    assert backlog == total
+                    digest = hashlib.sha256(
+                        repr(conn.execute(
+                            "SELECT " + ",".join(fr.COLUMNS) + " FROM outbox"
+                            " ORDER BY event_time, event_id"
+                        ).fetchall()).encode()).hexdigest()[:16]
+                    seen = conn.execute(
+                        "SELECT COUNT(*) FROM seen_ids").fetchone()[0]
+                    assert seen == total
+                    conn.close()
+            lat_sorted = sorted(lat)
+            report.append({
+                "envelope_rows": size, "repeats": repeats,
+                "units_per_repeat": units,
+                "scheduled_rate_per_s": rate,
+                "achieved_rate_per_s": round(statistics.mean(rates_out), 1),
+                "rows_per_sec": round(statistics.mean(rates_out) * size, 1),
+                "commits_per_1000_rows": round(
+                    statistics.mean(commits_per_1000), 3),
+                "durable_p50_ns": _percentile(lat_sorted, 50),
+                "durable_p95_ns": _percentile(lat_sorted, 95),
+                "durable_p99_ns": _percentile(lat_sorted, 99),
+                "cpu_s_mean": round(statistics.mean(cpus), 4),
+                "backlog_rows": units * size, "peak_rss_kb": rss,
+                "content_digest": digest,
+            })
+    return report
+
+
+def main_benchmark(argv=None):
+    """Entry: FLEET_BENCH_SIZES=10,50 FLEET_BENCH_REPEATS=3 FLEET_BENCH_RATES=50,500
+    FLEET_BENCH_UNITS=20: python3 -m tests.test_fleet benchmark."""
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sizes", default=os.environ.get(
+        "FLEET_BENCH_SIZES", "10,50"))
+    ap.add_argument("--repeats", type=int, default=int(os.environ.get(
+        "FLEET_BENCH_REPEATS", "3")))
+    ap.add_argument("--rates", default=os.environ.get("FLEET_BENCH_RATES", "50,500"))
+    ap.add_argument("--units", type=int, default=int(os.environ.get(
+        "FLEET_BENCH_UNITS", "20")))
+    args = ap.parse_args(argv)
+    sizes = tuple(int(s) for s in args.sizes.split(",") if s.strip())
+    rates = tuple(float(r) for r in args.rates.split(",") if r.strip())
+    for row in run_outbox_benchmark(sizes=sizes, repeats=args.repeats,
+                                    rates=rates, units=args.units):
+        print(json.dumps(row, sort_keys=True))
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) > 1 and sys.argv[1] == "benchmark":
+        main_benchmark(sys.argv[2:])
+    else:
+        unittest.main()

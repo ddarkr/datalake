@@ -708,7 +708,7 @@ services:
     - vehicle
     restart: unless-stopped
     labels:
-      datalake.recorder-revision: '2'
+      datalake.recorder-revision: '3'
     stop_grace_period: 90s
     depends_on:
       vehicle-setup:
@@ -764,7 +764,7 @@ services:
     - fleet
     restart: unless-stopped
     labels:
-      datalake.recorder-revision: '6'
+      datalake.recorder-revision: '7'
     stop_grace_period: 30s
     depends_on:
       fleet-deps:
@@ -25576,6 +25576,63 @@ configs:
               "ingest_time": ingest_time_ns}
 
 
+      def _insert_update(conn, last, path, row):
+          """Stage one update in the caller's transaction; no commit, no last touch.
+
+          Returns (stored, committable_key): stored True stages a new row;
+          committable_key marks last[path] only after the batch commits (new
+          rows, rowcontention duplicates, and seen duplicates alike), so a
+          rolled-back batch never poisons retry."""
+          key = row["event_id"]
+          if last.get(path) == key:
+              return False, key
+          seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?",
+                              (key,)).fetchone()
+          if seen is not None:
+              return False, key
+          cur = conn.execute(
+              "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
+              " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
+              [row[c] for c in COLUMNS])
+          conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
+                       " VALUES(?,?)", (key, now_ns()))
+          return (cur.rowcount > 0), key
+
+
+      def store_updates(conn, last, items):
+          """Store one already-received batch in a single commit.
+
+          items = [(path, row), ...] from one snapshot dict fetch or one
+          subscribe update. Returns stored count; last[path] marks only after
+          the batch is durable. Errors roll back and raise with no last side
+          effects. Pure redelivery (nothing staged) rolls back instead of
+          committing, so resnapshots cost no durable write; seen-only progress
+          still commits via total_changes."""
+          staged = []
+          before = conn.total_changes
+          try:
+              for path, row in items:
+                  staged.append((path,) + _insert_update(conn, last, path, row))
+          except Exception:
+              conn.rollback()
+              raise
+          if conn.total_changes == before:
+              conn.rollback()
+              for path, _, key in staged:
+                  last[path] = key
+              return 0
+          try:
+              conn.commit()
+          except Exception:
+              conn.rollback()
+              raise
+          stored = 0
+          for path, is_new, key in staged:
+              last[path] = key
+              stored += 1 if is_new else 0
+          return stored
+
+
       def store_update(conn, last, path, row):
           """Dedupe by deterministic event_id. Returns True when the row was
           new. event_id derives from (vehicle, path, source time, epoch,
@@ -25583,30 +25640,9 @@ configs:
           can never duplicate; the same value at a different timestamp is a
           different sample and keeps its own row. `last` is an in-memory
           same-tick shortcut only; seen_ids persists across ack-delete and
-          restarts."""
-          key = row["event_id"]
-          if last.get(path) == key:
-              return False
-          seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?",
-                              (key,)).fetchone()
-          if seen is not None:
-              last[path] = key
-              return False
-          cur = conn.execute(
-              "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
-              " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
-              [row[c] for c in COLUMNS])
-          if cur.rowcount == 0:
-              conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
-                           " VALUES(?,?)", (key, now_ns()))
-              conn.commit()
-              last[path] = key
-              return False
-          conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
-                       " VALUES(?,?)", (key, now_ns()))
-          conn.commit()
-          last[path] = key
-          return True
+          restarts. Single-update batches go through store_updates; pure
+          redelivery commits nothing."""
+          return store_updates(conn, last, [(path, row)]) == 1
 
 
       def prune_seen(conn, older_than_ns, limit=5000):
@@ -25961,23 +25997,15 @@ configs:
           signal.signal(signal.SIGTERM, _stop)
           signal.signal(signal.SIGINT, _stop)
 
-          def handle(conn, path, dp, snapshot=False):
+          def _build_update(path, dp, snapshot=False):
+              """Pure (path, row) constructor for one broker datapoint (no DB/stats)."""
               received_ns = now_ns()
-              with lock:
-                  stats["last_receive_timestamp_seconds"] = received_ns / 1e9
-              if not snapshot:
-                  nonlocal_last_recv[0] = received_ns / 1e9
               try:
                   got = classify(dp.value)
               except UnsupportedValue as ex:
-                  with lock:
-                      stats["unsupported"] += 1
-                      dropped = stats["unsupported"]
-                  if dropped <= 5:
-                      print(f"vss_recorder: unsupported value for {path}: {ex}")
-                  return
+                  return ("unsupported", path, ex, received_ns, snapshot)
               if got is None:
-                  return
+                  return ("skip", path, None, received_ns, snapshot)
               num, text, boolean = got
               ets = dt_to_ns(dp.timestamp)
               row = make_row(vehicle, path, ets,
@@ -25985,12 +26013,39 @@ configs:
                                  vehicle, path, ets, meta["decode_epoch"],
                                  num, text, boolean),
                              meta, units, num, text, boolean, received_ns)
-              if store_update(conn, last, path, row):
+              return ("row", path, row, received_ns, snapshot)
+
+
+          def _apply_built(built, conn):
+              rows = [b[2] for b in built if b[0] == "row"]
+              paths = [b[1] for b in built if b[0] == "row"]
+              stored = deduped = 0
+              if rows:
+                  stored = store_updates(conn, last, list(zip(paths, rows)))
+                  deduped = len(rows) - stored
+              for kind, path, extra, received_ns, snapshot in built:
                   with lock:
-                      stats["stored"] += 1
-              else:
-                  with lock:
-                      stats["snap_deduped"] += 1
+                      stats["last_receive_timestamp_seconds"] = max(
+                          stats.get("last_receive_timestamp_seconds", 0.0),
+                          received_ns / 1e9)
+                  if kind == "unsupported":
+                      with lock:
+                          stats["unsupported"] += 1
+                          dropped = stats["unsupported"]
+                      if dropped <= 5:
+                          print(f"vss_recorder: unsupported value for {path}: {extra}")
+                  elif kind == "row" and not snapshot:
+                      nonlocal_last_recv[0] = max(nonlocal_last_recv[0],
+                                                  received_ns / 1e9)
+              with lock:
+                  stats["stored"] += stored
+                  stats["snap_deduped"] += deduped
+
+
+          def handle(conn, path, dp, snapshot=False):
+              _apply_built([_build_update(path, dp, snapshot=snapshot)], conn)
+
+
 
           nonlocal_last_recv = [0.0]
 
@@ -26014,20 +26069,22 @@ configs:
                               print(f"vss_recorder: stream gap "
                                     f"[{gap_start:.0f},{time.time():.0f}] resnapshotted "
                                     f"(intermediate changes lost by broker design)")
-                          for path, dp in snap.items():
-                              if stop.is_set():
-                                  return
-                              if dp is not None:
-                                  handle(conn, path, dp, snapshot=True)
+                          built = [_build_update(p, dp, snapshot=True)
+                                   for p, dp in snap.items()
+                                   if not stop.is_set() and dp is not None]
+                          if built:
+                              _apply_built(built, conn)
                           backoff = 5
                           if stop.is_set():
                               return
                           for updates in client.subscribe_current_values(paths):
                               if stop.is_set():
                                   return
-                              for path, dp in updates.items():
-                                  if dp is not None:
-                                      handle(conn, path, dp)
+                              built = [_build_update(p, dp)
+                                       for p, dp in updates.items()
+                                       if dp is not None]
+                              if built:
+                                  _apply_built(built, conn)
                       except Exception as ex:
                           if stop.is_set():
                               return
@@ -26144,11 +26201,17 @@ configs:
         CONFIG_VERSION provenance is operator-supplied only, never invented.
 
       Durability:
-        Bounded SQLite outbox (PRAGMA WAL); MAX_OUTBOX_ROWS bounds TOTAL pending
-        signal + event rows. Overflow rejects new arrivals (never deletes unacked
-        rows); rejected rows skip seen_ids so redelivery can land after drain.
-        Seen table bounded by 24h prune and MAX_SEEN_IDS limit. Upload acks only on
-        affectedrows == batch size, then deletes exactly the acked batch.
+        Bounded SQLite outbox (PRAGMA WAL, synchronous=FULL); MAX_OUTBOX_ROWS
+        bounds TOTAL pending signal + event rows. One already-received envelope
+        (V payload or alerts/errors/connectivity envelope) commits once: rows
+        stage against a single base COUNT plus staged inserts, then one commit.
+        Success counters and dedupe state land only on commit; rollback reports
+        nothing and retries cleanly. Overflow rejects new arrivals (never deletes
+        unacked rows); rejected rows skip seen_ids so redelivery can land after
+        drain. Seen table bounded by 24h prune and MAX_SEEN_IDS limit. Upload
+        acks only on affectedrows == batch size, then deletes exactly the acked
+        batch. Commit-then-process-exit is durable; power-failure bounds are not
+        claimed (see docs/outbox-batching.md).
 
       Tesla API / vehicle command transmission is strictly prohibited (receive-only).
       """
@@ -27317,12 +27380,19 @@ configs:
           return total
 
 
-      def _store_row(conn, table, columns, row, max_rows):
+      def _insert_row(conn, table, columns, row, pending, max_rows):
+          """Stage one row in the caller's transaction; no commit here.
+
+          pending = committed base count + rows already staged as stored in
+          this transaction, so the TOTAL signal+event bound reflects actual
+          inserts without a COUNT per row. Returns 1 stored, 0 duplicate,
+          -1 overflow (rejected rows skip seen_ids so redelivery can land
+          after drain)."""
           key = row["event_id"]
           seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?", (key,)).fetchone()
           if seen is not None:
               return 0
-          if outbox_pending_total(conn) >= max_rows:
+          if pending >= max_rows:
               return -1  # Capacity overflow: reject new arrival, keep unacked rows
           cur = conn.execute(
               "INSERT OR IGNORE INTO " + table + "(" + ",".join(columns) + ")"
@@ -27331,8 +27401,18 @@ configs:
           inserted = cur.rowcount > 0
           conn.execute("INSERT OR IGNORE INTO seen_ids(event_id, seen_at) VALUES(?,?)",
                        (key, now_ns()))
-          conn.commit()
           return 1 if inserted else 0
+
+
+      def _store_row(conn, table, columns, row, max_rows):
+          try:
+              res = _insert_row(conn, table, columns, row,
+                                outbox_pending_total(conn), max_rows)
+          except Exception:
+              conn.rollback()
+              raise
+          conn.commit()
+          return res
 
 
       def open_outbox(path):
@@ -27427,21 +27507,20 @@ configs:
               pass
 
 
-      def _store_signal_row(conn, meta_env, stats, source_field, raw_val, metadata,
-                            ingest_time_ns, envelope, max_rows):
+      def _build_signal_row(meta_env, source_field, raw_val, metadata,
+                            ingest_time_ns, envelope):
+          """Pure row constructor for one allowlisted signal (no DB, no stats)."""
           spec = FIELD_ALLOWLIST.get(source_field)
           if not spec:
-              return 0  # Unreachable: extractor already filters non-allowlisted.
+              return None  # Unreachable: extractor already filters non-allowlisted.
           num, text, boolean, quality = validate_field_value(spec, raw_val)
-          if quality in ("invalid", "range_rejected"):
-              _stats_bump(stats, "invalid_fields")
           path = spec["path"]
           event_id = deterministic_event_id(
               vehicle=metadata["vehicle"], path=path, source_system=SOURCE_SYSTEM,
               source_field=source_field, event_time_ns=metadata["event_time_ns"],
               decode_epoch=meta_env["decode_epoch"], num=num, text=text,
               boolean=boolean)
-          row = {
+          return {
               "event_time": metadata["event_time_ns"],
               "vehicle": metadata["vehicle"],
               "path": path,
@@ -27469,21 +27548,12 @@ configs:
               "envelope_id": envelope,
               "config_version": meta_env.get("config_version") or None,
               "connectivity": None,
-          }
-          res = store_signal_update(conn, row, max_rows=max_rows)
-          if res == 1:
-              _stats_bump(stats, "signals_stored")
-              return 1
-          if res == 0:
-              _stats_bump(stats, "deduped")
-          elif res == -1:
-              _stats_bump(stats, "dropped_signals")
-              _stats_bump(stats, "outbox_overflow_drops")
-          return 0
+          }, quality
 
 
-      def _store_event_row(conn, meta_env, stats, topic, event_type, item,
-                           metadata, ingest_time_ns, envelope, max_rows):
+      def _build_event_row(meta_env, topic, event_type, item, metadata,
+                           ingest_time_ns, envelope):
+          """Pure row constructor for one envelope event item (no DB, no stats)."""
           audience = _opt_nonempty_str(item.get("audience"))
           is_active = item.get("is_active")
           is_active = is_active if isinstance(is_active, bool) else None
@@ -27493,7 +27563,7 @@ configs:
               decode_epoch=meta_env["decode_epoch"],
               started_ns=item.get("started_ns"), ended_ns=item.get("ended_ns"),
               audience=audience, is_active=is_active)
-          row = {
+          return {
               "event_time": item["event_time_ns"],
               "vehicle": item["vehicle"],
               "event_type": event_type,
@@ -27520,7 +27590,21 @@ configs:
               "config_version": meta_env.get("config_version") or None,
               "connectivity": _opt_nonempty_str(item.get("connectivity")),
           }
-          res = store_event_update(conn, row, max_rows=max_rows)
+
+
+      def _apply_signal_result(stats, res):
+          if res == 1:
+              _stats_bump(stats, "signals_stored")
+              return 1
+          if res == 0:
+              _stats_bump(stats, "deduped")
+          elif res == -1:
+              _stats_bump(stats, "dropped_signals")
+              _stats_bump(stats, "outbox_overflow_drops")
+          return 0
+
+
+      def _apply_event_result(stats, res):
           if res == 1:
               _stats_bump(stats, "events_stored")
               return 1
@@ -27536,7 +27620,12 @@ configs:
 
       def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
                           topic=TOPIC_V):
-          """Parse one V payload and store allowlisted signals (with tombstones)."""
+          """Parse one V payload and store allowlisted signals (with tombstones).
+
+          One already-received envelope = one SQLite transaction: rows stage via
+          _insert_row against a single base COUNT plus staged inserts, then one
+          commit. Success counters bump only after commit; a failed commit rolls
+          back and reports 0 with no counter or dedupe side effects."""
           ingest_time_ns = now_ns()
           try:
               metadata, raw_signals = extract_protojson_records(
@@ -27553,17 +27642,42 @@ configs:
           _stats_bump(stats, "messages_received")
           stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
           envelope = envelope_id(topic, payload_bytes)
-          stored = 0
+          built = []
           for source_field, raw_val in raw_signals:
-              stored += _store_signal_row(conn, meta_env, stats, source_field,
-                                          raw_val, metadata, ingest_time_ns,
-                                          envelope, max_rows)
+              rowq = _build_signal_row(meta_env, source_field, raw_val, metadata,
+                                       ingest_time_ns, envelope)
+              if rowq is not None:
+                  row, quality = rowq
+                  if quality in ("invalid", "range_rejected"):
+                      _stats_bump(stats, "invalid_fields")
+                  built.append(row)
+          pending = outbox_pending_total(conn)
+          staged = []
+          try:
+              for row in built:
+                  staged.append(_insert_row(conn, "outbox", COLUMNS, row,
+                                           pending, max_rows))
+                  if staged[-1] == 1:
+                      pending += 1
+          except Exception:
+              conn.rollback()
+              raise
+          try:
+              conn.commit()
+          except Exception:
+              conn.rollback()
+              raise
+          stored = 0
+          for res in staged:
+              stored += _apply_signal_result(stats, res)
           return stored
 
 
       def process_envelope(conn, topic, payload_bytes, meta_env, stats,
                            max_rows=50000):
-          """Parse one alerts/errors/connectivity envelope into event rows."""
+          """Parse one alerts/errors/connectivity envelope into event rows.
+
+          Same one-envelope-one-commit contract as process_message."""
           ingest_time_ns = now_ns()
           try:
               metadata, items = extract_event_envelope(
@@ -27579,11 +27693,26 @@ configs:
           _stats_bump(stats, "messages_received")
           stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
           envelope = envelope_id(topic, payload_bytes)
-          stored = 0
-          for item in items:
-              stored += _store_event_row(conn, meta_env, stats, topic,
-                                         metadata["event_type"], item, metadata,
-                                         ingest_time_ns, envelope, max_rows)
+          built = [_build_event_row(meta_env, topic, metadata["event_type"], item,
+                                    metadata, ingest_time_ns, envelope)
+                   for item in items]
+          pending = outbox_pending_total(conn)
+          staged = []
+          try:
+              for row in built:
+                  staged.append(_insert_row(conn, "outbox_events", EVENT_COLUMNS,
+                                           row, pending, max_rows))
+                  if staged[-1] == 1:
+                      pending += 1
+          except Exception:
+              conn.rollback()
+              raise
+          try:
+              conn.commit()
+          except Exception:
+              conn.rollback()
+              raise
+          stored = sum(_apply_event_result(stats, res) for res in staged)
           return stored
 
 
@@ -28621,6 +28750,63 @@ configs:
               "ingest_time": ingest_time_ns}
 
 
+      def _insert_update(conn, last, path, row):
+          """Stage one update in the caller's transaction; no commit, no last touch.
+
+          Returns (stored, committable_key): stored True stages a new row;
+          committable_key marks last[path] only after the batch commits (new
+          rows, rowcontention duplicates, and seen duplicates alike), so a
+          rolled-back batch never poisons retry."""
+          key = row["event_id"]
+          if last.get(path) == key:
+              return False, key
+          seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?",
+                              (key,)).fetchone()
+          if seen is not None:
+              return False, key
+          cur = conn.execute(
+              "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
+              " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
+              [row[c] for c in COLUMNS])
+          conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
+                       " VALUES(?,?)", (key, now_ns()))
+          return (cur.rowcount > 0), key
+
+
+      def store_updates(conn, last, items):
+          """Store one already-received batch in a single commit.
+
+          items = [(path, row), ...] from one snapshot dict fetch or one
+          subscribe update. Returns stored count; last[path] marks only after
+          the batch is durable. Errors roll back and raise with no last side
+          effects. Pure redelivery (nothing staged) rolls back instead of
+          committing, so resnapshots cost no durable write; seen-only progress
+          still commits via total_changes."""
+          staged = []
+          before = conn.total_changes
+          try:
+              for path, row in items:
+                  staged.append((path,) + _insert_update(conn, last, path, row))
+          except Exception:
+              conn.rollback()
+              raise
+          if conn.total_changes == before:
+              conn.rollback()
+              for path, _, key in staged:
+                  last[path] = key
+              return 0
+          try:
+              conn.commit()
+          except Exception:
+              conn.rollback()
+              raise
+          stored = 0
+          for path, is_new, key in staged:
+              last[path] = key
+              stored += 1 if is_new else 0
+          return stored
+
+
       def store_update(conn, last, path, row):
           """Dedupe by deterministic event_id. Returns True when the row was
           new. event_id derives from (vehicle, path, source time, epoch,
@@ -28628,30 +28814,9 @@ configs:
           can never duplicate; the same value at a different timestamp is a
           different sample and keeps its own row. `last` is an in-memory
           same-tick shortcut only; seen_ids persists across ack-delete and
-          restarts."""
-          key = row["event_id"]
-          if last.get(path) == key:
-              return False
-          seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?",
-                              (key,)).fetchone()
-          if seen is not None:
-              last[path] = key
-              return False
-          cur = conn.execute(
-              "INSERT OR IGNORE INTO outbox(" + ",".join(COLUMNS) + ")"
-              " VALUES(" + ",".join("?" * len(COLUMNS)) + ")",
-              [row[c] for c in COLUMNS])
-          if cur.rowcount == 0:
-              conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
-                           " VALUES(?,?)", (key, now_ns()))
-              conn.commit()
-              last[path] = key
-              return False
-          conn.execute("INSERT OR IGNORE INTO seen_ids(event_id,seen_at)"
-                       " VALUES(?,?)", (key, now_ns()))
-          conn.commit()
-          last[path] = key
-          return True
+          restarts. Single-update batches go through store_updates; pure
+          redelivery commits nothing."""
+          return store_updates(conn, last, [(path, row)]) == 1
 
 
       def prune_seen(conn, older_than_ns, limit=5000):
@@ -29006,23 +29171,15 @@ configs:
           signal.signal(signal.SIGTERM, _stop)
           signal.signal(signal.SIGINT, _stop)
 
-          def handle(conn, path, dp, snapshot=False):
+          def _build_update(path, dp, snapshot=False):
+              """Pure (path, row) constructor for one broker datapoint (no DB/stats)."""
               received_ns = now_ns()
-              with lock:
-                  stats["last_receive_timestamp_seconds"] = received_ns / 1e9
-              if not snapshot:
-                  nonlocal_last_recv[0] = received_ns / 1e9
               try:
                   got = classify(dp.value)
               except UnsupportedValue as ex:
-                  with lock:
-                      stats["unsupported"] += 1
-                      dropped = stats["unsupported"]
-                  if dropped <= 5:
-                      print(f"vss_recorder: unsupported value for {path}: {ex}")
-                  return
+                  return ("unsupported", path, ex, received_ns, snapshot)
               if got is None:
-                  return
+                  return ("skip", path, None, received_ns, snapshot)
               num, text, boolean = got
               ets = dt_to_ns(dp.timestamp)
               row = make_row(vehicle, path, ets,
@@ -29030,12 +29187,39 @@ configs:
                                  vehicle, path, ets, meta["decode_epoch"],
                                  num, text, boolean),
                              meta, units, num, text, boolean, received_ns)
-              if store_update(conn, last, path, row):
+              return ("row", path, row, received_ns, snapshot)
+
+
+          def _apply_built(built, conn):
+              rows = [b[2] for b in built if b[0] == "row"]
+              paths = [b[1] for b in built if b[0] == "row"]
+              stored = deduped = 0
+              if rows:
+                  stored = store_updates(conn, last, list(zip(paths, rows)))
+                  deduped = len(rows) - stored
+              for kind, path, extra, received_ns, snapshot in built:
                   with lock:
-                      stats["stored"] += 1
-              else:
-                  with lock:
-                      stats["snap_deduped"] += 1
+                      stats["last_receive_timestamp_seconds"] = max(
+                          stats.get("last_receive_timestamp_seconds", 0.0),
+                          received_ns / 1e9)
+                  if kind == "unsupported":
+                      with lock:
+                          stats["unsupported"] += 1
+                          dropped = stats["unsupported"]
+                      if dropped <= 5:
+                          print(f"vss_recorder: unsupported value for {path}: {extra}")
+                  elif kind == "row" and not snapshot:
+                      nonlocal_last_recv[0] = max(nonlocal_last_recv[0],
+                                                  received_ns / 1e9)
+              with lock:
+                  stats["stored"] += stored
+                  stats["snap_deduped"] += deduped
+
+
+          def handle(conn, path, dp, snapshot=False):
+              _apply_built([_build_update(path, dp, snapshot=snapshot)], conn)
+
+
 
           nonlocal_last_recv = [0.0]
 
@@ -29059,20 +29243,22 @@ configs:
                               print(f"vss_recorder: stream gap "
                                     f"[{gap_start:.0f},{time.time():.0f}] resnapshotted "
                                     f"(intermediate changes lost by broker design)")
-                          for path, dp in snap.items():
-                              if stop.is_set():
-                                  return
-                              if dp is not None:
-                                  handle(conn, path, dp, snapshot=True)
+                          built = [_build_update(p, dp, snapshot=True)
+                                   for p, dp in snap.items()
+                                   if not stop.is_set() and dp is not None]
+                          if built:
+                              _apply_built(built, conn)
                           backoff = 5
                           if stop.is_set():
                               return
                           for updates in client.subscribe_current_values(paths):
                               if stop.is_set():
                                   return
-                              for path, dp in updates.items():
-                                  if dp is not None:
-                                      handle(conn, path, dp)
+                              built = [_build_update(p, dp)
+                                       for p, dp in updates.items()
+                                       if dp is not None]
+                              if built:
+                                  _apply_built(built, conn)
                       except Exception as ex:
                           if stop.is_set():
                               return

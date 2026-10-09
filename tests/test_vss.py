@@ -6,10 +6,11 @@ signal validation, outbox value classification, INSERT escaping,
 store column-order roundtrip, fail-closed Greptime ack (HTTP200 errors,
 output errors, partial/missing affected rows keep rows; retry reuses the
 same event_id/event_time), source-time exactness/fallback/int64 range,
-int precision boundaries, deterministic event-id dedupe incl. acked-row
-restart and seen-prune bounds, uploader catch-up tick, idle-subscribe
-unblock helper, env validation, manifest top-level pins, and metrics
-reflecting outbox state.
+restart and seen-prune bounds, batched snapshot/update commits (one commit
+per received batch, late last-marking, commit-failure and pre-commit exit
+rollback, full-content baseline parity), size/rate benchmark grid, uploader
+catch-up tick, idle-subscribe unblock helper, env validation, manifest
+top-level pins, and metrics reflecting outbox state.
 """
 
 import calendar
@@ -377,6 +378,190 @@ class RecorderTest(unittest.TestCase):
             self.assertEqual(left, [("new-id",)])
             conn.close()
 
+    def test_snapshot_batch_is_one_commit_with_late_cache(self):
+        # One already-received snapshot batch commits once; last marks only
+        # after commit, and rollback leaves last untouched for retry.
+        # sqlite3.Connection.commit is read-only C: count COMMIT via the
+        # supported trace callback, never by patching the method.
+        with tempfile.TemporaryDirectory() as d:
+            conn = rec.open_outbox(os.path.join(d, "o.sqlite"))
+            meta, last = _meta(), {}
+            items = [(f"Vehicle.Speed.{i}", rec.make_row(
+                "v", f"Vehicle.Speed.{i}", 100 + i, f"batch-{i}", meta, {},
+                float(i), None, None, 1)) for i in range(4)]
+            commits = [0]
+
+            def trace(stmt):
+                if stmt.strip().upper() == "COMMIT":
+                    commits[0] += 1
+            conn.set_trace_callback(trace)
+            try:
+                self.assertEqual(rec.store_updates(conn, last, items), 4)
+            finally:
+                conn.set_trace_callback(None)
+            self.assertEqual(commits[0], 1)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM outbox").fetchone()[0], 4)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM seen_ids").fetchone()[0], 4)
+            for i in range(4):
+                self.assertEqual(last[f"Vehicle.Speed.{i}"], f"batch-{i}")
+            # Redelivered snapshot stores nothing: full content identical,
+            # last still marked, no new durable write.
+            before = conn.execute(
+                "SELECT " + ",".join(rec.COLUMNS) + " FROM outbox"
+                " ORDER BY event_id").fetchall()
+            conn.set_trace_callback(trace)
+            try:
+                self.assertEqual(rec.store_updates(conn, {}, items), 0)
+            finally:
+                conn.set_trace_callback(None)
+            self.assertEqual(commits[0], 1)
+            self.assertEqual(conn.execute(
+                "SELECT " + ",".join(rec.COLUMNS) + " FROM outbox"
+                " ORDER BY event_id").fetchall(), before)
+            conn.close()
+
+    def test_batch_rollback_leaves_cache_and_tables_clean(self):
+        with tempfile.TemporaryDirectory() as d:
+            conn = rec.open_outbox(os.path.join(d, "o.sqlite"))
+            meta, last = _meta(), {}
+            items = [(f"Vehicle.Speed.{i}", rec.make_row(
+                "v", f"Vehicle.Speed.{i}", 100 + i, f"rb-{i}", meta, {},
+                float(i), None, None, 1)) for i in range(4)]
+            real_insert = rec._insert_update
+            calls = [0]
+
+            def flaky(c, l, path, row):
+                calls[0] += 1
+                if calls[0] == 3:
+                    raise sqlite3.OperationalError("synthetic stage failure")
+                return real_insert(c, l, path, row)
+            with mock.patch.object(rec, "_insert_update", side_effect=flaky):
+                with self.assertRaises(sqlite3.OperationalError):
+                    rec.store_updates(conn, last, items)
+            self.assertEqual(last, {})
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+            self.assertEqual(conn.execute(
+                "SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+            self.assertEqual(rec.store_updates(conn, last, items), 4)
+            self.assertEqual(len(last), 4)
+            conn.close()
+
+    def test_full_content_parity_with_baseline(self):
+        # Same fixture through baseline (per-row commits) and batched
+        # paths: all outbox/seen fields and the upload SQL must match,
+        # not just row counts.
+        base = _load_baseline_recorder(_baseline_root())
+        if base is None:
+            self.skipTest("baseline checkout absent")
+        with tempfile.TemporaryDirectory() as d:
+            conns, digests = [], []
+            try:
+                for mode, path in (("baseline", "base.sqlite"),
+                                   ("batched", "batch.sqlite")):
+                    mod = base if mode == "baseline" else rec
+                    conn = mod.open_outbox(os.path.join(d, path))
+                    conns.append(conn)
+                    meta = _meta()
+                    items = _bench_items(mod, meta, 60, "parity")
+                    if mode == "baseline":
+                        stored = sum(mod.store_update(conn, {}, p, r)
+                                     for p, r in items)
+                    else:
+                        stored = mod.store_updates(conn, {}, items)
+                    self.assertEqual(stored, 60)
+                    digests.append((_content_digest(mod, conn),
+                                    [dict(zip(mod.COLUMNS, t))
+                                     for t in conn.execute(
+                                        "SELECT " + ",".join(mod.COLUMNS) +
+                                        " FROM outbox ORDER BY event_id")]))
+                self.assertEqual(digests[0][0], digests[1][0])
+                self.assertEqual(
+                    base.render_insert("vehicle_signal", digests[0][1]),
+                    rec.render_insert("vehicle_signal", digests[1][1]))
+            finally:
+                for conn in conns:
+                    conn.close()
+
+    def test_exit_before_commit_stores_nothing_on_restart(self):
+        # Pre-commit boundary the old suite missed: a child killed before
+        # commit must leave an empty outbox (no marks, no partial rows).
+        with tempfile.TemporaryDirectory() as d:
+            db_path = os.path.join(d, "o.sqlite")
+            child = (
+                "import os, sys; sys.path.insert(0, %r);"
+                "from scripts.vehicle import vss_recorder as rec;"
+                "conn = rec.open_outbox(%r);"
+                "meta = {'vehicle_firmware': 'fw1', 'decode_epoch': 'e7',"
+                " 'vss_version': '4.1', 'dbc_primary_commit': 'c-primary',"
+                " 'dbc_supplemental_commit': 'c-supp',"
+                " 'mapping_revision': 'mrev',"
+                " 'collector_version': 'vss-recorder-1'};"
+                "items = [(f'Vehicle.Speed.{i}', rec.make_row("
+                " 'v', f'Vehicle.Speed.{i}', 100 + i, f'pre-{i}',"
+                " meta, {}, float(i), None, None, 1)) for i in range(3)];"
+                "staged = [rec._insert_update(conn, {}, p, r)"
+                " for p, r in items];"
+                "assert all(s for s, _ in staged);"
+                "os._exit(0)" % (REPO, db_path))
+            import subprocess
+            proc = subprocess.run([sys.executable, "-c", child], timeout=60)
+            self.assertEqual(proc.returncode, 0)
+            conn = rec.open_outbox(db_path)
+            try:
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+            finally:
+                conn.close()
+
+    def test_commit_failure_rolls_back_cache_seen_and_outbox(self):
+        # Real commit wiring: a fail-once Connection subclass through the
+        # connect factory proves the batch leaves last/seen/outbox
+        # untouched and retries cleanly.
+        with tempfile.TemporaryDirectory() as d:
+            db_path = os.path.join(d, "o.sqlite")
+            real_connect = rec.sqlite3.connect
+
+            class FailOnceCommit(rec.sqlite3.Connection):
+                armed = False
+                fails_left = 1
+
+                def commit(self):
+                    if type(self).armed and type(self).fails_left:
+                        type(self).fails_left -= 1
+                        raise sqlite3.OperationalError(
+                            "synthetic commit failure")
+                    return super().commit()
+
+            def factory(*args, **kwargs):
+                kwargs.pop("factory", None)
+                return real_connect(*args, factory=FailOnceCommit, **kwargs)
+            meta, last = _meta(), {}
+            items = [(f"Vehicle.Speed.{i}", rec.make_row(
+                "v", f"Vehicle.Speed.{i}", 100 + i, f"cf-{i}", meta, {},
+                float(i), None, None, 1)) for i in range(3)]
+            with mock.patch.object(rec.sqlite3, "connect",
+                                   side_effect=factory):
+                conn = rec.open_outbox(db_path)
+            FailOnceCommit.armed = True
+            try:
+                with self.assertRaises(sqlite3.OperationalError):
+                    rec.store_updates(conn, last, items)
+                self.assertEqual(last, {})
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+                self.assertEqual(conn.execute(
+                    "SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+                self.assertEqual(rec.store_updates(conn, last, items), 3)
+                self.assertEqual(len(last), 3)
+            finally:
+                conn.close()
+
+
     def test_upload_tick_catches_up_full_batches(self):
         # 100 paths @ 1 Hz with 500 rows/10 s: a single tick must drain
         # multiple full batches, not one batch per 10 s.
@@ -636,5 +821,218 @@ class _StopOn:
         return True
 
 
+def _vss_percentile(sorted_ns, pct):
+    """Nearest-rank percentile over the actual sample set."""
+    if not sorted_ns:
+        return 0
+    idx = min(len(sorted_ns) - 1, int(pct / 100 * len(sorted_ns)))
+    return sorted_ns[idx]
+
+def _bench_items(mod, meta, size, tag):
+    """Deterministic mixed-type fixture: num/text/bool rotation with units
+    on every fifth path. Caller-supplied ids, so baseline and batched runs
+    stage byte-identical inputs."""
+    units = {f"Vehicle.Speed.{i}": "km/h"
+             for i in range(size) if i % 5 == 0}
+    items = []
+    for i in range(size):
+        path = f"Vehicle.Speed.{i}"
+        if i % 3 == 0:
+            num, text, boolean = float(i), None, None
+        elif i % 3 == 1:
+            num, text, boolean = None, "t-%d" % i, None
+        else:
+            num, text, boolean = None, None, i % 2
+        items.append((path, mod.make_row(
+            "v", path, 100 + i, "%s-%d" % (tag, i), meta, units,
+            num, text, boolean, 1 + i)))
+    return items
+
+def _rss_kb():
+    import resource
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":  # macOS reports bytes, Linux kilobytes
+        rss //= 1024
+    return rss
+
+
+def _load_baseline_recorder(root):
+    """Load an untouched baseline vss_recorder.py for parity runs. Returns
+    None when the baseline checkout is absent (benchmark then covers the
+    batched path only)."""
+    import importlib.util
+    path = os.path.join(root, "scripts", "vehicle", "vss_recorder.py")
+    if not os.path.isfile(path):
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "vss_baseline_recorder", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _baseline_root():
+    return os.environ.get(
+        "VSS_BASELINE_ROOT", "/tmp/datalake-issues-20261009-baseline")
+
+
+def _content_digest(mod, conn):
+    import hashlib
+    outbox = conn.execute(
+        "SELECT " + ",".join(mod.COLUMNS) + " FROM outbox"
+        " ORDER BY event_id").fetchall()
+    seen = conn.execute(
+        "SELECT event_id FROM seen_ids ORDER BY event_id").fetchall()
+    digest = hashlib.sha256(repr((outbox, seen)).encode()).hexdigest()[:16]
+    rows = [dict(zip(mod.COLUMNS, t)) for t in outbox]
+    sql = hashlib.sha256(mod.render_insert(
+        "vehicle_signal", rows).encode()).hexdigest()[:16]
+    return digest, sql
+
+
+def run_outbox_benchmark(sizes=(200, 1000), rates=(50.0, 500.0), repeats=3,
+                         baseline_root=None, units_per_repeat=25):
+    """Same-fixture baseline-vs-batched grid over snapshot sizes and real
+    received input rates. The received unit is one snapshot/update batch of
+    `size` rows: units are paced at `rate` units/sec with one real
+    monotonic receive timestamp per unit, so p50/p95/p99 run over
+    units_per_repeat*repeats actual receive-to-durable samples per cell
+    (never modeled per-row arrival). Each cell uses a fresh file-backed
+    WAL/FULL outbox; the baseline stores each received unit one row (one
+    commit) at a time, the batched path stores each received unit in one
+    commit. Reports per-unit actual receive-to-durable latency, achieved
+    receive rate, rows/s, commits/1000 rows, sleep-excluded CPU s, final
+    backlog rows, platform-correct peak RSS KB, and full-content plus
+    upload-SQL digests (counts alone prove nothing). Returns a list of row
+    dicts, one per (mode, size, rate) cell."""
+    import statistics
+    import time
+    meta = _meta()
+    base = (_load_baseline_recorder(baseline_root)
+            if baseline_root else None)
+    modes = ("baseline", "batched") if base is not None else ("batched",)
+    report = []
+    for size in sizes:
+        for rate in rates:
+            gap = 1_000_000_000 / rate
+            for mode in modes:
+                mod = base if mode == "baseline" else rec
+                lat, cpus, rss_peak = [], [], 0
+                commits_per_1000, rates_out = [], []
+                digest = sql_digest = None
+                backlog = 0
+                for rep in range(repeats):
+                    with tempfile.TemporaryDirectory() as d:
+                        conn = mod.open_outbox(
+                            os.path.join(d, "bench.sqlite"))
+                        last = {}
+                        commits = [0]
+
+                        def trace(stmt, _c=commits):
+                            if stmt.strip().upper() == "COMMIT":
+                                _c[0] += 1
+                        conn.set_trace_callback(trace)
+                        try:
+                            units, stored, ends, recvs = 0, 0, [], []
+                            c0 = time.process_time_ns()
+                            w0 = time.perf_counter_ns()
+                            for u in range(units_per_repeat):
+                                items = _bench_items(
+                                    mod, meta, size, "bench-%d-%d-%d"
+                                    % (size, rep, u))
+                                t_recv = time.perf_counter_ns()
+                                if mode == "baseline":
+                                    for p, r in items:
+                                        stored += mod.store_update(
+                                            conn, last, p, r)
+                                else:
+                                    stored += mod.store_updates(
+                                        conn, last, items)
+                                ends.append(time.perf_counter_ns())
+                                recvs.append(t_recv)
+                                units += 1
+                                nxt = w0 + units * gap
+                                while True:
+                                    now = time.perf_counter_ns()
+                                    if now >= nxt:
+                                        break
+                                    time.sleep(min(0.005, max(
+                                        0.0, (nxt - now) / 1e9)))
+                            t_end = time.perf_counter_ns()
+                        finally:
+                            conn.set_trace_callback(None)
+                        cpu_s = (time.process_time_ns() - c0) / 1e9
+                        wall_s = (t_end - w0) / 1e9
+                        assert stored == units * size, (mode, stored, units)
+                        lat.extend(e - r for r, e in zip(recvs, ends))
+                        cpus.append(cpu_s)
+                        rss_peak = max(rss_peak, _rss_kb())
+                        commits_per_1000.append(
+                            commits[0] * 1000 / stored)
+                        rates_out.append(units / wall_s if wall_s > 0 else 0)
+                        backlog = conn.execute(
+                            "SELECT COUNT(*) FROM outbox").fetchone()[0]
+                        assert backlog == stored
+                        assert conn.execute(
+                            "SELECT COUNT(*) FROM seen_ids").fetchone()[0] \
+                            == stored
+                        digest, sql_digest = _content_digest(mod, conn)
+                        conn.close()
+                lat_sorted = sorted(lat)
+                report.append({
+                    "mode": mode, "snapshot_rows": size,
+                    "input_rate_per_sec": rate, "repeats": repeats,
+                    "units_per_repeat": units_per_repeat,
+                    "units_measured": units_per_repeat * repeats,
+                    "achieved_units_per_sec": round(
+                        statistics.mean(rates_out), 1),
+                    "rows_per_sec": round(
+                        statistics.mean(rates_out) * size, 1),
+                    "commits_per_1000_rows": round(
+                        statistics.mean(commits_per_1000), 3),
+                    "unit_receive_to_durable_p50_ns": _vss_percentile(
+                        lat_sorted, 50),
+                    "unit_receive_to_durable_p95_ns": _vss_percentile(
+                        lat_sorted, 95),
+                    "unit_receive_to_durable_p99_ns": _vss_percentile(
+                        lat_sorted, 99),
+                    "cpu_s_mean": round(statistics.mean(cpus), 4),
+                    "backlog_rows": backlog, "peak_rss_kb": rss_peak,
+                    "content_digest": digest,
+                    "upload_sql_digest": sql_digest,
+                })
+    return report
+
+
+def main_benchmark(argv=None):
+    """Entry: VSS_BENCH_SIZES=200,1000 VSS_BENCH_RATES=50,500
+    VSS_BENCH_REPEATS=3 VSS_BENCH_UNITS=25 VSS_BASELINE_ROOT=<checkout>
+    python3 -m tests.test_vss benchmark."""
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--sizes", default=os.environ.get(
+        "VSS_BENCH_SIZES", "200,1000"))
+    ap.add_argument("--rates", default=os.environ.get(
+        "VSS_BENCH_RATES", "50,500"))
+    ap.add_argument("--repeats", type=int, default=int(os.environ.get(
+        "VSS_BENCH_REPEATS", "3")))
+    ap.add_argument("--units", type=int, default=int(os.environ.get(
+        "VSS_BENCH_UNITS", "25")))
+    ap.add_argument("--baseline-root", default=_baseline_root())
+    args = ap.parse_args(argv)
+    sizes = tuple(int(s) for s in args.sizes.split(",") if s.strip())
+    rates = tuple(float(s) for s in args.rates.split(",") if s.strip())
+    for row in run_outbox_benchmark(sizes=sizes, rates=rates,
+                                    repeats=args.repeats,
+                                    baseline_root=args.baseline_root,
+                                    units_per_repeat=args.units):
+        print(json.dumps(row, sort_keys=True))
+
+
+
+
 if __name__ == "__main__":
-    unittest.main()
+    if len(sys.argv) > 1 and sys.argv[1] == "benchmark":
+        main_benchmark(sys.argv[2:])
+    else:
+        unittest.main()

@@ -44,11 +44,17 @@ Identity and provenance:
   CONFIG_VERSION provenance is operator-supplied only, never invented.
 
 Durability:
-  Bounded SQLite outbox (PRAGMA WAL); MAX_OUTBOX_ROWS bounds TOTAL pending
-  signal + event rows. Overflow rejects new arrivals (never deletes unacked
-  rows); rejected rows skip seen_ids so redelivery can land after drain.
-  Seen table bounded by 24h prune and MAX_SEEN_IDS limit. Upload acks only on
-  affectedrows == batch size, then deletes exactly the acked batch.
+  Bounded SQLite outbox (PRAGMA WAL, synchronous=FULL); MAX_OUTBOX_ROWS
+  bounds TOTAL pending signal + event rows. One already-received envelope
+  (V payload or alerts/errors/connectivity envelope) commits once: rows
+  stage against a single base COUNT plus staged inserts, then one commit.
+  Success counters and dedupe state land only on commit; rollback reports
+  nothing and retries cleanly. Overflow rejects new arrivals (never deletes
+  unacked rows); rejected rows skip seen_ids so redelivery can land after
+  drain. Seen table bounded by 24h prune and MAX_SEEN_IDS limit. Upload
+  acks only on affectedrows == batch size, then deletes exactly the acked
+  batch. Commit-then-process-exit is durable; power-failure bounds are not
+  claimed (see docs/outbox-batching.md).
 
 Tesla API / vehicle command transmission is strictly prohibited (receive-only).
 """
@@ -1217,12 +1223,19 @@ def outbox_pending_total(conn):
     return total
 
 
-def _store_row(conn, table, columns, row, max_rows):
+def _insert_row(conn, table, columns, row, pending, max_rows):
+    """Stage one row in the caller's transaction; no commit here.
+
+    pending = committed base count + rows already staged as stored in
+    this transaction, so the TOTAL signal+event bound reflects actual
+    inserts without a COUNT per row. Returns 1 stored, 0 duplicate,
+    -1 overflow (rejected rows skip seen_ids so redelivery can land
+    after drain)."""
     key = row["event_id"]
     seen = conn.execute("SELECT 1 FROM seen_ids WHERE event_id=?", (key,)).fetchone()
     if seen is not None:
         return 0
-    if outbox_pending_total(conn) >= max_rows:
+    if pending >= max_rows:
         return -1  # Capacity overflow: reject new arrival, keep unacked rows
     cur = conn.execute(
         "INSERT OR IGNORE INTO " + table + "(" + ",".join(columns) + ")"
@@ -1231,8 +1244,18 @@ def _store_row(conn, table, columns, row, max_rows):
     inserted = cur.rowcount > 0
     conn.execute("INSERT OR IGNORE INTO seen_ids(event_id, seen_at) VALUES(?,?)",
                  (key, now_ns()))
-    conn.commit()
     return 1 if inserted else 0
+
+
+def _store_row(conn, table, columns, row, max_rows):
+    try:
+        res = _insert_row(conn, table, columns, row,
+                          outbox_pending_total(conn), max_rows)
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return res
 
 
 def open_outbox(path):
@@ -1327,21 +1350,20 @@ def _stats_bump(stats, key, delta=1):
         pass
 
 
-def _store_signal_row(conn, meta_env, stats, source_field, raw_val, metadata,
-                      ingest_time_ns, envelope, max_rows):
+def _build_signal_row(meta_env, source_field, raw_val, metadata,
+                      ingest_time_ns, envelope):
+    """Pure row constructor for one allowlisted signal (no DB, no stats)."""
     spec = FIELD_ALLOWLIST.get(source_field)
     if not spec:
-        return 0  # Unreachable: extractor already filters non-allowlisted.
+        return None  # Unreachable: extractor already filters non-allowlisted.
     num, text, boolean, quality = validate_field_value(spec, raw_val)
-    if quality in ("invalid", "range_rejected"):
-        _stats_bump(stats, "invalid_fields")
     path = spec["path"]
     event_id = deterministic_event_id(
         vehicle=metadata["vehicle"], path=path, source_system=SOURCE_SYSTEM,
         source_field=source_field, event_time_ns=metadata["event_time_ns"],
         decode_epoch=meta_env["decode_epoch"], num=num, text=text,
         boolean=boolean)
-    row = {
+    return {
         "event_time": metadata["event_time_ns"],
         "vehicle": metadata["vehicle"],
         "path": path,
@@ -1369,21 +1391,12 @@ def _store_signal_row(conn, meta_env, stats, source_field, raw_val, metadata,
         "envelope_id": envelope,
         "config_version": meta_env.get("config_version") or None,
         "connectivity": None,
-    }
-    res = store_signal_update(conn, row, max_rows=max_rows)
-    if res == 1:
-        _stats_bump(stats, "signals_stored")
-        return 1
-    if res == 0:
-        _stats_bump(stats, "deduped")
-    elif res == -1:
-        _stats_bump(stats, "dropped_signals")
-        _stats_bump(stats, "outbox_overflow_drops")
-    return 0
+    }, quality
 
 
-def _store_event_row(conn, meta_env, stats, topic, event_type, item,
-                     metadata, ingest_time_ns, envelope, max_rows):
+def _build_event_row(meta_env, topic, event_type, item, metadata,
+                     ingest_time_ns, envelope):
+    """Pure row constructor for one envelope event item (no DB, no stats)."""
     audience = _opt_nonempty_str(item.get("audience"))
     is_active = item.get("is_active")
     is_active = is_active if isinstance(is_active, bool) else None
@@ -1393,7 +1406,7 @@ def _store_event_row(conn, meta_env, stats, topic, event_type, item,
         decode_epoch=meta_env["decode_epoch"],
         started_ns=item.get("started_ns"), ended_ns=item.get("ended_ns"),
         audience=audience, is_active=is_active)
-    row = {
+    return {
         "event_time": item["event_time_ns"],
         "vehicle": item["vehicle"],
         "event_type": event_type,
@@ -1420,7 +1433,21 @@ def _store_event_row(conn, meta_env, stats, topic, event_type, item,
         "config_version": meta_env.get("config_version") or None,
         "connectivity": _opt_nonempty_str(item.get("connectivity")),
     }
-    res = store_event_update(conn, row, max_rows=max_rows)
+
+
+def _apply_signal_result(stats, res):
+    if res == 1:
+        _stats_bump(stats, "signals_stored")
+        return 1
+    if res == 0:
+        _stats_bump(stats, "deduped")
+    elif res == -1:
+        _stats_bump(stats, "dropped_signals")
+        _stats_bump(stats, "outbox_overflow_drops")
+    return 0
+
+
+def _apply_event_result(stats, res):
     if res == 1:
         _stats_bump(stats, "events_stored")
         return 1
@@ -1436,7 +1463,12 @@ def _store_event_row(conn, meta_env, stats, topic, event_type, item,
 
 def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
                     topic=TOPIC_V):
-    """Parse one V payload and store allowlisted signals (with tombstones)."""
+    """Parse one V payload and store allowlisted signals (with tombstones).
+
+    One already-received envelope = one SQLite transaction: rows stage via
+    _insert_row against a single base COUNT plus staged inserts, then one
+    commit. Success counters bump only after commit; a failed commit rolls
+    back and reports 0 with no counter or dedupe side effects."""
     ingest_time_ns = now_ns()
     try:
         metadata, raw_signals = extract_protojson_records(
@@ -1453,17 +1485,42 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
     _stats_bump(stats, "messages_received")
     stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
     envelope = envelope_id(topic, payload_bytes)
-    stored = 0
+    built = []
     for source_field, raw_val in raw_signals:
-        stored += _store_signal_row(conn, meta_env, stats, source_field,
-                                    raw_val, metadata, ingest_time_ns,
-                                    envelope, max_rows)
+        rowq = _build_signal_row(meta_env, source_field, raw_val, metadata,
+                                 ingest_time_ns, envelope)
+        if rowq is not None:
+            row, quality = rowq
+            if quality in ("invalid", "range_rejected"):
+                _stats_bump(stats, "invalid_fields")
+            built.append(row)
+    pending = outbox_pending_total(conn)
+    staged = []
+    try:
+        for row in built:
+            staged.append(_insert_row(conn, "outbox", COLUMNS, row,
+                                     pending, max_rows))
+            if staged[-1] == 1:
+                pending += 1
+    except Exception:
+        conn.rollback()
+        raise
+    try:
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    stored = 0
+    for res in staged:
+        stored += _apply_signal_result(stats, res)
     return stored
 
 
 def process_envelope(conn, topic, payload_bytes, meta_env, stats,
                      max_rows=50000):
-    """Parse one alerts/errors/connectivity envelope into event rows."""
+    """Parse one alerts/errors/connectivity envelope into event rows.
+
+    Same one-envelope-one-commit contract as process_message."""
     ingest_time_ns = now_ns()
     try:
         metadata, items = extract_event_envelope(
@@ -1479,11 +1536,26 @@ def process_envelope(conn, topic, payload_bytes, meta_env, stats,
     _stats_bump(stats, "messages_received")
     stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
     envelope = envelope_id(topic, payload_bytes)
-    stored = 0
-    for item in items:
-        stored += _store_event_row(conn, meta_env, stats, topic,
-                                   metadata["event_type"], item, metadata,
-                                   ingest_time_ns, envelope, max_rows)
+    built = [_build_event_row(meta_env, topic, metadata["event_type"], item,
+                              metadata, ingest_time_ns, envelope)
+             for item in items]
+    pending = outbox_pending_total(conn)
+    staged = []
+    try:
+        for row in built:
+            staged.append(_insert_row(conn, "outbox_events", EVENT_COLUMNS,
+                                     row, pending, max_rows))
+            if staged[-1] == 1:
+                pending += 1
+    except Exception:
+        conn.rollback()
+        raise
+    try:
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    stored = sum(_apply_event_result(stats, res) for res in staged)
     return stored
 
 
