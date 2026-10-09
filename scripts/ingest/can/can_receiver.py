@@ -991,20 +991,6 @@ class Receiver(HTTPServer):
                 pass
             self._slots.release()
 
-    def finish_request(self, request, client_address):
-        # A whole-request deadline also bounds clients trickling headers/body.
-        def expire():
-            try:
-                request.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-        deadline = threading.Timer(self.read_timeout, expire)
-        deadline.daemon = True
-        deadline.start()
-        try:
-            self.RequestHandlerClass(request, client_address, self)
-        finally:
-            deadline.cancel()
 
     def server_close(self):
         self._shutdown.set()
@@ -1020,8 +1006,49 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def setup(self):
+        self._deadline_lock = threading.Lock()
+        self._deadline_token = None
         self.request.settimeout(self.server.read_timeout)
         super().setup()
+
+    def handle_one_request(self):
+        # Absolute per-request deadline: socket timeout alone can be postponed
+        # indefinitely by trickled bytes, so a timer bounds the whole request.
+        # Token check and socket shutdown run atomically under the
+        # handler-local lock so a preempted timer N cannot close request N+1;
+        # cancel stays outside the lock so it never waits on a callback.
+        token = object()
+        expired = False
+        with self._deadline_lock:
+            self._deadline_token = token
+
+        def expire():
+            nonlocal expired
+            with self._deadline_lock:
+                if self._deadline_token is not token:
+                    return
+                expired = True
+                # Expired request must not keep the connection (and its slot)
+                # alive for buffered pipelined requests after the shutdown.
+                self.close_connection = True
+                try:
+                    self.request.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+        deadline = threading.Timer(self.server.read_timeout, expire)
+        deadline.daemon = True
+        deadline.start()
+        try:
+            super().handle_one_request()
+        finally:
+            with self._deadline_lock:
+                if self._deadline_token is token:
+                    self._deadline_token = None
+                    if expired:
+                        # A success reply racing the shutdown reopens
+                        # keep-alive; re-assert the expiry close after it.
+                        self.close_connection = True
+            deadline.cancel()
 
     def log_message(self, *args):
         pass

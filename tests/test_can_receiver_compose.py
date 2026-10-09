@@ -10,6 +10,7 @@ Run: python -m tests.test_can_receiver_compose
 """
 import base64
 import gzip
+import http.client
 import json
 import os
 from pathlib import Path
@@ -239,6 +240,24 @@ def main():
 
             wait_for(unauthorized, 60, "receiver auth")
             # Offline durability: backend unreachable, raw ACKs and decodes locally only.
+            # HTTP per-request deadline: the packaged socket stays reusable
+            # beyond one whole-request timeout worth of fast /status calls.
+            status_port = compose("port", "can-receiver", "4319").strip().rsplit(":", 1)[1]
+            status_auth = "Basic " + base64.b64encode((otlp_user + ":" + otlp_password).encode()).decode()
+            keep = http.client.HTTPConnection("127.0.0.1", int(status_port), timeout=30)
+            first_sock = None
+            for _ in range(8):
+                keep.request("GET", "/status", headers={"Authorization": status_auth})
+                kept = keep.getresponse()
+                assert kept.status == 200
+                kept.read()
+                if first_sock is None:
+                    first_sock = keep.sock
+                else:
+                    assert keep.sock is first_sock  # Zero reconnects.
+                time.sleep(2)  # ~16s connection life exceeds the default 15s whole-request bound.
+            keep.close()
+
             upload_all(endpoint)
             expected = expect_rows([(meta_a, chunks_a), (meta_b, chunks_b)])
             assert len(expected) == TINY_A + TINY_B + DENSE_ROWS

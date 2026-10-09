@@ -132,6 +132,11 @@ python -m tests.test_trace_privacy
 
 CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentelemetry-proto==1.38.0` 후 `python -m tests.test_can_receiver`, `python -m tests.test_can_decoder`, `python -m tests.test_can_otlp_wire`로 실행합니다. 조밀한 frame의 bounded decode·부분 cursor 재개·중복 event ID, 10,000레코드/2 MiB wire 경계와 엄격한 metadata 검증을 포함합니다. `python -m tests.test_can_backup`과 `python -m tests.test_storage_metrics`는 일관 snapshot·fresh target·공간 부족·private mode 및 cached counter/unknown 지표를 확인합니다. 운영 DBC·원본·자격 증명은 사용하지 않습니다. 기존 wire privacy 런타임의 `opentelemetry-proto==1.39.1`은 별도 감사 컨테이너에 유지하며 receiver의 venv와 섞지 않습니다.
 
+`python -m tests.test_can_http_deadline`은 실제 loopback HTTP에서 요청별 절대
+deadline, 같은 keep-alive socket의 timeout 초과 재사용, 느린 client 종료와
+ACK 유실 후 원본 중복 제거를 검사합니다. deadline은 연결 전체 수명이 아니라
+각 요청에 적용되며, idle 연결도 동일 timeout과 concurrency 제한을 받습니다.
+
 성능 비교는 같은 row 집합·27개 column·event ID·정수 nanosecond를 검증한 뒤 수행하세요. SQL timestamp CAST와 정수 literal, native gRPC의 HTTP/protobuf body 및 encode/ACK 시간을 분리합니다. full ACK, ACK 유실 뒤 재전송 중복 제거, NULL/0/false/빈 문자열/Unicode, 잘못된 인증을 함께 확인하며 backend가 거부한 timestamp 경계는 성공 행 수에서 숨기지 않습니다. 소규모 로컬 fixture의 gRPC 우위나 index/cache query plan은 운영 처리량 증거가 아니며 의존성·운영 query 선택도를 확인하기 전 transport/index 기본값을 바꾸지 않습니다.
 
 ### 성능·보존 정책 검사
