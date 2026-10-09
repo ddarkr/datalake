@@ -276,7 +276,106 @@ class MF4Test(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(spool, "quarantine", "m3_mid.jsonl")))
             self.assertFalse(os.path.exists(cp2))
+            cp4 = os.path.join(dirs["closed"], "m3_utf8.jsonl")
+            damaged = (good[0] + "\n").encode() + b"\xff\n"
+            with open(cp4, "wb") as fh:
+                fh.write(damaged)
+            with self.assertRaises(ValueError):
+                rec.finalize_segment(cp4, dirs["sealed"], spool=spool)
+            with open(os.path.join(spool, "quarantine", "m3_utf8.jsonl"),
+                      "rb") as fh:
+                self.assertEqual(fh.read(), damaged)
+            self.assertEqual(os.listdir(dirs["sealed"]), [])
 
+    def test_finalize_empty_whitespace_torn_tail_returns_none(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            for name, body in (
+                    ("m3_empty.jsonl", b""),
+                    ("m3_blank.jsonl", b"  \n\n \t\n"),
+                    ("m3_torn_only.jsonl", b'{"v":'),
+            ):
+                cp = os.path.join(dirs["closed"], name)
+                with open(cp, "wb") as fh:
+                    fh.write(body)
+                stats = {}
+                out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                           stats=stats)
+                self.assertIsNone(out)  # prior empty policy: None, no triple
+                self.assertFalse(os.path.exists(cp))  # empty closed consumed
+                stem = name[:-len(".jsonl")]
+                for suffix in (".mf4", ".ingress.jsonl.gz",
+                               ".mf4.manifest.json", ".stage.tmp"):
+                    self.assertFalse(os.path.exists(
+                        os.path.join(dirs["sealed"], stem + suffix)))
+                leftovers = [n for n in os.listdir(dirs["sealed"])
+                             if n.startswith(stem + ".")]
+                self.assertEqual(leftovers, [])
+
+    def test_finalize_combined_tmp_budget_fails_closed(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = BoundedMemoryTest()._frames(60)
+            stem = "m3_20260921T000017Z_deadbeef_017"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            # Calibrate on the same spill path (mem_frames=1): full
+            # finalize succeeds, so every partial sum fits a huge budget.
+            from unittest.mock import patch
+            stats = {}
+            match_bytes = []
+            note_live = rec.SortedFrameStore._note_live
+
+            def measure_live(store, extra_paths=()):
+                total = note_live(store, extra_paths)
+                stage_size = sum(os.path.getsize(p) for p in extra_paths)
+                match_bytes.append(total - stage_size)
+                return total
+
+            with patch.object(rec.SortedFrameStore, "_note_live", measure_live):
+                out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                           mem_frames=1, stats=stats)
+            combined = int(stats["peak_temp_bytes"])
+            staged_bytes = os.path.getsize(out)
+            for suffix in (".mf4", ".ingress.jsonl.gz",
+                           ".mf4.manifest.json"):
+                os.unlink(os.path.join(dirs["sealed"], stem + suffix))
+            store = rec.SortedFrameStore(dirs["sealed"], stem, 1, 2 << 30)
+            try:
+                for f in frames:
+                    store.add(f)
+                store.finish_staging()
+                sort_only = rec._enforce_tmp_budget(store.dir, 2 << 30)
+            finally:
+                store.destroy()
+            # Keep both partials below the cap, with room for MF4 metadata
+            # size variation between writes; the combined footprint exceeds it.
+            partial_peak = max(sort_only + staged_bytes, max(match_bytes))
+            cap = (partial_peak + combined) // 2
+            self.assertLess(sort_only + staged_bytes, cap)
+            self.assertLess(max(match_bytes), cap)
+            with self.assertRaises(rec.NoSpace):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     mem_frames=1, tmp_max_bytes=cap)
+            self.assertTrue(os.path.exists(cp))  # source kept for retry
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".mf4")))
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".mf4.manifest.json")))
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".ingress.jsonl.gz")))
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".stage.tmp")))
 
 class _Missing(Exception):
     """Mimics botocore ClientError for a missing key (NoSuchKey)."""

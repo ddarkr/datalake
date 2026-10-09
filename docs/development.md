@@ -14,7 +14,7 @@
 | [`tools/check_env.py`](../tools/check_env.py) | Compose 환경변수와 예제의 일치 검사 |
 | [`tools/demo.py`](../tools/demo.py) | stdlib 데모 CLI, 격리 런타임·복원 검사와 필수 CAN/RAW 검사 |
 | [`tests/`](../tests/) | 동작·보안·스토리지·렌더링 검증 |
-| [`.github/workflows/compose.yml`](../.github/workflows/compose.yml) | push/PR 시 비밀 정보·플러그인·회귀·생성물·프로필 검사 |
+| [`.github/workflows/compose.yml`](../.github/workflows/compose.yml) | push/PR 시 비밀 정보·플러그인·회귀·CAN 성능·생성물·프로필 검사 |
 
 ### Python 도메인
 
@@ -33,6 +33,23 @@
 `scripts`는 Python namespace package입니다. 저장소 루트에서 `python -m scripts.<도메인>.<모듈>`로 실행하며, 로컬 모듈은 같은 정규 경로로 import합니다. 컨테이너도 `/app/scripts/`에 같은 구조를 마운트하고 `/app`에서 실행합니다. 파일 직접 실행이나 이전 평탄 경로는 지원하지 않습니다. 예를 들어 CAN 상태 조회는 `python -m scripts.ingest.can.can_receiver status --database /private/path/raw.sqlite3`입니다.
 
 테스트는 루트에서 `python -m tests.test_can_receiver`처럼 실행합니다. 배터리 계산 모듈은 DB·수집기를 import하지 않으며 `battery_runtime`이 조회·분석·저장을 연결합니다. SocketCAN/MF4 원본 경로와 서버 CAN/SQLite 원본 경로는 별도 계약입니다.
+
+### CAN 성능 회귀 검사
+
+`can-decode-perf`는 PR의 base 또는 push 직전 커밋과 현재 코드를 별도 프로세스에서 비교합니다. 합성 데이터 7종을 순서를 교대하여 3회 실행하고, 최종 행·순서·커서·부분 체크포인트·카운터가 다르거나 어느 fixture의 중앙 실행 시간이 25% 넘게 느려지면 실패합니다. 실패 때도 JSON 결과를 artifact로 남깁니다. 최초 push처럼 기준 커밋이 없는 경우는 성능 검증을 했다고 표시하지 않으며, 잘못되거나 가져올 수 없는 기존 커밋은 실패 처리합니다.
+
+```bash
+python -m pip install --only-binary=:all: cantools==40.7.1 \
+  opentelemetry-proto==1.38.0 protobuf==6.33.6
+python tools/benchmark_can_decode.py \
+  --baseline-root /path/to/pre-change-checkout \
+  --chunks 2000 --repeats 3 --no-instrument --max-slowdown 0.25 \
+  --json-out /tmp/datalake-can-decode-perf.json
+# Docker가 있는 환경: 격리된 GreptimeDB 1.2.1에 실제 적재·ACK·재시작·재전송 검사
+python -m tests.test_can_receiver_compose
+```
+
+CI에는 합성 DBC·OTLP만 사용합니다. 운영 원본·정의·차량 식별자·접속 정보는 공개 checkout과 artifact에 넣지 않습니다. 합성 처리율과 격리 재생 결과만으로 운영 수집·적재 처리율이나 적체 감소를 보장하지 않습니다.
 
 ### 배포 번들 생성
 

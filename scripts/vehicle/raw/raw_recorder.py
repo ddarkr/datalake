@@ -584,6 +584,28 @@ def _frame_sort_key(f):
 
 
 
+def _live_tmp_bytes(store, extra_paths=()):
+    """Aggregate all simultaneously live per-segment temp bytes: the store
+    temp-dir files plus the staged MF4 living beside it. Sealed outputs
+    (.mf4, sidecar, manifest) never count. Returns the aggregate; the
+    caller records the max as the combined peak, so partial sums can never
+    hide a joint overrun."""
+    total = 0
+    if getattr(store, "dir", None):
+        for root, _ds, fns in os.walk(store.dir):
+            for fn in fns:
+                try:
+                    total += os.path.getsize(os.path.join(root, fn))
+                except OSError:
+                    pass
+    for path in extra_paths or ():
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
 def _enforce_tmp_budget(tmpdir, max_bytes):
     total = 0
     for name in os.listdir(tmpdir):
@@ -638,6 +660,7 @@ class SortedFrameStore:
         self.spilled = False
         self.peak_resident_frames = 0
         self.peak_temp_bytes = 0
+        self._stage_paths = ()
         try:
             self.db = sqlite3.connect(self.db_path)
             self.db.execute("CREATE TABLE frames (twall_ns INTEGER,"
@@ -658,6 +681,20 @@ class SortedFrameStore:
         self.peak_temp_bytes = max(
             self.peak_temp_bytes,
             _enforce_tmp_budget(self.dir, self.max_bytes))
+
+    def _note_live(self, extra_paths=()):
+        # ONE budget over sort dir + staged MF4; call once the staged MF4
+        # exists and on every match batch/index so a joint overrun fails
+        # closed even when each partial sum fits. Reuses the existing
+        # _enforce_tmp_budget dir walk, just aggregated with the stage.
+        total = _live_tmp_bytes(self, extra_paths)
+        if total > self.max_bytes:
+            self.peak_temp_bytes = max(self.peak_temp_bytes, total)
+            raise NoSpace("finalize temp budget exceeded"
+                          " (%d > %d)" % (total, self.max_bytes))
+        if total > self.peak_temp_bytes:
+            self.peak_temp_bytes = total
+        return total
 
     def _flush_batch(self):
         try:
@@ -896,11 +933,11 @@ def _matched_mf4_store(mf4_path, store):
     duplicate-heavy segments do not build one proportional in-memory
     list per identity. Rows stage in budget-derived batches (never the
     fixed 2000-row window regardless of a smaller budget, never more
-    than the configured frame budget resident); the temp dir budget is
-    enforced during every staging batch and after the match index is
-    built, counting journal/WAL/index bytes. On NoSpace the caller keeps
-    the closed JSONL, publishes nothing, and the temp dir is destroyed
-    closed; the separate match table is unlinked before return.
+    than the configured frame budget resident); the ONE tmp budget is
+    enforced as the combined aggregate (sort dir + staged MF4 via
+    `store._note_live`) during every staging batch and after the match
+    index is built, counting journal/WAL/index bytes. On NoSpace the caller
+    keeps the closed JSONL, publishes nothing, and the temp dir is
     """
     import json as _json
     from can.io.mf4 import MF4Reader
@@ -930,6 +967,7 @@ def _matched_mf4_store(mf4_path, store):
             store._note_temp()
             if len(rows) > store.peak_resident_frames:
                 store.peak_resident_frames = len(rows)
+            store._note_live(getattr(store, "_stage_paths", ()))
 
         for frame in store.ordered():
             ident = repr(_message_key(_frame_to_message(frame, None)))
@@ -949,6 +987,7 @@ def _matched_mf4_store(mf4_path, store):
                 raise NoSpace("finalize match db: %s" % ex)
             raise
         store._note_temp()
+        store._note_live(getattr(store, "_stage_paths", ()))
         reader = MF4Reader(mf4_path)
         try:
             for message in reader:
@@ -1037,23 +1076,28 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
     then publishes the immutable triple (<stem>.mf4 + <stem>.ingress.jsonl.gz
     + <stem>.mf4.manifest.json) and RETURNS with the closed JSONL still on
     disk. The uploader deletes closed + sealed locals only after the verified
-    remote ack, so finalize itself never deletes ingress history.
+    remote ack, so finalize itself never deletes ingress history, except the
+    prior empty-segment rule: zero decodable frames (empty, whitespace-only,
+    or torn-tail-only salvage with nothing left) unlinks the closed JSONL
+    and returns None with no triple and no temp leftovers.
     Resumable: if a crash left a verified triple behind (MF4 + sidecar +
     manifest all present and hash-clean), the closed JSONL is re-hashed and
     the call returns the existing MF4; a half-written triple is rebuilt from
     the closed JSONL still on disk. Returns the MF4 path or None for empty.
-
     Bounded: the closed JSONL streams through IngressStream (fixed-size
     chunks, one line buffer capped at 1 MiB) with at most mem_frames
     (RAW_FINALIZE_MEM_FRAMES, default 20000) resident; larger segments
     spill insert batches to one temp SQLite file indexed by
     (twall_ns, seq) under sealed_dir, bounded by tmp_max_bytes
-    (RAW_TMP_MAX_BYTES, default 2 GiB) enforced during sort AND match
-    staging. Budgets <= 0 raise ValueError. Exceeding the temp budget
-    raises NoSpace: the closed JSONL stays, nothing is published, retry
-    later. Interrupted temp dirs (<stem>.* sqlite dirs) are swept on
-    entry before reuse. Pass stats={} to collect peak_temp_bytes,
-    peak_resident_frames, budget_frames, tmp_max_bytes.
+    (RAW_TMP_MAX_BYTES, default 2 GiB) enforced as ONE aggregate over the
+    simultaneously live sort dir, match DB/files, and staged MF4
+    (`store._note_live`), recording the true combined peak. Budgets <= 0
+    raise ValueError. Exceeding the temp budget raises NoSpace: the closed
+    JSONL stays, nothing is published, retry later. Sealed outputs never
+    count as temporary. Interrupted temp dirs (<stem>.* sqlite dirs) and a
+    stale `<stem>.stage.tmp` are swept on entry before reuse. Pass
+    stats={} to collect peak_temp_bytes, peak_resident_frames,
+    budget_frames, tmp_max_bytes.
     """
     import gzip
     from can.io.mf4 import MF4Writer
@@ -1075,6 +1119,10 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
     if spool is None:
         spool = os.path.dirname(os.path.dirname(closed_path))
     _sweep_stale_tmp(sealed_dir, stem)
+    try:
+        os.unlink(os.path.join(sealed_dir, stem + ".stage.tmp"))
+    except OSError:
+        pass
     out = os.path.join(sealed_dir, stem + ".mf4")
     sidecar = os.path.join(sealed_dir, stem + ".ingress.jsonl.gz")
     manifest_path = out + ".manifest.json"
@@ -1139,6 +1187,12 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
                              tmp_max_bytes=store.max_bytes)
             minc("finalize_errors")
             raise
+        nframes, first, last, seq_first, seq_last, tw_first, tw_last = \
+            store.first_last()
+        if nframes == 0:
+            # Prior empty policy: no frames (empty, whitespace-only, or
+            # torn-tail-only salvage with nothing decodable) seals nothing.
+            # Drop the empty closed JSONL, leave no triple/temp behind.
             if stats is not None:
                 stats.update(peak_temp_bytes=store.peak_temp_bytes,
                              peak_resident_frames=store.peak_resident_frames,
@@ -1147,8 +1201,6 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
             store.destroy()
             os.unlink(closed_path)
             return None
-        nframes, first, last, seq_first, seq_last, tw_first, tw_last = \
-            store.first_last()
         bus = first["bus"]
         # MF4Writer has no append mode: one writer per segment, stop()
         # persists. Write to a staging name WITHOUT a .mf4 suffix: asammdf
@@ -1171,22 +1223,16 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
                 pass
             minc("finalize_errors")
             raise
+        store._stage_paths = (stage,)
         try:
-            staged_bytes = os.path.getsize(stage)
-        except OSError:
-            staged_bytes = 0
-        combined_temp = store.peak_temp_bytes + staged_bytes
-        if combined_temp > store.max_bytes:
+            store._note_live((stage,))
+        except NoSpace:
             try:
                 os.unlink(stage)
             except OSError:
                 pass
             minc("finalize_errors")
-            raise NoSpace("finalize temp budget exceeded by staged MF4"
-                          " (%d + %d > %d)"
-                          % (staged_bytes, store.peak_temp_bytes,
-                             store.max_bytes))
-        store.peak_temp_bytes = combined_temp
+            raise
         try:
             verify_sealed_mf4(stage, store)
         except Exception:
@@ -1196,6 +1242,8 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
                 pass
             minc("finalize_errors")
             raise
+        finally:
+            store._stage_paths = ()
         mf4_digest = _sha256_file(stage)
         # fsync the verified MF4 before any rename makes it visible.
         with open(stage, "rb") as fh:

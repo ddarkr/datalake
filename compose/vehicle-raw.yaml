@@ -25,6 +25,8 @@ services:
   raw-recorder:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
+    labels:
+      datalake.raw-recorder-revision: "1"
     working_dir: /app
     command: [/opt/venv/bin/python, -m, scripts.vehicle.raw.raw_recorder]
     depends_on:

@@ -1396,15 +1396,40 @@ def release_generation_ref(client, bucket, key):
         pass
 
 
+def read_retiring_identity(client, bucket, bp, bid):
+    """Validate the RETIRING marker body names exactly this backup id.
+
+    The marker is the durable resume identity: a stray or cross-generation
+    marker must never authorize payload deletion."""
+    rbase = remote_base(bp, bid)
+    try:
+        raw = s3_get_control(client, bucket, rbase + RETIRING_NAME, SIDECAR_CAP)
+    except Exception as e:
+        raise IOError("RETIRING marker unreadable for %s (refusing): %s"
+                      % (bid, str(e)[:120]))
+    try:
+        body = raw.decode("utf-8").strip()
+    except Exception:
+        raise IOError("RETIRING marker not text for %s (refusing)" % bid)
+    if body != bid:
+        raise IOError("RETIRING marker identity mismatch for %s (refusing)" % bid)
+    return True
+
+
 def resume_retiring(client, bucket, bp, bid):
     """Finish an interrupted retirement: re-list live keys (durable identity
-    is the REAL remaining objects under the prefix), refuse active refs, then
-    delete COMPLETE alone, confirm its absence, and only then delete payload
-    before the RETIRING marker. Idempotent."""
+    is the REAL remaining objects under the prefix), validate the RETIRING
+    marker names this generation, refuse active refs, then delete COMPLETE
+    alone, confirm its absence, and only then delete payload before the
+    RETIRING marker. Idempotent."""
     rbase = remote_base(bp, bid)
     live = [o["Key"] for o in s3_list_all(client, bucket, rbase)]
     if not live:
         return 0
+    if rbase + RETIRING_NAME not in set(live):
+        raise IOError("generation %s has no RETIRING marker (not a started"
+                      " retirement: refusing)" % bid)
+    read_retiring_identity(client, bucket, bp, bid)
     refs = sorted(k for k in live if k.startswith(rbase + REFS_DIR))
     if refs:
         raise IOError("generation %s referenced by %d active reader(s): refusing"
@@ -1488,15 +1513,18 @@ def cmd_retention(current_bid=None):
         client = make_s3_client()
         gens, _ = remote_generations(client, env("S3_BUCKET"), bp)
         # Resume interrupted retirements first: a RETIRING marker is the
-        # durable identity cmd_retention omitted before. Refuse refs: a
-        # restore that started before retirement must finish first.
-        # Unaged/fresh incomplete prefixes (concurrent backup/restore with
-        # no COMPLETE yet) block enforce; aged ones are reported, never
-        # deleted. Set grace 0 to override explicitly after manual review.
+        # durable identity (marker body names the generation; resume
+        # validates it, refuses active refs, confirms COMPLETE absence
+        # before payload, and removes RETIRING last). A started retirement
+        # whose COMPLETE is already gone classifies as incomplete with
+        # created_ns=None, so it must never sit in the grace gate: waiting
+        # cannot age a None timestamp. Fresh incomplete prefixes with no
+        # RETIRING (concurrent backup with no COMPLETE yet) still block
+        # enforce inside grace; aged ones are reported, never deleted.
         retiring = [g for g in gens if g.get("retiring")]
         now_ns = time.time_ns()
         blocking = [g for g in gens
-                    if g["status"] == "incomplete" and (
+                    if g["status"] == "incomplete" and not g.get("retiring") and (
                         g["created_ns"] is None
                         or now_ns - g["created_ns"] < settings["grace"] * 1_000_000_000)]
         keep, deletes, skipped = retention_plan(gens, settings, now_ns)
@@ -1504,8 +1532,12 @@ def cmd_retention(current_bid=None):
         for g in deletes:
             sys.stdout.write("retention: candidate %s bytes=%d objects=%d\n"
                              % (g["backup_id"], g["bytes"], len(g["keys"])))
-        sys.stdout.write("retention: mode=%s keep=%d delete=%d bytes=%d\n"
-                         % (settings["mode"], len(keep), len(deletes), expect))
+        for g in retiring:
+            sys.stdout.write("retention: resume %s bytes=%d objects=%d\n"
+                             % (g["backup_id"], g["bytes"], len(g["keys"])))
+        sys.stdout.write("retention: mode=%s keep=%d delete=%d resume=%d bytes=%d\n"
+                         % (settings["mode"], len(keep), len(deletes),
+                            len(retiring), expect))
         for bid, why in skipped:
             sys.stdout.write("retention: skip %s (%s)\n" % (bid, why))
         if settings["mode"] != "enforce":

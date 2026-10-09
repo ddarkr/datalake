@@ -122,3 +122,71 @@ jobs:
           if test -f "$RUNNER_TEMP/datalake-demo/state.json"; then
             python tools/demo.py stop --state "$RUNNER_TEMP/datalake-demo"
           fi
+
+  can-decode-perf:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the PR base / push before commit exists for git archive.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned synthetic CAN decode dependencies
+        run: |
+          python -m pip install --only-binary=:all: cantools==40.7.1 \
+            opentelemetry-proto==1.38.0 protobuf==6.33.6
+      - name: Materialize baseline archive under RUNNER_TEMP
+        id: baseline
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          unavailable() {
+            printf '{"baseline_available": false, "cases": {}, "max_slowdown": 0.25, "mismatch": [], "note": "synthetic fixture only; baseline unavailable (%s); no regression gate claimed", "regressions": [], "synthetic": true}\n' "$1" > "$RUNNER_TEMP/can-decode-perf.json"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          }
+          sha=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            sha="$PR_BASE_SHA"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            sha="$PUSH_BEFORE_SHA"
+          else
+            unavailable "unsupported-event"
+            exit 1
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            unavailable "untrusted-or-missing-sha"
+            exit 1
+          fi
+          if [ "$sha" = "0000000000000000000000000000000000000000" ]; then
+            unavailable "initial-push-has-no-before-commit"
+            exit 0
+          fi
+          if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+            unavailable "object-not-present"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/can-decode-baseline"
+          mkdir -p "$RUNNER_TEMP/can-decode-baseline"
+          git archive "$sha" | tar -x -C "$RUNNER_TEMP/can-decode-baseline"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+      - name: Run synthetic CAN decode regression gate
+        if: steps.baseline.outputs.available == 'true'
+        run: |
+          python tools/benchmark_can_decode.py \
+            --baseline-root "$RUNNER_TEMP/can-decode-baseline" \
+            --chunks 2000 --repeats 3 --no-instrument \
+            --max-slowdown 0.25 \
+            --json-out "$RUNNER_TEMP/can-decode-perf.json"
+      - name: Upload synthetic decode measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: can-decode-perf
+          path: ${{ runner.temp }}/can-decode-perf.json
+          if-no-files-found: error

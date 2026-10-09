@@ -15,9 +15,13 @@ via `gunzip_compare`) never build proportional bytes/frame objects.
   `ValueError` (fail fast, never silent `max(1, ...)`).
   This bounds application frame staging, not total process RSS: SQLite,
   Python and MF4 libraries have their own buffers. Measure RSS separately.
-- `RAW_TMP_MAX_BYTES` (default 2 GiB, must be > 0): checked temp-disk
-  budget over the per-segment temp dir after every bounded sort/match
-  batch, index build, and staged-MF4 accounting (journal/WAL included).
+- `RAW_TMP_MAX_BYTES` (default 2 GiB, must be > 0): ONE aggregate over the
+  simultaneously live sort dir (`frames.sqlite3` + journal/WAL/index),
+  match DB/files (`match.sqlite3*`), and the staged MF4
+  (`<stem>.stage.tmp`) living beside the dir, enforced via
+  `store._note_live` after staging and on every match batch/index, and
+  recording the true combined `peak_temp_bytes`. Partial sums can each fit
+  while the joint total exceeds the cap; that trips `NoSpace` too.
   This is not an OS filesystem quota; an individual write can cross the
   threshold before the check. Exceeding it raises `NoSpace`: the closed
   JSONL stays, nothing is published, and temp handles/directories are
@@ -32,25 +36,29 @@ via `gunzip_compare`) never build proportional bytes/frame objects.
   quarantines via `CorruptSegment` (never salvaged, `.torn` stays False).
   Only an unterminated decodable tail sets `.torn`.
 
-## Temp lifecycle
-
 - Temp dirs are `sealed/<stem>.*` holding `frames.sqlite3` (+ journals)
-  and `match.sqlite3` during verify. `finalize_segment` sweeps stale
-  ones for its stem on entry (legacy `run-*.tmp` dirs too);
+  and `match.sqlite3` during verify, plus the staged MF4
+  (`<stem>.stage.tmp`) living beside the dir until the sealed rename.
+  `finalize_segment` sweeps stale ones for its stem on entry (legacy
+  `run-*.tmp` dirs and a stale `<stem>.stage.tmp` too);
   `recover_spool` sweeps all of them on restart. The closed JSONL they
   came from is still on disk, so sweeping never loses data.
 - `store.destroy()` closes the SQLite handle first, then removes the
   temp dir, on success, empty-segment return, corruption quarantine,
   NoSpace, and verify-failure paths. `finalize_segment(..., stats={})`
-  reports `peak_temp_bytes` (max temp-dir bytes incl. staged MF4),
-  `peak_resident_frames` (max resident incl. match batches),
-  `budget_frames`, `tmp_max_bytes` for the benchmark hook; sealed
-  outputs never count as temporary.
+  reports `peak_temp_bytes` (true combined max: live sort dir + match
+  files + staged MF4), `peak_resident_frames` (max resident incl. match
+  batches), `budget_frames`, `tmp_max_bytes` for the benchmark hook;
+  sealed outputs never count as temporary.
 
 ## Semantics preserved
 
 - Torn-tail salvage (unterminated last line only), mid-file and
   newline-terminated corruption quarantine, UTF-8 failure quarantine.
+  Zero decodable frames (empty file, whitespace/newlines only, or a lone
+  torn tail such as `b'{"v":'` with nothing salvageable) is the prior
+  empty policy: `finalize_segment` returns `None`, unlinks the empty
+  closed JSONL, and publishes no triple with no temp leftovers.
 - Chronological MF4 order by `(twall_ns, seq)`; float-equal timestamps,
   Data/Error/Remote reorder, duplicate identities consume timestamps
   chronologically; full payload/DLC/channel/flags/identifier/capture-time

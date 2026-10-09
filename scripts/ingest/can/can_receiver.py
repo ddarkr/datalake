@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+from collections import deque
 import contextlib
 import datetime
 import fcntl
 import hashlib
+import heapq
 import hmac
 import http.client
 import ipaddress
@@ -41,6 +43,7 @@ COLUMNS = (
     "collector_id", "source_is_resend", "quality", "envelope_id",
     "config_version", "connectivity",
 )
+_COLUMN_SET = frozenset(COLUMNS)
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
 INT64_MAX = 2**63 - 1
 SCHEMA = """
@@ -182,26 +185,32 @@ def _refresh_pending_epoch(conn, epoch):
     )
 
 
-def candidate_sql(n_progress):
-    """Pending-driven candidate SELECT shared by decode_once and runners.
+def candidate_sql():
+    """Pending-head merge source shared by decode_once and runners.
 
-    Bind 2*n_progress (session, want-seq) progress pairs, then the epoch
-    twice. CROSS JOIN pins decode_pending first so retained completed
-    history is never scanned; ORDER BY c.id LIMIT 1 keeps the global
-    earliest-arrival choice and staged-progress semantics.
+    One row per pending session at its persisted next-seq cursor, in global
+    raw arrival order: bind the epoch twice. decode_once pages each head
+    forward with the indexed (session, seq) key, so retained completed
+    history is never scanned and no staged-progress CTE is needed. BLOBs
+    stay out: heads carry (id, session, seq) only; chunk bytes load per
+    session page under a global byte cap.
     """
-    placeholders = ",".join("(?,?)" for _ in range(n_progress)) or "(NULL,NULL)"
     return (
-        "WITH progress(session,next_seq) AS (VALUES " + placeholders + ") "
-        "SELECT c.session AS session, c.seq AS seq, c.offset_ns AS offset_ns, "
-        "c.phase AS phase, c.data AS data, s.meta_json AS meta_json, d.state_json AS state_json, "
-        "d.counts_json AS counts_json, d.rows AS rows FROM decode_pending q "
+        "SELECT c.id AS id, c.session AS session, c.seq AS seq "
+        "FROM decode_pending q "
         "CROSS JOIN sessions s ON s.id=q.session AND q.epoch=? "
         "LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
-        "LEFT JOIN progress p ON p.session=s.id "
-        "JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(p.next_seq,d.next_seq,0) "
-        "ORDER BY c.id LIMIT 1"
+        "JOIN raw_chunks c ON c.session=s.id AND c.seq=COALESCE(d.next_seq,0) "
+        "ORDER BY c.id"
     )
+
+
+# Per-session page size for bounded prefetch: indexed (session, seq) pages of
+# full rows behind each pending head, merged by global raw id in a heap.
+DECODE_PAGE_ROWS = 64
+# Global cap on prefetched raw chunk bytes across sessions: tiny serial
+# frames decode far below this, so one batch normally stages one read pass.
+DECODE_PREFETCH_BYTES = 1024 * 1024
 
 
 def _reconcile_pending_session(conn, epoch, session_id):
@@ -401,57 +410,100 @@ class Archive:
         # within budget stages alone and commits its resume state; later chunks
         # wait for the next call so no remaining frames are skipped.
         deadline = time.monotonic() + 0.05
+        if limit <= 0:
+            return 0
+        window = getattr(self, "_decode_prefetch_limit", 1000)
+        prefetch_limit = min(limit, window)
+        # Merge a bounded prefix while reading, then release the snapshot before
+        # decoding. Unpaged heads remain in the heap: exhausting a page or the
+        # byte budget must never let a later session bypass the earliest chunk.
+        with self.connect() as conn:
+            conn.execute("BEGIN")
+            heap = [(head["id"], head["session"], head["seq"]) for head in
+                    conn.execute(candidate_sql(), (decoder.epoch, decoder.epoch))]
+            heapq.heapify(heap)
+            pages, anchors, partials, metadata = {}, {}, {}, {}
+            prefix = []
+            prefetched_bytes = fetched_rows = 0
+            while heap and len(prefix) < prefetch_limit:
+                _, session, want = heapq.heappop(heap)
+                run = pages.get(session)
+                if not run:
+                    if fetched_rows >= prefetch_limit or prefetched_bytes >= DECODE_PREFETCH_BYTES:
+                        break
+                    run = deque()
+                    with contextlib.closing(conn.execute(
+                        "SELECT c.id,c.session,c.seq,c.offset_ns,c.phase,c.data,s.meta_json "
+                        "FROM raw_chunks c JOIN sessions s ON s.id=c.session "
+                        "WHERE c.session=? AND c.seq>=? ORDER BY c.seq LIMIT ?",
+                        (session, want, min(DECODE_PAGE_ROWS, prefetch_limit - fetched_rows)),
+                    )) as cursor:
+                        for row in cursor:
+                            if row["seq"] != want + len(run):
+                                break
+                            if prefetched_bytes + len(row["data"]) > DECODE_PREFETCH_BYTES:
+                                break
+                            run.append(row)
+                            prefetched_bytes += len(row["data"])
+                            fetched_rows += 1
+                    if not run:
+                        break
+                    pages[session] = run
+                    if session not in anchors:
+                        metadata[session] = json.loads(run[0]["meta_json"])
+                        anchors[session] = conn.execute(
+                            "SELECT next_seq,state_json,counts_json,rows FROM decode_states "
+                            "WHERE session=? AND epoch=?", (session, decoder.epoch),
+                        ).fetchone()
+                        partials[session] = conn.execute(
+                            "SELECT seq,state_json,counts_json,rows_emitted FROM decode_partial "
+                            "WHERE session=? AND epoch=?", (session, decoder.epoch),
+                        ).fetchone()
+                raw = run.popleft()
+                prefix.append(raw)
+                if len(prefix) >= prefetch_limit:
+                    break
+                if run:
+                    next_head = run[0]
+                else:
+                    next_head = conn.execute(
+                        "SELECT id,seq FROM raw_chunks WHERE session=? AND seq=?",
+                        (session, raw["seq"] + 1),
+                    ).fetchone()
+                if next_head is not None:
+                    heapq.heappush(heap, (next_head["id"], session, next_head["seq"]))
+        # Only the prefix is needed now; discard speculative page rows before
+        # allocating decoded rows. Raw bytes are capped at 1MiB, fetched chunks
+        # at `limit`, with at most one transient wire-capped row during reading.
+        pages.clear()
+        previous = {}
         staged = []
         emitted_rows = 0
-        while len(staged) < limit:
-            with self.connect() as conn:
-                # Indexed candidate kept in its original shape; staged seqs
-                # override the persisted cursor through an in-memory CTE.
-                # Invariant: staged holds exactly seqs [cursor, cursor+n) per
-                # session in order, so the next wanted seq is anchor+n.
-                progress = {}
-                for entry in staged:
-                    progress[entry[0]["session"]] = entry[0]["seq"] + 1
-                params = []
-                for session, want in progress.items():
-                    params.extend((session, want))
-                # candidate_sql is the single source; bind pairs first, epoch twice.
-                raw = conn.execute(
-                    candidate_sql(len(progress)), (*params, decoder.epoch, decoder.epoch),
-                ).fetchone()
-                if raw is None:
-                    break
-                partial = conn.execute(
-                    "SELECT seq,state_json,counts_json,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
-                    (raw["session"], decoder.epoch),
-                ).fetchone()
-                anchor = conn.execute(
-                    "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
-                    (raw["session"], decoder.epoch),
-                ).fetchone()
-            self.reserve()
-            meta = json.loads(raw["meta_json"])
+        if not prefix:
+            return 0
+        self.reserve()
+        for raw in prefix:
+            session = raw["session"]
+            meta = metadata[session]
             chunk = {key: raw[key] for key in ("seq", "offset_ns", "phase", "data")}
+            anchor = anchors[session]
+            partial = partials[session]
             if partial is not None and partial["seq"] == raw["seq"]:
                 state = json.loads(partial["state_json"])
                 carried, emitted = json.loads(partial["counts_json"]), partial["rows_emitted"]
-            elif raw["session"] in progress:
+                totals = json.loads(anchor["counts_json"]) if anchor and anchor["counts_json"] else {}
+            elif session in previous:
                 # Continue from the staged predecessor's output state: it has
                 # not committed yet, so the persisted cursor still points at it.
-                state = next(e[2]["state"] for e in reversed(staged) if e[0]["session"] == raw["session"])
+                state, totals = previous[session][0], dict(previous[session][1])
                 carried, emitted = {}, 0
             else:
-                state = json.loads(raw["state_json"]) if raw["state_json"] else None
+                state = json.loads(anchor["state_json"]) if anchor and anchor["state_json"] else None
                 carried, emitted = {}, 0
+                totals = json.loads(anchor["counts_json"]) if anchor and anchor["counts_json"] else {}
             rows, state, counts, done = decode_some(meta, chunk, state, max(1, DECODE_ROW_BUDGET - emitted_rows))
             if type(done) is not bool:
                 raise ValueError("invalid decode batch completion flag")
-            if raw["session"] in progress:
-                # Continue totals from the staged predecessor: the persisted
-                # cursor still holds pre-batch counts.
-                totals = dict(next(w["totals"] for r, c, w in reversed(staged) if r["session"] == raw["session"]))
-            else:
-                totals = json.loads(raw["counts_json"]) if raw["counts_json"] else {}
             for deltas in ([carried] if carried else []) + [counts]:
                 for key, value in deltas.items():
                     if type(value) is not int or value < 0:
@@ -466,6 +518,7 @@ class Archive:
             staged.append((raw, chunk, {"state": state, "counts": counts, "done": done, "totals": totals,
                                         "carried": carried, "emitted": emitted, "rows": rows,
                                         "partial": partial, "anchor": anchor}))
+            previous[session] = (state, totals)
             emitted_rows += len(rows)
             if not done or emitted_rows >= DECODE_ROW_BUDGET or time.monotonic() >= deadline:
                 break
@@ -477,67 +530,86 @@ class Archive:
         self.reserve(staged_bytes + len(staged) * 512 + staged_bytes // 4)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            # Validate each session's anchor ONCE before any writes: staged
-            # same-session writes are ours, not an external race.
-            seen = set()
+            # Validate each touched session ONCE before any writes, against
+            # the state read in the prefetch pass (not an empty default):
+            # staged same-session writes are ours, not an external race.
+            order = {}
             for raw, chunk, work in staged:
-                if raw["session"] in seen:
-                    continue
-                seen.add(raw["session"])
+                order.setdefault(raw["session"], []).append((raw, work))
+            for session, entries in order.items():
+                first_raw, first_work = entries[0]
+                before = anchors[session]
                 anchor = conn.execute(
                     "SELECT next_seq,state_json,counts_json,rows FROM decode_states WHERE session=? AND epoch=?",
-                    (raw["session"], decoder.epoch),
+                    (session, decoder.epoch),
                 ).fetchone()
-                before = work["anchor"]
                 if (anchor["next_seq"] if anchor else 0) != (before["next_seq"] if before else 0) or \
                         (anchor["state_json"] if anchor else None) != (before["state_json"] if before else None) or \
                         (anchor["counts_json"] if anchor else None) != (before["counts_json"] if before else None) or \
                         (anchor["rows"] if anchor else 0) != (before["rows"] if before else 0):
                     raise ValueError("decode cursor moved during decode")
-                if work["partial"] is not None:
+                if first_work["partial"] is not None:
                     current = conn.execute(
                         "SELECT seq,rows_emitted FROM decode_partial WHERE session=? AND epoch=?",
-                        (raw["session"], decoder.epoch),
+                        (session, decoder.epoch),
                     ).fetchone()
-                    if work["partial"]["seq"] == raw["seq"]:
-                        if current is None or current["seq"] != raw["seq"] or current["rows_emitted"] != work["emitted"]:
+                    if first_work["partial"]["seq"] == first_raw["seq"]:
+                        if current is None or current["seq"] != first_raw["seq"] or current["rows_emitted"] != first_work["emitted"]:
                             raise ValueError("decode partial moved during decode")
-                    elif current is not None and current["seq"] != raw["seq"]:
+                    elif current is not None and current["seq"] != first_raw["seq"]:
                         conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
-                                     (raw["session"], decoder.epoch))
-            committed = {}
-            for raw, chunk, work in staged:
-                conn.executemany(
-                    "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-                    [(row["event_id"], decoder.epoch, canonical) for row, canonical in zip(work["rows"], work["canonicals"])],
-                )
-                # Chain within the batch: later chunks of the same session build
-                # on this commit, not on the pre-batch persisted cursor.
-                prior = committed.get(raw["session"], (raw["rows"] or 0))
-                if work["done"]:
+                                     (session, decoder.epoch))
+            # Outbox stays in staged (global raw arrival) order; per-chunk
+            # cursor writes collapse to the last done entry plus one trailing
+            # partial entry per session. Only the batch-final entry can be
+            # partial (it ends staging), so the last entry's own carried
+            # counts are exactly the resume prefix, never an earlier chunk's.
+            conn.executemany(
+                "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
+                [(row["event_id"], decoder.epoch, canonical) for _, _, work in staged
+                 for row, canonical in zip(work["rows"], work["canonicals"])],
+            )
+            total_rows = 0
+            for session, entries in order.items():
+                first_work = entries[0][1]
+                base = (first_work["anchor"]["rows"] if first_work["anchor"] else 0) + first_work["emitted"]
+                done_entries = [(raw, work) for raw, work in entries if work["done"]]
+                if done_entries:
+                    last_raw, last_work = done_entries[-1]
+                    done_count = sum(len(work["rows"]) for _, work in done_entries)
                     conn.execute(
                         "INSERT INTO decode_states VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
                         "next_seq=excluded.next_seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows=excluded.rows",
-                        (raw["session"], decoder.epoch, raw["seq"] + 1, _json(work["state"]), _json(work["totals"]), prior + work["emitted"] + len(work["rows"])),
+                        (session, decoder.epoch, last_raw["seq"] + 1, _json(last_work["state"]), _json(last_work["totals"]), base + done_count),
                     )
-                    conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
-                                 (raw["session"], decoder.epoch))
-                else:
-                    merged = dict(work["carried"])
-                    for key, value in work["counts"].items():
+                last_raw, last_work = entries[-1]
+                if not last_work["done"]:
+                    merged = dict(last_work["carried"])
+                    for key, value in last_work["counts"].items():
                         merged[key] = value if key == "tail_bytes" else merged.get(key, 0) + value
                     conn.execute(
                         "INSERT INTO decode_partial VALUES(?,?,?,?,?,?) ON CONFLICT(session,epoch) DO UPDATE SET "
                         "seq=excluded.seq,state_json=excluded.state_json,counts_json=excluded.counts_json,rows_emitted=excluded.rows_emitted",
-                        (raw["session"], decoder.epoch, raw["seq"], _json(work["state"]), _json(merged), work["emitted"] + len(work["rows"])),
+                        (session, decoder.epoch, last_raw["seq"], _json(last_work["state"]), _json(merged), last_work["emitted"] + len(last_work["rows"])),
                     )
-                committed[raw["session"]] = prior + work["emitted"] + len(work["rows"])
-                _meta_bump(conn, "outbox_rows", len(work["rows"]))
-                _meta_bump(conn, "decoded_rows_total", len(work["rows"]))
-            for session_id in {raw["session"] for raw, _, _ in staged}:
-                _reconcile_pending_session(conn, decoder.epoch, session_id)
+                else:
+                    conn.execute("DELETE FROM decode_partial WHERE session=? AND epoch=?",
+                                 (session, decoder.epoch))
+                total_rows += sum(len(work["rows"]) for _, work in entries)
+            _meta_bump(conn, "outbox_rows", total_rows)
+            _meta_bump(conn, "decoded_rows_total", total_rows)
+            for session in order:
+                _reconcile_pending_session(conn, decoder.epoch, session)
             _meta_set(conn, "last_decode_ns", time.time_ns())
             conn.commit()
+        # A deadline/row-budget stop leaves speculative rows unused. Match the
+        # next read to actual progress; grow again after consuming a full window.
+        # This is an in-memory hint only: rollback/restart cannot move cursors.
+        if limit >= window:
+            if len(staged) < len(prefix):
+                self._decode_prefetch_limit = max(1, len(staged))
+            elif len(prefix) == prefetch_limit and staged[-1][2]["done"] and emitted_rows < DECODE_ROW_BUDGET:
+                self._decode_prefetch_limit = min(limit, window * 2)
         return len(staged)
 
     def rebuild_pending(self):
@@ -661,7 +733,7 @@ def archive_status(path):
 
 
 def validate_row(row):
-    if not isinstance(row, dict) or set(row) != set(COLUMNS):
+    if not isinstance(row, dict) or row.keys() != _COLUMN_SET:
         raise ValueError("invalid canonical row fields")
     for field in COLUMNS:
         value = row[field]

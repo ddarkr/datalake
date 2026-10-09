@@ -5,8 +5,8 @@ Builds one synthetic closed JSONL fixture per step in the PARENT (input
 creation memory is never counted in child peaks), then runs
 finalize_segment and the uploader gunzip_compare preflight each in a
 spawned child and reports per-step wall/CPU/peak-RSS plus the ACTUAL
-peak temp-disk bytes (run-*.tmp spill only; sealed triple never counts
-as temporary) and max resident frames.
+peak temp-disk bytes (sort runs, match database and staged MF4; verified
+sealed triple never counts as temporary) and max resident frames.
 
 The stepped sizes deliberately exceed the chosen tiny frame budget so
 the spill path is exercised, e.g. --memory-frames 50 with
@@ -86,10 +86,8 @@ def load_recorder(root):
 
 
 def _sampler_peak(stop, sealed_dir, stem, out):
-    # Fallback sampler: whole per-segment temp dir (<stem>.*) across sort
-    # and match phases (run files + journal/WAL/index/scratch). Sealed
-    # triple files (<stem>.mf4/.gz/.json) live directly under sealed_dir,
-    # never inside the temp dir, so they are not counted as temporary.
+    # Sample all per-segment temporary files: sort/match directories and
+    # the staged MF4 outside them. Verified sealed triple files are excluded.
     peak = 0
     prefix = stem + "."
     while not stop.is_set():
@@ -100,6 +98,11 @@ def _sampler_peak(stop, sealed_dir, stem, out):
                     continue
                 d = os.path.join(sealed_dir, name)
                 if not os.path.isdir(d):
+                    if name.endswith(".tmp"):
+                        try:
+                            total += os.path.getsize(d)
+                        except OSError:
+                            pass
                     continue
                 for root, _ds, fns in os.walk(d):
                     for fn in fns:
@@ -224,6 +227,7 @@ def run_step(n, mem_frames, tmp_max, baseline_root):
     src = os.path.join(fx, stem + ".jsonl")
     build_segment(src, n)
     closed_bytes = os.path.getsize(src)
+    tmp = btmp = None
     try:
         tmp = tempfile.mkdtemp(prefix="raw-bench-%d-" % n)
         rec.ensure_dirs(tmp)
@@ -281,7 +285,9 @@ def run_step(n, mem_frames, tmp_max, baseline_root):
                 and bres["want"] == fres["want"])
         print(json.dumps(out, sort_keys=True))
     finally:
-        shutil.rmtree(fx, ignore_errors=True)
+        for directory in (fx, tmp, btmp):
+            if directory is not None:
+                shutil.rmtree(directory, ignore_errors=True)
 
 
 def main(argv):

@@ -28,9 +28,19 @@ tar + sidecar + 내장 manifest + SST snapshot + **검증된 COMPLETE**를 한 �
 fail-closed(건너뜀, 삭제·집계 제외)입니다. 미래 시각 COMPLETE가 있다고 해서
 age 정책으로 복구 세대를 보호하는 것이 아닙니다.
 
+- 이미 retirement이 시작된 세대(RETIRING + COMPLETE 부재 → `incomplete/created_ns=None`)
+  는 grace gate 대상이 아닙니다. 재개 전 마커 본문이 해당 세대를 정확히 가리키는지
+  검증하고 활성 `refs/`가 없을 때만 `COMPLETE` 부재 확인 → payload 삭제 → `RETIRING`
+  마지막 삭제 순으로 재개합니다. 마커 본문이 다르거나 읽히지 않으면 재개를 거부합니다.
+  `RETIRING` 없는 새 incomplete prefix(진행 중 백업)는 기본 grace=86400 안에서
+  enforce를 계속 차단합니다. grace=0 우회는 운영 권고가 아닙니다.
+
 삭제하지 않는 대상: live root, 백업 prefix 밖, pin/보존 세대, 방금 쓴 세대,
 진행 중 backup/restore 참조(유예 내 미완료는 enforce 거부), 손상 세대,
 활성 `refs/` 리더가 있는 세대, `RETIRING` 중인 세대(재계획이 아닌 재개 대상).
+
+dry-run은 `resume <id>`와 `candidate <id>`를 구분해 출력하고 enforce 선택과
+동일한 집합을 보여줍니다(`retention: mode=... delete=N resume=M bytes=B`).
 
 ## 상호 배제(backup/restore/retention)
 
@@ -74,12 +84,13 @@ prefix가 남아 restore가 선택하지 않고, 재실행이 이름 기준으�
 끝냅니다(멱등). 부분 삭제 뒤 재실행도 같은 순서로 완료됩니다. 새 세대 검증
 전에 기존 복구 세대를 정리하지 않습니다. `backup` 뒤 후크 경고는 이미 검증된
 백업을 실패로 바꾸지 않습니다.
-## 검증 유지
+## 검증 유지와 비용 범위
 
-복사·업로드 검증은 스트리밍 SHA-256이며 ETag를 비교하지 않습니다.
-세대마다 SST 전체를 복사하는 독립 full snapshot이며, 공유 SST/content-addressed
-최적화를 도입하지 않습니다.
-
+ 복사·업로드 검증은 스트리밍 SHA-256이며 ETag를 비교하지 않습니다.
+ 세대마다 SST 전체를 복사하는 독립 full snapshot이며, 공유 SST/content-addressed
+최적화를 도입하지 않습니다. retention은 누적 저장 바이트를 줄일 뿐 세대당
+COPY/GET I/O는 그대로이며, 매 백업 I/O 절감은 명시적 후속 최적화 범위입니다.
+무결성 검증을 빼거나 안전하지 않은 shared-object GC로 대체하지 않습니다.
 ## 운영 정책
 
 - 백업 prefix에 만료 lifecycle을 설정하지 마세요. versioned bucket의 noncurrent
@@ -111,3 +122,18 @@ prefix가 남아 restore가 선택하지 않고, 재실행이 이름 기준으�
 가장 오래된 보존 세대, pin 세대를 각각 빈 격리 디렉터리와 live prefix로
 복원했고 모든 파일 및 SST hash가 일치했습니다. 운영 데이터나 운영
 복구 가능성을 검증한 결과는 아닙니다.
+
+## 재개 회귀 smoke(격리 fake, 운영 데이터 없음)
+
+`python3 -m tests.test_backup`는 부모가 실행합니다. 재개 경계만 별도 확인용:
+
+```sh
+python3 - <<'EOF'
+import tests.test_backup as t
+t.test_retirement_interrupt_resumes_and_partial_delete_surfaces()
+t.test_retiring_identity_mismatch_and_active_reader_refuse_resume()
+t.test_retention_dryrun_matches_enforce_selection()
+t.test_retention_refuses_active_reader_and_concurrent_backup()
+print("retention resume smoke: ok")
+EOF
+```

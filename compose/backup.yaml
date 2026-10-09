@@ -106,6 +106,8 @@ services:
   backup:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
+    labels:
+      datalake.backup-revision: "1"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -158,6 +160,8 @@ services:
   can-backup:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
+    labels:
+      datalake.backup-revision: "1"
     depends_on:
       backup-deps:
         condition: service_completed_successfully

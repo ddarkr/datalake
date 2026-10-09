@@ -20,13 +20,17 @@ Behavioral checks (each fails against the named defect, passes fixed):
       archive; downloads stream to .tmp and only atomically appear after
       COMPLETE verification (a failed download leaves no tar behind).
   (6) Remote retention: off default deletes nothing; dry-run lists the same
-      candidates enforce would delete (with matching bytes); enforce keeps
-      newest/age/min/pinned/current/referenced/retiring, never touches
-      live/outside/incomplete/corrupt prefixes, resumes RETIRING markers
-      first, separates COMPLETE deletion from payload deletion (COMPLETE
-      absence confirmed before payload), refuses active restore refs and
-      concurrent backup/retention races, surfaces per-key partial delete
-      errors, and refuses inside incomplete grace or without approval.
+      candidates enforce would delete (with matching bytes) and names resume
+      targets separately; enforce keeps newest/age/min/pinned/current/
+      referenced/retiring, never touches live/outside/incomplete/corrupt
+      prefixes, resumes RETIRING markers first (a started retirement with
+      COMPLETE already gone is exempt from the incomplete grace gate: the
+      gate cannot age a None timestamp), validates the RETIRING marker body
+      names the generation, separates COMPLETE deletion from payload deletion
+      (COMPLETE absence confirmed before payload, RETIRING removed last),
+      refuses active restore refs and concurrent backup/retention races,
+      surfaces per-key partial delete errors, and refuses inside incomplete
+      grace or without approval.
       Generation race: reader precheck/marker/ref-PUT/postcheck and writer
       precheck/marker/postcheck interleave deterministically (racing marker
       refuses the reader; late reader aborts the writer with marker+COMPLETE
@@ -1505,7 +1509,7 @@ def test_retention_dryrun_matches_enforce_selection():
         dry = out.getvalue()
         assert ("candidate " + ids[0]) in dry and ids[-1] not in dry.split("candidate")[1].split("retention: mode=")[0]
         expect = [l for l in dry.splitlines() if l.startswith("retention: mode=")][0]
-        assert "delete=1" in expect
+        assert "delete=1" in expect and "resume=0" in expect
         listed_bytes = int(expect.split("bytes=")[1])
         assert listed_bytes == sum(len(v) for k, v in fake.objects.items()
                                    if k.startswith("test-backups/%s/" % ids[0]))
@@ -1677,11 +1681,37 @@ def test_retirement_interrupt_resumes_and_partial_delete_surfaces():
         fake.objects[rbase + "RETIRING"] = (ids[0] + "\n").encode()
         del fake.objects[rbase + "COMPLETE"]
         resumed, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
-        assert next(g for g in resumed if g["backup_id"] == ids[0])["retiring"]
+        victim = next(g for g in resumed if g["backup_id"] == ids[0])
+        assert victim["retiring"] and victim["status"] == "incomplete"
+        assert victim["created_ns"] is None
+        # Reported boundary: default grace must not block a started retirement,
+        # even when the clock moves 30 days forward (created_ns stays None).
+        real_ns = bk.time.time_ns
+        future_ns = real_ns() + 30 * 86400 * 1_000_000_000
+        import io as _io
+        try:
+            for now_ns in (None, future_ns):
+                if now_ns is not None:
+                    bk.time.time_ns = lambda: now_ns
+                setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="dry-run",
+                            BACKUP_REMOTE_RETAIN_COUNT="3",
+                            BACKUP_REMOTE_MIN_RECOVERY="1"))
+                out = _io.StringIO()
+                old, bk.sys.stdout = bk.sys.stdout, out
+                try:
+                    assert bk.cmd_retention() == 0
+                finally:
+                    bk.sys.stdout = old
+                dry = out.getvalue()
+                assert ("resume " + ids[0]) in dry
+                assert [l for l in dry.splitlines()
+                        if l.startswith("retention: mode=")][0].count("resume=1") == 1
+                assert rbase + "RETIRING" in fake.objects  # dry-run resumes nothing
+        finally:
+            bk.time.time_ns = real_ns
         setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
                     BACKUP_REMOTE_RETAIN_COUNT="3",
                     BACKUP_REMOTE_MIN_RECOVERY="1",
-                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
                     BACKUP_REMOTE_RETENTION_APPROVE="1"))
         assert bk.cmd_retention() == 0
         assert not [k for k in fake.objects if k.startswith(rbase)]
@@ -1695,6 +1725,44 @@ def test_retirement_interrupt_resumes_and_partial_delete_surfaces():
             assert False, "partial delete must raise"
         except IOError as e:
             assert "AccessDenied" in str(e)
+    finally:
+        end_retention_run(tmp)
+
+
+def test_retiring_identity_mismatch_and_active_reader_refuse_resume():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        rbase = "test-backups/%s/" % ids[0]
+        setenv(env)
+        # Stray marker body must never authorize payload deletion.
+        fake.objects[rbase + "RETIRING"] = b"some-other-id\n"
+        try:
+            bk.resume_retiring(fake, "test-bucket", "test-backups/", ids[0])
+            assert False, "identity mismatch must refuse"
+        except IOError as e:
+            assert "identity mismatch" in str(e)
+        assert [k for k in fake.objects if k.startswith(rbase)]
+        # Active reader ref blocks resume even with a valid marker.
+        fake.objects[rbase + "RETIRING"] = (ids[0] + "\n").encode()
+        ref = rbase + bk.REFS_DIR + "reader"
+        fake.objects[ref] = b"ref"
+        try:
+            bk.resume_retiring(fake, "test-bucket", "test-backups/", ids[0])
+            assert False, "resume must refuse while the reader ref is held"
+        except IOError as e:
+            assert "active reader" in str(e)
+        bk.release_generation_ref(fake, "test-bucket", ref)
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="3",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        assert bk.cmd_retention() == 0
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids[1:])
+        # Fresh incomplete prefix (no RETIRING) still blocks default-grace enforce.
+        fake.objects["test-backups/greptime-backup-20990101T000000.000000000-fresh01/stray"] = b"x"
+        assert bk.cmd_retention() == 2  # fail() writes to stderr, exit 2
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids[1:])
     finally:
         end_retention_run(tmp)
 
@@ -2003,10 +2071,11 @@ if __name__ == "__main__":
     test_retention_newest_oldest_pinned_restore_hash_match()
     test_retention_refuses_active_reader_and_concurrent_backup()
     test_retirement_interrupt_resumes_and_partial_delete_surfaces()
+    test_retiring_identity_mismatch_and_active_reader_refuse_resume()
     test_retention_rejects_bad_settings_and_future_complete()
     test_ref_reader_postcheck_refuses_racing_marker()
     test_retire_postcheck_aborts_on_late_reader()
     test_resume_aborted_writer_deletes_complete_first()
     test_generation_race_threading_refs()
     test_local_tar_restore_holds_ref_until_snapshot_used()
-    print("test_backup: ok (61 tests)")
+    print("test_backup: ok (62 tests)")
