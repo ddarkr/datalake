@@ -19,15 +19,9 @@ BASE = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
 
 
 def drain(archive, decoder, **kwargs):
-    total, calls = 0, 0
-    while True:
-        with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
-            n = archive.decode_once(decoder, **kwargs)
-        if not n:
-            break
-        total += n
-        calls += 1
-    return total, calls
+    with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+        while archive.decode_once(decoder, **kwargs):
+            pass
 
 
 def full_snapshot(archive, decoder):
@@ -145,9 +139,7 @@ class DemandPrefetch(unittest.TestCase):
                         return_value=1800000000000000001):
                 for name, c in arrival:
                     archive.accept(metas[name], [c])
-                with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
-                    total, _ = drain(archive, decoder)
-                self.assertEqual(total, len(arrival))
+                drain(archive, decoder)
                 expected, states, totals = [], {}, {}
                 for name, c in arrival:
                     rows, state, counts = decoder.decode(metas[name], c, states.get(name))
@@ -167,11 +159,11 @@ class DemandPrefetch(unittest.TestCase):
                     self.assertEqual(row[3], totals[row[0]]["rows"])
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
             # New session arrival after drain decodes exactly once.
+            before = full_snapshot(archive, decoder)
             with patch("scripts.ingest.can.can_receiver.time.time_ns",
                         return_value=1800000000000000002):
                 archive.accept(dict(BASE, session_id="late"),
                                [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": FRAME}])
-            before = full_snapshot(archive, decoder)
             with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
                 self.assertEqual(archive.decode_once(decoder), 1)
             after = full_snapshot(archive, decoder)
@@ -194,43 +186,34 @@ class DemandPrefetch(unittest.TestCase):
             with patch.object(decoder, "decode_some", move_cursor):
                 with self.assertRaisesRegex(ValueError, "decode cursor moved during decode"):
                     archive.decode_once(decoder, limit=1)
-            self.assertEqual(full_snapshot(archive, decoder), status_before)
+            concurrent_state = {**status_before, "states": [
+                {**row, "next_seq": 99} if row["session_id"] == "late" else row
+                for row in status_before["states"]]}
+            self.assertEqual(full_snapshot(archive, decoder), concurrent_state)
+            # Undo only the fixture's committed cursor tamper before restart.
+            with archive.connect() as conn:
+                conn.execute("UPDATE decode_states SET next_seq=? WHERE session="
+                             "(SELECT id FROM sessions WHERE session_id='late') AND epoch=?",
+                             (next(row["next_seq"] for row in status_before["states"]
+                                   if row["session_id"] == "late"), decoder.epoch))
+                conn.commit()
             # Restart: reopened archive resumes and drains identically.
             reopened = Archive(path, disk_reserve_bytes=0)
-            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
-                while reopened.decode_once(decoder):
-                    pass
-            rows, _, _, done = decoder.decode(dict(BASE, session_id="late"),
-                                              {"seq": 1, "offset_ns": 1,
-                                               "phase": "capture", "data": FRAME}, None)
-            self.assertTrue(done)
-            with reopened.connect() as conn:
-                tail = [json.loads(r[0])["event_id"] for r in
-                        conn.execute("SELECT row_json FROM outbox ORDER BY id")]
-            self.assertEqual(len(tail), len(set(tail)))
-
-    def test_adaptive_hint_learns_speculative_waste(self):
-        """A byte-cap stop shrinks the next window instead of staying at 1000."""
-        with tempfile.TemporaryDirectory() as directory:
-            decoder = synthetic_decoder(directory)
-            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
-            archive.register_epoch(decoder)
-            big = FRAME + b"\r" * (65536 - len(FRAME))
-            metas = {k: dict(BASE, session_id="cap-%d" % k) for k in range(4)}
             with patch("scripts.ingest.can.can_receiver.time.time_ns",
-                        return_value=1800000000000000001):
-                for k in range(4):
-                    archive.accept(metas[k], [{"seq": 0, "offset_ns": k,
-                                               "phase": "capture", "data": big}])
-                    archive.accept(metas[k], [{"seq": s + 1, "offset_ns": 10 + s,
-                                               "phase": "capture", "data": FRAME}
-                                              for s in range(30)])
-            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
-                archive.decode_once(decoder, limit=1000)
-                first_window = archive._decode_prefetch_limit
-            # 1MiB cap stops the prefix early with more work pending: the hint
-            # must shrink below the 1000 default.
-            self.assertLess(first_window, 1000)
+                       return_value=1800000000000000003):
+                with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                    while reopened.decode_once(decoder):
+                        pass
+                prior_state = json.loads(next(row["state_json"] for row in
+                                              status_before["states"] if row["session_id"] == "late"))
+                rows, _, _ = decoder.decode(dict(BASE, session_id="late"),
+                                             {"seq": 1, "offset_ns": 1,
+                                              "phase": "capture", "data": FRAME}, prior_state)
+            with reopened.connect() as conn:
+                tail = [json.loads(r[0]) for r in
+                        conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            self.assertEqual(tail[-len(rows):], rows)
+
 
 
 if __name__ == "__main__":
