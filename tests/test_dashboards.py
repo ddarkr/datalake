@@ -209,18 +209,24 @@ def test_battery_dashboard_warning_overlap_keeps_started_before_range():
             (1500, 'v', 'errors', 'boom', 'can', 'x1', 1500, 'env', NULL, NULL,
              NULL, 'owner', 0, 0, 's', 'e1', 'c', NULL, NULL, NULL, NULL)""")
         assert db.execute(counts).fetchone() == (4, 4, 1, None)
-        rows = {r[0]: r for r in db.execute(state).fetchall()}
-        assert rows["ep-active"][10] == "open"
-        assert rows["ep-closed"][10] == "closed" and rows["ep-closed"][12] == 1300.0
-        assert rows["ep-reversed"][10] == "conflict_time" and rows["ep-reversed"][12] is None
-        assert rows["ep-stale"][10] == "unknown_activity"
+        db.row_factory = sqlite3.Row
+        rows = {r["episode"]: r for r in db.execute(state).fetchall()}
+        assert rows["ep-active"]["state"] == "open"
+        assert rows["ep-closed"]["state"] == "closed"
+        assert rows["ep-closed"]["authoritative_end"] == 1300.0
+        assert rows["ep-closed"]["reported_duration_s"] == 100.0
+        assert rows["ep-reversed"]["state"] == "conflict_time"
+        assert rows["ep-reversed"]["authoritative_end"] is None
+        assert rows["ep-stale"]["state"] == "unknown_activity"
         db.execute("""INSERT INTO vehicle_event VALUES
             (2600, 'v', 'alerts', 'w', 'can', 'e-late', 2600, 'env',
              1100, NULL, NULL, 'owner', 1, 0, 's', 'e1', 'c', 'ep-closed',
              NULL, NULL, NULL)""")
-        rows = {r[0]: r for r in db.execute(state).fetchall()}
-        assert rows["ep-closed"][10] == "conflict_active"
-        assert rows["ep-closed"][12] is None and rows["ep-closed"][13] is None
+        rows = {r["episode"]: r for r in db.execute(state).fetchall()}
+        assert rows["ep-closed"]["state"] == "conflict_active"
+        assert rows["ep-closed"]["authoritative_end"] is None
+        assert rows["ep-closed"]["reported_duration_s"] is None
+
 
 
 def test_battery_cards_raw_display_latest_valid_only():
