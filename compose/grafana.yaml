@@ -4,7 +4,7 @@ services:
     profiles: [server]
     # Bump with dashboard changes: inline configs alone do not trigger recreation.
     labels:
-      datalake.dashboard-revision: "46"
+      datalake.dashboard-revision: "47"
     depends_on:
       db-schema:
         condition: service_completed_successfully
@@ -46,7 +46,7 @@ services:
       - source: grafana-dash-dbc-health
         target: /etc/grafana/provisioning/dashboards/json/vehicle/can/dbc-health.json
       - source: grafana-dash-home
-        target: /etc/grafana/provisioning/dashboards/json/home/home.json
+        target: /etc/grafana/provisioning/dashboards/json/home/home-overview.json
       - source: grafana-dash-health
         target: /etc/grafana/provisioning/dashboards/json/operations/datalake-health.json
       - source: grafana-dash-battery
