@@ -291,7 +291,9 @@ Compose 관리 도구가 단일 파일만 읽는다면 `.env` 주입 방식을 �
 
 폴더와 대시보드 UID는 서로 겹치지 않아야 합니다. Grafana 12.4.0의 목록 화면은 두 종류를 UID로 식별하므로 홈 폴더와 홈 대시보드가 모두 `datalake-home`이면 선택 상태 계산이 재귀 호출되어 `Maximum call stack size exceeded`가 발생합니다. 홈 폴더 UID는 `datalake-home`, 홈 대시보드 UID는 `datalake-home-overview`로 구분합니다. 이 변경을 기존 설치에 공급하면 이전 UID의 홈 대시보드를 새 UID로 대체하므로 직접 대시보드 링크와 즐겨찾기는 다시 지정해야 합니다. 폴더 링크는 그대로 유지됩니다.
 
-UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overview.json`으로 이동합니다. 같은 경로에서 UID만 바꾸면 Grafana 12.4.0은 이전 대시보드를 남깁니다. 이전 파일 경로가 사라져야 홈 공급자가 충돌하는 옛 UID를 정리합니다. 별도 Grafana 12.4.0에서 같은 경로의 UID 교체는 두 대시보드를 남기고, 파일 경로 이동은 새 UID 하나만 남기는 것을 확인했습니다.
+UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overview.json`으로 이동합니다. 같은 경로에서 UID만 바꾸면 Grafana 12.4.0은 이전 대시보드를 남깁니다. 별도 Grafana 12.4.0의 reload 검사에서는 파일 경로 이동으로 새 UID 하나만 남았지만, 기존 설치에는 [이전 provisioning 메타데이터가 남는 문제](https://github.com/grafana/grafana/issues/109229)가 있어 경로 이동만으로 정리를 보장하지 않습니다.
+
+옛 `datalake-home` 대시보드가 남으면 먼저 실제 provisioning 파일이 더 이상 그 UID를 공급하지 않고 새 `datalake-home-overview`가 정상인지 확인합니다. 그 후 관리자 권한으로 `/apis/dashboard.grafana.app/v1beta1/namespaces/default/dashboards/datalake-home`의 리소스를 읽어 `resourceVersion`과 `spec`을 유지한 채 `metadata.annotations`의 `grafana.app/managedBy`, `managerId`, `sourcePath`, `sourceChecksum`, `sourceTimestamp`(각각 `grafana.app/` 접두사)를 제거해 PUT하고, 같은 **대시보드** 리소스를 DELETE합니다. 아직 공급되는 UID나 같은 이름의 폴더는 삭제하지 않습니다. SQL 저장소 직접 수정 없이 이 절차로 옛 UID 제거와 새 홈 화면의 API 복구를 확인했습니다.
 
 - `기록 없음`은 정상이나 0을 의미하지 않습니다. 수집 미설정·누락·조회 범위를 먼저 확인하세요.
 - AI 비용은 도구가 보고한 값과, 비용이 없을 때 적용 가능한 공개 단가의 보충 추정치입니다. 청구서가 아니며 가격을 결정할 수 없는 사용량은 미산정으로 남습니다. 보충 단가는 LiteLLM 공개 가격표를 조회·캐시합니다.
