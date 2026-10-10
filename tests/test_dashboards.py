@@ -888,11 +888,23 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
         scopes = [("demo-can", "can", "can-v1"),
                   ("demo-fleet", "fleet", "fleet-v1"),
                   ("demo-other", "can", "can-v1")]
+        soc_rows = {
+            "demo-can": ("Vehicle.CAN.x292.BMS_socUI", "BMS_socUI", 42.0),
+            "demo-fleet": ("Vehicle.Powertrain.TractionBattery.StateOfCharge.Displayed",
+                           "BatteryLevel", 44.0)}
         for vehicle, source, epoch in scopes:
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, ingest_time, path, value_num)
-                VALUES (1500, ?, ?, ?, 1500, 'Vehicle.Speed', ?)""",
-                       (vehicle, source, epoch, 42 if source == "can" else 44))
+            if vehicle in soc_rows:
+                path, field, value = soc_rows[vehicle]
+                db.execute("""INSERT INTO vehicle_signal
+                    (event_time, vehicle, source, decode_epoch, ingest_time, path,
+                     source_field, value_num, unit, quality)
+                    VALUES (1500, ?, ?, ?, 1500, ?, ?, ?, '%', 'reported_unverified')""",
+                           (vehicle, source, epoch, path, field, value))
+            else:
+                db.execute("""INSERT INTO vehicle_signal
+                    (event_time, vehicle, source, decode_epoch, ingest_time, path, value_num)
+                    VALUES (1500, ?, ?, ?, 1500, 'Vehicle.Speed', ?)""",
+                           (vehicle, source, epoch, 42))
             db.execute("""INSERT INTO vehicle_analysis
                 (window_start, window_end, vehicle, metric, source, analysis_id,
                  revision, value, unit, status, decode_epoch, computed_at)
@@ -931,6 +943,7 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
         assert sorted((r[0], r[2], r[5]) for r in db.execute(query(hourly))) == [
             (1500, "demo-can", -1.0), (1500, "demo-fleet", -1.0),
             (1700, "demo-can", -2.0)]
+
 
 
 def test_coverage_frontier_lists_scopes_without_range_rows():
