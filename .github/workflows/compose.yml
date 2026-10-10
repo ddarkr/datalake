@@ -31,6 +31,9 @@ jobs:
   validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      PYTHON_IMAGE: mirror.gcr.io/library/python:3.12.8-slim-bookworm
+      GREPTIME_IMAGE: mirror.gcr.io/greptime/greptimedb:v1.2.1
     steps:
       - uses: actions/checkout@v5
         with:
@@ -108,6 +111,14 @@ jobs:
   synthetic-runtime:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Use the public cache directly: never fall back to quota-limited Hub pulls.
+      # Production image defaults and pinned versions remain unchanged.
+      PYTHON_IMAGE: mirror.gcr.io/library/python:3.12.8-slim-bookworm
+      BACKUP_IMAGE: mirror.gcr.io/library/python:3.12.8-slim-bookworm
+      GREPTIME_IMAGE: mirror.gcr.io/greptime/greptimedb:v1.2.1
+      GRAFANA_IMAGE: mirror.gcr.io/grafana/grafana:12.4.0
+      ALLOY_IMAGE: mirror.gcr.io/grafana/alloy:v1.19.2
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6

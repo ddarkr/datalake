@@ -49,6 +49,7 @@ python tools/benchmark_can_decode.py \
   --json-out /tmp/datalake-can-decode-perf.json
 # Docker가 있는 환경: 격리된 GreptimeDB 1.2.1에 실제 적재·ACK·재시작·재전송 검사
 python -m tests.test_can_receiver_compose
+python -m unittest tests.test_can_prefetch -v
 ```
 
 CI에는 합성 DBC·OTLP만 사용합니다. 운영 원본·정의·차량 식별자·접속 정보는 공개 checkout과 artifact에 넣지 않습니다. 합성 처리율과 격리 재생 결과만으로 운영 수집·적재 처리율이나 적체 감소를 보장하지 않습니다.
@@ -181,6 +182,8 @@ python3 tools/demo.py stop
 호스트와 Docker VM의 시계를 동기화해야 Grafana 로그인 세션과 상대 시각이 정상 동작합니다. 과거의 교정 관측은 `last_check.battery_panels.from_ms/to_ms`를 절대 조회 범위로 사용해 확인할 수 있습니다. 현재 시간창에 관측이 없으면 이전 전력·전압 숫자를 현재 값처럼 표시하지 않습니다.
 
 CI의 `synthetic-runtime` job도 같은 `start/check/stop`을 실행하며 운영 secrets를 받지 않습니다. `check`는 `tests/test_privacy.py`의 실제 protobuf trace/log/metric·exemplar·인증 검사와 error-type 비밀 marker를 재사용합니다. 컨테이너 내부 감사 프록시를 Alloy exporter와 DB 사이에 두므로, VM host-gateway 설정이 필요 없으며 **DB가 필드를 버리기 전 wire protobuf**를 검사합니다. `opentelemetry-proto==1.39.1`은 감사 컨테이너에만 설치합니다.
+
+이 job은 고정 버전 Python·GreptimeDB·Grafana·Alloy 이미지를 [Google의 공개 Docker Hub 캐시](https://cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images) `mirror.gcr.io`에서 직접 받습니다. `validate`의 packaged CAN 검사도 Python·GreptimeDB에 같은 캐시를 사용합니다. `start`는 기존 `PYTHON_IMAGE`, `BACKUP_IMAGE`, `GREPTIME_IMAGE`, `GRAFANA_IMAGE`, `ALLOY_IMAGE` override만 데모 설정에 전달하며 운영 기본 이미지는 바꾸지 않습니다. 캐시에 이미지가 없으면 Hub로 우회하지 않고 pull 오류로 실패합니다.
 
 대기열 검사는 DB를 중지하고 exporter queue occupancy를 확인한 뒤 Alloy를 SIGKILL합니다. DB와 Alloy를 다시 시작해 동일 identity의 사용량이 정확히 한 번 집계되는지 확인합니다. 복원 검사는 집계기를 먼저 멈춰 합성 원시행·세션·일별·차량 집계와 token metric 테이블의 모든 열을 고정하고, 전체 데모를 멈춘 뒤 오프라인 백업을 만듭니다. 별도 복원 프로젝트의 빈 볼륨에 복원해 DB를 실제로 시작하고 전체 행을 정확히 비교한 뒤 복원 프로젝트만 삭제합니다. 원래 데모는 다시 켜 두며 `stop`은 데모가 만든 두 프로젝트와 그 볼륨에만 한정됩니다.
 

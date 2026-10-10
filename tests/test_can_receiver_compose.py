@@ -28,8 +28,8 @@ from scripts.ingest.can.can_otlp_wire import check_response
 from tests.test_can_receiver import encode_batch, synthetic_decoder
 
 ROOT = Path(__file__).resolve().parents[1]
-GREPTIME_IMAGE = "greptime/greptimedb:v1.2.1"
-RECEIVER_IMAGE = "python:3.12.8-slim-bookworm"
+GREPTIME_IMAGE = os.environ.get("GREPTIME_IMAGE", "greptime/greptimedb:v1.2.1")
+RECEIVER_IMAGE = os.environ.get("PYTHON_IMAGE", "python:3.12.8-slim-bookworm")
 REQUIRED_SOURCES = (
     "scripts/ingest/can/can_receiver.py",
     "scripts/ingest/can/can_decoder.py",
@@ -109,6 +109,7 @@ def main():
     auth = base64.b64encode((db_user + ":" + db_password).encode()).decode()
     environment = {k: v for k, v in os.environ.items()
                    if k in {"PATH", "HOME", "TMPDIR", "LANG"} or k.startswith("DOCKER_")}
+    environment["PYTHON_IMAGE"] = RECEIVER_IMAGE
     with tempfile.TemporaryDirectory(prefix=project) as directory:
         path = Path(directory)
         path.chmod(0o755)

@@ -204,6 +204,10 @@ def start(directory):
            "STORAGE_METRICS_INTERVAL_SEC": "10", "INFRA_SCRAPE_INTERVAL": "15s",
            "BATTERY_ANALYSIS_CONFIG_JSON": json.dumps({"energy": {"current_sign": "positive_charge",
                                                                    "field_calibration": calibration}})}
+    # Honor the existing image overrides without importing operator credentials.
+    for key in ("PYTHON_IMAGE", "BACKUP_IMAGE", "GREPTIME_IMAGE", "GRAFANA_IMAGE", "ALLOY_IMAGE"):
+        if key in os.environ:
+            env[key] = os.environ[key]
     private_write(directory / "demo.env", "".join(f"{key}='{value}'\n" for key, value in env.items()))
     # Docker allocates free ports atomically; no reserve/release socket race.
     services = {"greptimedb": [4000, 4002], "grafana": [3000]}
@@ -214,7 +218,7 @@ def start(directory):
                  "    command: [run, --stability.level=public-preview, --server.http.listen-addr=0.0.0.0:12345, "
                  "--storage.path=/var/lib/alloy/data, /etc/alloy/config.alloy]\n"
                  "    environment:\n      GREPTIME_HTTP_URL: http://demo-wire:18144\n")
-    wire = {"image": "python:3.12.8-slim-bookworm", "profiles": ["server"],
+    wire = {"image": env.get("PYTHON_IMAGE", "python:3.12.8-slim-bookworm"), "profiles": ["server"],
             "command": ["sh", "-ec", "pip install --disable-pip-version-check --no-cache-dir opentelemetry-proto==1.39.1 && python /demo/demo.py _wire"],
             "ports": ["127.0.0.1::18144"], "environment": env | {"GREPTIME_HTTP_URL": "http://greptimedb:4000", "OTLP_HTTP_URL": "http://alloy:4318"},
             "volumes": [f"{ROOT / 'tools/demo.py'}:/demo/demo.py:ro", f"{ROOT / 'tests/test_privacy.py'}:/demo/test_privacy.py:ro",
