@@ -213,6 +213,7 @@ def ddl_statements(otel_ttl):
 """
     traces_tail = """  "span_attributes.cost_usd" Float64 NULL,
   "span_attributes.pi.gen_ai.cost.estimated_usd" Float64 NULL,
+  "span_attributes.ttft_ms" Float64 NULL,
   "span_attributes.pi.gen_ai.cost.source" STRING NULL,
   "span_attributes.error.type" STRING NULL,
   "resource_attributes.service.version" STRING NULL,
@@ -571,6 +572,8 @@ def alter_statements():
         ' "input_digest" STRING',
         'ALTER TABLE "opentelemetry_traces" ADD COLUMN IF NOT EXISTS'
         ' "span_attributes.cost_usd" Float64',
+        'ALTER TABLE "opentelemetry_traces" ADD COLUMN IF NOT EXISTS'
+        ' "span_attributes.ttft_ms" Float64',
         'ALTER TABLE "opentelemetry_logs" ADD COLUMN IF NOT EXISTS'
         ' "trace_flags" UInt32',
         'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
