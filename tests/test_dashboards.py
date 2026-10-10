@@ -56,7 +56,6 @@ def test_coverage_distinguishes_absence_from_observed_zero():
                        [(1500,), (1500,), (3000,)])
         assert [db.execute(q).fetchone()[0] for q in queries] == [1, 1]
 
-
 def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     dashboard = json.loads(configs["grafana-dash-ai-usage"]["content"])
@@ -91,7 +90,6 @@ def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
                 client TEXT, provider TEXT, model TEXT)""")
             only.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, 0.015, 0, NULL, NULL, NULL)")
             assert only.execute(query).fetchone()[:4] == (0.015, None, 0.015, 0)
-
 
 def _all_battery_panels(panels):
     for panel in panels:
@@ -226,7 +224,6 @@ def test_battery_dashboard_warning_overlap_keeps_started_before_range():
         assert rows["ep-closed"]["state"] == "conflict_active"
         assert rows["ep-closed"]["authoritative_end"] is None
         assert rows["ep-closed"]["reported_duration_s"] is None
-
 
 
 def test_battery_cards_raw_display_latest_valid_only():
@@ -951,7 +948,6 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
             (1700, "demo-can", -2.0)]
 
 
-
 def test_coverage_frontier_lists_scopes_without_range_rows():
     """Panel 92: whole-history frontier lists scopes even with zero range rows."""
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
@@ -1124,6 +1120,376 @@ def test_provenance_table_matches_card_eligibility():
         assert rows['최고 셀 전압'][8] == 'cal-v1'
 
 
+def _fleet_timeline_query(configs, dashboard_name, panel_id, start=1000, end=2000):
+    """State timeline with boundary anchor (panels 13/14 pattern)."""
+    dashboard = json.loads(configs[dashboard_name]["content"])
+    panel = next(p for p in _all_battery_panels(dashboard["panels"])
+                 if p["id"] == panel_id)
+    return (panel["targets"][0]["rawSql"].replace("$$", "$")
+            .replace("$__timeFilter(event_time)", f"event_time BETWEEN {start} AND {end}")
+            .replace("$__unixEpochFrom()", str(start))
+            .replace("$__unixEpochTo()", str(end))
+            .replace("${vehicle:sqlstring}", "''")
+            .replace("${vehicle_ids:sqlstring}", "''")
+            .replace("${source:sqlstring}", "''")
+            .replace("${epoch:sqlstring}", "''"))
+
+
+def test_fleet_gear_and_charge_timelines_include_latest_invalid():
+    """Gear/charge timelines (overview 13/14, drives 9, charging 11, battery 57)
+    carry both Fleet and CAN branches: a newer invalid report wins and renders
+    NULL instead of resurrecting the older good value."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    cases = (("grafana-dash-vehicle-overview", 14, "Gear",
+              "Vehicle.Powertrain.Transmission.CurrentGear", "D",
+              "DI_gear", "Vehicle.CAN.x118.DI_gear", "DI_GEAR_D"),
+             ("grafana-dash-vehicle-overview", 13, "DetailedChargeState",
+              "Vehicle.Powertrain.TractionBattery.Charging.DetailedState",
+              "DetailedChargeStateCharging",
+              "CP_hvChargeStatus", "Vehicle.CAN.x13D.CP_hvChargeStatus",
+              "CP_CHARGE_ENABLED"),
+             ("grafana-dash-drives", 9, "Gear",
+              "Vehicle.Powertrain.Transmission.CurrentGear", "D",
+              "DI_gear", "Vehicle.CAN.x118.DI_gear", "DI_GEAR_D"),
+             ("grafana-dash-charging", 11, "DetailedChargeState",
+              "Vehicle.Powertrain.TractionBattery.Charging.DetailedState",
+              "DetailedChargeStateCharging",
+              "CP_hvChargeStatus", "Vehicle.CAN.x13D.CP_hvChargeStatus",
+              "CP_CHARGE_ENABLED"),
+             ("grafana-dash-battery", 57, "DetailedChargeState",
+              "Vehicle.Powertrain.TractionBattery.Charging.DetailedState",
+              "DetailedChargeStateCharging",
+              "CP_hvChargeStatus", "Vehicle.CAN.x13D.CP_hvChargeStatus",
+              "CP_CHARGE_ENABLED"))
+    for dashboard, panel, fleet_field, fleet_path, fleet_text, can_field, can_path, can_text in cases:
+        query = _fleet_timeline_query(configs, dashboard, panel)
+        with _battery_db() as db:
+            db.row_factory = sqlite3.Row
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            db.create_function("FROM_UNIXTIME", 1, lambda value: value)
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, value_text, unit, quality, ingest_time, envelope_id, path)
+                VALUES (900, 'v', 'fleet', 'fleet-v1', ?, NULL, ?, NULL,
+                        NULL, 900, 'fleet-base', ?)""",
+                       (fleet_field, fleet_text, fleet_path))
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, value_text, unit, quality, ingest_time, envelope_id, path)
+                VALUES (1500, 'v', 'fleet', 'fleet-v1', ?, NULL, ?, NULL,
+                        'invalid', 1500, 'fleet-bad', ?)""",
+                       (fleet_field, fleet_text, fleet_path))
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, value_text, unit, quality, ingest_time, envelope_id, path)
+                VALUES (1500, 'v', 'can', 'e1', ?, NULL, ?, NULL,
+                        'reported_unverified', 1500, 'can-good', ?)""",
+                       (can_field, can_text, can_path))
+            rows = db.execute(query).fetchall()
+            assert rows, (dashboard, panel)
+            value_key = [key for key in rows[0].keys() if key not in ("time", "series")][0]
+            by_series = {}
+            for row in rows:
+                by_series.setdefault(row["series"], []).append(row)
+            assert any("fleet" in series for series in by_series), (dashboard, panel, list(by_series))
+            assert any("can" in series for series in by_series), (dashboard, panel, list(by_series))
+            fleet_in_range = [row for series, series_rows in by_series.items()
+                              if "fleet" in series for row in series_rows
+                              if row["time"] >= 1000]
+            # Latest Fleet report is invalid: in-range Fleet buckets render NULL,
+            # never the older good value.
+            assert fleet_in_range and all(row[value_key] is None for row in fleet_in_range), (dashboard, panel, [dict(row) for row in fleet_in_range])
+            can_rows = [row for series, series_rows in by_series.items()
+                        if "can" in series for row in series_rows]
+            assert can_rows[-1][value_key] == can_text, (dashboard, panel, [dict(row) for row in can_rows])
+
+
+def _scoped_graph_query(configs, dashboard_name, panel_id):
+    """Numeric graph with expected-unit CASE and invalid-only NULL buckets."""
+    query = _physical_query(configs, dashboard_name, panel_id)
+    return query.replace("date_bin(INTERVAL $__interval_ms MILLISECOND, event_time)",
+                         "event_time")
+
+
+def test_speed_soc_scope_separation_units_and_invalid_buckets():
+    """Speed/SOC graphs keep raw vehicle/source/epoch scopes separate, gate on
+    expected units (km/h, %) and leave invalid-only buckets NULL, never 0."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    with _battery_db() as db:
+        db.row_factory = sqlite3.Row
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        # Drives speed: scopes stay separate; a wrong-unit-only scope keeps its
+        # bucket but reads NULL, never 0.
+        speed = _scoped_graph_query(configs, "grafana-dash-drives", 1)
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'can-car', 'can', 'can-v1', 'DI_vehicleSpeed',
+             'Vehicle.CAN.x257.DI_vehicleSpeed', 50, 'km/h', 'reported_unverified'),
+            (1100, 'other-car', 'can', 'can-v1', 'DI_vehicleSpeed',
+             'Vehicle.CAN.x257.DI_vehicleSpeed', 30, 'km/h', 'reported_unverified')""")
+        rows = db.execute(speed).fetchall()
+        assert {row["value"] for row in rows} == {50.0, 30.0}, [dict(row) for row in rows]
+        db.execute("UPDATE vehicle_signal SET unit = 'mph' WHERE vehicle = 'can-car'")
+        rows = db.execute(speed).fetchall()
+        mine = [row for row in rows if "can-car" in row["metric"]]
+        assert len(mine) == 1 and mine[0]["value"] is None, [dict(row) for row in rows]
+        # Overview SOC: incompatible-unit CAN leg yields a NULL bucket, not 0;
+        # the invalid Fleet row never moves the valid mean.
+        soc = _scoped_graph_query(configs, "grafana-dash-vehicle-overview", 11)
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'can-car', 'can', 'can-v1', 'BMS_socUI',
+             'Vehicle.CAN.x292.BMS_socUI', 62, 'fraction', 'reported_unverified')""")
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1200, 'fleet-car', 'fleet', 'fleet-v1', 'Soc',
+             'Vehicle.Powertrain.TractionBattery.StateOfCharge.Current',
+             70, '%', NULL),
+            (1200, 'fleet-car', 'fleet', 'fleet-v1', 'Soc',
+             'Vehicle.Powertrain.TractionBattery.StateOfCharge.Current',
+             80, '%', 'invalid')""")
+        pairs = {(row["time"], row["value"]) for row in db.execute(soc)}
+        assert (1100, None) in pairs, pairs
+        assert (1200, 70.0) in pairs, pairs
+
+
+def test_ledger_overlap_window_and_nested_raw_scopes():
+    """Drive/charge ledgers return sessions overlapping the range (not just
+    started inside it); every ledger and nested raw sibling carries
+    source/epoch filters."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    with _battery_db() as db:
+        db.row_factory = sqlite3.Row
+        db.create_function("FROM_UNIXTIME", 1, lambda value: value)
+        db.execute("""CREATE TABLE trip_summary (
+            trip_id TEXT, vehicle TEXT, source TEXT, decode_epoch TEXT,
+            started_at TIMESTAMP, ended_at TIMESTAMP, duration_s REAL,
+            distance_km REAL, energy_kwh REAL, avg_speed_kph REAL,
+            start_soc REAL, end_soc REAL)""")
+        db.execute("""CREATE TABLE charge_session (
+            session_id TEXT, vehicle TEXT, source TEXT, decode_epoch TEXT,
+            started_at TIMESTAMP, ended_at TIMESTAMP, duration_s REAL,
+            energy_added_kwh REAL, start_soc REAL, end_soc REAL,
+            avg_power_kw REAL, max_power_kw REAL)""")
+        for dashboard, panel, table in (
+                ("grafana-dash-drives", 4, "trip_summary"),
+                ("grafana-dash-charging", 4, "charge_session")):
+            raw = next(p for p in _all_battery_panels(
+                json.loads(configs[dashboard]["content"])["panels"])
+                if p["id"] == panel)["targets"][0]["rawSql"].replace("$$", "$")
+            query = (raw.replace("$__timeFilter(started_at)",
+                                "started_at BETWEEN 1000 AND 2000")
+                     .replace("$__unixEpochFrom()", "1000")
+                     .replace("$__unixEpochTo()", "2000")
+                     .replace("${vehicle:sqlstring}", "''")
+                     .replace("${vehicle_ids:sqlstring}", "''")
+                     .replace("${source:sqlstring}", "''")
+                     .replace("${epoch:sqlstring}", "''"))
+            # Intended contract: overlap window plus source/epoch on the ledger.
+            assert "started_at <=" in query and "ended_at" in query, (dashboard, panel)
+            assert "source" in query and "decode_epoch" in query, (dashboard, panel)
+            db.execute(f"""INSERT INTO {table} VALUES
+                ('inside', 'v', 'can', 'e1', 1500, 1600, 100, 10, 1, 40, 20, 30)""")
+            # A session started before the window but still open inside it
+            # overlaps the range and must be listed.
+            db.execute(f"""INSERT INTO {table} VALUES
+                ('started-before', 'v', 'can', 'e1', 900, NULL, NULL, 10, 1, 40, 20, 30)""")
+            # A session fully ended before the window does not overlap.
+            db.execute(f"""INSERT INTO {table} VALUES
+                ('ended-before', 'v', 'can', 'e1', 800, 950, 100, 10, 1, 40, 20, 30)""")
+            rows = {row[0] for row in db.execute(query)}
+            assert rows == {"inside", "started-before"}, (dashboard, panel, rows)
+            db.execute(f"DELETE FROM {table}")
+        # Nested raw children share fixtures but keep distinct scopes, each with
+        # source/epoch filters.
+        children = []
+        row = next(p for p in _all_battery_panels(
+            json.loads(configs["grafana-dash-charging"]["content"])["panels"])
+            if p["id"] == 20)
+        for panel_id in (1, 2, 3):
+            raw = next(p for p in row["panels"]
+                       if p["id"] == panel_id)["targets"][0]["rawSql"].replace("$$", "$")
+            child = (raw.replace("$__timeFilter(event_time)",
+                                "event_time BETWEEN 1000 AND 2000")
+                     .replace("${vehicle:sqlstring}", "''")
+                     .replace("${vehicle_ids:sqlstring}", "''")
+                     .replace("${source:sqlstring}", "''")
+                     .replace("${epoch:sqlstring}", "''"))
+            assert "source" in child and "decode_epoch" in child, panel_id
+            children.append(child)
+        assert len({len(query) for query in children}) == 3
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1500, 'v', 'can', 'e1', 'BMS_socUI',
+             'Vehicle.CAN.x292.BMS_socUI', 62, '%', 'reported_unverified')""")
+        assert db.execute(children[0]).fetchall() != []
+        assert db.execute(children[1]).fetchall() != []
+        assert db.execute(children[2]).fetchall() != []
+
+
+def test_dbc_divergence_exact_soc_aliases_with_unit_gate():
+    """DBC divergence (panel 9) pairs exact supported SOC aliases (CAN x292
+    BMS_socUI/Avg vs Fleet Soc/BatteryLevel canonical paths) under the %
+    reported gate; a missing counterpart yields NULL diff, never a
+    fabricated zero."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-dbc-health", 9)
+    assert "BMS_socUI" in query and "StateOfCharge" in query
+    assert "unit = '%'" in query
+    with _battery_db() as db:
+        db.row_factory = sqlite3.Row
+        db.create_function("date_trunc", 2, lambda unit, value: value - value % 60)
+        db.executemany("INSERT INTO vehicle_identity VALUES ('1970-01-01 00:00:00', ?, ?)",
+                       [("demo-can", "demo-car"), ("demo-fleet", "demo-car")])
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'demo-can', 'can', 'can-v1', 'BMS_socUI',
+             'Vehicle.CAN.x292.BMS_socUI', 60, '%', 'reported_unverified')""")
+        # CAN-only bucket: no Fleet leg joins, so diff stays NULL, never 0.
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1, [dict(row) for row in rows]
+        assert rows[0]["can_value"] == 60.0, dict(rows[0])
+        assert rows[0]["fleet_value"] is None and rows[0]["diff"] is None, dict(rows[0])
+        # Distinct raw identities sharing one canonical vehicle pair up.
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'demo-fleet', 'fleet', 'fleet-v1', 'Soc',
+             'Vehicle.Powertrain.TractionBattery.StateOfCharge.Current',
+             62, '%', 'reported_unverified')""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 1, [dict(row) for row in rows]
+        assert rows[0]["can_value"] == 60.0 and rows[0]["fleet_value"] == 62.0, dict(rows[0])
+        assert rows[0]["diff"] == -2.0, dict(rows[0])
+        # A wrong-unit CAN leg is unit-ineligible: no fabricated pair row.
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'demo-can', 'can', 'can-v1', 'BMS_socUI',
+             'Vehicle.CAN.x292.BMS_socUI', 60, 'fraction', 'reported_unverified')""")
+        assert db.execute(query).fetchall() == []
+
+
+def test_battery_lifecycle_counts_only_valid_active_evidence():
+    """Warning lifecycle (panel 19): an invalid-only active episode surfaces
+    as unknown_activity with zero valid-active observations for diagnosis —
+    never counted as an open episode."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    state = _battery_query(configs, 19)
+    with _battery_db() as db:
+        db.row_factory = sqlite3.Row
+        db.execute("""INSERT INTO vehicle_event VALUES
+            (1500, 'v', 'alerts', 'w', 'can', 'e-bad', 1500, 'env',
+             1500, NULL, NULL, 'owner', 1, 0, 's', 'e1', 'c', 'ep-badonly',
+             'error', NULL, NULL)""")
+        db.execute("""INSERT INTO vehicle_event VALUES
+            (1500, 'v', 'alerts', 'w', 'can', 'e-good', 1500, 'env',
+             1500, NULL, NULL, 'owner', 1, 0, 's', 'e1', 'c', 'ep-good',
+             NULL, NULL, NULL)""")
+        rows = {row["episode"]: row for row in db.execute(state).fetchall()}
+        assert rows["ep-badonly"]["state"] == "unknown_activity", dict(rows["ep-badonly"])
+        assert rows["ep-badonly"]["valid_active_obs"] == 0, dict(rows["ep-badonly"])
+        assert rows["ep-good"]["state"] == "open", dict(rows["ep-good"])
+        assert rows["ep-good"]["valid_active_obs"] == 1, dict(rows["ep-good"])
+
+
+def test_cell_latest_raw_scope_across_epochs_with_cap():
+    """Cell latest table (panel 91) projects raw scope identifiers, keeps all
+    96 bricks visible across 3 epochs, and documents its row cap; the
+    per-brick coverage sibling (panel 93) accounts every brick/epoch."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-can-cells", 91)
+    assert "LIMIT 500" in query
+    with _battery_db() as db:
+        db.row_factory = sqlite3.Row
+        for epoch in ("e1", "e2", "e3"):
+            for brick in range(96):
+                db.execute("""INSERT INTO vehicle_signal
+                    (event_time, vehicle, source, decode_epoch, source_field, path,
+                     value_num, unit, quality, ingest_time, envelope_id) VALUES
+                    (1500, 'v', 'can', ?, ?, ?, 4.1, 'V',
+                     'reported_unverified', 1500, ?)""",
+                           (epoch, f"BMS_brick{brick}",
+                            f"Vehicle.CAN.x401.BMS_brick{brick}",
+                            f"env-{epoch}-{brick}"))
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 288, len(rows)
+        assert {row["해석 버전"] for row in rows} == {"e1", "e2", "e3"}
+        assert {row["수집원"] for row in rows} == {"can"}
+        assert {row["원본 신호"] for row in rows} == {f"BMS_brick{brick}" for brick in range(96)}
+        coverage = _physical_query(configs, "grafana-dash-can-cells", 93)
+        assert len(db.execute(coverage).fetchall()) == 288
+
+
+def test_ai_runtime_dedup_ttft_and_subagent_samples():
+    """AI runtime aggregates (panels 11/13) dedupe on (trace_id, span_id):
+    duplicate ingested rows never double-count samples or subagent spans, and
+    NULL/negative TTFT never becomes a latency sample."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    runtime = json.loads(configs["grafana-dash-ai-runtime"]["content"])
+    panels = {p["id"]: p for p in _all_battery_panels(runtime["panels"])}
+
+    def query(panel_id, *percentiles):
+        sql = (panels[panel_id]["targets"][0]["rawSql"].replace("$$", "$")
+               .replace("$__timeFilter(timestamp)", "timestamp BETWEEN 1000 AND 2000")
+               .replace("FROM_UNIXTIME($__unixEpochTo() - 172800)", "0")
+               .replace("${client:sqlstring}", "''")
+               .replace("${provider:sqlstring}", "''")
+               .replace("${model:sqlstring}", "''"))
+        for percentile in percentiles:
+            inner = percentile[len("approx_percentile_cont("):-1].split(",")[0].strip()
+            sql = sql.replace(percentile, "AVG(" + inner + ")")
+        return sql
+
+    with sqlite3.connect(":memory:") as db:
+        db.row_factory = sqlite3.Row
+        db.execute("""CREATE TABLE opentelemetry_traces (
+            timestamp TIMESTAMP, trace_id TEXT, span_id TEXT,
+            service_name TEXT, span_name TEXT, duration_nano INTEGER,
+            "span_attributes.coding_agent.client" TEXT,
+            "span_attributes.client" TEXT,
+            "span_attributes.event.name" TEXT,
+            "span_attributes.gen_ai.provider.name" TEXT,
+            "span_attributes.gen_ai.request.model" TEXT,
+            "span_attributes.gen_ai.response.model" TEXT,
+            "span_attributes.ttft_ms" REAL,
+            "span_attributes.coding_agent.subagent.type" TEXT,
+            "span_attributes.coding_agent.subagent.status" TEXT,
+            "span_attributes.coding_agent.subagent.duration_ms" INTEGER)""")
+        for _ in range(2):
+            db.execute("""INSERT INTO opentelemetry_traces VALUES
+                (1500, 't1', 's1', 'oh-my-pi', 'op', 1000000, 'oh-my-pi', NULL, NULL,
+                 'prov', 'm', NULL, 120, 'task', 'completed', 50)""")
+        db.execute("""INSERT INTO opentelemetry_traces VALUES
+            (1500, 't1', 's2', 'oh-my-pi', 'op', 2000000, 'oh-my-pi', NULL, NULL,
+             'prov', 'm', NULL, 250, 'scout', 'failed', NULL)""")
+        db.execute("""INSERT INTO opentelemetry_traces VALUES
+            (1500, 't2', 's3', 'oh-my-pi', 'op', 3000000, 'oh-my-pi', NULL, NULL,
+             'prov', 'm', NULL, -5, NULL, NULL, NULL)""")
+        db.execute("""INSERT INTO opentelemetry_traces VALUES
+            (1500, 't3', 's4', 'oh-my-pi', 'op', 4000000, 'oh-my-pi', NULL, NULL,
+             'prov', 'm', NULL, NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query(11, "approx_percentile_cont(ttft_ms, 0.5)",
+                                "approx_percentile_cont(ttft_ms, 0.95)")).fetchall()
+        assert [(row["client"], row["samples"]) for row in rows] == [("oh-my-pi", 2)], [dict(row) for row in rows]
+        assert db.execute(query(10)).fetchone()["ttft_samples"] == 2
+        rows = {(row["subagent_type"], row["subagent_status"]): row for row in db.execute(
+            query(13, "approx_percentile_cont(duration_ms, 0.5)",
+                  "approx_percentile_cont(duration_ms, 0.95)"))}
+        assert rows[("task", "completed")]["spans"] == 1, {key: dict(row) for key, row in rows.items()}
+        assert rows[("scout", "failed")]["spans"] == 1, {key: dict(row) for key, row in rows.items()}
+        assert rows[("scout", "failed")]["duration_samples"] == 0, {key: dict(row) for key, row in rows.items()}
+        db.execute('DELETE FROM opentelemetry_traces WHERE "span_attributes.ttft_ms" >= 0')
+        assert db.execute(query(10)).fetchone()["ttft_samples"] is None
+
+
 if __name__ == "__main__":
     test_dashboard_and_folder_uids_are_disjoint()
     test_coverage_distinguishes_absence_from_observed_zero()
@@ -1132,7 +1498,7 @@ if __name__ == "__main__":
     test_battery_dashboard_warning_overlap_keeps_started_before_range()
     test_battery_cards_raw_display_latest_valid_only()
     test_battery_cards_latest_window_energy_not_lifetime()
-    test_battery_period_totals_sum_latest_revision_per_window()
+    test_battery_soh_card_prefers_absolute_then_estimate_with_error()
     test_physical_cards_latest_analysis_and_new_raw_barriers()
     test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
@@ -1148,4 +1514,10 @@ if __name__ == "__main__":
     test_cell_frequency_respects_selected_source_and_epoch()
     test_provenance_table_matches_card_eligibility()
     test_can_latest_cards_keep_invalid_reports_and_separate_epochs()
-    print("test_dashboards: ok (absence, observed zero, retransmission, time range, known cost, battery latest-wins, warning overlap, raw display card, latest-window energy)")
+    test_fleet_gear_and_charge_timelines_include_latest_invalid()
+    test_speed_soc_scope_separation_units_and_invalid_buckets()
+    test_ledger_overlap_window_and_nested_raw_scopes()
+    test_dbc_divergence_exact_soc_aliases_with_unit_gate()
+    test_battery_lifecycle_counts_only_valid_active_evidence()
+    test_cell_latest_raw_scope_across_epochs_with_cap()
+    test_ai_runtime_dedup_ttft_and_subagent_samples()
