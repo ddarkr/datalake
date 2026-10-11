@@ -122,7 +122,7 @@ import math
 
 from scripts.analytics.battery import battery_common as bc
 
-ALGORITHM_VERSION = "1.1.0"
+ALGORITHM_VERSION = "1.1.1"
 ANALYSIS_ID = "battery_electrical"
 
 SUPPORTED_METRICS = (
@@ -1232,12 +1232,23 @@ def _row_usable(row, field, expected_unit, field_units, has_top_calibration):
 
 def _first_field_timeline(rows, fields, expected_unit, field_units,
                           has_top_calibration):
-    """First configured field with any rows: (field, timeline)."""
+    """First configured field with usable samples, else first with rows.
+
+    Never merges fields: one field's barrier-preserving timeline wins, so
+    an uncalibrated first-listed field cannot mask a usable explicitly
+    mapped alternative (e.g. native-A BatteryCurrent behind PackCurrent).
+    """
+    fallback = (None, [])
     for field in fields:
-        if any(r.get("source_field") == field for r in rows):
-            return field, _field_timeline(rows, field, expected_unit,
-                                          field_units, has_top_calibration)
-    return None, []
+        if not any(r.get("source_field") == field for r in rows):
+            continue
+        timeline = _field_timeline(rows, field, expected_unit,
+                                   field_units, has_top_calibration)
+        if fallback[0] is None:
+            fallback = (field, timeline)
+        if any(ok for _, _, ok, _ in timeline):
+            return field, timeline
+    return fallback
 
 
 def required_fields(config=None):

@@ -1490,7 +1490,75 @@ def test_ai_runtime_dedup_ttft_and_subagent_samples():
         assert db.execute(query(10)).fetchone()["ttft_samples"] is None
 
 
+def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for dashboard, panel in (("grafana-dash-battery", 25),
+                             ("grafana-dash-vehicle-overview", 1)):
+        query = _physical_query(configs, dashboard, panel).replace(
+            "CAST(event_time AS TIMESTAMP(6))", "event_time")
+        with _battery_db() as db:
+            assert db.execute(query).fetchall() == []
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time,vehicle,source,decode_epoch,source_field,
+                 value_num,unit,quality,path)
+                VALUES (900,'v','fleet','e1','BatteryLevel',62,'%','ok','soc')""")
+            cursor = db.execute(query)
+            row = dict(zip((c[0] for c in cursor.description), cursor.fetchone()))
+            assert row["reading"] == 62
+            if dashboard == "grafana-dash-battery":
+                assert row["observed_at"] == 900
+            # A future report cannot leak into a historical snapshot.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time,vehicle,source,decode_epoch,source_field,
+                 value_num,unit,quality,path)
+                VALUES (2001,'v','fleet','e1','BatteryLevel',99,'%','ok','soc')""")
+            cursor = db.execute(query)
+            assert dict(zip((c[0] for c in cursor.description),
+                            cursor.fetchone()))["reading"] == 62
+            # The newest retained invalid report wins, even before range start.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time,vehicle,source,decode_epoch,source_field,
+                 value_num,unit,quality,path)
+                VALUES (950,'v','fleet','e1','BatteryLevel',NULL,'%','invalid','soc')""")
+            cursor = db.execute(query)
+            assert dict(zip((c[0] for c in cursor.description),
+                            cursor.fetchone()))["reading"] is None
+
+    query, ns_timestamp, ts_display = _native_ts_query(
+        configs, "grafana-dash-battery", 44)
+    provenance, _, _ = _native_ts_query(configs, "grafana-dash-battery", 94)
+    with _battery_db() as db:
+        db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
+        db.create_function("TS_DISPLAY", 1, ts_display)
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start,window_end,vehicle,metric,source,analysis_id,
+             revision,value,value_text,unit,status,reason,decode_epoch,computed_at)
+            VALUES (800,900,'v','battery.conditions.brick_max_v','fleet',
+                    'battery_conditions','r1',4.02,'1970-01-01 00:00:00.0000009',
+                    'V','derived','latest_calibrated_sample','e1',1000)""")
+        assert db.execute(query).fetchone()[3] == 4.02
+        evidence = {row[3]: row for row in db.execute(provenance)}
+        assert evidence["최고 셀 전압"][5] == 4.02
+        # An unfinished window cannot replace a completed older snapshot.
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start,window_end,vehicle,metric,source,analysis_id,
+             revision,value,value_text,unit,status,reason,decode_epoch,computed_at)
+            VALUES (1900,2100,'v','battery.conditions.brick_max_v','fleet',
+                    'battery_conditions','future',9,'1970-01-01 00:00:00.0000019',
+                    'V','derived','latest_calibrated_sample','e1',2100)""")
+        assert db.execute(query).fetchone()[3] == 4.02
+        db.execute("""INSERT INTO vehicle_analysis
+            (window_start,window_end,vehicle,metric,source,analysis_id,
+             revision,value,value_text,unit,status,reason,decode_epoch,computed_at)
+            VALUES (800,900,'v','battery.conditions.brick_max_v','fleet',
+                    'battery_conditions','r2',NULL,NULL,'V','unavailable',
+                    'terminal_invalid','e1',1100)""")
+        assert db.execute(query).fetchone()[3] is None
+        evidence = {row[3]: row for row in db.execute(provenance)}
+        assert evidence["최고 셀 전압"][5] is None
+
 if __name__ == "__main__":
+    test_last_reported_snapshots_keep_history_without_resurrecting_invalid()
     test_dashboard_and_folder_uids_are_disjoint()
     test_coverage_distinguishes_absence_from_observed_zero()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
