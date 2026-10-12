@@ -127,20 +127,27 @@ def main():
 
         def write_override(greptime_url):
             receiver = {
-                "environment": {"CAN_OTLP_USER": otlp_user, "CAN_OTLP_PASSWORD": otlp_password,
-                                "GREPTIME_USER": db_user, "GREPTIME_PASSWORD": db_password},
+                "environment": {"CAN_OTLP_USER": otlp_user, "CAN_OTLP_PASSWORD": otlp_password},
                 "command": ["/opt/venv/bin/python", "-m", "scripts.ingest.can.can_receiver", "serve",
+                            "--database", "/data/raw.sqlite3", "--vehicle", "fixture",
+                            "--collector-id", "fixture", "--bind", "0.0.0.0", "--port", "4319"],
+            }
+            worker = {
+                "environment": {"GREPTIME_USER": db_user, "GREPTIME_PASSWORD": db_password},
+                "command": ["/opt/venv/bin/python", "-m", "scripts.ingest.can.can_receiver", "work",
                             "--database", "/data/raw.sqlite3", "--dbc", "/definitions/synthetic.dbc",
-                            "--definitions", "/definitions/synthetic.json", "--vehicle", "fixture",
-                            "--collector-id", "fixture", "--greptime-url", greptime_url,
-                            "--greptime-db", db_name, "--bind", "0.0.0.0", "--port", "4319",
-                            "--worker-interval", "0.2"],
+                            "--definitions", "/definitions/synthetic.json",
+                            "--greptime-url", greptime_url,
+                            "--greptime-db", db_name, "--worker-interval", "0.2"],
                 "volumes": [str(path) + ":/definitions:ro"],
             }
+            receiver["volumes"] = [str(path) + ":/definitions:ro"]
             override.write_text(
                 "services:\n  can-receiver:\n" + "".join(
                     "    " + key + ": " + json.dumps(value) + "\n" for key, value in receiver.items())
                 + "    ports: !override ['127.0.0.1::4319']\n"
+                + "  can-worker:\n" + "".join(
+                    "    " + key + ": " + json.dumps(value) + "\n" for key, value in worker.items())
                 + "  smoke-greptime:\n"
                 + "    image: " + json.dumps(GREPTIME_IMAGE) + "\n"
                 + '    profiles: ["can-receiver"]\n'
@@ -224,11 +231,12 @@ def main():
             compose("run", "--rm", "--no-deps", "--user", "0:0", "--cap-add", "CHOWN",
                     "--entrypoint", "/bin/sh", "can-receiver", "-ec",
                     "chmod 0700 /data; chown 10001:10001 /data")
-            compose("up", "-d", "can-receiver")
-            cid = compose("ps", "-q", "can-receiver").strip()
-            container = json.loads(subprocess.check_output(["docker", "inspect", cid], text=True))[0]
-            assert container["HostConfig"]["ReadonlyRootfs"] and container["Config"]["User"] == "10001:10001"
-            assert not next(m for m in container["Mounts"] if m["Destination"] == "/app")["RW"]
+            compose("up", "-d", "can-receiver", "can-worker")
+            for svc in ("can-receiver", "can-worker"):
+                cid = compose("ps", "-q", svc).strip()
+                container = json.loads(subprocess.check_output(["docker", "inspect", cid], text=True))[0]
+                assert container["HostConfig"]["ReadonlyRootfs"] and container["Config"]["User"] == "10001:10001"
+                assert not next(m for m in container["Mounts"] if m["Destination"] == "/app")["RW"]
             endpoint = "http://" + compose("port", "can-receiver", "4319").strip() + "/v1/logs"
 
             def unauthorized():
@@ -266,8 +274,8 @@ def main():
                      and status()["raw_chunks"] == total_chunks, 300, "offline decode")
             saved = status()
             assert saved["sessions"] == 2 and saved["epochs"][0]["decoded_rows"] == len(expected)
-            # Restart with the backend still down: durable outbox survives, replay dedups.
-            compose("restart", "can-receiver")
+            # Restart both roles with the backend still down: durable outbox survives, replay dedups.
+            compose("restart", "can-receiver", "can-worker")
             endpoint = "http://" + compose("port", "can-receiver", "4319").strip() + "/v1/logs"
             wait_for(unauthorized, 60, "receiver auth after restart")
             upload_all(endpoint)
@@ -275,9 +283,9 @@ def main():
             assert (saved["raw_chunks"], saved["sessions"], saved["pending_rows"]) == \
                 (total_chunks, 2, len(expected))
 
-            # Point at the real isolated backend (test service only) and drain.
+            # Point the worker at the real isolated backend (test service only) and drain.
             write_override("http://smoke-greptime:4000")
-            compose("up", "-d", "can-receiver")
+            compose("up", "-d", "can-worker")
             endpoint = "http://" + compose("port", "can-receiver", "4319").strip() + "/v1/logs"
             wait_for(unauthorized, 60, "receiver auth after backend switch")
             wait_for(lambda: status()["pending_rows"] == 0, 300, "drain to greptime")
@@ -313,8 +321,8 @@ def main():
             assert dirty and all(r[0] == "fixture" and r[1] == "can" and r[2] == epoch
                                  and len(r[3]) == 64 for r in dirty)
 
-            # Restart with the backend up, then replay: no duplicates.
-            compose("restart", "can-receiver")
+            # Restart both roles with the backend up, then replay: no duplicates.
+            compose("restart", "can-receiver", "can-worker")
             endpoint = "http://" + compose("port", "can-receiver", "4319").strip() + "/v1/logs"
             wait_for(unauthorized, 60, "receiver auth after online restart")
             upload_all(endpoint)
@@ -345,7 +353,7 @@ def main():
             wait_for(lambda: status()["pending_rows"] == 0, 300, "post-outage drain")
             assert _count(greptime_host, auth, db_name, "vehicle_signal") == len(expected)
 
-            print("read-only receiver: offline durability, %d chunks/%d rows, dense resume,"
+            print("split receiver+worker: offline durability, %d chunks/%d rows, dense resume,"
                   " real greptime rows/dirty ACK, restart dedup, outage retention+drain passed"
                   % (total_chunks + OUTAGE_CHUNKS, len(expected)))
             print("sources: " + ",".join(REQUIRED_SOURCES))

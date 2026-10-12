@@ -133,9 +133,9 @@ COMPOSE_PROFILES=redecode docker compose --env-file .env run --rm redecode
 
 ### 별도 CAN uploader의 서버 receiver
 
-`can-receiver`는 opt-in 서버 프로필입니다. 이 저장소가 receiver·디코더·배포를 관리하며 차량 측 capture/uploader는 `tesla-obd`에서 관리합니다. 기존 `vehicle`의 SocketCAN/MF4 경로와 혼용하지 않습니다. 공개 Git에는 DBC, companion evidence JSON, 실제 원본·샘플·차량 식별자·자격 증명을 넣지 않습니다.
+`can-receiver`는 opt-in 서버 프로필입니다. 원본 수신(`can-receiver`, `serve`)과 디코딩·적재(`can-worker`, `work`)를 별도 서비스·프로세스로 실행합니다. 이 저장소가 receiver·worker·배포를 관리하며 차량 측 capture/uploader는 `tesla-obd`에서 관리합니다. 기존 `vehicle`의 SocketCAN/MF4 경로와 혼용하지 않습니다. 공개 Git에는 DBC, companion evidence JSON, 실제 원본·샘플·차량 식별자·자격 증명을 넣지 않습니다.
 
-서버의 비공개 `.env`에 `COMPOSE_PROFILES=server,can-receiver`, `CAN_OTLP_USER`, `CAN_OTLP_PASSWORD`, `CAN_VEHICLE`, `CAN_COLLECTOR_ID`를 설정합니다. 기존 uploader의 인증·identity를 그대로 유지하세요. `GREPTIME_HTTP_URL` 기본값은 컨테이너 네트워크의 `http://greptimedb:4000`이며 `GREPTIME_DB/USER/PASSWORD`는 **서버에만** 둡니다. 차량에는 수신 주소와 CAN 인증만 전달합니다. 빈 인증·identity는 inactive profile의 구조 검사를 허용하지만 실제 receiver 기동은 거부됩니다.
+서버의 비공개 `.env`에 `COMPOSE_PROFILES=server,can-receiver`, `CAN_OTLP_USER`, `CAN_OTLP_PASSWORD`, `CAN_VEHICLE`, `CAN_COLLECTOR_ID`를 설정합니다. 기존 uploader의 인증·identity를 그대로 유지하세요. `GREPTIME_HTTP_URL` 기본값은 컨테이너 네트워크의 `http://greptimedb:4000`이며 `GREPTIME_DB/USER/PASSWORD`는 **서버에만** 둡니다. receiver는 CAN 수신 인증·identity만 사용하고 Greptime 자격 증명·DBC 없이 기동하며, worker는 Greptime 연결·DBC 정의만 사용하고 수신 포트·CAN 인증 없이 기동합니다. 차량에는 수신 주소와 CAN 인증만 전달합니다. 빈 인증·identity는 inactive profile의 구조 검사를 허용하지만 실제 receiver 기동은 거부됩니다.
 
 #### 새 볼륨 준비
 
@@ -167,18 +167,18 @@ docker rm can-definitions-load
 
 ```bash
 docker compose --env-file .env --profile can-receiver config --quiet
-docker compose --env-file .env --profile can-receiver up -d can-receiver
+docker compose --env-file .env --profile can-receiver up -d can-receiver can-worker
 docker compose --env-file .env --profile can-receiver exec can-receiver \
   /opt/venv/bin/python -m scripts.ingest.can.can_receiver status --database /data/raw.sqlite3
 ```
 
-초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps와 receiver **두 서비스의 revision label**을 함께 갱신하세요. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
+초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps·receiver·worker **세 서비스의 revision label**을 함께 갱신하세요. receiver와 worker는 독립적으로 재시작할 수 있습니다. 정상 ingest 중에는 어느 한쪽을 멈추기 위해 다른 쪽을 중지할 필요가 없으며, worker 공백 동안 받은 원본은 SQLite에 보존되었다가 worker 재기동 후 처리됩니다. 두 프로세스는 GIL을 공유하지 않지만 같은 SQLite archive를 공유 writer로 사용하므로 쓰기는 SQLite 잠금으로 직렬화됩니다. receiver·worker는 같은 archive에 공유 수명 lock과 각 역할 lock을 함께 사용하며, 같은 역할 중복 실행·구 combined 실행·`re-decode`와 worker 동시 실행은 시작 전에 거부됩니다. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
 
 CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
 
 디코딩은 쓰기 잠금 밖에서 최대 1,000청크·2,000출력 행을 준비하고, 청크 사이의 경과 시간이 50ms를 넘으면 다음 commit으로 넘깁니다. 조밀한 청크도 parser 상태와 frame 경계 cursor로 이어서 처리하므로 한 청크의 모든 신호를 메모리에 펼치지 않습니다. commit 전 각 세션의 기존 cursor·상태를 다시 확인하며, parser 상태·decode cursor·outbox는 한 트랜잭션에서 함께 commit하거나 rollback합니다. 개별 frame·commit 시간을 포함한 엄격한 50ms 상한은 아니며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
 
-단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, ingress socket의 `--http-timeout` 기본값 15초와 별개입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 독점 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
+단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, `serve`의 ingress socket `--http-timeout` 기본값 15초와 별개입니다. `--greptime-timeout`·`--outbox-limit`·`--max-body-bytes`는 `work` 옵션입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
 
 signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신까지 ACK되어야 outbox에서 제거합니다. 알림 실패는 `dirty_notify_failure`로 남고 signal 재전송은 같은 event ID로 중복 제거됩니다. 집계기는 완료된 시간창을 scope별 영속 sweep cursor로 순회하므로 알림 이전의 과거 CAN도 처리합니다. 시간창의 raw fingerprint·generation·분석 설정과 코드 revision이 이전 checkpoint와 같으면 재계산하지 않으며, 처리 중 입력이 바뀌거나 분석이 실패하면 checkpoint를 완료하지 않습니다. 이 확인은 해당 scope·시간창의 처리 기록이지 물리 교정 성공 증거가 아닙니다.
 
@@ -186,7 +186,7 @@ signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신�
 
 #### CAN archive 백업과 새 볼륨 복원
 
-DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE를 GET으로 검증한 뒤 성공하며 원격 자동 GC는 하지 않습니다.
+DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE를 GET으로 검증한 뒤 성공하며 원격 자동 GC는 하지 않습니다.
 
 ```bash
 docker compose --env-file .env --profile backup run --rm can-backup backup
@@ -197,27 +197,27 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 
 복원 대상은 `CAN_RESTORE_RAW_VOLUME`과 `CAN_RESTORE_DEFS_VOLUME`의 **별도 빈 볼륨**입니다. 기본 이름은 `${COMPOSE_PROJECT_NAME}_can-restore-raw`와 `${COMPOSE_PROJECT_NAME}_can-restore-defs`이며 각각 receiver의 `/data`, `/definitions`에 직접 연결할 수 있습니다. `CAN_BACKUP_FILE`로 완료 백업을 선택할 수 있습니다. CAN 복원의 offline 확인은 이 두 **대상**에 대한 확인이며 live 원본의 WAL·소유권 lock은 그대로 유지할 수 있습니다. 원본과 같은 대상, 기존 파일이 있는 대상, 사용 중인 대상에는 복원하지 않습니다. 원본의 UID/GID와 `0700` 디렉터리·`0600` 파일 모드를 그대로 복원하며 접근을 위해 권한을 넓히지 않습니다.
 
-복원본의 정의 SHA·연속 seq·epoch·cursor·outbox를 확인한 뒤 별도 receiver로 검증하세요. 운영 receiver를 복원본으로 인계하는 것은 별도 승인된 절차이며, 같은 archive에 두 writer를 시작하지 마세요. `CAN_BACKUP_RESERVE_BYTES`와 `BACKUP_RESERVE_BYTES`는 각각 CAN·DB staging 예산에 추가할 여유 byte이며 기본 64 MiB입니다. 백업은 snapshot과 압축 작업 공간, 복원은 archive와 해제될 파일 및 대상 파일시스템별 공간을 사전 검사합니다. 공간 부족을 발견하면 기존 원본·복원 대상 데이터를 변경하지 않습니다.
+복원본의 정의 SHA·연속 seq·epoch·cursor·outbox를 확인한 뒤 별도 receiver·worker로 검증하세요. 운영 archive를 복원본으로 교체(인계)할 때는 receiver와 worker **둘 다** 먼저 정상 종료하고, 같은 archive에 구·신 writer를 병렬 실행하지 마세요. `CAN_BACKUP_RESERVE_BYTES`와 `BACKUP_RESERVE_BYTES`는 각각 CAN·DB staging 예산에 추가할 여유 byte이며 기본 64 MiB입니다. 백업은 snapshot과 압축 작업 공간, 복원은 archive와 해제될 파일 및 대상 파일시스템별 공간을 사전 검사합니다. 공간 부족을 발견하면 기존 원본·복원 대상 데이터를 변경하지 않습니다.
 
-`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
+`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver·worker를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
-#### 기존 receiver 인계
+#### 기존 receiver·worker 인계
 
-1. 기존 receiver의 raw volume 이름, identity·인증, 정의 두 파일의 SHA256, 상태·epoch를 비공개로 기록하고 SQLite-consistent 백업을 확보합니다. **온라인 백업은 SQLite backup API 등 일관성 있는 방식으로 수행하세요. WAL이 열린 `.db`만 `cp`하면 안 됩니다.** 오프라인 전체 볼륨 백업도 모든 writer를 먼저 중지해야 합니다.
-2. **기존 receiver만** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. uploader는 기존 로컬 spool·cursor·immutable 요청을 유지한 채 서버 공백 동안 재시도합니다.
+1. 기존 receiver·worker의 raw volume 이름, identity·인증, 정의 두 파일의 SHA256, 상태·epoch를 비공개로 기록하고 SQLite-consistent 백업을 확보합니다. **온라인 백업은 SQLite backup API 등 일관성 있는 방식으로 수행하세요. WAL이 열린 `.db`만 `cp`하면 안 됩니다.** 오프라인 전체 볼륨 백업도 모든 writer(receiver·worker)를 먼저 중지해야 합니다.
+2. **기존 receiver와 worker 둘 다** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. uploader는 기존 로컬 spool·cursor·immutable 요청을 유지한 채 서버 공백 동안 재시도합니다.
 3. `CAN_RECEIVER_RAW_VOLUME`을 기존 raw volume의 정확한 이름으로 지정합니다. 새 빈 raw volume으로 교체하거나 DB를 복사·삭제하지 않습니다. 기존 `/data/raw.sqlite3`와 WAL/SHM, decode cursor·outbox·epoch를 그대로 사용하며 소유자 `10001:10001`와 private 모드를 확인합니다. 필요한 권한 조정은 writer를 멈춘 상태에서만 수행합니다.
-4. 동일한 정의 바이트를 private definitions volume에 공급합니다. 서버 이전을 이유로 새 epoch를 만들거나 `re-decode`를 실행하지 않습니다. 기존 worker가 완전히 종료된 뒤 위 명령으로 새 receiver만 시작합니다. **같은 raw archive에 구·신 worker를 병렬 실행하지 마세요.**
-5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 원본은 어느 쪽에서도 삭제하지 않습니다. rollback도 새 receiver만 종료한 뒤 동일 볼륨·정의로 기존 receiver를 단독 기동합니다.
+4. 동일한 정의 바이트를 private definitions volume에 공급합니다. 서버 이전을 이유로 새 epoch를 만들거나 `re-decode`를 실행하지 않습니다. 같은 raw·정의 볼륨으로 새 receiver와 worker를 시작합니다. **같은 raw archive에 구·신 receiver·worker를 병렬 실행하지 마세요.**
+5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 원본은 어느 쪽에서도 삭제하지 않습니다. rollback도 새 receiver·worker를 종료한 뒤 동일 볼륨·정의로 기존 버전을 단독 기동합니다.
 
-의도적으로 정의를 변경하는 재해석은 receiver를 먼저 중지하고 새 정의를 검토한 뒤 아래처럼 같은 venv·볼륨의 단독 컨테이너에서 실행합니다. 이 작업은 새 decode epoch를 명시적으로 등록하므로 단순 배포 인계와 구분합니다. 정의 파일 교체는 receiver를 중지한 상태에서만 수행합니다.
+의도적으로 정의를 변경하는 재해석은 worker를 먼저 중지하고 새 정의를 검토한 뒤 아래처럼 같은 venv·볼륨의 단독 컨테이너에서 실행합니다. `re-decode`는 worker 역할 lock을 사용하므로 `can-worker` 실행 중에는 동시에 시작하지 마세요. 이 작업은 새 decode epoch를 명시적으로 등록하므로 단순 배포 인계와 구분합니다. 정의 파일 교체는 worker를 중지한 상태에서만 수행합니다. receiver는 계속 수신할 수 있으며 worker 시작 전에 받은 원본도 이후 처리됩니다.
 
 ```bash
-docker compose --env-file .env --profile can-receiver stop can-receiver
-docker compose --env-file .env --profile can-receiver run --rm --no-deps can-receiver \
+docker compose --env-file .env --profile can-receiver stop can-worker
+docker compose --env-file .env --profile can-receiver run --rm --no-deps can-worker \
   /opt/venv/bin/python -m scripts.ingest.can.can_receiver re-decode \
   --database /data/raw.sqlite3 --dbc /definitions/observed.dbc \
   --definitions /definitions/observed.json
-docker compose --env-file .env --profile can-receiver up -d can-receiver
+docker compose --env-file .env --profile can-receiver up -d can-worker
 ```
 
 완전한 OTLP ACK는 **서버 raw SQLite의 durable 수락**이지 Greptime commit이 아닙니다. downstream 장애 시 raw와 outbox가 남으며, ACK는 차량 원본 삭제 허가가 아닙니다. 자동 raw GC를 추가하지 말고 SQLite archive·차량 원본을 보존하세요. epoch·정수 nanosecond·quality를 유지하며 `reported_unverified` 등을 집계 편의를 위해 `valid`로 바꾸지 않습니다.

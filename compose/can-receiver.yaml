@@ -3,7 +3,7 @@ services:
     image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [can-receiver]
     labels:
-      datalake.can-receiver-revision: "13"
+      datalake.can-receiver-revision: "14"
     volumes:
       - receiver-venv:/opt/venv
       - receiver-code:/app
@@ -37,7 +37,54 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: "13"
+      datalake.can-receiver-revision: "14"
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - receiver-venv:/opt/venv:ro
+      - receiver-code:/app:ro
+      - can-receiver-raw:/data
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONUNBUFFERED: "1"
+      CAN_OTLP_USER: ${CAN_OTLP_USER:-}
+      CAN_OTLP_PASSWORD: ${CAN_OTLP_PASSWORD:-}
+      CAN_VEHICLE: ${CAN_VEHICLE:-}
+      CAN_COLLECTOR_ID: ${CAN_COLLECTOR_ID:-}
+    working_dir: /app
+    command:
+      - /opt/venv/bin/python
+      - -m
+      - scripts.ingest.can.can_receiver
+      - serve
+      - --database
+      - /data/raw.sqlite3
+      - --vehicle
+      - ${CAN_VEHICLE:-}
+      - --collector-id
+      - ${CAN_COLLECTOR_ID:-}
+      - --bind
+      - 0.0.0.0
+      - --port
+      - "4319"
+    ports:
+      - "127.0.0.1:${CAN_RECEIVER_PORT:-4319}:4319"
+    restart: unless-stopped
+    stop_grace_period: 90s
+
+  can-worker:
+    image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
+    profiles: [can-receiver]
+    depends_on:
+      can-receiver-deps:
+        condition: service_completed_successfully
+    labels:
+      datalake.can-receiver-revision: "14"
     user: "10001:10001"
     read_only: true
     tmpfs:
@@ -53,10 +100,6 @@ services:
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       PYTHONUNBUFFERED: "1"
-      CAN_OTLP_USER: ${CAN_OTLP_USER:-}
-      CAN_OTLP_PASSWORD: ${CAN_OTLP_PASSWORD:-}
-      CAN_VEHICLE: ${CAN_VEHICLE:-}
-      CAN_COLLECTOR_ID: ${CAN_COLLECTOR_ID:-}
       GREPTIME_HTTP_URL: ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
       GREPTIME_DB: ${GREPTIME_DB:-}
       GREPTIME_USER: ${GREPTIME_USER:-}
@@ -66,27 +109,25 @@ services:
       - /opt/venv/bin/python
       - -m
       - scripts.ingest.can.can_receiver
-      - serve
+      - work
       - --database
       - /data/raw.sqlite3
       - --dbc
       - /definitions/observed.dbc
       - --definitions
       - /definitions/observed.json
-      - --vehicle
-      - ${CAN_VEHICLE:-}
-      - --collector-id
-      - ${CAN_COLLECTOR_ID:-}
       - --greptime-url
       - ${GREPTIME_HTTP_URL:-http://greptimedb:4000}
       - --greptime-db
       - ${GREPTIME_DB:-}
-      - --bind
-      - 0.0.0.0
-      - --port
-      - "4319"
-    ports:
-      - "127.0.0.1:${CAN_RECEIVER_PORT:-4319}:4319"
+      - --worker-interval
+      - ${CAN_WORKER_INTERVAL:-1}
+      - --greptime-timeout
+      - ${CAN_GREPTIME_TIMEOUT:-60}
+      - --outbox-limit
+      - ${CAN_OUTBOX_LIMIT:-20000}
+      - --max-body-bytes
+      - ${CAN_MAX_BODY_BYTES:-4194304}
     restart: unless-stopped
     stop_grace_period: 90s
 

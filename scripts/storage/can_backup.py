@@ -6,7 +6,7 @@ Commands (operator runs only these; `.env` holds all settings):
   restore   fetch archive (local or S3) -> verify -> populate FRESH restore volumes
   list      local archives (+ remote COMPLETE backup ids when S3 configured)
 
-Procedure (backup profile; both nondisruptive to the live receiver):
+Procedure (backup profile; both nondisruptive to the live receiver and worker):
   docker compose --profile backup run --rm can-backup backup
   BACKUP_OFFLINE_CONFIRMED=1 docker compose --profile backup run --rm can-backup restore
 
@@ -41,14 +41,14 @@ and runs integrity_check. Manifest uids/modes are untrusted input:
 world-writable and setuid/setgid/sticky modes refuse,
 and staging extraction is traversal/symlink/special-file free.
 
-Restore gate: BACKUP_OFFLINE_CONFIRMED=1 AND the *restore-target* receiver
-lock (CAN_RESTORE_RAW_DIR/raw.sqlite3.lock) is free. The live source needs
+Restore gate: BACKUP_OFFLINE_CONFIRMED=1 AND the *restore-target* archive
+lock (CAN_RESTORE_RAW_DIR/raw.sqlite3.lock) is free of both receiver and worker. The live source needs
 no gate: restore populates only the separate fresh volumes (self-overwrite
 refuses), reads the source read-only, and never disturbs the running
-receiver or its WAL writer. Gates only inspect (read-only flock); they never
+receiver, worker, or their WAL writes. Gates only inspect (read-only flock); they never
 write the source mounts, which stay read-only in Compose. Cutover/restart
-replacement is a separate step: stop the original, keep a single archive
-owner for one path, and start the receiver on the verified restore.
+replacement is a separate step: stop both original roles, keep one receiver
+and one worker per archive, and start both on the verified restore.
 
 Capacity: backup preflights 2x source estimate + reserve on the backup
 volume; restore preflights tar + uncompressed members + reserve on the backup

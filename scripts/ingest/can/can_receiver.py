@@ -1,7 +1,8 @@
 """Authenticated OTLP raw archive and resumable CAN-to-Greptime worker.
 
 A successful /v1/logs response acknowledges SQLite raw durability, not Greptime.
-Raw chunks are never deleted. Run from /app with ``python -m scripts.ingest.can.can_receiver serve|status|re-decode``.
+Raw chunks are never deleted. Run from /app with ``python -m scripts.ingest.can.can_receiver serve|work|status|re-decode``:
+serve only receives raw, work only decodes/uploads.
 """
 from __future__ import annotations
 
@@ -31,7 +32,6 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.parse
 import zlib
 
-from scripts.ingest.can.can_decoder import Decoder
 from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, decode_batch, success_response
 
 COLUMNS = (
@@ -123,19 +123,72 @@ def _archive_path(path):
     return path
 
 
+def _prepare_archive_dir(path):
+    """Create and validate the archive parent before any lock/DB file exists."""
+    path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    parent = path.parent.stat()
+    if path.parent.is_symlink() or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
+        raise ConfigurationError("archive_directory_requires_private_0700_and_ownership")
+
+
 @contextlib.contextmanager
-def exclusive_archive(path):
-    """Serve and explicit replay cannot race another process's checkpoint."""
-    fd = os.open(str(path) + ".lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+def _locked(path, exclusive=True):
+    """Hold a nonblocking flock for the whole context; SH allows serve+work coexistence."""
+    fd = os.open(str(path), os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
         os.fchmod(fd, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
         except BlockingIOError:
             raise ConfigurationError("archive_already_in_use") from None
         yield
     finally:
         os.close(fd)
+
+
+INIT_LOCK_TIMEOUT = 120.0
+
+
+@contextlib.contextmanager
+def _init_guarded(path):
+    """Serialize Archive schema/migration init across simultaneous role startups."""
+    fd = os.open(str(path) + ".init.lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        deadline = time.monotonic() + INIT_LOCK_TIMEOUT
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise ConfigurationError("archive_already_in_use") from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        os.close(fd)
+
+
+@contextlib.contextmanager
+def receiver_locks(path):
+    """Raw-only role lifetime: SH legacy .lock plus EX receiver role lock."""
+    with _locked(str(path) + ".lock", exclusive=False):
+        with _locked(str(path) + ".receiver.lock", exclusive=True):
+            yield
+
+
+@contextlib.contextmanager
+def worker_locks(path):
+    """Decode/upload role lifetime (and re-decode): SH legacy .lock plus EX worker role lock."""
+    with _locked(str(path) + ".lock", exclusive=False):
+        with _locked(str(path) + ".worker.lock", exclusive=True):
+            yield
 
 DECODE_ROW_BUDGET = 2000
 
@@ -289,23 +342,22 @@ class Archive:
     def __init__(self, path, disk_reserve_bytes=64 * 1024 * 1024):
         self.path = _archive_path(path)
         self.disk_reserve_bytes = disk_reserve_bytes
-        self.path.parent.mkdir(parents=True, mode=0o700, exist_ok=True)
-        parent = self.path.parent.stat()
-        if self.path.parent.is_symlink() or parent.st_uid != os.getuid() or parent.st_mode & 0o077:
-            raise ConfigurationError("archive_directory_requires_private_0700_and_ownership")
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            if os.fstat(fd).st_uid != os.getuid():
-                raise ConfigurationError("archive_requires_ownership")
-            os.fchmod(fd, 0o600)
-        finally:
-            os.close(fd)
-        with self.connect() as conn:
-            conn.executescript(SCHEMA)
-            conn.execute("BEGIN IMMEDIATE")
-            _migrate_counters(conn)
-            _migrate_pending(conn)
-            conn.commit()
+        # Secure parent init BEFORE lock creation; narrow init lock only here.
+        _prepare_archive_dir(self.path)
+        with _init_guarded(self.path):
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                if os.fstat(fd).st_uid != os.getuid():
+                    raise ConfigurationError("archive_requires_ownership")
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+            with self.connect() as conn:
+                conn.executescript(SCHEMA)
+                conn.execute("BEGIN IMMEDIATE")
+                _migrate_counters(conn)
+                _migrate_pending(conn)
+                conn.commit()
 
 
 
@@ -1005,6 +1057,7 @@ class Receiver(HTTPServer):
         self.expected_auth = (user + ":" + password).encode()
         self.read_timeout = timeout
         self._slots = threading.BoundedSemaphore(concurrency)
+        self._concurrency = concurrency
         self._shutdown = threading.Event()
         super().__init__(address, Handler)
 
@@ -1038,6 +1091,14 @@ class Receiver(HTTPServer):
     def server_close(self):
         self._shutdown.set()
         super().server_close()
+        # Drain in-flight handler commits before the caller releases role
+        # locks: slot threads still hold one permit each until their commit
+        # lands, and Handler's per-request deadline bounds each wait. Listener
+        # is already closed above, so no new slot can start during the drain.
+        for _ in range(self._concurrency):
+            self._slots.acquire()
+        for _ in range(self._concurrency):
+            self._slots.release()
 
     def handle_error(self, request, client_address):
         pass  # Never let stdlib traceback logging include client-controlled data.
@@ -1055,6 +1116,12 @@ class Handler(BaseHTTPRequestHandler):
         super().setup()
 
     def handle_one_request(self):
+        if self.server._shutdown.is_set():
+            # Shutdown began between keep-alive requests: dispatch nothing
+            # further so the slot releases and the server_close drain proceeds.
+            # The in-flight request already replied (reply closes on shutdown).
+            self.close_connection = True
+            return
         # Absolute per-request deadline: socket timeout alone can be postponed
         # indefinitely by trickled bytes, so a timer bounds the whole request.
         # Token check and socket shutdown run atomically under the
@@ -1102,11 +1169,13 @@ class Handler(BaseHTTPRequestHandler):
     def reply(self, code, body, protobuf=False):
         # Success keeps the connection alive for client reuse; any error,
         # timeout, or framing ambiguity closes it so no state leaks across requests.
-        self.close_connection = code != 200
+        # Shutdown also closes: the in-flight reply still commits, but no next
+        # keep-alive request can sustain the slot and starve server_close drain.
+        self.close_connection = code != 200 or self.server._shutdown.is_set()
         self.send_response(code)
         self.send_header("Content-Type", "application/x-protobuf" if protobuf else "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Connection", "keep-alive" if code == 200 else "close")
+        self.send_header("Connection", "keep-alive" if not self.close_connection else "close")
         if code == 401:
             self.send_header("WWW-Authenticate", 'Basic realm="CANArchive"')
         self.end_headers()
@@ -1188,27 +1257,119 @@ class Handler(BaseHTTPRequestHandler):
                     self.close_connection = True
 
 
+@contextlib.contextmanager
+def _role_archive(args, role_locks):
+    """Lifetime role locks around init and the whole role run.
+
+    Directory is prepared/validated before lock files are created, so a first
+    start on a nested non-existent parent works. Role + legacy SH locks are
+    held for the whole run (released only after the graceful drain below);
+    the EX init lock lives only inside Archive.__init__.
+    """
+    path = _archive_path(args.database)
+    _prepare_archive_dir(path)
+    with role_locks(path):
+        yield Archive(path, args.disk_reserve_mib * 1024 * 1024)
+
+
+def _run_serve(args):
+    if type(args.port) is bool or not 0 <= args.port <= 65535 or not math.isfinite(args.http_timeout) or args.http_timeout <= 0:
+        raise ConfigurationError("invalid_receiver_limits")
+    otlp_user, otlp_password = _credentials("CAN_OTLP")
+    with _role_archive(args, receiver_locks) as archive:
+        server = Receiver((args.bind, args.port), archive, args.vehicle, args.collector_id,
+                          otlp_user, otlp_password, args.http_timeout)
+        previous_term = signal.getsignal(signal.SIGTERM)
+        previous_int = signal.getsignal(signal.SIGINT)
+
+        def _stop(signum, frame):
+            # shutdown() must not run in the serve_forever thread itself: it blocks
+            # waiting for that same thread. Signal from a helper thread instead.
+            threading.Thread(target=server.shutdown, daemon=True).start()
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+        print(_json({"receiver": "ready", "port": server.server_port}), flush=True)
+        try:
+            server.serve_forever()
+        finally:
+            # Handlers stay installed through the drain, so a second SIGTERM
+            # during server_close still routes to shutdown, not the default.
+            server.server_close()
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
+    return 0
+
+
+def _run_work(args):
+    from scripts.ingest.can.can_decoder import Decoder
+    if (not math.isfinite(args.worker_interval) or args.worker_interval <= 0
+            or not math.isfinite(args.greptime_timeout) or args.greptime_timeout <= 0
+            or not 1 <= args.outbox_limit <= 20000 or args.max_body_bytes < 1):
+        raise ConfigurationError("invalid_receiver_limits")
+    db_user, db_password = _credentials("GREPTIME")
+    decoder = Decoder(args.dbc, args.definitions)
+    greptime = Greptime(args.greptime_url, args.greptime_db, db_user, db_password,
+                        args.greptime_timeout, args.max_body_bytes)
+    with _role_archive(args, worker_locks) as archive:
+        archive.register_epoch(decoder)
+        worker = Worker(archive, decoder, greptime, args.worker_interval, args.outbox_limit, args.max_body_bytes)
+        previous_term = signal.getsignal(signal.SIGTERM)
+        previous_int = signal.getsignal(signal.SIGINT)
+
+        def _stop(signum, frame):
+            worker.stop_event.set()
+        signal.signal(signal.SIGTERM, _stop)
+        signal.signal(signal.SIGINT, _stop)
+        worker.start()
+        print(_json({"worker": "ready"}), flush=True)
+        try:
+            while worker.is_alive():
+                worker.join(timeout=0.5)
+        finally:
+            worker.stop_event.set()
+            worker.join()
+            greptime.close()
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
+    return 0
+
+
+def _run_redecode(args):
+    from scripts.ingest.can.can_decoder import Decoder
+    decoder = Decoder(args.dbc, args.definitions)
+    with _role_archive(args, worker_locks) as archive:
+        archive.register_epoch(decoder, explicit=True)
+        while archive.decode_once(decoder):
+            pass
+        print(_json(archive.status()))
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
-    serve = commands.add_parser("serve", help="receive durable raw OTLP and run decode/SQL worker")
+    serve = commands.add_parser("serve", help="receive durable raw OTLP only")
+    work = commands.add_parser("work", help="decode stored raw and upload to Greptime")
     replay = commands.add_parser("re-decode", help="explicitly decode retained raw into an independent epoch/outbox")
     status = commands.add_parser("status", help="print only local archive counts and non-sensitive error codes")
-    for command in (serve, replay, status):
+    for command in (serve, work, replay, status):
         command.add_argument("--database", required=True)
-    for command in (serve, replay):
+    serve.add_argument("--vehicle", required=True)
+    serve.add_argument("--collector-id", required=True)
+    serve.add_argument("--bind", default="127.0.0.1")
+    serve.add_argument("--port", type=int, default=4319)
+    serve.add_argument("--http-timeout", type=float, default=15)
+    serve.add_argument("--disk-reserve-mib", type=int, default=64)
+    for command in (work, replay):
         command.add_argument("--dbc", required=True)
         command.add_argument("--definitions", required=True)
         command.add_argument("--disk-reserve-mib", type=int, default=64)
-    for name in ("vehicle", "collector-id", "greptime-url", "greptime-db"):
-        serve.add_argument("--" + name, required=True)
-    serve.add_argument("--bind", default="127.0.0.1")
-    serve.add_argument("--port", type=int, default=4319)
-    serve.add_argument("--worker-interval", type=float, default=1)
-    serve.add_argument("--http-timeout", type=float, default=15)
-    serve.add_argument("--greptime-timeout", type=float, default=60)
-    serve.add_argument("--outbox-limit", type=int, default=20000)
-    serve.add_argument("--max-body-bytes", type=int, default=4 * 1024 * 1024)
+    work.add_argument("--greptime-url", required=True)
+    work.add_argument("--greptime-db", required=True)
+    work.add_argument("--worker-interval", type=float, default=1)
+    work.add_argument("--greptime-timeout", type=float, default=60)
+    work.add_argument("--outbox-limit", type=int, default=20000)
+    work.add_argument("--max-body-bytes", type=int, default=4 * 1024 * 1024)
     args = parser.parse_args(argv)
     try:
         if args.command == "status":
@@ -1218,44 +1379,10 @@ def main(argv=None):
         if args.disk_reserve_mib < 0:
             raise ConfigurationError("disk_reserve_must_be_nonnegative")
         if args.command == "serve":
-            if not 0 <= args.port <= 65535 or not math.isfinite(args.worker_interval) or args.worker_interval <= 0 or not math.isfinite(args.http_timeout) or args.http_timeout <= 0 or not math.isfinite(args.greptime_timeout) or args.greptime_timeout <= 0 or not 1 <= args.outbox_limit <= 20000 or args.max_body_bytes < 1:
-                raise ConfigurationError("invalid_receiver_limits")
-            otlp_user, otlp_password = _credentials("CAN_OTLP")
-            db_user, db_password = _credentials("GREPTIME")
-            greptime = Greptime(args.greptime_url, args.greptime_db, db_user, db_password, args.greptime_timeout, args.max_body_bytes)
-        decoder = Decoder(args.dbc, args.definitions)
-        archive = Archive(args.database, args.disk_reserve_mib * 1024 * 1024)
-        with exclusive_archive(archive.path):
-            archive.register_epoch(decoder, explicit=args.command == "re-decode")
-            if args.command == "re-decode":
-                while archive.decode_once(decoder):
-                    pass
-                print(_json(archive.status()))
-                return 0
-            server = Receiver((args.bind, args.port), archive, args.vehicle, args.collector_id, otlp_user, otlp_password, args.http_timeout)
-            worker = Worker(archive, decoder, greptime, args.worker_interval, args.outbox_limit, args.max_body_bytes)
-            worker.start()
-            print(_json({"receiver": "ready", "port": server.server_port}), flush=True)
-
-            def _stop(signum, frame):
-                # shutdown() must not run in the serve_forever thread itself: it blocks
-                # waiting for that same thread. Signal from a helper thread instead.
-                worker.stop_event.set()
-                threading.Thread(target=server.shutdown, daemon=True).start()
-            previous_term = signal.getsignal(signal.SIGTERM)
-            previous_int = signal.getsignal(signal.SIGINT)
-            signal.signal(signal.SIGTERM, _stop)
-            signal.signal(signal.SIGINT, _stop)
-            try:
-                server.serve_forever()
-            finally:
-                signal.signal(signal.SIGTERM, previous_term)
-                signal.signal(signal.SIGINT, previous_int)
-                server.server_close()
-                worker.stop_event.set()
-                worker.join()
-                greptime.close()
-        return 0
+            return _run_serve(args)
+        if args.command == "work":
+            return _run_work(args)
+        return _run_redecode(args)
     except ConfigurationError as exc:
         print(_json({"error": str(exc)}), flush=True)
         return 1
