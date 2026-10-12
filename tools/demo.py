@@ -275,7 +275,10 @@ def grafana_check(state, rows):
 
 def battery_dashboard_check(state):
     window = sql(state, "SELECT window_start, window_end FROM vehicle_analysis WHERE vehicle = 'demo-car' "
-                 "AND metric = 'battery.energy.latest_power_kw' ORDER BY window_start DESC, computed_at DESC LIMIT 1")[0]
+                 "AND source = 'fleet' AND decode_epoch = 'fleet-v1' "
+                 "AND window_start = (SELECT DATE_TRUNC('hour', MAX(event_time)) FROM vehicle_signal "
+                 "WHERE vehicle = 'demo-car' AND source = 'fleet' AND decode_epoch = 'fleet-v1') "
+                 "AND metric = 'battery.energy.latest_power_kw' ORDER BY computed_at DESC, revision DESC LIMIT 1")[0]
     from_ms = window["window_start"] // 1_000_000 - 3_600_000
     to_ms = (window["window_end"] + 1) // 1_000_000 + 60_000
     checked = []
@@ -340,9 +343,16 @@ def restore_check(state):
 
 
 def calibrated_battery(state):
-    rows = sql(state, "SELECT metric, value, unit FROM vehicle_analysis WHERE vehicle = 'demo-car' "
-               "AND source = 'fleet' AND metric IN "
-               "('battery.energy.latest_power_kw', 'battery.energy.latest_pack_voltage_v')")
+    # Check the fixture's observed hour, not unrelated empty-window reasons.
+    # Rank before inspecting values: a newer failure must invalidate success.
+    rows = sql(state, "WITH ranked AS (SELECT metric, value, unit, "
+               "ROW_NUMBER() OVER (PARTITION BY metric ORDER BY computed_at DESC, revision DESC) AS rank "
+               "FROM vehicle_analysis WHERE vehicle = 'demo-car' "
+               "AND source = 'fleet' AND decode_epoch = 'fleet-v1' "
+               "AND window_start = (SELECT DATE_TRUNC('hour', MAX(event_time)) FROM vehicle_signal "
+               "WHERE vehicle = 'demo-car' AND source = 'fleet' AND decode_epoch = 'fleet-v1') "
+               "AND metric IN ('battery.energy.latest_power_kw', 'battery.energy.latest_pack_voltage_v')) "
+               "SELECT metric, value, unit FROM ranked WHERE rank = 1")
     expected = {"battery.energy.latest_power_kw": (-40, "kW"),
                 "battery.energy.latest_pack_voltage_v": (400, "V")}
     observed = {row["metric"]: (row["value"], row["unit"]) for row in rows}

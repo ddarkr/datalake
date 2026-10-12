@@ -179,6 +179,8 @@ python3 tools/demo.py stop
 
 실제 합성 Fleet recorder 경로는 2-frame 검증 → `process_frame` → SQLite outbox → `upload_tick` → 실제 Greptime acknowledgement입니다. 가상 차량만 사용하며 실제 ZMQ 네트워크 발행자나 물리 CAN을 검증하지 않습니다. 시간창 마지막 10분 이내에 있는 이전 완료 시간의 V/I 쌍에 데모 범위 교정만 적용합니다. 전력·전압 카드는 완료된 시간창의 마지막 관측이며, raw 단위가 불명확한 다른 물리 값은 unknown 상태로 남습니다.
 
+교정 검사와 패널의 절대 조회 범위는 합성 원시 관측이 있는 시간창에서 정합니다. 같은 Fleet epoch·지표의 최신 개정을 먼저 선택하므로, 다른 빈 시간창의 NULL 사유 행이 측정값을 덮지 않으며 해당 관측 시간창의 최신 실패는 과거 정상값으로 대체하지 않습니다.
+
 호스트와 Docker VM의 시계를 동기화해야 Grafana 로그인 세션과 상대 시각이 정상 동작합니다. 과거의 교정 관측은 `last_check.battery_panels.from_ms/to_ms`를 절대 조회 범위로 사용해 확인할 수 있습니다. 현재 시간창에 관측이 없으면 이전 전력·전압 숫자를 현재 값처럼 표시하지 않습니다.
 
 CI의 `synthetic-runtime` job도 같은 `start/check/stop`을 실행하며 운영 secrets를 받지 않습니다. `check`는 `tests/test_privacy.py`의 실제 protobuf trace/log/metric·exemplar·인증 검사와 error-type 비밀 marker를 재사용합니다. 컨테이너 내부 감사 프록시를 Alloy exporter와 DB 사이에 두므로, VM host-gateway 설정이 필요 없으며 **DB가 필드를 버리기 전 wire protobuf**를 검사합니다. `opentelemetry-proto==1.39.1`은 감사 컨테이너에만 설치합니다.
