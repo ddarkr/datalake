@@ -613,6 +613,9 @@ def alter_statements():
     ):
         stmts.append('ALTER TABLE "vehicle_signal" ADD COLUMN IF NOT EXISTS'
                      ' "' + name + '" ' + coltype)
+    # ponytail: metadata only; build old SST indexes in an authorized maintenance run.
+    stmts.append('ALTER TABLE "vehicle_signal" MODIFY COLUMN'
+                 ' "source_field" SET INVERTED INDEX')
     for name, coltype in (
         ("episode_id", "STRING"),
         ("quality", "STRING"),

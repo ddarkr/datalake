@@ -4,9 +4,10 @@ Plain asserts, stdlib only; doubles as __main__ runner. All inputs are
 tiny in-memory dicts and fake fetch/insert seams -- never a live DB, never
 mock echoes. Covers: exact ns cell conversion (no float), strict bound
 parsing (offsets, garbage rejection), per-module error isolation with
-scope/window/module identity, failure invalidation of previous successes
+scope/window/module identity, first-time unavailable persistence (NULL
+value + reason queryable, per-epoch isolation, newest failure never
+returns old health), failure invalidation of previous successes
 (same-identity NULL error revisions; epochs/modules preserved),
-recovery clearing of stale error indicators (non-health, history kept),
 nullable-epoch invalidation, episode analysis_id folding without touching
 revision, duplicate-PK refusal, config boundary errors (incl.
 explicit-missing distinction), bounded-query refusal, backfill windows,
@@ -470,7 +471,7 @@ def test_sql_values_preserve_identity_and_nanoseconds():
     assert "2026-09-27 07:11:06.062145840" in decoded
 
 
-def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
+def test_sparse_runtime_persists_unavailable_first_sighting():
     from contextlib import ExitStack
     from unittest.mock import patch
 
@@ -499,8 +500,14 @@ def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
         stack.enter_context(patch.object(
             br, "coverage_min", lambda *args, **kwargs: None))
         cfg = {"vehicle": "v", "battery_config": "", "battery_lookback_h": 2}
-        assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
-        assert db.execute("SELECT COUNT(*) FROM vehicle_analysis").fetchone() == (0,)
+        # First sighting persists NULL unavailable rows with reasons (no
+        # health values); they are queryable, not silently omitted.
+        assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) > 0
+        first = db.execute(
+            "SELECT reason, value FROM vehicle_analysis "
+            "WHERE status='unavailable'").fetchall()
+        assert first, "first-time unavailable reasons must be stored"
+        assert all(value is None and reason for reason, value in first)
 
         signals.append(_sig("v", "fleet", "e1", 8 * hour + 1,
                             field="BrickVoltageMax", value=4.1, unit=None,
@@ -508,14 +515,13 @@ def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
         br.run_battery(("", "", ""), cfg, now_ns=10 * hour + 1)
         metric = "battery.conditions.brick_max_raw"
         assert db.execute(
-            'SELECT "value", status FROM vehicle_analysis WHERE metric=?',
-            (metric,)).fetchall() == [(4.1, "reported")]
-        assert db.execute(
-            "SELECT COUNT(*) FROM vehicle_analysis WHERE status='unavailable'"
-        ).fetchone() == (0,)
+            'SELECT "value", status FROM vehicle_analysis WHERE metric=? '
+            "AND decode_epoch='e1' ORDER BY computed_at DESC LIMIT 1",
+            (metric,)).fetchone() == [(4.1, "reported")][0]
 
-        # A late invalid sample must clear the old value, but cannot create
-        # empty results for a different epoch or the adjacent empty hour.
+        # A late invalid sample must clear the old value, but cannot leak
+        # into a different epoch: newest failure never returns old health,
+        # and e2 keeps its own isolated identity.
         for epoch in ("e1", "e2"):
             signals.append(_sig("v", "fleet", epoch, 8 * hour + 2,
                                 field="BrickVoltageMax", value=None,
@@ -525,12 +531,21 @@ def test_sparse_runtime_only_persists_unavailable_to_invalidate_prior_result():
             'SELECT "value", status FROM vehicle_analysis WHERE metric=? '
             "AND decode_epoch='e1' ORDER BY computed_at DESC LIMIT 1",
             (metric,)).fetchone() == (None, "unavailable")
+        # Each epoch keeps its own latest: e1's newest failure never
+        # returns its older healthy value, and e2's failure never leaks
+        # into e1 (scope isolation per decode_epoch).
+        for epoch, expect in (("e1", (None, "unavailable")),
+                              ("e2", (None, "unavailable"))):
+            assert db.execute(
+                'SELECT "value", status FROM vehicle_analysis WHERE '
+                "metric=? AND decode_epoch=? ORDER BY computed_at DESC "
+                "LIMIT 1", (metric, epoch)).fetchone() == expect
+        # The adjacent empty hour carries NULL unavailable rows only, never
+        # a resurrected healthy value.
         assert db.execute(
-            "SELECT metric, decode_epoch FROM vehicle_analysis "
-            "WHERE status='unavailable'").fetchall() == [(metric, "e1")]
-        assert db.execute(
-            "SELECT COUNT(*) FROM vehicle_analysis WHERE window_start=?",
-            (br.ns_to_sql_ts(9 * hour),)).fetchone() == (0,)
+            "SELECT DISTINCT value FROM vehicle_analysis WHERE "
+            "window_start=?",
+            (br.ns_to_sql_ts(9 * hour),)).fetchall() == [(None,)]
 
 def test_prepared_scope_rows_do_not_mutate_across_windows():
     hour = br.HOUR_NS
@@ -550,6 +565,66 @@ def test_prepared_scope_rows_do_not_mutate_across_windows():
     fresh = co.analyze([first, second], [], two)
     assert second_out == fresh
     assert first_out != second_out
+
+def test_scopeless_unavailable_binds_original_revision():
+    # Empty-window unavailable rows must preserve the analyzer's
+    # config/model/algorithm dependency: a config change opens new
+    # revisions while prior rows stay stored (PK coexistence),
+    # identical reruns dedup to the same PKs, and epochs never collide.
+    from scripts.analytics.battery import battery_conditions as co
+    hour = br.HOUR_NS
+    ws, we = 8 * hour, 9 * hour - 1
+    scope = ("v", "fleet", "e1")
+    runnable = [("battery_conditions",
+                 br._named("battery_conditions", co.analyze))]
+    analyzers = [("battery_conditions", "conditions", None)]
+    def run(target_scope, ccfg):
+        previous = {target_scope: {"ids": set(), "failed": set()}}
+        rows = br._dispatch_all(
+            {"conditions": ccfg}, None, None, 10 * hour,
+            {target_scope}, {target_scope: [(ws, we)]}, previous,
+            {target_scope: bc.prepare_signals([])}, {}, analyzers,
+            runnable, [])
+        assert rows, "empty window must yield unavailable rows"
+        assert all(r["status"] == "unavailable" for r in rows), rows
+        return rows
+    def revs(rows):
+        return sorted(r["revision"] for r in rows)
+    def pks(rows):
+        return sorted((r.get("window_start_ns"), r.get("vehicle"),
+                       r.get("metric"), r.get("source"),
+                       r.get("analysis_id"), r.get("revision"))
+                      for r in rows)
+    first = run(scope, {"domain": "pack-a"})
+    assert all((r["vehicle"], r["source"], r["decode_epoch"]) == scope
+               for r in first)
+    assert all(r["value"] is None and r["reason"] for r in first)
+    assert all(r["revision"] for r in first)
+    # Identical rerun -> same revisions; exact copies dedup in PK
+    # validation (idempotent, no history growth).
+    again = run(scope, {"domain": "pack-a"})
+    assert revs(again) == revs(first)
+    assert br.validate_no_duplicate_pks(list(first) + list(again)) == \
+        list(first)
+    # Changed config domain -> distinct revisions; old and new rows
+    # coexist as separate PKs (oldest history retained, never
+    # overwritten). A second analyzer input knob behaves the same.
+    changed = run(scope, {"domain": "pack-b"})
+    assert set(revs(changed)).isdisjoint(set(revs(first)))
+    assert set(pks(changed)).isdisjoint(set(pks(first)))
+    assert len(br.validate_no_duplicate_pks(
+        list(first) + list(changed))) == len(first) + len(changed)
+    retuned = run(scope, {"domain": "pack-a", "soc_window_pct": 9.0})
+    assert set(revs(retuned)).isdisjoint(set(revs(first)))
+    # Different epoch -> distinct decode_epoch and revision, so the DB
+    # PK (window_start, vehicle, metric, source, analysis_id, revision)
+    # never collides across epochs.
+    other = run(("v", "fleet", "e2"), {"domain": "pack-a"})
+    assert all(r["decode_epoch"] == "e2" for r in other)
+    assert set(revs(other)).isdisjoint(set(revs(first)))
+    assert set(pks(other)).isdisjoint(set(pks(first)))
+    assert len(br.validate_no_duplicate_pks(
+        list(first) + list(other))) == len(first) + len(other)
 
 
 def test_scope_windows_exact_tuple_only_mode():

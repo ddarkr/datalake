@@ -29,8 +29,13 @@ Config JSON shape (plain JSON object, no secrets):
   {"conditions": {}, "energy": {}, "electrical": {}, "rul": {},
    "alerts": {}} -- only these five keys, each value a dict passed
   opaquely to that analyzer under its suffix. Absent/empty dict runs
-  uncalibrated (never guessed numbers). New unavailable identities are
-  omitted from storage; only prior results get NULL invalidations. Unknown
+  uncalibrated (never guessed numbers). All generated rows are persisted,
+  including first-time unavailable identities (value NULL, reason retained
+  with existing revision/status scope/calibration/model/coverage metadata)
+  so unavailable reasons stay queryable in vehicle_analysis with no new
+  table. Storage tradeoff: sparse windows/scopes now write their NULL
+  unavailable rows, so row counts grow with generated unavailable
+  identities; no health values are stored for them. Unknown
   top-level keys, non-dict top level, or non-dict suffix values are
   malformed and yield per-scope/window error rows (status error), never
   silent zeros. Per-analyzer thresholds/calibration/model content are
@@ -131,7 +136,7 @@ import urllib.request
 
 from scripts.analytics.battery import battery_common as bc
 
-RUNTIME_VERSION = "1.0.5"
+RUNTIME_VERSION = "1.0.6"
 BATTERY_SCOPE_WINDOWS_SUPPORTED = True
 ANALYSIS_TABLE = "vehicle_analysis"
 SIGNAL_TABLE = "vehicle_signal"
@@ -1437,7 +1442,7 @@ def run_battery(ctx, cfg, now_ns=None):
             if win[0] in previous.get(scope, {}).get("failed", set()):
                 coordinated_failed = True
     written = _persist_all(
-        base_url, auth, db, all_rows, previous, scopes,
+        base_url, auth, db, all_rows, scopes,
         per_scope_windows, vehicle, None if only_scoped else fetch_start,
         config_error=config_error)
     if gate_raise and coordinated_failed:
@@ -1623,6 +1628,33 @@ def _dispatch_all(analysis_cfg, config_version, config_error, computed_at,
                         revision=bc.revision_id(
                             "battery_dispatch", scope, (ws, we),
                             type(exc).__name__, RUNTIME_VERSION))]
+                # Scope-less unavailable rows (empty window) arrive with
+                # vehicle/source None and share one revision across
+                # requesting scopes; re-scope BEFORE fill_missing_identity
+                # assigns the scope, so each scope keeps its own PK
+                # identity and epochs never collide on (vehicle, metric,
+                # source, analysis_id, revision). The original analyzer
+                # revision (which already digests config/algorithm inputs)
+                # is hashed in, so config/analyzer changes still produce a
+                # new revision instead of overwriting history. Deterministic:
+                # same inputs rerun to the same revision (idempotent, no
+                # duplicates). Analyzer-scoped rows already carry
+                # vehicle/source and are untouched. ponytail: O(n) rescan,
+                # per-row hash only for scope-less rows.
+                for row in produced:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("status") != "unavailable":
+                        continue
+                    if row.get("vehicle") is not None \
+                            or row.get("source") is not None:
+                        continue
+                    if row.get("window_start_ns") != ws:
+                        continue
+                    row["revision"] = bc.revision_id(
+                        row.get("analysis_id"), scope, (ws, we),
+                        row.get("revision") or row.get("reason"),
+                        RUNTIME_VERSION)
                 fill_missing_identity(produced, scope, (ws, we),
                                       computed_at, config_version)
                 for key in missing:
@@ -1685,28 +1717,27 @@ def _dispatch_all(analysis_cfg, config_version, config_error, computed_at,
     return all_rows
 
 
-def _persist_all(base_url, auth, db, all_rows, previous, scopes,
+def _persist_all(base_url, auth, db, all_rows, scopes,
                  per_scope_windows, vehicle, fetch_start,
                  config_error=None):
-    """Omit fresh unavailable; validate; insert; warn; return count."""
+    """Persist all rows incl. first-time unavailable; validate; insert.
+
+    Unavailable rows carry value NULL with reason plus the existing
+    revision/status scope/calibration/model/coverage metadata, so reasons
+    stay queryable in vehicle_analysis with no new table. No health
+    values are fabricated. Storage tradeoff: every generated unavailable
+    identity is now stored (previously first-time ones were omitted), so
+    sparse windows/scopes write more NULL rows; latest-view queries
+    (computed_at DESC, revision DESC per identity) still resolve to the
+    newest row, recovery overwrites the same logical identity, and reruns
+    reuse deterministic revisions (idempotent PK upsert, no duplicates).
+    Row cap still fails closed upstream; nothing new cached.
+    """
     if config_error is not None and not all_rows:
         raise BatteryConfigError(config_error)
     disambiguate_rows(all_rows)
-    writable = []
-    omitted = {}
-    for row in all_rows:
-        scope = (row.get("vehicle"), row.get("source"), row.get("decode_epoch"))
-        identity = (row.get("metric"), row.get("analysis_id"),
-                    row.get("window_start_ns"), row.get("decode_epoch"))
-        if (row.get("status") == "unavailable"
-                and identity not in previous.get(scope, {}).get("ids", ())):
-            reason = (row.get("reason") or "unspecified").split(":", 1)[0]
-            omitted[reason] = omitted.get(reason, 0) + 1
-        else:
-            writable.append(row)
-    checked = validate_no_duplicate_pks(writable)
+    checked = validate_no_duplicate_pks(list(all_rows))
     written, skipped = insert_analysis_rows(base_url, auth, db, checked)
-    # Disjoint coordinated windows have no global uncovered-history floor.
     if fetch_start is not None:
         oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE, vehicle)
         oldest_event = coverage_min(base_url, auth, db, EVENT_TABLE, vehicle)
@@ -1723,10 +1754,10 @@ def _persist_all(base_url, auth, db, all_rows, previous, scopes,
     if skipped:
         sys.stdout.write("battery: skipped %d rows missing NOT NULL "
                          "identity (no vehicle/metric/revision)\n" % skipped)
-    if omitted:
-        sys.stdout.write("battery: unavailable_not_stored (%d rows; %s)\n"
-                         % (sum(omitted.values()),
-                            json.dumps(omitted, sort_keys=True)))
+    unavailable = sum(1 for r in checked if r.get("status") == "unavailable")
+    if unavailable:
+        sys.stdout.write("battery: unavailable_stored (%d rows, NULL "
+                         "values with reasons)\n" % unavailable)
     error_rows = sum(1 for r in checked if r.get("status") == "error")
     total_windows = sum(len(wins) for wins in per_scope_windows.values())
     if error_rows and error_rows >= len(checked):

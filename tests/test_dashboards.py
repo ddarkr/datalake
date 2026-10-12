@@ -110,9 +110,23 @@ def _battery_query(configs, panel_id):
             .replace("${metric:sqlstring}", "'battery.electrical.soc_ekf_pct'"))
 
 
+class _LastValue:
+    """SQLite adapter for Greptime's NULL-preserving ordered aggregate."""
+    def __init__(self):
+        self.value = None
+
+    def step(self, value):
+        self.value = value
+
+    def finalize(self):
+        return self.value
+
+
 def _battery_db():
     db = sqlite3.connect(":memory:")
     db.create_function("FROM_UNIXTIME", 1, lambda value: value)
+    db.create_function("NS_TIMESTAMP", 1, _physical_ns_timestamp)
+    db.create_aggregate("LAST_VALUE", 1, _LastValue)
     db.execute('''CREATE TABLE vehicle_analysis (
         window_start TIMESTAMP, window_end TIMESTAMP, vehicle TEXT,
         "metric" TEXT, source TEXT, analysis_id TEXT, revision TEXT,
@@ -368,11 +382,23 @@ def test_battery_period_totals_sum_latest_revision_per_window():
             assert rows[0][3] == 2
 
 
+def _physical_ns_timestamp(value):
+    """Backend time parser for _physical_query TIMESTAMP(9) guards (same as
+    _native_ts_query's ns_timestamp; test-only adapter, never source SQL)."""
+    from scripts.analytics.battery import battery_runtime as _br
+    if value is None or isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return _br.parse_time_bound(value)
+
+
 def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
     dashboard = json.loads(configs[dashboard_name]["content"])
     panel = next(p for p in _all_battery_panels(dashboard["panels"])
                  if p["id"] == panel_id)
-    return (panel["targets"][0]["rawSql"].replace("$$", "$")
+    import re as _re
+    query = (panel["targets"][0]["rawSql"].replace("$$", "$")
             .replace("$__timeFilter(window_start)", f"window_start BETWEEN {start} AND {end}")
             .replace("$__timeFilter(s.event_time)", f"s.event_time BETWEEN {start} AND {end}")
             .replace("$__timeFilter(event_time)", f"event_time BETWEEN {start} AND {end}")
@@ -381,15 +407,24 @@ def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
             .replace("${vehicle_ids:sqlstring}", "''")
             .replace("${source:sqlstring}", "''")
             .replace("${epoch:sqlstring}", "''"))
-
+    # Landed 110/111 guard compares native timestamps
+    # (CAST(raw.raw_event_time AS TIMESTAMP(9)) <= CAST(latest.value_text AS
+    # TIMESTAMP(9))); sqlite CAST on UTC text is NUMERIC-affinity lossy, so
+    # translate to the backend parser (callers register NS_TIMESTAMP via
+    # _physical_ns_timestamp; test-only adapter name, never source SQL).
+    query = _re.sub(r"CAST\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s+AS\s+TIMESTAMP\(9\)\s*\)",
+                    r"NS_TIMESTAMP(\1)", query)
+    query = _re.sub(r"CAST\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+TIMESTAMP\(9\)\s*\)",
+                    r"NS_TIMESTAMP(\1)", query)
+    return query
 
 def test_physical_cards_latest_analysis_and_new_raw_barriers():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     cards = (("grafana-dash-vehicle-overview", 6, "latest_power_kw", "kW", -18.45),
              ("grafana-dash-drives", 7, "latest_power_kw", "kW", -18.45),
              ("grafana-dash-charging", 6, "latest_power_kw", "kW", -18.45),
-             ("grafana-dash-battery", 42, "latest_power_kw", "kW", -18.45),
-             ("grafana-dash-battery", 46, "latest_pack_voltage_v", "V", 410.0))
+             ("grafana-dash-battery", 110, "latest_power_kw", "kW", -18.45),
+             ("grafana-dash-battery", 111, "latest_pack_voltage_v", "V", 410.0))
     for dashboard, panel, suffix, unit, value in cards:
         query = _physical_query(configs, dashboard, panel, start=0, end=7800)
         with _battery_db() as db:
@@ -405,8 +440,8 @@ def test_physical_cards_latest_analysis_and_new_raw_barriers():
                            (ws, ws+3599, "battery.energy."+suffix, revision,
                             reading, unit, status, computed))
             insert(0, "older-window", value+1, "derived", 10000)
-            # Unavailable identities in the newest hour may be omitted by runtime.
-            # An older stored physical number must not fill that absence.
+            # First-time unavailable identities are stored (value NULL); an
+            # older stored physical number must not fill that absence.
             assert db.execute(query).fetchone()[4] is None
             insert(3600, "good", value, "derived", 10001)
             assert db.execute(query).fetchone()[4] == value
@@ -424,7 +459,12 @@ def test_physical_cards_latest_analysis_and_new_raw_barriers():
             db.execute("UPDATE vehicle_signal SET source_field = 'CustomVoltage'")
             assert db.execute(query).fetchone()[4] is None
             db.execute("UPDATE vehicle_signal SET event_time = 8500")
-            assert db.execute(query).fetchone()[4] is None
+            # Current battery cards fence observations at the selected end;
+            # future reports cannot invalidate the completed historical window.
+            if dashboard == "grafana-dash-battery":
+                assert db.execute(query).fetchone()[4] == value
+            else:
+                assert db.execute(query).fetchone()[4] is None
             db.execute("DELETE FROM vehicle_signal")
             # Late-ingested same-time invalid observations also need reanalysis.
             db.execute("""INSERT INTO vehicle_signal
@@ -469,22 +509,31 @@ def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
         with _battery_db() as db:
             db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
             db.create_function("FROM_UNIXTIME", 1, lambda value: value)
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
                  'unit_unverified', 1500, 'raw')""", (field,))
             row = db.execute(query).fetchone()
             index = 4 if panel == 52 else 3
             assert row[index] is None
             db.execute("UPDATE vehicle_signal SET unit = ?, quality = 'ok'", (unit,))
             assert db.execute(query).fetchone()[index] == 4
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1600, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1600, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
                  'invalid', 1600, 'invalid')""", (field, unit))
             assert db.execute(query).fetchone()[index] is None
+            if panel in (51, 52):
+                db.execute("DELETE FROM vehicle_signal")
+                db.executemany("""INSERT INTO vehicle_signal
+                    (event_time, vehicle, source, decode_epoch, source_field,
+                     value_num, unit, quality, ingest_time, envelope_id, path)
+                    VALUES (1700, 'v', ?, 'fleet-v1', ?, 23, ?, 'ok', 1700, 'outside', ?)""",
+                    (("can", field, unit, f"Vehicle.Powertrain.TractionBattery.{field}"),
+                     ("fleet", field, unit, f"Vehicle.Custom.{field}")))
+                assert db.execute(query).fetchall() == []
 
 
 def _native_ts_query(configs, dashboard, panel, start=1000, end=2000):
@@ -501,27 +550,46 @@ def _native_ts_query(configs, dashboard, panel, start=1000, end=2000):
     from scripts.analytics.battery import battery_runtime as battery_runtime
 
     query = _physical_query(configs, dashboard, panel, start=start, end=end)
+    import re as _re
+    # Native TIMESTAMP(9) safety comparisons: the landed source also uses
+    # unqualified simple identifiers (e.g. the 44 raw_frontier lower bound
+    # MIN(... CAST(value_text AS TIMESTAMP(9)) ...)). Translate every
+    # dotted alias.column form first, then any remaining bare identifier
+    # form; both use the same backend time parser (no result repinning).
+    # NS_TIMESTAMP is a test-only adapter name, never source SQL.
     for alias, column in (("f", "raw_event_time"), ("c", "value_text"),
                           ("fmax", "raw_event_time"), ("cm", "value_text"),
                           ("fmin", "raw_event_time"), ("cn", "value_text"),
                           ("fvmax", "raw_event_time"), ("cvmax", "value_text"),
                           ("fvmin", "raw_event_time"), ("cvmin", "value_text"),
                           ("ftmax", "raw_event_time"), ("ctmax", "value_text"),
-                          ("ftmin", "raw_event_time"), ("ctmin", "value_text")):
+                          ("ftmin", "raw_event_time"), ("ctmin", "value_text"),
+                          ("latest", "value_text"), ("raw", "raw_event_time")):
         query = query.replace(
             "CAST(%s.%s AS TIMESTAMP(9))" % (alias, column),
             "NS_TIMESTAMP(%s.%s)" % (alias, column))
+    query = _re.sub(r"CAST\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+TIMESTAMP\(9\)\s*\)",
+                    r"NS_TIMESTAMP(\1)", query)
     assert "TIMESTAMP(9)" not in query
+    # TIMESTAMP(6) display projections: translate every qualified form the
+    # landed source uses in _native_ts_query panels (44/45/51/52/94), plus
+    # any other qualified or bare-identifier form, to the same backend µs
+    # parser (no result repinning).
     for alias, column in (("r", "raw_time"), ("c", "value_text"),
                           ("r", "raw_max_time"), ("cm", "value_text"),
                           ("r", "raw_min_time"), ("cn", "value_text"),
                           ("r", "max_time"), ("r", "min_time"),
                           ("r", "tmax_time"), ("r", "tmin_time"),
+                          ("r", "raw_max_time"), ("r", "raw_min_time"),
                           ("cvmax", "value_text"), ("cvmin", "value_text"),
                           ("ctmax", "value_text"), ("ctmin", "value_text")):
         query = query.replace(
             "CAST(%s.%s AS TIMESTAMP(6))" % (alias, column),
             "TS_DISPLAY(%s.%s)" % (alias, column))
+    query = _re.sub(r"CAST\(\s*([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)+)\s+AS\s+TIMESTAMP\(6\)\s*\)",
+                    r"TS_DISPLAY(\1)", query)
+    query = _re.sub(r"CAST\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+TIMESTAMP\(6\)\s*\)",
+                    r"TS_DISPLAY(\1)", query)
     assert "TIMESTAMP(6)" not in query
 
     def ns_timestamp(value):
@@ -673,10 +741,10 @@ def test_calibrated_extrema_fallback_and_frontier():
             db.create_function("NS_TIMESTAMP", 1, ns_timestamp)
             db.create_function("TS_DISPLAY", 1, ts_display)
             assert db.execute(query).fetchall() == []
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1500, 'v', 'fleet', 'fleet-v1', ?, 4, NULL,
                  'unit_unverified', 1500, 'raw')""", (field,))
             # Unit-unverified raw alone never renders a physical value.
             assert db.execute(query).fetchone()[index] is None
@@ -698,26 +766,26 @@ def test_calibrated_extrema_fallback_and_frontier():
             assert row[index] == 4 and row[6] == "raw"
             db.execute("UPDATE vehicle_signal SET unit = NULL, quality = 'unit_unverified'")
             # 1ns-newer raw of the same field blocks stale calibration until reanalysis.
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1501, 'v', 'fleet', 'fleet-v1', ?, 5, NULL,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1501, 'v', 'fleet', 'fleet-v1', ?, 5, NULL,
                  'unit_unverified', 1501, 'newer')""", (field,))
             assert db.execute(query).fetchone()[index] is None
             db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'newer'")
             # A wrong-unit newest raw never revives calibration.
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1600, 'v', 'fleet', 'fleet-v1', ?, 4100, 'mV',
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1600, 'v', 'fleet', 'fleet-v1', ?, 4100, 'mV',
                  'ok', 1600, 'wrong-unit')""", (field,))
             assert db.execute(query).fetchone()[index] is None
             db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'wrong-unit'")
             # A same-timestamp late tombstone blocks calibration until reanalysis.
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1500, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1500, 'v', 'fleet', 'fleet-v1', ?, NULL, ?,
                  'invalid', 1700, 'tombstone')""", (field, unit))
             assert db.execute(query).fetchone()[index] is None
             db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'tombstone'")
@@ -727,10 +795,10 @@ def test_calibrated_extrema_fallback_and_frontier():
             db.execute("UPDATE vehicle_signal SET ingest_time = 1500")
             assert db.execute(query).fetchone()[index] == calibrated
             # Raw beyond the selected range end never blocks the historical view.
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (2500, 'v', 'fleet', 'fleet-v1', ?, 9, NULL,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 2500, 'v', 'fleet', 'fleet-v1', ?, 9, NULL,
                  'unit_unverified', 2500, 'future')""", (field,))
             assert db.execute(query).fetchone()[index] == calibrated
             db.execute("DELETE FROM vehicle_signal WHERE envelope_id = 'future'")
@@ -785,12 +853,16 @@ def test_calibrated_extrema_retained_without_raw_join():
             assert row[index] == calibrated
             assert row[5] == ts_display(observed)
             assert row[6] == observed
+            if panel in (51, 52):
+                db.execute("UPDATE vehicle_analysis SET source = 'can'")
+                assert db.execute(query).fetchall() == []
+                db.execute("UPDATE vehicle_analysis SET source = 'fleet'")
             # A same-scope newer raw frontier outside the initial narrow
             # selection blocks the stale value when the range widens.
-            db.execute("""INSERT INTO vehicle_signal
-                (event_time, vehicle, source, decode_epoch, source_field,
+            db.execute(f"""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
                  value_num, unit, quality, ingest_time, envelope_id) VALUES
-                (1500, 'v', 'fleet', 'fleet-v1', ?, 5, NULL,
+                ('Vehicle.Powertrain.TractionBattery.{field}', 1500, 'v', 'fleet', 'fleet-v1', ?, 5, NULL,
                  'unit_unverified', 1500, 'newer')""", (field,))
             assert db.execute(narrow_query).fetchone()[index] == calibrated
             assert db.execute(query).fetchone()[index] is None
@@ -807,6 +879,8 @@ def test_can_reports_keep_invalid_latest_and_scope_boundaries():
     )
     for panel_id, signal, unit, number, text, index, expected in cases:
         query = _physical_query(configs, "grafana-dash-vehicle-overview", panel_id)
+        if panel_id == 9:
+            query = "SELECT * FROM (" + query + ") WHERE scope_label LIKE '%외기%'"
         with _battery_db() as db:
             def insert(event, quality="reported_unverified", epoch="can-v1", path=None):
                 db.execute("""INSERT INTO vehicle_signal
@@ -834,6 +908,38 @@ def test_can_reports_keep_invalid_latest_and_scope_boundaries():
             db.execute("UPDATE vehicle_signal SET source = 'fleet'")
             assert db.execute(query).fetchall() == []
 
+
+def test_temperature_cards_keep_both_cabin_and_outside_readings():
+    """Battery 53 / overview 9 UNION long form: one row per scope+measure with
+    the actual reading (not just scope labels); both cabin (실내) and outside
+    (외기) legs survive with their own values, invalid-newest NULLs only its
+    own leg, and fleet-relabeled CAN rows stay excluded."""
+    for dashboard, panel in (("grafana-dash-battery", 53),
+                             ("grafana-dash-vehicle-overview", 9)):
+        configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+        query = _physical_query(configs, dashboard, panel)
+        with _battery_db() as db:
+            db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+            assert db.execute(query).fetchall() == []
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id, path) VALUES
+                (1500, 'v', 'fleet', 'e1', 'InsideTemp', 20.0, 'celsius', 'ok', 1500, 'a', 'p/inside'),
+                (1500, 'v', 'fleet', 'e1', 'OutsideTemp', 15.0, 'celsius', 'ok', 1500, 'b', 'p/outside')""")
+            rows = {row[3]: row[4] for row in db.execute(query)}
+            assert len(rows) == 2, rows
+            cabin = next(v for k, v in rows.items() if "실내" in k)
+            outside = next(v for k, v in rows.items() if "외기" in k)
+            assert cabin == 20.0 and outside == 15.0, rows
+            # Newest-invalid cabin tombstone NULLs only the cabin leg.
+            db.execute("""INSERT INTO vehicle_signal
+                (event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id, path) VALUES
+                (1600, 'v', 'fleet', 'e1', 'InsideTemp', NULL, 'celsius', 'invalid', 1600, 'c', 'p/inside')""")
+            rows = {row[3]: row[4] for row in db.execute(query)}
+            cabin = next(v for k, v in rows.items() if "실내" in k)
+            outside = next(v for k, v in rows.items() if "외기" in k)
+            assert cabin is None and outside == 15.0, rows
 
 def test_vehicle_coverage_separates_observation_from_receipt():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
@@ -1339,8 +1445,6 @@ def test_dbc_divergence_exact_soc_aliases_with_unit_gate():
     fabricated zero."""
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     query = _physical_query(configs, "grafana-dash-dbc-health", 9)
-    assert "BMS_socUI" in query and "StateOfCharge" in query
-    assert "unit = '%'" in query
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
         db.create_function("date_trunc", 2, lambda unit, value: value - value % 60)
@@ -1406,7 +1510,6 @@ def test_cell_latest_raw_scope_across_epochs_with_cap():
     per-brick coverage sibling (panel 93) accounts every brick/epoch."""
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     query = _physical_query(configs, "grafana-dash-can-cells", 91)
-    assert "LIMIT 500" in query
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
         for epoch in ("e1", "e2", "e3"):
@@ -1557,6 +1660,606 @@ def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
         evidence = {row[3]: row for row in db.execute(provenance)}
         assert evidence["최고 셀 전압"][5] is None
 
+def test_analysis_ah_observed_completed_windows_only():
+    """Panel 130: only observed completed windows; sparse coverage is shown, never a daily total."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _battery_query(configs, 130)
+    with _battery_db() as db:
+        assert db.execute(query).fetchall() == []
+        for ts, metric, rev, value, computed, status in (
+                (1200, "battery.energy.charge_throughput_ah", "r1", 1.5, 10, "derived"),
+                (1200, "battery.energy.charge_throughput_ah", "r2", None, 20, "unavailable"),
+                (1500, "battery.energy.discharge_throughput_ah", "r3", 0.4, 10, "derived"),
+                (1700, "battery.energy.charge_throughput_ah", "r4", 9.0, 10, "derived"),
+                (1200, "battery.energy.soh_pct", "r5", 99.0, 10, "derived")):
+            db.execute("""INSERT INTO vehicle_analysis
+                (window_start, window_end, vehicle, "metric", source, analysis_id,
+                 revision, "value", value_text, unit, status, reason, decode_epoch,
+                 evidence_count, sample_count, coverage_ratio, algorithm_version,
+                 calibration_version, model_version, uncertainty, uncertainty_lower,
+                 uncertainty_upper, computed_at, quality, config_version,
+                 connectivity, episode_id)
+                VALUES (?, ?, 'v', ?, 'fleet', 'battery_energy',
+                 ?, ?, NULL, ?, ?, 'ok', 'e1', 1, 2, 0.05,
+                 'a', NULL, NULL, NULL, NULL, NULL, ?, NULL, NULL, NULL, NULL)""",
+                (ts, None if ts == 1700 else ts + 100, metric, rev,
+                 value, "Ah" if "ah" in metric else "%", status, computed))
+        rows = db.execute(query).fetchall()
+        by_metric = {row[6]: row for row in rows}
+        # Window 1200: newest revision is unavailable -> NULL, never resurrected r1.
+        assert by_metric["battery.energy.charge_throughput_ah"][7] is None
+        assert by_metric["battery.energy.charge_throughput_ah"][10] == "unavailable"
+        # Window 1500 discharge survives with its sparse coverage intact.
+        assert by_metric["battery.energy.discharge_throughput_ah"][7] == 0.4
+        assert by_metric["battery.energy.discharge_throughput_ah"][9] == 0.05
+        # Window 1700 has no window_end (incomplete) and soh_pct is out of scope.
+        assert sorted(by_metric) == ["battery.energy.charge_throughput_ah",
+                                     "battery.energy.discharge_throughput_ah"]
+        # A foreign analysis_id writing the same metric/window never merges in.
+        db.execute("""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', 'battery.energy.charge_throughput_ah', 'fleet',
+             'battery_energy:session:ep1', 'r9', 99.0, NULL, 'Ah', 'derived',
+             'ok', 'e1', 1, 2, 0.05, 'a', NULL, NULL, NULL, NULL, NULL, 50,
+             NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        assert len(rows) == 2 and {r[3] for r in rows} == {"battery_energy"}
+        assert rows[0][7] != 99.0
+
+
+def test_analysis_ah_summary_selected_vs_observed_gap():
+    """Panel 130 target B: per-direction (metric) rows, so one observed hour with both
+    charge+discharge counts ONE window per direction (distinct=1), never 2; a missing
+    direction stays derived 0, not fully covered."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
+    panel = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == 130)
+    query = (panel["targets"][1]["rawSql"].replace("$$", "$")
+            .replace("$__timeFilter(window_start)", "window_start BETWEEN 1000 AND 2000")
+            .replace("$__unixEpochTo()", "2000").replace("$__unixEpochFrom()", "1000")
+            .replace("${vehicle:sqlstring}", "''").replace("${source:sqlstring}", "''")
+            .replace("${vehicle_ids:sqlstring}", "''").replace("${epoch:sqlstring}", "''"))
+    with _battery_db() as db:
+        assert db.execute(query).fetchall() == []
+        db.execute("""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', 'battery.energy.charge_throughput_ah', 'fleet',
+             'battery_energy', 'r1', 1.5, NULL, 'Ah', 'derived', 'ok', 'e1',
+             1, 2, 0.05, 'a', NULL, NULL, NULL, NULL, NULL, 10,
+             NULL, NULL, NULL, NULL),
+            (1200, 1300, 'v', 'battery.energy.discharge_throughput_ah', 'fleet',
+             'battery_energy', 'r1', 0.4, NULL, 'Ah', 'derived', 'ok', 'e1',
+             1, 2, 0.05, 'a', NULL, NULL, NULL, NULL, NULL, 10,
+             NULL, NULL, NULL, NULL),
+            (1200, 1300, 'v', 'battery.energy.charge_throughput_ah', 'fleet',
+             'rogue_writer', 'r9', 99.0, NULL, 'Ah', 'derived', 'ok', 'e1',
+             1, 2, 0.05, 'a', NULL, NULL, NULL, NULL, NULL, 50,
+             NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        # Two rows: one per direction; each counts ONE window, never 2.
+        assert len(rows) == 2 and {r[4] for r in rows} == {
+            "battery.energy.charge_throughput_ah",
+            "battery.energy.discharge_throughput_ah"}
+        assert all(r[3] == "battery_energy" and r[5] == 1 and r[6] == 1 and r[9] == 1
+                   for r in rows)
+        assert rows[0][10] == 1000 / 3600.0  # selected_hours from the range macros
+        # Same hour with discharge unavailable: charge derived 1, discharge derived 0.
+        db.execute("""UPDATE vehicle_analysis SET "value" = NULL, status = 'unavailable',
+            reason = 'sparse', revision = 'r2', computed_at = 20
+            WHERE "metric" = 'battery.energy.discharge_throughput_ah'
+            AND analysis_id = 'battery_energy'""")
+        by_metric = {r[4]: r for r in db.execute(query).fetchall()}
+        assert by_metric["battery.energy.charge_throughput_ah"][6] == 1
+        assert by_metric["battery.energy.discharge_throughput_ah"][6] == 0
+        assert by_metric["battery.energy.discharge_throughput_ah"][5] == 1
+
+
+def test_analysis_counter_vs_vi_same_window_no_addition():
+    """Panel 131: counter and VI legs join only on the exact same window/scope; AC+DC never added."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _battery_query(configs, 131)
+    with _battery_db() as db:
+        assert db.execute(query).fetchall() == []
+        for ts, metric, rev, value, computed, status in (
+                (1200, "battery.energy.dc_charging_energy_in_kwh", "r1", 2.0, 10, "derived"),
+                (1200, "battery.energy.vi_charge_energy_kwh", "r1", 1.8, 10, "derived"),
+                (1200, "battery.energy.vi_charge_energy_kwh", "r2", None, 20, "unavailable"),
+                (1200, "battery.energy.dc_charging_energy_in_kwh", "r3", 5.0, 10, "derived"),
+                (1500, "battery.energy.discharge_energy_kwh", "r4", 1.0, 10, "derived"),
+                (1500, "battery.energy.vi_discharge_energy_kwh", "r4", 0.9, 10, "derived")):
+            epoch = "e2" if rev == "r3" else "e1"
+            db.execute(f"""INSERT INTO vehicle_analysis VALUES
+                ({ts}, {ts + 100}, 'v', '{metric}', 'fleet', 'battery_energy',
+                 '{rev}', {value if value is not None else 'NULL'}, NULL, 'kWh',
+                 '{status}', 'ok', '{epoch}', 1, 1, NULL, 'a', NULL, NULL,
+                 NULL, NULL, NULL, {computed}, NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        e1 = [r for r in rows if r[2] == "e1"]
+        e2 = [r for r in rows if r[2] == "e2"]
+        # Same scope+window 1200/e1: counter survives, newest VI is unavailable -> NULL.
+        assert len(e1) == 2 and {r[3] for r in e1} == {"battery_energy"}
+        w1200 = [r for r in e1 if r[4] == 1200][0]
+        assert w1200[6] == 2.0 and w1200[8] is None and w1200[9] == "unavailable"
+        # Same window on another epoch never merges into e1 (no cross-scope join).
+        assert len(e2) == 1 and e2[0][6] == 5.0 and e2[0][8] is None
+        # Discharge pair on window 1500 stays in separate columns, never summed.
+        w1500 = [r for r in e1 if r[4] == 1500][0]
+        assert w1500[10] == 1.0 and w1500[12] == 0.9
+        # A foreign analysis_id writing the same metric/window never merges in.
+        db.execute("""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', 'battery.energy.vi_charge_energy_kwh', 'fleet',
+             'rogue_writer', 'r9', 42.0, NULL, 'kWh', 'derived', 'ok', 'e1',
+             1, 1, NULL, 'a', NULL, NULL, NULL, NULL, NULL, 99,
+             NULL, NULL, NULL, NULL)""")
+        rows = db.execute(query).fetchall()
+        w1200 = [r for r in rows if r[2] == "e1" and r[4] == 1200][0]
+        assert w1200[3] == "battery_energy" and w1200[8] is None and w1200[6] == 2.0
+
+
+def test_analysis_brick_id_latest_invalid_never_resurrected():
+    """Panel 132: newest unavailable ID row wins; max/min stay separate (diagnostic only)."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _battery_query(configs, 132)
+    with _battery_db() as db:
+        assert db.execute(query).fetchall() == []
+        for metric, rev, value, computed, status in (
+                ("battery.conditions.brick_max_id_persistence_s", "r1", 3600.0, 10, "derived"),
+                ("battery.conditions.brick_max_id_persistence_s", "r2", None, 20, "unavailable"),
+                ("battery.conditions.brick_min_id_recurrence", "r3", 2.0, 10, "derived")):
+            db.execute(f"""INSERT INTO vehicle_analysis VALUES
+                (1200, 1300, 'v', '{metric}', 'fleet', 'battery_conditions',
+                 '{rev}', {value if value is not None else 'NULL'}, NULL,
+                 's', '{status}', 'ok', 'e1', 4, 4, NULL, 'a', NULL, NULL,
+                 NULL, NULL, NULL, {computed}, NULL, NULL, NULL, NULL)""")
+        rows = {r[4]: (r[5], r[8]) for r in db.execute(query).fetchall()}
+        assert rows["battery.conditions.brick_max_id_persistence_s"] == (None, "unavailable")
+        assert rows["battery.conditions.brick_min_id_recurrence"] == (2.0, "derived")
+        # A foreign analysis_id writing the same metric/window never merges in.
+        db.execute("""INSERT INTO vehicle_analysis VALUES
+            (1200, 1300, 'v', 'battery.conditions.brick_max_id_persistence_s', 'fleet',
+             'rogue_writer', 'r9', 9999.0, NULL, 's', 'derived', 'ok', 'e1',
+             4, 4, NULL, 'a', NULL, NULL, NULL, NULL, NULL, 99,
+             NULL, NULL, NULL, NULL)""")
+        rows = {r[4]: (r[3], r[5], r[8]) for r in db.execute(query).fetchall()}
+        assert rows["battery.conditions.brick_max_id_persistence_s"] == ("battery_conditions", None, "unavailable")
+
+
+def test_analysis_level_minus_soc_exact_timestamp_only():
+    """Panel 133: BatteryLevel-Soc only at identical event_time+scope; async/invalid/conflict excluded."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    db = _battery_db()
+    db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+    query = _battery_query(configs, 133)
+    with db:
+        assert db.execute(query).fetchall() == []
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', 70, '%', NULL),
+            (1100, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 65, '%', NULL),
+            (1200, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', 71, '%', NULL),
+            (1250, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 66, '%', NULL),
+            (1300, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', 72, '%', 'invalid'),
+            (1300, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 67, '%', NULL),
+            (1400, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', 73, '%', NULL),
+            (1400, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 68, '%', NULL),
+            (1400, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 69, '%', NULL),
+            (1500, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', 74, 'fraction', NULL),
+            (1500, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 70, '%', NULL),
+            (1600, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', 62, '%', 'ok'),
+            (1600, 'v', 'fleet', 'fleet-v1', 'BatteryLevel', 'p/level', NULL, '%', 'ok'),
+            (1600, 'v', 'fleet', 'fleet-v1', 'Soc', 'p/soc', 60, '%', NULL)""")
+        pairs = {(row[0], row[2]) for row in db.execute(query).fetchall()}
+        assert (1100, 5.0) in pairs, pairs               # exact same-timestamp pair
+        assert not any(t in (1200, 1250) for t, _ in pairs), pairs  # async never paired
+        assert not any(t in (1300, 1400, 1500, 1600) for t, _ in pairs), pairs  # invalid/conflict/unit/NULL-sibling
+
+
+def _uistatus_query(configs, panel_id, start=1000, end=2000):
+    import json, math
+    from scripts.analytics.battery import battery_runtime as br
+    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
+    def flat(panels):
+        for p in panels:
+            yield p
+            yield from flat(p.get("panels") or [])
+    panel = next(p for p in flat(dashboard["panels"]) if p["id"] == panel_id)
+    q = panel["targets"][0]["rawSql"].replace("$$", "$")
+    q = q.replace("$__timeFilter(window_start)", f"window_start BETWEEN {start} AND {end}")
+    q = q.replace("$__timeFilter(event_time)", f"event_time BETWEEN {start} AND {end}")
+    q = q.replace("$__unixEpochTo()", str(end)).replace("$__unixEpochFrom()", str(start))
+    for v in ("vehicle", "source", "vehicle_ids", "epoch", "status", "metric"):
+        q = q.replace("${%s:sqlstring}" % v, "''")
+    import re
+    time_expr = r"([\w.]+|(?:MAX|MIN)\([\w.]+\))"
+    q = re.sub(r"CAST\(\s*" + time_expr + r"\s+AS\s+TIMESTAMP\(9\)\s*\)", r"NS_TIMESTAMP(\1)", q)
+    q = re.sub(r"CAST\(\s*" + time_expr + r"\s+AS\s+TIMESTAMP\(6\)\s*\)", r"TS_DISPLAY(\1)", q)
+    assert "TIMESTAMP(9)" not in q and "TIMESTAMP(6)" not in q
+    assert "$__" not in q and "${" not in q
+    def ns_timestamp(value):
+        if value is None or isinstance(value, int):
+            return value
+        if isinstance(value, float):
+            return int(value)
+        return br.parse_time_bound(value)
+    def ts_display(value):
+        if value is None:
+            return None
+        if isinstance(value, int):
+            return value // 1000 * 1000
+        if isinstance(value, float):
+            return int(value) // 1000 * 1000
+        return br.parse_time_bound(value) // 1000 * 1000
+    return q, ns_timestamp, ts_display, math.floor
+
+def _uistatus_db():
+    import sqlite3
+    from tests.test_dashboards import _battery_db
+    return _battery_db()
+
+_ANALYSIS_COLS = "(window_start,window_end,vehicle,metric,source,analysis_id,revision,value,value_text,unit,status,reason,decode_epoch,computed_at)"
+_SIGNAL_COLS = "(event_time,vehicle,source,decode_epoch,source_field,value_num,unit,quality,ingest_time,path)"
+
+def test_uistatus_current_power_needs_fresh_completed_window():
+    """Panel 110 CURRENT: stale completed window stays NULL; fresh completed window shows value. No resurrection."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 110, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        assert db.execute(q).fetchall() == []
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (1000,2000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',5.0,'1970-01-01 00:00:00.000002000','kW','derived','latest_calibrated_sample;asof_ns=2000','e1',2000)")
+        rows = db.execute(q).fetchall()
+        assert len(rows) == 1 and rows[0][4] is None, dict(rows)
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','latest_calibrated_sample;asof_ns=7200','e1',7200)")
+        rows = db.execute(q).fetchall()
+        assert len(rows) == 1 and rows[0][4] == 7.5, dict(rows)
+
+def test_uistatus_future_raw_never_suppresses_current():
+    """Panels 110/111: raw beyond selectedEnd is excluded early; historical current state stays visible."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for pid, metric, aid, val, unit in ((110, "battery.energy.latest_power_kw", "battery_energy", 7.5, "kW"), (111, "battery.energy.latest_pack_voltage_v", "battery_voltage", 400.0, "V")):
+        q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
+        with _uistatus_db() as db:
+            import math
+            db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+            db.create_function("FLOOR", 1, math.floor)
+            db.create_function("NS_TIMESTAMP", 1, ns)
+            db.create_function("TS_DISPLAY", 1, disp)
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','{metric}','fleet','{aid}','r1',{val},'1970-01-01 00:00:00.000007200','{unit}','derived','latest_calibrated_sample','e1',7200)")
+            assert db.execute(q).fetchall()[0][4] == val
+            db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (9000,'v','fleet','e1','PackCurrent',10.0,'A','ok',9001,'p')")
+            rows = db.execute(q).fetchall()
+            assert len(rows) == 1 and rows[0][4] == val, dict(rows)
+
+def test_uistatus_inrange_raw_keeps_conservative_guard():
+    """Panels 110/111: in-range raw newer than the analyzed observation suppresses the card; older raw does not."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for pid, metric, aid, val, unit in ((110, "battery.energy.latest_power_kw", "battery_energy", 7.5, "kW"), (111, "battery.energy.latest_pack_voltage_v", "battery_voltage", 400.0, "V")):
+        q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
+        with _uistatus_db() as db:
+            import math
+            db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+            db.create_function("FLOOR", 1, math.floor)
+            db.create_function("NS_TIMESTAMP", 1, ns)
+            db.create_function("TS_DISPLAY", 1, disp)
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','{metric}','fleet','{aid}','r1',{val},'1970-01-01 00:00:00.000007000','{unit}','derived','latest_calibrated_sample','e1',7200)")
+            db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (7100,'v','fleet','e1','PackVoltage',400.0,'V','ok',7101,'p')")
+            rows = db.execute(q).fetchall()
+            assert len(rows) == 1 and rows[0][4] is None, rows
+            db.execute("DELETE FROM vehicle_signal")
+            db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (6000,'v','fleet','e1','PackVoltage',400.0,'V','ok',6001,'p')")
+            rows = db.execute(q).fetchall()
+            assert len(rows) == 1 and rows[0][4] == val, dict(rows)
+
+def test_uistatus_last_completed_is_timestamped_nonlive():
+    """Panel 112 LAST: newest completed window shows value with observed_at/window/computed_at; explicitly history, not live."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 112, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        for ws, we, val, vt, comp in ((1000, 2000, 5.0, "1970-01-01 00:00:00.000002000", 2000), (7000, 7200, 7.5, "1970-01-01 00:00:00.000007200", 7200)):
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES ({ws},{we},'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',{val},'{vt}','kW','derived','latest_calibrated_sample','e1',{comp})")
+        rows = db.execute(q).fetchall()
+        assert len(rows) == 1
+        d = dict(zip([c[0] for c in db.execute(q).description], rows[0]))
+        assert d["value"] == 7.5 and d["observed_at"] is not None and d["window_end"] is not None and d["computed_at"] is not None
+
+def test_uistatus_evidence_keeps_analysis_identities_separate():
+    """Panel 113: same scope/metric with two analysis_ids yields two rows; identities never merge."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        assert db.execute(q).fetchall() == []
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','A1','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7200)")
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','A2','r1',9.5,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7201)")
+        rows = db.execute(q).fetchall()
+        d = [dict(zip([c[0] for c in db.execute(q).description], r)) for r in rows]
+        assert sorted((x["analysis_id"], x["value"]) for x in d) == [("A1", 7.5), ("A2", 9.5)], d
+
+def test_uistatus_evidence_raw_snapshot_basis():
+    """Panel 113: raw BatteryLevel snapshot keeps before-range latest, excludes future, shows invalid; CAN alias is reported_unverified."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7200)")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (100,'v','fleet','e1','BatteryLevel',60.0,'%','ok',101,'p')")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','BatteryLevel',62.5,'%','ok',5001,'p')")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (9000,'v','fleet','e1','BatteryLevel',99.0,'%','ok',9001,'p')")
+        d = dict(zip([c[0] for c in db.execute(q).description], db.execute(q).fetchone()))
+        assert d["raw_battery_level"] == 62.5 and d["raw_battery_level_at"] == 5000 and d["raw_battery_level_basis"] == "보고값", d
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute("INSERT INTO vehicle_signal (event_time,vehicle,source,decode_epoch,source_field,unit,quality,ingest_time,path) VALUES (5000,'v','fleet','e1','BatteryLevel','%','invalid',5001,'p')")
+        d = dict(zip([c[0] for c in db.execute(q).description], db.execute(q).fetchone()))
+        assert d["raw_battery_level"] is None and d["raw_battery_level_at"] == 5000 and d["raw_battery_level_basis"] == "invalid", d
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute("INSERT INTO vehicle_signal (event_time,vehicle,source,decode_epoch,source_field,value_num,unit,quality,ingest_time,path) VALUES (5000,'v','can','e1','BMS_socUI',70.0,'%','reported_unverified',5001,'Vehicle.CAN.x292.BMS_socUI')")
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','can','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7202)")
+        rows = {r[2]: dict(zip([c[0] for c in db.execute(q).description], r)) for r in db.execute(q)}
+        assert rows["can"]["raw_battery_level"] == 70.0 and rows["can"]["raw_battery_level_basis"] == "보고값(can·미검증)", rows["can"]
+
+def test_uistatus_evidence_raw_energy_cabin():
+    """Panel 113: raw EnergyRemaining/cabin snapshots follow the same selectedEnd-bounded latest-valid rule."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7200)")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','EnergyRemaining',50.0,'kWh','ok',5001,'p')")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','InsideTemp',20.0,'celsius','ok',5001,'p')")
+        db.execute("INSERT INTO vehicle_signal (event_time,vehicle,source,decode_epoch,source_field,value_num,unit,quality,ingest_time,path) VALUES (5000,'v','can','e1','VCRIGHT_tempAmbientRaw',15.0,'°C','reported_unverified',5001,'Vehicle.CAN.x20C.VCRIGHT_tempAmbientRaw')")
+        rows = {r[2]: dict(zip([c[0] for c in db.execute(q).description], r)) for r in db.execute(q)}
+        assert rows["fleet"]["raw_energy_kwh"] == 50.0 and rows["fleet"]["raw_cabin_c"] == 20.0, rows["fleet"]
+
+def test_uistatus_newest_invalid_blocks_older_valid():
+    """Panels 110/112: newest unavailable revision NULLs the value; older derived never resurrects. Scope-isolated."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for pid in (110, 112):
+        q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
+        with _uistatus_db() as db:
+            import math
+            db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+            db.create_function("FLOOR", 1, math.floor)
+            db.create_function("NS_TIMESTAMP", 1, ns)
+            db.create_function("TS_DISPLAY", 1, disp)
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','latest_calibrated_sample','e1',7200)")
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r2',NULL,NULL,NULL,'unavailable','terminal_invalid:latest_sample_unmeasurable;asof_ns=7200','e1',7300)")
+            rows = db.execute(q).fetchall()
+            assert len(rows) == 1
+            d = dict(zip([c[0] for c in db.execute(q).description], rows[0]))
+            val = d.get("reading", d.get("value"))
+            assert val is None, d
+            assert d.get("reason") is not None and d.get("status") == "unavailable", d
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',9.0,'1970-01-01 00:00:00.000007200','kW','derived','latest_calibrated_sample','e2',7200)")
+            assert len(db.execute(q).fetchall()) == 2
+
+def test_uistatus_latest_rank_keeps_canonical_unavailable_over_rogue_value():
+    """Panels 112/114: final latest_rank drops analysis_id, so a rogue writer's
+    numeric row can outrank the canonical writer's newer unavailable row.
+    The canonical newest-unavailable must stay visible (NULL, never the rogue
+    number); DashboardRecovery owns the source fix (per-scope canonical
+    constraint or analysis_id-aware rank). This test pins the coexistence
+    shape that the fix must resolve toward the canonical NULL."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for pid in (112, 114):
+        q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
+        with _uistatus_db() as db:
+            import math
+            db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+            db.create_function("FLOOR", 1, math.floor)
+            db.create_function("NS_TIMESTAMP", 1, ns)
+            db.create_function("TS_DISPLAY", 1, disp)
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','latest_calibrated_sample','e1',7200)")
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r2',NULL,NULL,NULL,'unavailable','terminal_invalid:latest_sample_unmeasurable;asof_ns=7200','e1',7300)")
+            db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','rogue_writer','r9',99.0,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7400)")
+            rows = db.execute(q).fetchall()
+            d = [dict(zip([c[0] for c in db.execute(q).description], r)) for r in rows]
+            canon = [x for x in d if x["analysis_id"] == "battery_energy"]
+            assert len(canon) == 1, d
+            val = canon[0].get("reading", canon[0].get("value"))
+            assert val is None and canon[0]["status"] == "unavailable", d
+
+def test_uistatus_window_end_fence_blocks_unfinished():
+    """Panels 110/112/113/114: window_end beyond selected end never displays."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 112, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',7.5,'1970-01-01 00:00:00.000007200','kW','derived','latest_calibrated_sample','e1',7200)")
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7100,8000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',99.0,'1970-01-01 00:00:00.000008000','kW','derived','latest_calibrated_sample','e1',8000)")
+        rows = db.execute(q).fetchall()
+        assert len(rows) == 1 and rows[0][4] == 7.5, rows
+
+def test_uistatus_pending_states_follow_scoped_evidence():
+    """Panel 115: scoped bounded observation evidence only. Observed raw with no
+    analysis remains pending; a completed window with later in-range raw needs
+    reanalysis; covered/latest input produces no pending row."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    qp, ns, disp, fl = _uistatus_query(configs, 115, start=1000, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        assert db.execute(qp).fetchall() == []
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (500,'v','fleet','e1','PackCurrent',10.0,'A','ok',501,'p')")
+        assert db.execute(qp).fetchall() == []
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','PackCurrent',10.0,'A','ok',5001,'p')")
+        rows = db.execute(qp).fetchall()
+        assert len(rows) == 1, rows
+        d = dict(zip([c[0] for c in db.execute(qp).description], rows[0]))
+        assert d["completed_window_end"] is None and d["last_observation"] == disp(5000), d
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (100,200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',5.0,'1970-01-01 00:00:00.000000200','kW','derived','x','e1',200)")
+        rows = db.execute(qp).fetchall()
+        assert len(rows) == 1 and rows[0][5] is None, rows
+        db.execute("DELETE FROM vehicle_analysis")
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (1000,2000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',5.0,'1970-01-01 00:00:00.000002000','kW','derived','x','e1',2000)")
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (1500,'v','fleet','e1','PackCurrent',10.0,'A','ok',1501,'p')")
+        assert db.execute(qp).fetchall() == []
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','PackCurrent',10.0,'A','ok',5001,'p')")
+        rows = db.execute(qp).fetchall()
+        assert len(rows) == 1, rows
+        d = dict(zip([c[0] for c in db.execute(qp).description], rows[0]))
+        assert d["state"] == "재분석 필요" and d["completed_window_end"] == 2000, d
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (9000,'v','fleet','e1','PackCurrent',10.0,'A','ok',9001,'p')")
+        assert db.execute(qp).fetchall() == []
+
+
+def test_uistatus_pending_ignores_superseded_windows_and_future_analysis():
+    """Panel 115: two completed window_ends (09/10) with raw 09:30 covered by the
+    newest window must not pend; raw without analysis remains pending;
+    future analysis rows never confirm."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    qp, ns, disp, fl = _uistatus_query(configs, 115, start=1000, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        # Superseded window covered by the newest: raw 09:30 is older than the
+        # newest completed window_end 10 -> covered, no pending row.
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (1000,2000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',5.0,'1970-01-01 00:00:00.000002000','kW','derived','x','e1',2000)")
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (800,900,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',4.0,'1970-01-01 00:00:00.000000900','kW','derived','x','e1',900)")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (950,'v','fleet','e1','PackCurrent',10.0,'A','ok',951,'p')")
+        assert db.execute(qp).fetchall() == []
+        # Observed raw with no analysis anywhere in range: explicit
+        # '분석 기록 없음 · 확인 필요', never a healthy zero or silent absence.
+        db.execute("DELETE FROM vehicle_analysis")
+        db.execute("DELETE FROM vehicle_signal")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','PackCurrent',10.0,'A','ok',5001,'p')")
+        rows = db.execute(qp).fetchall()
+        assert len(rows) == 1, rows
+        d = dict(zip([c[0] for c in db.execute(qp).description], rows[0]))
+        assert d["completed_window_end"] is None and d["last_observation"] == disp(5000), d
+        # Future analysis never confirms: window_end beyond selected end plus
+        # in-range raw still yields no covered row (pending only, end NULL).
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7100,8000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',99.0,'1970-01-01 00:00:00.000008000','kW','derived','x','e1',8000)")
+        rows = db.execute(qp).fetchall()
+        assert len(rows) == 1, rows
+        d = dict(zip([c[0] for c in db.execute(qp).description], rows[0]))
+        assert d["completed_window_end"] is None, d
+
+def test_uistatus_evidence_times_match_card_logic():
+    """Panel 113 observed_at/window/computed_at equal the per-identity latest analysis row; raw times are selectedEnd-bounded."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (1000,2000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',5.0,'1970-01-01 00:00:00.000002000','kW','derived','x','e1',2000)")
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7000,7200,'v','battery.energy.latest_power_kw','fleet','battery_energy','r2',7.5,'1970-01-01 00:00:00.000007200','kW','derived','x','e1',7200)")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (9000,'v','fleet','e1','BatteryLevel',99.0,'%','ok',9001,'p')")
+        d = dict(zip([c[0] for c in db.execute(q).description], db.execute(q).fetchone()))
+        assert d["value"] == 7.5 and d["observed_at"] == disp(7200) and d["window_start"] == 7000 and d["computed_at"] == disp(7200), d
+        assert d["raw_battery_level"] is None and d["raw_battery_level_at"] is None, d
+
+def test_uistatus_pending_fences_selected_end():
+    """Panel 115: completed window beyond selectedEnd never confirms; future raw never lists."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    qp, ns, disp, fl = _uistatus_query(configs, 115, start=1000, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        db.execute(f"INSERT INTO vehicle_analysis {_ANALYSIS_COLS} VALUES (7100,8000,'v','battery.energy.latest_power_kw','fleet','battery_energy','r1',99.0,'1970-01-01 00:00:00.000008000','kW','derived','x','e1',8000)")
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','fleet','e1','PackCurrent',10.0,'A','ok',5001,'p')")
+        rows = db.execute(qp).fetchall()
+        assert len(rows) == 1, rows
+        d = dict(zip([c[0] for c in db.execute(qp).description], rows[0]))
+        assert d["state"] == "분석 기록 없음 · 확인 필요" and d["completed_window_end"] is None, d
+
+def test_uistatus_observation_vs_receipt_distinct():
+    """Panel 116 keeps event_time and ingest_time as separate columns; receipt never poses as freshness."""
+    import yaml
+    import tests.test_dashboards as _T
+    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    q, ns, disp, fl = _uistatus_query(configs, 116, start=0, end=7200)
+    with _uistatus_db() as db:
+        import math
+        db.create_function("FROM_UNIXTIME", 1, lambda v: v)
+        db.create_function("FLOOR", 1, math.floor)
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, disp)
+        db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (5000,'v','can','e1','BMS_socUI',62,'%','reported_unverified',7000,'Vehicle.CAN.x292.BMS_socUI')")
+        row = db.execute(q).fetchone()
+        d = dict(zip([c[0] for c in db.execute(q).description], row))
+        assert d["last_observation"] != d["last_receipt"], d
+        assert d["range_rows"] == 1, d
+
+def test_uistatus_row118_holds_flat_panels_only():
+    """Row 118 contract: flat regular-panel move children only (Grafana one-level rows); observed energy 30 stays visible."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    dashboard = json.loads(configs["grafana-dash-battery"]["content"])
+    row = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == 118)
+    assert row["type"] == "row" and row.get("collapsed") is True
+    child_ids = [c["id"] for c in row.get("panels", [])]
+    assert 30 not in child_ids, child_ids
+    assert set(child_ids) == {27, 31, 32, 33, 11, 12, 14, 15, 16}, child_ids
+    for c in row.get("panels", []):
+        assert c.get("type") != "row" and "panels" not in c, c
+    tops = {p["id"] for p in dashboard["panels"]}
+    assert 30 in tops, tops
+
 if __name__ == "__main__":
     test_last_reported_snapshots_keep_history_without_resurrecting_invalid()
     test_dashboard_and_folder_uids_are_disjoint()
@@ -1574,6 +2277,7 @@ if __name__ == "__main__":
     test_calibrated_extrema_retained_without_raw_join()
     test_calibrated_graphs_render_hourly_samples_beside_verified_raw()
     test_can_reports_keep_invalid_latest_and_scope_boundaries()
+    test_temperature_cards_keep_both_cabin_and_outside_readings()
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()
     test_vehicle_identity_canonical_selection_and_scope_split()
@@ -1589,3 +2293,23 @@ if __name__ == "__main__":
     test_battery_lifecycle_counts_only_valid_active_evidence()
     test_cell_latest_raw_scope_across_epochs_with_cap()
     test_ai_runtime_dedup_ttft_and_subagent_samples()
+    test_analysis_ah_observed_completed_windows_only()
+    test_analysis_ah_summary_selected_vs_observed_gap()
+    test_analysis_counter_vs_vi_same_window_no_addition()
+    test_analysis_brick_id_latest_invalid_never_resurrected()
+    test_analysis_level_minus_soc_exact_timestamp_only()
+    test_uistatus_row118_holds_flat_panels_only()
+    test_uistatus_observation_vs_receipt_distinct()
+    test_uistatus_pending_fences_selected_end()
+    test_uistatus_evidence_times_match_card_logic()
+    test_uistatus_pending_states_follow_scoped_evidence()
+    test_uistatus_window_end_fence_blocks_unfinished()
+    test_uistatus_latest_rank_keeps_canonical_unavailable_over_rogue_value()
+    test_uistatus_pending_ignores_superseded_windows_and_future_analysis()
+    test_uistatus_evidence_raw_energy_cabin()
+    test_uistatus_evidence_raw_snapshot_basis()
+    test_uistatus_evidence_keeps_analysis_identities_separate()
+    test_uistatus_last_completed_is_timestamped_nonlive()
+    test_uistatus_inrange_raw_keeps_conservative_guard()
+    test_uistatus_future_raw_never_suppresses_current()
+    test_uistatus_current_power_needs_fresh_completed_window()
