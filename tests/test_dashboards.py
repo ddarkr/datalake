@@ -393,6 +393,7 @@ def _physical_ns_timestamp(value):
     return _br.parse_time_bound(value)
 
 
+
 def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
     dashboard = json.loads(configs[dashboard_name]["content"])
     panel = next(p for p in _all_battery_panels(dashboard["panels"])
@@ -1592,7 +1593,6 @@ def test_ai_runtime_dedup_ttft_and_subagent_samples():
         db.execute('DELETE FROM opentelemetry_traces WHERE "span_attributes.ttft_ms" >= 0')
         assert db.execute(query(10)).fetchone()["ttft_samples"] is None
 
-
 def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     for dashboard, panel in (("grafana-dash-battery", 25),
@@ -1659,6 +1659,7 @@ def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
         assert db.execute(query).fetchone()[3] is None
         evidence = {row[3]: row for row in db.execute(provenance)}
         assert evidence["최고 셀 전압"][5] is None
+
 
 def test_analysis_ah_observed_completed_windows_only():
     """Panel 130: only observed completed windows; sparse coverage is shown, never a daily total."""
@@ -1803,7 +1804,10 @@ def test_analysis_brick_id_latest_invalid_never_resurrected():
         for metric, rev, value, computed, status in (
                 ("battery.conditions.brick_max_id_persistence_s", "r1", 3600.0, 10, "derived"),
                 ("battery.conditions.brick_max_id_persistence_s", "r2", None, 20, "unavailable"),
-                ("battery.conditions.brick_min_id_recurrence", "r3", 2.0, 10, "derived")):
+                ("battery.conditions.brick_min_id_recurrence", "r3", 2.0, 10, "derived"),
+                ("battery.conditions.brick_max_id", "r4", 7.0, 10, "reported"),
+                ("battery.conditions.brick_min_id", "r5", 3.0, 10, "reported"),
+                ("battery.conditions.brick_min_id", "r6", None, 20, "unavailable")):
             db.execute(f"""INSERT INTO vehicle_analysis VALUES
                 (1200, 1300, 'v', '{metric}', 'fleet', 'battery_conditions',
                  '{rev}', {value if value is not None else 'NULL'}, NULL,
@@ -1812,6 +1816,8 @@ def test_analysis_brick_id_latest_invalid_never_resurrected():
         rows = {r[4]: (r[5], r[8]) for r in db.execute(query).fetchall()}
         assert rows["battery.conditions.brick_max_id_persistence_s"] == (None, "unavailable")
         assert rows["battery.conditions.brick_min_id_recurrence"] == (2.0, "derived")
+        assert rows["battery.conditions.brick_max_id"] == (7.0, "reported")
+        assert rows["battery.conditions.brick_min_id"] == (None, "unavailable")
         # A foreign analysis_id writing the same metric/window never merges in.
         db.execute("""INSERT INTO vehicle_analysis VALUES
             (1200, 1300, 'v', 'battery.conditions.brick_max_id_persistence_s', 'fleet',
@@ -1958,6 +1964,9 @@ def test_uistatus_inrange_raw_keeps_conservative_guard():
             db.execute(f"INSERT INTO vehicle_signal {_SIGNAL_COLS} VALUES (6000,'v','fleet','e1','PackVoltage',400.0,'V','ok',6001,'p')")
             rows = db.execute(q).fetchall()
             assert len(rows) == 1 and rows[0][4] == val, dict(rows)
+            # A late receipt can invalidate a result even when its observation is older.
+            db.execute("UPDATE vehicle_signal SET ingest_time = 7300")
+            assert db.execute(q).fetchone()[4] is None
 
 def test_uistatus_last_completed_is_timestamped_nonlive():
     """Panel 112 LAST: newest completed window shows value with observed_at/window/computed_at; explicitly history, not live."""
@@ -2293,6 +2302,7 @@ if __name__ == "__main__":
     test_battery_lifecycle_counts_only_valid_active_evidence()
     test_cell_latest_raw_scope_across_epochs_with_cap()
     test_ai_runtime_dedup_ttft_and_subagent_samples()
+    test_temperature_cards_keep_both_cabin_and_outside_readings()
     test_analysis_ah_observed_completed_windows_only()
     test_analysis_ah_summary_selected_vs_observed_gap()
     test_analysis_counter_vs_vi_same_window_no_addition()
@@ -2313,3 +2323,4 @@ if __name__ == "__main__":
     test_uistatus_inrange_raw_keeps_conservative_guard()
     test_uistatus_future_raw_never_suppresses_current()
     test_uistatus_current_power_needs_fresh_completed_window()
+
