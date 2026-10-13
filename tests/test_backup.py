@@ -45,6 +45,15 @@ Behavioral checks (each fails against the named defect, passes fixed):
   dead force flag, subset/traversal/symlink/torn(sidecar mismatch/identity/
   prune rules, overlap and missing-S3 fail-closed, incomplete prefixes
   ignored.
+  Shared-pool incremental backups (layout shared-v1): SSTs live once under
+  <backup-prefix>/_sst/ at an identity address
+  sha256([bucket, root, key, size, source-etag]); each generation manifest
+  is a full inventory resolved via snapshot_object_key. Repeated identical
+  backups COPY0; new/changed identities COPY exactly once; retirement frees
+  only unreferenced pool objects (dry-run pool-gc bytes match enforced
+  deletions); locks fail closed with no expiry; tampered/partial pool
+  entries and off-address snapshot_keys refuse; historical per-generation
+  HEAD/SHA256 generations still restore via the same resolver.
 
 Real S3/MinIO runs are the parent's job (native loopback MinIO + Greptime);
 the fake streams chunks like the S3 API and the parent gates real runs.
@@ -227,6 +236,52 @@ def use_fake(fake):
         bk.make_s3_client = lambda: fake
 
 
+def snap_of(complete, bid, bp="test-backups/"):
+    """Snapshot handle for both layouts: shared pool or per-gen prefix."""
+    if complete.get("sst_layout") == bk.SHARED_LAYOUT:
+        return {"layout": bk.SHARED_LAYOUT, "snap_prefix": bp + "_sst/"}
+    return {"snap_prefix": bp + bid + "/sst/"}
+
+
+def pool_keys(fake, bp="test-backups/"):
+    return sorted(k for k in fake.objects if k.startswith(bp + "_sst/"))
+
+
+def fetch_complete_record(fake, bid, bp="test-backups/"):
+    return json.loads(fake.objects[bp + bid + "/COMPLETE"].decode("utf-8"))
+
+
+def pool_bytes_for(fake, complete, bid, bp="test-backups/"):
+    """Live rel key -> pool bytes via snapshot_object_key (old/new layouts)."""
+    snap = snap_of(complete, bid, bp)
+    return {o["key"]: fake.objects[bk.snapshot_object_key(snap, o)]
+            for o in complete["sst"]}
+
+
+def rewrite_tar_manifest(tar, manifest):
+    """Repack a local tar with a mutated manifest + fresh sidecar."""
+    import io as _io
+    raw = json.dumps(manifest, indent=2, sort_keys=True).encode()
+    with tarfile.open(tar, "r:gz") as src:
+        members = [m for m in src.getmembers() if m.name != "manifest.json"]
+        blobs = {m.name: src.extractfile(m).read()
+                 for m in members if m.isfile()}
+    with tarfile.open(tar, "w:gz", format=tarfile.PAX_FORMAT) as out:
+        for m in members:
+            if m.isfile():
+                info = tarfile.TarInfo(m.name)
+                info.size = len(blobs[m.name])
+                info.mode = m.mode
+                out.addfile(info, _io.BytesIO(blobs[m.name]))
+            else:
+                out.addfile(m)
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(raw)
+        info.mode = 0o600
+        out.addfile(info, _io.BytesIO(raw))
+    write_sidecar(tar)
+
+
 def make_tree(base):
     data = os.path.join(base, "greptime-data")
     etc = os.path.join(base, "greptime-etc")
@@ -359,11 +414,14 @@ def test_s3_backup_writes_snapshot_and_complete():
         snap = manifest["sst_snapshot"]
         assert snap["bucket"] == "test-bucket"
         assert snap["src_prefix"] == "test-root/"
+        assert snap["layout"] == "shared-v1", snap
         assert len(snap["objects"]) == 3, snap
         bid = manifest["backup_id"]
-        assert snap["snap_prefix"] == "test-backups/%s/sst/" % bid
+        assert snap["snap_prefix"] == "test-backups/_sst/"
         for obj in snap["objects"]:
-            assert fake.objects[snap["snap_prefix"] + obj["key"]] is not None
+            assert obj["snapshot_key"].startswith("test-backups/_sst/")
+            assert fake.objects[obj["snapshot_key"]] is not None
+            assert fake.objects[obj["snapshot_key"] + ".json"] is not None
         rbase = "test-backups/%s/" % bid
         assert rbase + os.path.basename(tar) in fake.objects
         assert rbase + os.path.basename(tar) + ".sha256" in fake.objects
@@ -372,7 +430,9 @@ def test_s3_backup_writes_snapshot_and_complete():
         with open(tar, "rb") as f:
             digest = hashlib.sha256(f.read()).hexdigest()
         assert complete["tar_sha256"] == digest
+        assert complete["sst_layout"] == "shared-v1"
         assert complete["sst_count"] == 3
+        assert not [k for k in fake.objects if k.startswith("test-backups/_locks/")]
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -420,6 +480,10 @@ def test_s3_restore_downloads_and_verifies():
         setenv(env)
         before_src = hash_tree(os.path.join(tmp, "src"))
         assert bk.cmd_backup() == 0
+        bid = _remote_bid(bdir)
+        complete = fetch_complete_record(fake, bid)
+        snap = snap_of(complete, bid)
+        want = pool_bytes_for(fake, complete, bid)
         # Fresh host: empty local dir AND empty volumes/prefix.
         shutil.rmtree(os.path.join(tmp, "src"))
         for f in os.listdir(bdir):
@@ -430,10 +494,8 @@ def test_s3_restore_downloads_and_verifies():
         assert hash_tree(tgt) == before_src
         live = {k[len("test-root/"):]: v for k, v in fake.objects.items()
                 if k.startswith("test-root/")}
-        snap = {k.split("/sst/", 1)[1]: v for k, v in fake.objects.items()
-                if k.startswith("test-backups/") and "/sst/" in k}
-        assert len(live) == 3 and len(snap) == 3, (sorted(live), sorted(snap))
-        assert live == snap
+        assert sorted(live) == sorted(want) and live == want
+        assert snap["layout"] == "shared-v1"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -449,9 +511,9 @@ def test_s3_restore_reuses_matching_live_prefix():
         setenv(env)
         before_src = hash_tree(os.path.join(tmp, "src"))
         assert bk.cmd_backup() == 0
-        tar = newest_tar(bdir)
-        manifest = read_manifest(tar)
-        snap = manifest["sst_snapshot"]
+        bid = _remote_bid(bdir)
+        complete = fetch_complete_record(fake, bid)
+        snap = snap_of(complete, bid)
         live_before = {k: v for k, v in fake.objects.items()
                        if k.startswith("test-root/")}
         assert live_before, "backup fixture must leave live SSTs in place"
@@ -462,8 +524,8 @@ def test_s3_restore_reuses_matching_live_prefix():
         assert hash_tree(tgt) == before_src
         live_after = {k: v for k, v in fake.objects.items()
                       if k.startswith("test-root/")}
-        snap_live = {("test-root/" + o["key"]): fake.objects[snap["snap_prefix"] + o["key"]]
-                     for o in snap["objects"]}
+        snap_live = {("test-root/" + o["key"]): fake.objects[bk.snapshot_object_key(snap, o)]
+                     for o in complete["sst"]}
         for key, blob in snap_live.items():
             assert live_after[key] == blob
         assert live_after[extra_key] == extra_blob  # unrelated untouched
@@ -482,19 +544,21 @@ def test_s3_restore_uploads_only_missing():
     try:
         setenv(env)
         assert bk.cmd_backup() == 0
-        tar = newest_tar(bdir)
-        manifest = read_manifest(tar)
-        snap = manifest["sst_snapshot"]
-        missing = "test-root/" + snap["objects"][0]["key"]
-        survivor = "test-root/" + snap["objects"][1]["key"]
+        bid = _remote_bid(bdir)
+        complete = fetch_complete_record(fake, bid)
+        snap = snap_of(complete, bid)
+        want = pool_bytes_for(fake, complete, bid)
+        missing = "test-root/" + complete["sst"][0]["key"]
+        survivor = "test-root/" + complete["sst"][1]["key"]
         survivor_blob = fake.objects[survivor]
         del fake.objects[missing]
         copies_before = fake.copies
         assert bk.cmd_restore() == 0
-        assert fake.objects[missing] == fake.objects[snap["snap_prefix"] + snap["objects"][0]["key"]]
+        assert fake.objects[missing] == want[complete["sst"][0]["key"]]
         assert fake.objects[survivor] == survivor_blob
         assert fake.copies == copies_before + 1  # exactly one missing key
         assert hash_tree(tgt) == hash_tree(os.path.join(tmp, "src"))
+        assert snap["layout"] == "shared-v1"
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -508,12 +572,12 @@ def test_s3_restore_conflict_refuses_without_overwrite():
     try:
         setenv(env)
         assert bk.cmd_backup() == 0
-        tar = newest_tar(bdir)
-        manifest = read_manifest(tar)
-        snap = manifest["sst_snapshot"]
-        victim = "test-root/" + snap["objects"][0]["key"]
+        bid = _remote_bid(bdir)
+        complete = fetch_complete_record(fake, bid)
+        snap = snap_of(complete, bid)
+        victim = "test-root/" + complete["sst"][0]["key"]
         conflict_blob = b"conflicting-bytes-not-snapshot"
-        assert fake.objects[snap["snap_prefix"] + snap["objects"][0]["key"]] != conflict_blob
+        assert fake.objects[bk.snapshot_object_key(snap, complete["sst"][0])] != conflict_blob
         fake.objects[victim] = conflict_blob
         before = hash_tree(tgt)
         assert bk.cmd_restore() == 2
@@ -560,10 +624,9 @@ def test_s3_restore_partial_copy_failure_keeps_matching_live():
     try:
         setenv(env)
         assert bk.cmd_backup() == 0
-        manifest = read_manifest(newest_tar(bdir))
-        snap = manifest["sst_snapshot"]
-        missing = "test-root/" + snap["objects"][0]["key"]
-        survivor = "test-root/" + snap["objects"][1]["key"]
+        complete = fetch_complete_record(fake, _remote_bid(bdir))
+        missing = "test-root/" + complete["sst"][0]["key"]
+        survivor = "test-root/" + complete["sst"][1]["key"]
         survivor_blob = fake.objects[survivor]
         del fake.objects[missing]
         fake.fail_copy_at = 0  # the single missing-key copy fails
@@ -1092,9 +1155,12 @@ def test_backup_never_downloads_payloads_and_restore_only_fetches_controls():
         fake.get_object = no_backup_get
         assert bk.cmd_backup() == 0
         manifest = read_manifest(newest_tar(bdir))
-        assert all("sha256" not in obj for obj in manifest["sst_snapshot"]["objects"])
+        snap = manifest["sst_snapshot"]
+        assert snap["layout"] == "shared-v1"
+        assert all("sha256" not in obj for obj in snap["objects"])
+        assert all(obj["snapshot_key"].startswith("test-backups/_sst/") for obj in snap["objects"])
         def controls_only(**kw):
-            assert not kw["Key"].startswith("test-root/") and "/sst/" not in kw["Key"]
+            assert not kw["Key"].startswith("test-root/") and "/_sst/" not in kw["Key"]
             return original_get(**kw)
         fake.get_object = controls_only
         fake.objects = {k: v for k, v in fake.objects.items() if not k.startswith("test-root/")}
@@ -1146,14 +1212,17 @@ def test_nested_inventory_never_resolves_as_archive():
         assert bk.cmd_backup() == 0
         bid = _remote_bid(bdir)
         rbase = "test-backups/%s/" % bid
-        # Attacker/accidental nested tar inside the sst/ tree.
-        fake.objects[rbase + "sst/nested-" + bid + ".tar.gz"] = b"junk"
-        for f in os.listdir(bdir):
-            os.unlink(os.path.join(bdir, f))
-        fake.objects = {k: v for k, v in fake.objects.items()
-                        if not k.startswith("test-root/")}
-        assert bk.cmd_restore() == 0  # exact top-level match, nested ignored
-        assert len(hash_tree(tgt)) == 5
+        # Attacker/accidental nested tar inside the pool tree.
+        fake.objects["test-backups/_sst/nested-" + bid + ".tar.gz"] = b"junk"
+        try:
+            for f in os.listdir(bdir):
+                os.unlink(os.path.join(bdir, f))
+            fake.objects = {k: v for k, v in fake.objects.items()
+                            if not k.startswith("test-root/")}
+            assert bk.cmd_restore() == 0  # exact top-level match, nested ignored
+            assert len(hash_tree(tgt)) == 5
+        finally:
+            fake.objects.pop("test-backups/_sst/nested-" + bid + ".tar.gz", None)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -1190,33 +1259,11 @@ def test_duplicate_sst_keys_refused():
         setenv(env)
         assert bk.cmd_backup() == 0
         tar = newest_tar(bdir)
-        import io as _io
         manifest = read_manifest(tar)
         manifest["sst_snapshot"]["objects"] = (
             manifest["sst_snapshot"]["objects"]
             + [manifest["sst_snapshot"]["objects"][0]])
-        raw = json.dumps(manifest, indent=2, sort_keys=True).encode()
-        with tarfile.open(tar, "r:gz") as src:
-            members = [m for m in src.getmembers() if m.name != "manifest.json"]
-            blobs = {m.name: src.extractfile(m).read()
-                     for m in members if m.isfile()}
-        with tarfile.open(tar, "w:gz", format=tarfile.PAX_FORMAT) as out:
-            for m in members:
-                if m.isfile():
-                    info = tarfile.TarInfo(m.name)
-                    info.size = len(blobs[m.name])
-                    info.mode = m.mode
-                    out.addfile(info, _io.BytesIO(blobs[m.name]))
-                else:
-                    out.addfile(m)
-            info = tarfile.TarInfo("manifest.json")
-            info.size = len(raw)
-            info.mode = 0o600
-            out.addfile(info, _io.BytesIO(raw))
-        with open(tar, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-        with open(tar + ".sha256", "w") as f:
-            f.write(digest + "  " + os.path.basename(tar) + "\n")
+        rewrite_tar_manifest(tar, manifest)
         fake.objects = {k: v for k, v in fake.objects.items()
                         if not k.startswith("test-root/")}
         assert bk.cmd_restore() == 2
@@ -1233,31 +1280,9 @@ def test_wrong_snapshot_bucket_refused():
         setenv(env)
         assert bk.cmd_backup() == 0
         tar = newest_tar(bdir)
-        import io as _io
         manifest = read_manifest(tar)
         manifest["sst_snapshot"]["bucket"] = "other-bucket"
-        raw = json.dumps(manifest, indent=2, sort_keys=True).encode()
-        with tarfile.open(tar, "r:gz") as src:
-            members = [m for m in src.getmembers() if m.name != "manifest.json"]
-            blobs = {m.name: src.extractfile(m).read()
-                     for m in members if m.isfile()}
-        with tarfile.open(tar, "w:gz", format=tarfile.PAX_FORMAT) as out:
-            for m in members:
-                if m.isfile():
-                    info = tarfile.TarInfo(m.name)
-                    info.size = len(blobs[m.name])
-                    info.mode = m.mode
-                    out.addfile(info, _io.BytesIO(blobs[m.name]))
-                else:
-                    out.addfile(m)
-            info = tarfile.TarInfo("manifest.json")
-            info.size = len(raw)
-            info.mode = 0o600
-            out.addfile(info, _io.BytesIO(raw))
-        with open(tar, "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
-        with open(tar + ".sha256", "w") as f:
-            f.write(digest + "  " + os.path.basename(tar) + "\n")
+        rewrite_tar_manifest(tar, manifest)
         fake.objects = {k: v for k, v in fake.objects.items()
                         if not k.startswith("test-root/")}
         assert bk.cmd_restore() == 2
@@ -1305,6 +1330,9 @@ def test_large_sst_inventory_roundtrips_local_and_remote():
             rbase = "test-backups/%s/" % bid
             assert len(fake.objects[rbase + "manifest.json"]) > 1 << 20
             assert len(fake.objects[rbase + "COMPLETE"]) > 1 << 20
+            complete = fetch_complete_record(fake, bid)
+            assert complete["sst_layout"] == "shared-v1"
+            want = pool_bytes_for(fake, complete, bid)
             if remote:
                 for name in os.listdir(bdir):
                     os.unlink(os.path.join(bdir, name))
@@ -1314,6 +1342,9 @@ def test_large_sst_inventory_roundtrips_local_and_remote():
             assert hash_tree(tgt) == expected
             assert {k: v for k, v in fake.objects.items()
                     if k.startswith("test-root/")} == inventory
+            assert {k[len("test-root/"):]: v for k, v in fake.objects.items()
+                    if k.startswith("test-root/")} == want
+            assert not [k for k in fake.objects if k.startswith("test-backups/_locks/")]
             with open(os.path.join(bdir, "restore-verification.json")) as stream:
                 marker = json.load(stream)
             assert marker["backup_id"] == bid
@@ -1529,10 +1560,19 @@ def test_retention_dryrun_matches_enforce_selection():
         expect = [l for l in dry.splitlines() if l.startswith("retention: mode=")][0]
         assert "delete=1" in expect and "resume=0" in expect
         listed_bytes = int(expect.split("bytes=")[1])
-        assert listed_bytes == sum(len(v) for k, v in fake.objects.items()
-                                   if k.startswith("test-backups/%s/" % ids[0]))
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        doomed = next(g for g in gens if g["backup_id"] == ids[0])
+        garbage, reason = bk.pool_gc_plan(fake, "test-bucket", "test-backups/",
+                                          gens, [ids[0]])
+        assert reason is None, reason
+        expect_bytes = doomed["bytes"] + sum(o.get("Size", 0) for o in garbage)
+        assert listed_bytes == expect_bytes
+        gc_line = [l for l in dry.splitlines() if l.startswith("retention: pool-gc objects=")][0]
+        assert "bytes=%d" % sum(o.get("Size", 0) for o in garbage) in gc_line
+        pool_before = set(pool_keys(fake))
         assert len(fake.objects) and bk.remote_complete_ids(
             fake, "test-bucket", "test-backups/") == sorted(ids)  # dry-run deletes nothing
+        assert set(pool_keys(fake)) == pool_before
         # Same selection under enforce+approval deletes exactly that generation.
         setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
                     BACKUP_REMOTE_RETAIN_COUNT="2",
@@ -1542,6 +1582,9 @@ def test_retention_dryrun_matches_enforce_selection():
         assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids[1:])
         assert not [k for k in fake.objects if k.startswith("test-backups/%s/" % ids[0])]
         assert [k for k in fake.objects if k.startswith("test-root/")]  # live untouched
+        # Shared SSTs are still referenced: the pool only shrinks when the
+        # last referencing generation is gone (identical fixture -> no GC).
+        assert set(pool_keys(fake)) == pool_before
     finally:
         end_retention_run(tmp)
 
@@ -1594,7 +1637,10 @@ def test_retention_fail_closed_faults():
         finally:
             bk.sys.stdout = old
         assert ("skip " + ids[0]) in out.getvalue()
+        assert "retention: pool-gc blocked" in out.getvalue()  # corrupt survivor pins the pool
         assert fake.objects["outside-scope/stray"] == b"stray"
+        pool_pinned = set(pool_keys(fake))
+        assert pool_pinned, "shared pool must survive a blocked GC"
         assert {k: v for k, v in fake.objects.items()
                 if k.startswith("test-root/")} == live_before
         # Prefix misconfiguration fails closed before any deletion.
@@ -1650,6 +1696,8 @@ def test_retention_newest_oldest_pinned_restore_hash_match():
         # target dirs are a fixture setup step, not a production fallback).
         before_src = hash_tree(os.path.join(tmp, "src"))
         for bid in (ids[0], ids[1], ids[-1]):
+            complete = fetch_complete_record(fake, bid)
+            want = pool_bytes_for(fake, complete, bid)
             setenv(dict(env, BACKUP_FILE=bid, BACKUP_REMOTE_PINNED=ids[1]))
             for name in os.listdir(env["BACKUP_DIR"]):  # force remote fetch path
                 os.unlink(os.path.join(env["BACKUP_DIR"], name))
@@ -1659,6 +1707,9 @@ def test_retention_newest_oldest_pinned_restore_hash_match():
                 del fake.objects[key]
             assert bk.cmd_restore() == 0
             assert hash_tree(env["BACKUP_RESTORE_BASE"]) == before_src
+            live = {k[len("test-root/"):]: v for k, v in fake.objects.items()
+                    if k.startswith("test-root/")}
+            assert live == want
     finally:
         end_retention_run(tmp)
 
@@ -2000,6 +2051,7 @@ def test_local_tar_restore_holds_ref_until_snapshot_used():
         setenv(env)
         assert bk.cmd_backup() == 0
         bid = _remote_bid(bdir)
+        complete = fetch_complete_record(fake, bid)
         rbase = "test-backups/%s/" % bid
         for key in [k for k in fake.objects if k.startswith("test-root/")]:
             del fake.objects[key]
@@ -2021,9 +2073,7 @@ def test_local_tar_restore_holds_ref_until_snapshot_used():
             fake.copy_object = orig_copy
         assert held_during_copy and all(held_during_copy)
         assert not [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)]
-        manifest = read_manifest(newest_tar(bdir))
-        snap = manifest["sst_snapshot"]
-        victim = "test-root/" + snap["objects"][0]["key"]
+        victim = "test-root/" + complete["sst"][0]["key"]
         fake.objects[victim] = b"conflicting-bytes-not-snapshot"
         reset_targets(env["BACKUP_RESTORE_BASE"])
         setenv(dict(env, BACKUP_FILE=bid))
@@ -2050,6 +2100,468 @@ def test_head_snapshot_refuses_same_size_identity_changes():
             raise AssertionError("changed SST identity accepted")
         assert fake.objects == before
 
+
+def test_historical_head_generation_restores_via_resolver():
+    # Pre-shared-layout generation: per-generation prefix + ETag identity
+    # records resolve through snapshot_object_key and restore like the pool.
+    original = b"abcd"
+    fake = FakeS3({"backups/old/sst/data.sst": original})
+    head = fake.head_object("bucket", "backups/old/sst/data.sst")
+    record = {"key": "data.sst", "size": head["ContentLength"],
+              "source_etag": head["ETag"], "etag": head["ETag"]}
+    assert bk.validate_sst_record(record) is None
+    snap = {"snap_prefix": "backups/old/sst/"}
+    assert bk.s3_restore_snapshot(fake, "bucket", "live/", snap, [record]) == ["live/data.sst"]
+    assert fake.objects["live/data.sst"] == original
+    fake.objects["live/data.sst"] = b"wxyz"
+    try:
+        bk.s3_restore_snapshot(fake, "bucket", "live/", snap, [record])
+    except IOError:
+        pass
+    else:
+        raise AssertionError("historical identity mismatch accepted")
+    assert fake.objects["live/data.sst"] == b"wxyz"
+
+
+def test_invalid_shared_snapshot_key_cannot_redirect_restore():
+    fake = FakeS3(sst_fixture())
+    tmp, _src, tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        tar = newest_tar(bdir)
+        manifest = read_manifest(tar)
+        evil = dict(manifest["sst_snapshot"]["objects"][0])
+        evil["snapshot_key"] = "test-backups/_sst/" + "0" * 64
+        manifest["sst_snapshot"]["objects"][0] = evil
+        rewrite_tar_manifest(tar, manifest)
+        fake.objects = {k: v for k, v in fake.objects.items()
+                        if not k.startswith("test-root/")}
+        assert bk.validate_sst_record(evil) is not None
+        assert bk.cmd_restore() == 2
+        assert hash_tree(tgt) == {}
+        assert [k for k in fake.objects if k.startswith("test-backups/_sst/")]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_incremental_repeat_backup_copies_zero():
+    # Identical live second backup must reuse every pool object: COPY0,
+    # no pool growth, no SST-body GET, same identity addresses.
+    live = {"test-root/sst/a.sst": b"A" * 128, "test-root/sst/b.sst": b"B" * 64}
+    fake = FakeS3(dict(live))
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        assert fake.copies == 2
+        pool_before = dict((k, fake.objects[k]) for k in pool_keys(fake))
+        assert len(pool_before) == 4  # 2 SSTs + 2 .json records
+        complete1 = fetch_complete_record(fake, bid1)
+        copies_before = fake.copies
+        seen_gets = []
+        orig_get = fake.get_object
+
+        def spy_get(**kw):
+            seen_gets.append(kw["Key"])
+            return orig_get(**kw)
+
+        fake.get_object = spy_get
+        try:
+            assert bk.cmd_backup() == 0
+        finally:
+            fake.get_object = orig_get
+        tars = sorted(f for f in os.listdir(bdir) if f.endswith(".tar.gz"))
+        bid2 = tars[-1][:-len(".tar.gz")]
+        assert bid1 != bid2
+        assert fake.copies == copies_before  # COPY0: full reuse
+        assert set(pool_keys(fake)) == set(pool_before)
+        for k, v in pool_before.items():
+            assert fake.objects[k] == v
+        pool_data = {k for k in pool_before if not k.endswith(".json")}
+        assert not (set(seen_gets) & pool_data)  # records only, never SST bodies
+        complete2 = fetch_complete_record(fake, bid2)
+        assert complete2["sst_layout"] == "shared-v1"
+        assert ({o["key"]: o["snapshot_key"] for o in complete2["sst"]}
+                == {o["key"]: o["snapshot_key"] for o in complete1["sst"]})
+        assert not [k for k in fake.objects if k.startswith("test-backups/_locks/")]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_incremental_new_and_changed_identity_copy_once():
+    # One new key + one same-size identity change COPY exactly once each;
+    # untouched keys keep their pool address; manifests stay full inventories.
+    fake = FakeS3({"test-root/sst/a.sst": b"A" * 128, "test-root/sst/b.sst": b"B" * 64})
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        complete1 = fetch_complete_record(fake, bid1)
+        keys1 = {o["key"]: o["snapshot_key"] for o in complete1["sst"]}
+        pool_before = set(pool_keys(fake))
+        copies_before = fake.copies
+        old_b = fake.objects["test-root/sst/b.sst"]
+        fake.objects["test-root/sst/b.sst"] = bytes(x ^ 0xFF for x in old_b)
+        fake.objects["test-root/sst/c.sst"] = b"C" * 32
+        assert bk.cmd_backup() == 0
+        assert fake.copies == copies_before + 2  # changed b + new c, only once each
+        tars = sorted(f for f in os.listdir(bdir) if f.endswith(".tar.gz"))
+        bid2 = tars[-1][:-len(".tar.gz")]
+        complete2 = fetch_complete_record(fake, bid2)
+        keys2 = {o["key"]: o["snapshot_key"] for o in complete2["sst"]}
+        assert keys2["sst/a.sst"] == keys1["sst/a.sst"]  # untouched: reused
+        assert keys2["sst/b.sst"] != keys1["sst/b.sst"]  # same size, new identity
+        assert keys2["sst/b.sst"].startswith("test-backups/_sst/")
+        assert "sst/c.sst" in keys2
+        assert len(set(pool_keys(fake)) - pool_before) == 4  # 2 data + 2 records
+        assert {o["key"] for o in complete1["sst"]} == {"sst/a.sst", "sst/b.sst"}
+        assert {o["key"] for o in complete2["sst"]} == {"sst/a.sst", "sst/b.sst", "sst/c.sst"}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_incremental_full_manifest_restores_after_retire_and_compaction():
+    # Compaction drops b and adds c; retiring the original generation must
+    # not strand the survivor: its full manifest restores byte-identical live.
+    fake = FakeS3({"test-root/sst/a.sst": b"A" * 128, "test-root/sst/b.sst": b"B" * 64})
+    tmp, src, tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        before_src = hash_tree(src)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        fake.objects["test-root/sst/c.sst"] = b"C" * 32
+        del fake.objects["test-root/sst/b.sst"]
+        assert bk.cmd_backup() == 0
+        tars = sorted(f for f in os.listdir(bdir) if f.endswith(".tar.gz"))
+        bid2 = tars[-1][:-len(".tar.gz")]
+        assert bid1 != bid2
+        complete2 = fetch_complete_record(fake, bid2)
+        want = pool_bytes_for(fake, complete2, bid2)
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        victim = next(g for g in gens if g["backup_id"] == bid1)
+        assert bk.retire_generation(fake, "test-bucket", "test-backups/", victim) > 0
+        assert not [k for k in fake.objects if k.startswith("test-backups/%s/" % bid1)]
+        snap2 = snap_of(complete2, bid2)
+        for o in complete2["sst"]:
+            assert bk.snapshot_object_key(snap2, o) in fake.objects
+        fake.objects = {k: v for k, v in fake.objects.items()
+                        if not k.startswith("test-root/")}
+        copies_before = fake.copies
+        setenv(dict(env, BACKUP_FILE=bid2))
+        reset_targets(tgt)
+        assert bk.cmd_restore() == 0
+        assert fake.copies == copies_before + len(complete2["sst"])
+        live = {k[len("test-root/"):]: v for k, v in fake.objects.items()
+                if k.startswith("test-root/")}
+        assert live == want
+        assert hash_tree(tgt) == before_src
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_pin_and_ref_protect_shared_pool():
+    # Pinned + actively-read generations survive enforce; the pool they
+    # reference is untouched (no silent GC of required SSTs).
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake)
+    try:
+        pool_before = dict((k, fake.objects[k]) for k in pool_keys(fake))
+        assert pool_before
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_PINNED=ids[0],
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        ref = bk.acquire_generation_ref(fake, "test-bucket", "test-backups/", ids[1])
+        try:
+            assert bk.cmd_retention() == 0
+            assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == sorted(ids)
+            assert ref in fake.objects
+            assert set(pool_keys(fake)) == set(pool_before)
+            for k, v in pool_before.items():
+                assert fake.objects[k] == v
+        finally:
+            bk.release_generation_ref(fake, "test-bucket", ref)
+    finally:
+        end_retention_run(tmp)
+
+
+def test_gc_releases_only_last_reference_and_dryrun_matches_actual():
+    # Shared a survives; orphaned b is the only pool GC after bid1 retires.
+    # Dry-run generation bytes + pool-gc bytes must equal actual deletions.
+    import io as _io
+    fake = FakeS3({"test-root/sst/a.sst": b"A" * 128, "test-root/sst/b.sst": b"B" * 64})
+    tmp, _src, tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        complete1 = fetch_complete_record(fake, bid1)
+        fake.objects["test-root/sst/c.sst"] = b"C" * 32
+        del fake.objects["test-root/sst/b.sst"]
+        assert bk.cmd_backup() == 0
+        tars = sorted(f for f in os.listdir(bdir) if f.endswith(".tar.gz"))
+        bid2 = tars[-1][:-len(".tar.gz")]
+        assert bid1 != bid2
+        complete2 = fetch_complete_record(fake, bid2)
+        keys1 = {o["key"]: o["snapshot_key"] for o in complete1["sst"]}
+        keys2 = {o["key"]: o["snapshot_key"] for o in complete2["sst"]}
+        assert keys2["sst/a.sst"] == keys1["sst/a.sst"]  # same identity shared
+        orphan = {keys1["sst/b.sst"], keys1["sst/b.sst"] + ".json"}
+        assert orphan <= set(pool_keys(fake))
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="dry-run",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0"))
+        out = _io.StringIO()
+        old, bk.sys.stdout = bk.sys.stdout, out
+        try:
+            assert bk.cmd_retention() == 0
+        finally:
+            bk.sys.stdout = old
+        dry = out.getvalue()
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        doomed = next(g for g in gens if g["backup_id"] == bid1)
+        garbage, reason = bk.pool_gc_plan(fake, "test-bucket", "test-backups/",
+                                          gens, [bid1])
+        assert reason is None, reason
+        assert {o["Key"] for o in garbage} == orphan  # only the last reference frees
+        gc_bytes = sum(o.get("Size", 0) for o in garbage)
+        expect = doomed["bytes"] + gc_bytes
+        mode_line = [l for l in dry.splitlines() if l.startswith("retention: mode=")][0]
+        assert "bytes=%d" % expect in mode_line
+        gc_line = [l for l in dry.splitlines()
+                   if l.startswith("retention: pool-gc objects=")][0]
+        assert gc_line == "retention: pool-gc objects=%d bytes=%d" % (len(garbage), gc_bytes)
+        store_before = {k: len(v) for k, v in fake.objects.items()}
+        setenv(dict(env, BACKUP_REMOTE_RETENTION_MODE="enforce",
+                    BACKUP_REMOTE_RETAIN_COUNT="1",
+                    BACKUP_REMOTE_MIN_RECOVERY="1",
+                    BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0",
+                    BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        out2 = _io.StringIO()
+        old, bk.sys.stdout = bk.sys.stdout, out2
+        try:
+            assert bk.cmd_retention() == 0
+        finally:
+            bk.sys.stdout = old
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [bid2]
+        assert not (orphan & set(fake.objects))
+        assert keys2["sst/a.sst"] in fake.objects and keys2["sst/c.sst"] in fake.objects
+        removed = sum(sz for k, sz in store_before.items() if k not in fake.objects)
+        assert removed == expect  # dry-run bytes match actual deletions
+        assert "retention: pool-gc deleted=%d bytes=%d" % (len(garbage), gc_bytes) in out2.getvalue()
+        # Survivor still restores byte-identical live after the sweep.
+        want = pool_bytes_for(fake, complete2, bid2)
+        fake.objects = {k: v for k, v in fake.objects.items()
+                        if not k.startswith("test-root/")}
+        setenv(dict(env, BACKUP_FILE=bid2))
+        reset_targets(tgt)
+        assert bk.cmd_restore() == 0
+        live = {k[len("test-root/"):]: v for k, v in fake.objects.items()
+                if k.startswith("test-root/")}
+        assert live == want
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_failed_backup_preserves_reused_pool():
+    # A new SST whose COPY fails must roll back only its own keys; reused
+    # pool objects, live source, and the prior generation are untouched, the
+    # pool lock is released, and a retry publishes exactly one COPY.
+    fake = FakeS3({"test-root/sst/a.sst": b"A" * 128, "test-root/sst/b.sst": b"B" * 64})
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        pool_before = dict((k, fake.objects[k]) for k in pool_keys(fake))
+        local_before = set(os.listdir(bdir))
+        fake.objects["test-root/sst/c.sst"] = b"C" * 32
+        copies_before = fake.copies
+        fake.fail_copy_at = copies_before  # the single new-SST COPY fails
+        assert bk.cmd_backup() == 3
+        for k, v in pool_before.items():
+            assert fake.objects.get(k) == v  # reused pool preserved
+        assert set(os.listdir(bdir)) == local_before  # no half-written tar
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [bid1]
+        assert not [k for k in fake.objects if k.startswith("test-backups/_locks/")]
+        assert fake.objects["test-root/sst/c.sst"] == b"C" * 32  # live untouched
+        fake.fail_copy_at = None
+        assert bk.cmd_backup() == 0  # lock was released: retry works
+        assert fake.copies == copies_before + 1
+        tars = sorted(f for f in os.listdir(bdir) if f.endswith(".tar.gz"))
+        assert len(tars) == 2
+        complete2 = fetch_complete_record(fake, tars[-1][:-len(".tar.gz")])
+        assert "sst/c.sst" in {o["key"] for o in complete2["sst"]}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_partial_and_tampered_pool_refuse_without_overwrite():
+    # Partial entries, mismatched records, and tampered pool bytes each fail
+    # closed: nothing overwritten, no new generation, lock always released.
+    fake = FakeS3({"test-root/sst/a.sst": b"A" * 128, "test-root/sst/b.sst": b"B" * 64})
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        complete = fetch_complete_record(fake, bid1)
+        by_key = {o["key"]: o for o in complete["sst"]}
+        pool_before = dict((k, fake.objects[k]) for k in pool_keys(fake))
+        local_before = set(os.listdir(bdir))
+        key_a = by_key["sst/a.sst"]["snapshot_key"]
+        rec_key = key_a + ".json"
+        saved_rec = fake.objects.pop(rec_key)  # (a) partial entry: data without record
+        data_blob = fake.objects[key_a]
+        assert bk.cmd_backup() == 3
+        assert fake.objects[key_a] == data_blob  # never overwritten
+        assert rec_key not in fake.objects
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [bid1]
+        fake.objects[rec_key] = saved_rec  # repair
+        rec = json.loads(saved_rec.decode("utf-8"))
+        rec["size"] = rec["size"] + 1  # (b) record disagrees with live HEAD
+        fake.objects[rec_key] = json.dumps(rec, sort_keys=True).encode("utf-8")
+        assert bk.cmd_backup() == 3
+        assert fake.objects[key_a] == data_blob
+        fake.objects[rec_key] = saved_rec  # repair
+        key_b = by_key["sst/b.sst"]["snapshot_key"]
+        saved_data = fake.objects[key_b]
+        fake.objects[key_b] = bytes(x ^ 0x01 for x in saved_data)  # (c) same-size tamper
+        assert bk.cmd_backup() == 3
+        assert fake.objects[key_b] != saved_data  # tamper kept, not overwritten
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [bid1]
+        fake.objects[key_b] = saved_data  # repair
+        assert fake.objects[rec_key] == saved_rec
+        assert set(os.listdir(bdir)) == local_before
+        assert not [k for k in fake.objects if k.startswith("test-backups/_locks/")]
+        assert {k: fake.objects[k] for k in pool_before} == pool_before
+        assert bk.cmd_backup() == 0  # healthy pool backs up again
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_pool_lock_contention_and_stale_claims_fail_closed():
+    # Pre-existing holder blocks (precheck) and a rival landing after our
+    # PUT aborts (postcheck): own claim released, rival kept. Stale claims
+    # never expire: leftovers block until an operator clears them.
+    fake = FakeS3(sst_fixture())
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid1 = _remote_bid(bdir)
+        before = dict(fake.objects)
+        local_before = set(os.listdir(bdir))
+        fake.objects["test-backups/_locks/holder-claim"] = b"pool operation"
+        assert bk.cmd_backup() == 3  # holder-first ordering refuses
+        assert fake.objects == dict(before, **{"test-backups/_locks/holder-claim": b"pool operation"})
+        assert set(os.listdir(bdir)) == local_before
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [bid1]
+        del fake.objects["test-backups/_locks/holder-claim"]
+        orig_put = fake.put_object
+
+        def racy_put(Bucket, Key, Body, ContentLength=None, Metadata=None):
+            r = orig_put(Bucket=Bucket, Key=Key, Body=Body,
+                         ContentLength=ContentLength, Metadata=Metadata)
+            if Key.startswith("test-backups/_locks/"):
+                fake.objects["test-backups/_locks/rival-claim"] = b"pool operation"
+            return r
+
+        fake.put_object = racy_put
+        try:
+            try:
+                with bk.shared_pool_lock(fake, "test-bucket", "test-backups/",
+                                         token="contender"):
+                    raise AssertionError("raced pool lock must not enter")
+            except IOError as e:
+                assert "rac" in str(e).lower() or "busy" in str(e).lower()
+        finally:
+            fake.put_object = orig_put
+        assert "test-backups/_locks/rival-claim" in fake.objects  # rival kept
+        assert "test-backups/_locks/contender" not in fake.objects  # own released
+        del fake.objects["test-backups/_locks/rival-claim"]
+        try:
+            with bk.shared_pool_lock(fake, "test-bucket", "test-backups/",
+                                     token="../evil"):
+                raise AssertionError("unsafe lock token must not enter")
+        except IOError:
+            pass
+        assert "test-backups/_locks/contender" not in fake.objects
+        fake.objects["test-backups/_locks/stale-crashed-owner"] = b"pool operation"
+        assert bk.cmd_backup() == 3  # durable stale claim fails closed, no expiry
+        assert "test-backups/_locks/stale-crashed-owner" in fake.objects
+        assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [bid1]
+        assert set(os.listdir(bdir)) == local_before
+        del fake.objects["test-backups/_locks/stale-crashed-owner"]
+        assert bk.cmd_backup() == 0  # cleared claims unblock
+        assert not [k for k in fake.objects if k.startswith("test-backups/_locks/")]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_restore_uses_complete_inventory_during_pool_write():
+    # A backup/GC writer claim must not prevent a reader from restoring a
+    # committed generation protected by its own generation ref.
+    fake = FakeS3(sst_fixture())
+    tmp, src, tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        expected = hash_tree(src)
+        live_before = {k: v for k, v in fake.objects.items() if k.startswith("test-root/")}
+        assert bk.cmd_backup() == 0
+        fake.objects = {k: v for k, v in fake.objects.items()
+                        if not k.startswith("test-root/")}
+        with bk.shared_pool_lock(fake, "test-bucket", "test-backups/", token="writer"):
+            assert bk.cmd_restore() == 0
+            assert hash_tree(tgt) == expected
+            assert {k: v for k, v in fake.objects.items()
+                    if k.startswith("test-root/")} == live_before
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_remote_generations_ignore_pool_and_locks():
+    # _sst/_locks are never generation ids and per-generation bytes count
+    # only owned controls (pool bytes are shared, not per-generation).
+    fake = FakeS3(sst_fixture())
+    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        bid = _remote_bid(bdir)
+        rbase = "test-backups/%s/" % bid
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        assert [g["backup_id"] for g in gens] == [bid]
+        gen = gens[0]
+        assert gen["status"] == "complete"
+        assert all(k.startswith(rbase) for k in gen["keys"])
+        assert not [k for k in gen["keys"] if "/_sst/" in k or "/_locks/" in k]
+        assert gen["bytes"] == sum(len(fake.objects[k]) for k in gen["keys"])
+        assert pool_keys(fake), "shared pool must exist beside the generation"
+        fake.objects["test-backups/_locks/stray"] = b"x"
+        gens2, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        assert [g["backup_id"] for g in gens2] == [bid]
+        assert gens2[0]["keys"] == gen["keys"] and gens2[0]["bytes"] == gen["bytes"]
+        fake.objects.pop("test-backups/_locks/stray")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
 
 def test_historical_sha256_snapshot_restores_and_rejects_corruption():
     original = b"abcd"
@@ -2114,6 +2626,18 @@ if __name__ == "__main__":
     test_unreadable_live_sst_is_never_overwritten_or_deleted()
     test_head_snapshot_refuses_same_size_identity_changes()
     test_historical_sha256_snapshot_restores_and_rejects_corruption()
+    test_historical_head_generation_restores_via_resolver()
+    test_invalid_shared_snapshot_key_cannot_redirect_restore()
+    test_incremental_repeat_backup_copies_zero()
+    test_incremental_new_and_changed_identity_copy_once()
+    test_incremental_full_manifest_restores_after_retire_and_compaction()
+    test_pin_and_ref_protect_shared_pool()
+    test_gc_releases_only_last_reference_and_dryrun_matches_actual()
+    test_failed_backup_preserves_reused_pool()
+    test_partial_and_tampered_pool_refuse_without_overwrite()
+    test_pool_lock_contention_and_stale_claims_fail_closed()
+    test_restore_uses_complete_inventory_during_pool_write()
+    test_remote_generations_ignore_pool_and_locks()
     test_large_sst_inventory_roundtrips_local_and_remote()
     test_inventory_limit_is_shared_by_backup_and_restore()
     test_oversized_complete_is_not_missing_and_closes_body()
@@ -2136,4 +2660,4 @@ if __name__ == "__main__":
     test_resume_aborted_writer_deletes_complete_first()
     test_generation_race_threading_refs()
     test_local_tar_restore_holds_ref_until_snapshot_used()
-    print("test_backup: ok (64 tests)")
+    print("test_backup: ok (76 tests)")

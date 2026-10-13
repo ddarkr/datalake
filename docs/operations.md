@@ -437,7 +437,9 @@ docker compose --env-file .env up -d
 `BACKUP_OFFLINE_CONFIRMED=1`은 실제 정지를 대신하지 않습니다. 스크립트는 DB가 응답하면 작업을 거부합니다.
 
 - 백업 범위는 `greptime-data`, `greptime-etc`와 S3 모드의 SST 객체입니다. **Grafana 사용자 설정, Alloy 큐, 차량 spool/outbox, `.env`는 이 백업에 포함되지 않습니다.** 별도 보관 정책이 필요합니다.
-- S3 모드는 SST를 HEAD → 조건부 서버 측 COPY → HEAD 크기·metadata 확인으로 백업하며 원본/복사본 전체 GET을 하지 않습니다. SST 기록은 크기와 원본·복사본 ETag입니다(ETag는 객체 identity이며 전체 바이트 SHA256이 아닙니다). archive·sidecar·manifest·완료 표식 업로드도 HEAD 크기·로컬 hash metadata로 확인합니다. 이 방식은 동일 크기의 원격 비트 손상을 직접 검출하지 못합니다. live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
+- S3 모드는 SST를 `<S3_BACKUP_PREFIX>/_sst/` 공유 pool에 증분 저장합니다. 첫 실행에는 기존 SST를 모두 서버 측 COPY하고, 이후에는 bucket·live root/key·크기·원본 ETag가 같은 SST를 재사용해 신규 identity만 복사합니다. 각 세대의 manifest/COMPLETE는 전체 복원 목록을 담으므로 이전 세대 archive를 순차 적용하지 않습니다. 기존 full SST 백업도 복원할 수 있습니다. WAL·설정 tar와 DB offline 조건은 그대로입니다.
+- 새 SST는 HEAD → 조건부 서버 측 COPY → HEAD 크기·metadata 확인, 재사용 SST는 작은 `.json` 기록과 HEAD identity 확인을 거칩니다. 원본/복사본 전체 GET과 업로드 archive의 재다운로드는 하지 않습니다. ETag는 객체 identity이며 전체 바이트 SHA256이 아닙니다. 업로드는 HEAD 크기·로컬 hash metadata로 확인하므로 동일 크기의 원격 비트 손상을 직접 검출하지 못합니다. live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
+- backup/retention은 `_locks/` claim으로 직렬화하고 복원은 세대 `refs/`로 참조를 보호합니다. 승인된 retention만 남은 세대가 참조하지 않는 pool 객체를 정리합니다. 강제 종료 시 남은 claim/ref는 자동 만료시키지 않으며, 소유 작업의 종료를 확인하기 전에는 제거하지 마세요. 공급자의 강한 LIST/GET 일관성이 전제입니다.
 - inventory JSON(`manifest.json`의 archive 내/원격 사본과 `COMPLETE`)은 **각각 비압축 UTF-8 64 MiB 이하**여야 합니다. 백업 생성과 로컬·원격 복원에 같은 한도를 적용하며 초과한 백업은 성공으로 보고하지 않습니다. 8,000개 이상의 SST도 이 바이트 한도 안이면 복원할 수 있습니다. checksum sidecar는 1 MiB 이하입니다. JSON 읽기는 한도와 chunk 크기로 제한하고 원격 응답 스트림은 성공·실패 모두 닫습니다. **archive 전체나 SST 데이터 총량에는 이 JSON 한도를 적용하지 않습니다.**
 - `BACKUP_KEEP=7`은 로컬 백업 세대 수입니다. 원격 보존은 기본 `off`이며 별도 승인된 `enforce`에서만 삭제합니다. [원격 보존 정책과 dry-run 절차](backup-retention.md)를 확인하고, 복구에 필요한 prefix에 임의 만료 정책을 설정하지 마세요.
 

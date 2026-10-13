@@ -241,13 +241,25 @@ def live_snapshot_hashes(bkmod, client, bucket, live_pfx):
     return out
 
 
+def resolve_complete_snap(bkmod, complete, backup_pfx, bid):
+    """Snapshot handle for old per-generation and new shared-pool layouts."""
+    if complete.get("sst_layout") == getattr(bkmod, "SHARED_LAYOUT", "shared-v1"):
+        return {"layout": complete.get("sst_layout"), "snap_prefix": backup_pfx + "_sst/"}
+    if hasattr(bkmod, "snapshot_prefix"):
+        return {"snap_prefix": bkmod.snapshot_prefix(backup_pfx, bid)}
+    return {"snap_prefix": backup_pfx + bid + "/sst/"}
+
+
 def sst_snapshot_hashes(bkmod, client, bucket, backup_pfx, bid):
     """Explicit benchmark-only byte verification, outside measured backup I/O."""
     complete, err = bkmod.fetch_complete(client, bucket, backup_pfx, bid)
     assert err is None, bid + ": " + str(err)[:120]
-    snap = bkmod.snapshot_prefix(backup_pfx, bid)
-    return {o["key"]: bkmod.s3_stream_hash(client, bucket, snap + o["key"])[0]
-            for o in complete["sst"]}
+    snap = resolve_complete_snap(bkmod, complete, backup_pfx, bid)
+    out = {}
+    for o in complete["sst"]:
+        key = bkmod.snapshot_object_key(snap, o) if hasattr(bkmod, "snapshot_object_key") else snap["snap_prefix"] + o["key"]
+        out[o["key"]] = bkmod.s3_stream_hash(client, bucket, key)[0]
+    return out
 
 
 def load_baseline(root):
@@ -412,18 +424,31 @@ def retention_eval(bkmod, client, env, pinned, mode):
             with contextlib.redirect_stdout(io.StringIO()):
                 assert bkmod.cmd_retention() == 0, "enforce failed"
         else:
+            buf = io.StringIO()
             settings, err = bkmod.retention_settings()
             assert err is None, err
             bp = bkmod.norm_prefix(os.environ["S3_BACKUP_PREFIX"])
-            gens, _ = bkmod.remote_generations(client, os.environ["S3_BUCKET"], bp)
-            keep, deletes, skipped = bkmod.retention_plan(gens, settings)
+            with contextlib.redirect_stdout(buf):
+                gens, _ = bkmod.remote_generations(client, os.environ["S3_BUCKET"], bp)
+                keep, deletes, skipped = bkmod.retention_plan(gens, settings)
+            removed = [g["backup_id"] for g in deletes]
+            retiring = [g["backup_id"] for g in gens if g.get("retiring")]
+            plan_gc, gc_reason = ([], None)
+            if hasattr(bkmod, "pool_gc_plan"):
+                plan_gc, gc_reason = bkmod.pool_gc_plan(
+                    client, os.environ["S3_BUCKET"], bp, gens, removed + retiring)
+            gc_bytes = sum(o.get("Size", 0) for o in plan_gc)
             m = {"lists": client.lists - before[0], "gets": client.gets - before[1],
                  "copies": client.copies - before[2], "puts": client.puts - before[3],
                  "deletes": client.deletes - before[4],
                  "verify_bytes": client.verify_bytes - before[5]}
             out = {"keep": keep,
                    "delete_ids": [g["backup_id"] for g in deletes],
-                   "delete_bytes": sum(g["bytes"] for g in deletes),
+                   "delete_bytes": sum(g["bytes"] for g in deletes) + gc_bytes,
+                   "generation_bytes": sum(g["bytes"] for g in deletes),
+                   "pool_gc_objects": len(plan_gc),
+                   "pool_gc_bytes": gc_bytes,
+                   "pool_gc_blocked": gc_reason,
                    "skipped": [[b, w] for b, w in skipped]}
             out.update(m)
             return out
@@ -461,6 +486,7 @@ def bench_impl(bkmod, client, bucket, case_pfx, base_env, small_n, large_count, 
                  ("small-change", det("small", small_n), 0),
                  ("large-change", b"", large_count)]
     cases, by_bid, tmps = [], {}, []
+    pooled = hasattr(bkmod, "pool_gc_plan") and hasattr(bkmod, "snapshot_object_key")
     for label, extra, large in scenarios:
         seed_live(client, bucket, live_pfx,
                   {k: v for k, v in live_fixture(len(extra), large).items()})
@@ -470,6 +496,9 @@ def bench_impl(bkmod, client, bucket, case_pfx, base_env, small_n, large_count, 
         out, bid, src_hash, tmp, e = run_backup(bkmod, client, env, label)
         if label == "repeated-identical-2":
             assert src_hash == by_bid[cases[0]["backup_id"]][0]
+            if pooled:
+                # Same live identities must add no pool COPY on the rerun.
+                assert out["copies"] == 0, "repeat must COPY0, got %r" % out
         cases.append(out)
         by_bid[bid] = (src_hash, tmp, e)
         tmps.append(tmp)
@@ -483,8 +512,7 @@ def bench_impl(bkmod, client, bucket, case_pfx, base_env, small_n, large_count, 
         finally:
             restore_env(saved)
         assert len(complete) == 4, "expected 4 complete generations"
-        # retain=3 keeps ids1/2/3; pin mid ids2 so oldest-retained, pinned, and
-        # newest are three distinct survivors and ids0 is the only candidate.
+        # retain=3 keeps ids1/2/3; pin mid ids2 so all three restore roles differ.
         victim, oldest_retained, pinned_bid, newest = (
             complete[0]["backup_id"], complete[1]["backup_id"],
             complete[2]["backup_id"], complete[-1]["backup_id"])
@@ -509,18 +537,15 @@ def bench_impl(bkmod, client, bucket, case_pfx, base_env, small_n, large_count, 
         assert victim not in enforced["remaining"], "ids0 must be deleted"
         for bid in (oldest_retained, pinned_bid, newest):
             assert bid in enforced["remaining"], bid + " must survive enforce"
-        # Planned-vs-actual: dry-run bytes must equal measured removed bytes.
         assert enforced["remote_bytes_removed"] == dry["delete_bytes"], (
             "planned %d != removed %d" % (dry["delete_bytes"],
                                           enforced["remote_bytes_removed"]))
-        # AFTER enforcement: restore each survivor from remote into fresh empty
-        # roots; every file hash plus every live SST snapshot hash must match.
+        # Restore each survivor from remote AFTER GC into isolated empty roots.
         restores = [restore_one(bkmod, client, by_bid[bid][2], bid, by_bid[bid][0],
                                 role, live_pfx)
                     for bid, role in ((oldest_retained, "oldest-retained"),
                                       (pinned_bid, "pinned"),
                                       (newest, "newest"))]
-        # Reseed the isolated live prefix so restores leave no owned keys behind.
         seed_live(client, bucket, live_pfx, live_fixture(0, 0))
         return {"cases": cases, "retention_dry_run": dry,
                 "retention_enforced": enforced, "restores": restores}
