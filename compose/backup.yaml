@@ -71,7 +71,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "3"
+      datalake.storage-metrics-revision: "4"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -107,7 +107,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "1"
+      datalake.backup-revision: "2"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -161,7 +161,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "1"
+      datalake.backup-revision: "2"
     depends_on:
       backup-deps:
         condition: service_completed_successfully

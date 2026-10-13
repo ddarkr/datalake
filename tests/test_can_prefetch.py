@@ -80,26 +80,36 @@ class DemandPrefetch(unittest.TestCase):
             self.assertLessEqual(total_fetched / total_staged, 2.0)
             self.assertLessEqual(calls, 120)
 
-    def test_many_session_fetched_cap_shrinks_window(self):
-        """400-session round-robin: fetched-beyond-staged waste shrinks hint."""
+    def test_shallow_sessions_bound_refetch_amplification_without_reordering(self):
         with tempfile.TemporaryDirectory() as directory:
             decoder = synthetic_decoder(directory)
             archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
             archive.register_epoch(decoder)
-            metas = {k: dict(BASE, session_id="wide-%d" % k) for k in range(400)}
+            metas = [dict(BASE, session_id="wide-%d" % k) for k in range(400)]
+            expected, states = [], {}
             with patch("scripts.ingest.can.can_receiver.time.time_ns",
-                        return_value=1800000000000000001):
-                for seq in range(10):
-                    for k in range(400):
-                        archive.accept(metas[k], [{"seq": seq, "offset_ns": seq * 1000 + k,
-                                                   "phase": "capture", "data": FRAME}])
-            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
-                first = archive.decode_once(decoder, limit=1000)
-                stats = dict(archive._decode_prefetch_stats)
-            # ceil(1000/400)=3-row pages hit the fetched cap mid-prefix: more
-            # fetched than staged, so the window must shrink below 1000.
-            self.assertGreater(stats["fetched_chunks"], first)
-            self.assertLess(archive._decode_prefetch_limit, 1000)
+                       return_value=1800000000000000001):
+                for seq in range(5):
+                    for k, meta in enumerate(metas):
+                        chunk = {"seq": seq, "offset_ns": seq * 1000 + k,
+                                 "phase": "capture", "data": FRAME}
+                        archive.accept(meta, [chunk])
+                        rows, state, _ = decoder.decode(meta, chunk, states.get(k))
+                        expected.extend(rows)
+                        states[k] = state
+                fetched = 0
+                with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                    while archive.decode_once(decoder, limit=1000):
+                        fetched += archive._decode_prefetch_stats["fetched_chunks"]
+                # Repeated speculative reads must not amplify this shallow backlog.
+                self.assertLessEqual(fetched, len(metas) * 5 * 3 // 2)
+                with archive.connect() as conn:
+                    actual = [json.loads(r[0]) for r in conn.execute(
+                        "SELECT row_json FROM outbox ORDER BY id")]
+                    self.assertEqual(actual, expected)
+                    self.assertEqual([r[0] for r in conn.execute(
+                        "SELECT next_seq FROM decode_states ORDER BY session")], [5] * 400)
+
 
     def test_contiguous_single_session_keeps_full_pages(self):
         """A lone contiguous session still gets full 64-row pages."""

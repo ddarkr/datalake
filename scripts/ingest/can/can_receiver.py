@@ -671,12 +671,13 @@ class Archive:
         # Merge a bounded prefix while reading, then release the snapshot before
         # decoding. Unpaged heads remain in the heap: exhausting a page or the
         # byte budget must never let a later session bypass the earliest chunk.
-        # Cold pages are demand-sized: fair share of the remaining prefix need
-        # across frontier sessions lacking a buffered run (at most
-        # DECODE_PAGE_ROWS), so interleaved round-robin fetches ~need/frontier
-        # rows per session instead of 64 each and stops the repeated
-        # 1000-read/16-commit waste; a lone contiguous session still gets full
-        # 64-row pages. Buffered (hot) runs are reused without new queries.
+        # Cold pages are demand-sized: fair share of the remaining fetch
+        # budget across frontier sessions lacking a buffered run (at most
+        # DECODE_PAGE_ROWS), so wide round-robin fan-out fetches ~budget/cold
+        # rows per session instead of over-fetching early heads and hitting
+        # the fetched cap before every head enters the prefix; a lone
+        # contiguous session still gets full 64-row pages. Buffered (hot)
+        # runs are reused without new queries.
         stats = {"fetched_chunks": 0, "fetched_bytes": 0, "prefix_chunks": 0,
                  "staged_chunks": 0, "read_queries": 0}
         self._decode_prefetch_stats = stats
@@ -711,8 +712,7 @@ class Archive:
                         cold += 1
                         break
                     run = deque()
-                    need = prefetch_limit - len(prefix)
-                    fetch_rows = min(DECODE_PAGE_ROWS, max(1, -(-need // (cold + 1))))
+                    fetch_rows = min(DECODE_PAGE_ROWS, max(1, (prefetch_limit - fetched_rows) // (cold + 1)))
                     stats["read_queries"] += 1
                     with contextlib.closing(conn.execute(
                         "SELECT c.id,c.session,c.seq,c.offset_ns,c.phase,c.data,s.meta_json "

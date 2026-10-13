@@ -93,8 +93,9 @@ cursors. Restart needs no replay beyond opening the archive.
   sequential decoder across 64-row pages, 64 KiB chunks and dense resumes.
 - Demand-driven prefetch: `python -m unittest tests.test_can_prefetch -v`
   covers the 100x64 round-robin waste shape (no 1000-read/16-commit
-  repetition), contiguous single-session full pages, byte-cap adaptive
-  shrink, and boundary/order/partial/new-session/CAS/restart in one module.
+  repetition), bounded refetch amplification for 400 shallow sessions,
+  contiguous single-session full pages, byte-cap adaptive shrink, and
+  boundary/order/partial/new-session/CAS/restart in one module.
 - Split-frame merge and cursor-race rollback:
   `python -m unittest tests.test_can_receiver.ReceiverBehavior.test_prefetch_merge_keeps_arrival_order_split_resume_and_conflict`.
 - Throughput: `python tools/benchmark_can_decode.py --baseline-root
@@ -105,9 +106,11 @@ cursors. Restart needs no replay beyond opening the archive.
   baseline never stored are normalized from the snapshot itself (sessions_total
   from drained states, active_epoch from the snapshot epoch, outbox_bytes from
   summed canonical row bytes); only one-time migration bookkeeping is excluded.
-  Reports use median wall/CPU time; a separate instrumented pass observes
-  cursor-fetched raw rows/bytes, read queries, connections and commits in both
-  source trees. Retained-prefetch statistics are not baseline I/O evidence.
+  Reports use absolute median wall/CPU time; slowdown is the median relative
+  wall change within adjacent baseline/current pairs. A separate instrumented
+  pass observes cursor-fetched raw rows/bytes, read queries, connections and
+  commits in both source trees. Retained-prefetch statistics are not baseline
+  I/O evidence.
   Fixtures cover small fragments, whole frames, sparse/control traffic,
   interleaved and many sessions, dense/near-maximum-size chunks, and the
   1/4/100/400-session contiguous/round-robin/uneven long-backlog matrix

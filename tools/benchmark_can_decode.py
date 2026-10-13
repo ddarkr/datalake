@@ -29,8 +29,9 @@ alongside wall/CPU time. Fails on any outbox / decode_states /
 decode_partial / counter content mismatch (full compare, never
 length-only; counters the baseline never stored are normalized from the
 snapshot itself, and only one-time migration bookkeeping is excluded), or
-when a case's current median wall time exceeds its baseline median by more
-than --max-slowdown (default 0.25). Repeats
+when the median paired relative wall change (median over repeats of
+(current - baseline) / baseline per adjacent baseline/current pair)
+exceeds --max-slowdown (default 0.25). Repeats
 alternate baseline-first / current-first order to reduce runner drift.
 --json-out writes the same report to a file even on failure for artifact
 publishing.
@@ -223,9 +224,8 @@ def snapshot(archive, decoder):
     return {"epoch": decoder.epoch, "outbox": outbox, "states": states,
             "partial": partial, "counters": counters}
 
-# Frozen before seeding: every wall-derived value (last_receive_ns,
-# ingest_time, last_decode_ns) is deterministic, so equality covers the
-# full snapshot with no excluded fields.
+# Freeze wall-derived values before seeding so output and counter timestamps
+# compare exactly across source trees.
 time.time_ns = lambda: fixed_ns  # noqa: E731 - deterministic wall clock
 archive, decoder, total_chunks, total_bytes = seed(str(work / "seed.db"))
 w0, c0 = time.monotonic(), time.process_time()
@@ -427,8 +427,9 @@ def main(argv=None):
     parser.add_argument("--fixed-ns", type=int, default=1810000000000000000)
     parser.add_argument("--no-instrument", action="store_true")
     parser.add_argument("--max-slowdown", type=float, default=0.25,
-                        help="fail when a case's current median wall time exceeds "
-                        "the baseline median by more than this fraction")
+                        help="fail when a case's median paired relative wall change "
+                        "(median of (current - baseline) / baseline over repeats) "
+                        "exceeds this fraction")
     parser.add_argument("--json-out", type=Path, default=None,
                         help="write the JSON report here even on failure (CI artifact)")
     args = parser.parse_args(argv)
@@ -473,11 +474,17 @@ def main(argv=None):
             cur_cpus.append(cur["cpu_s"])
         base_median = statistics.median(base_walls) if base_walls else base["wall_s"]
         cur_median = statistics.median(cur_walls) if cur_walls else cur["wall_s"]
-        equal = not any(m["case"] == case for m in report["mismatch"])
-        if base_median > 0:
-            slowdown = (cur_median - base_median) / base_median
+        # Normalize adjacent pairs before reducing across changing runner load.
+        slowdown = None
+        if base_walls and all(b > 0 for b in base_walls):
+            slowdown = statistics.median(
+                (c - b) / b for b, c in zip(base_walls, cur_walls))
+        if cur_walls and all(c > 0 for c in cur_walls):
+            speedup = statistics.median(
+                b / c for b, c in zip(base_walls, cur_walls))
         else:
-            slowdown = None
+            speedup = None
+        equal = not any(m["case"] == case for m in report["mismatch"])
         regressed = bool(equal and base_walls and slowdown is not None
                          and slowdown > args.max_slowdown)
         if regressed:
@@ -492,7 +499,7 @@ def main(argv=None):
                                     cpu_s=statistics.median(base_cpus) if base_cpus else base["cpu_s"])),
             "current": _rates(dict(cur, wall_s=cur_median,
                                    cpu_s=statistics.median(cur_cpus) if cur_cpus else cur["cpu_s"])),
-            "speedup_wall": base_median / cur_median if cur_median > 0 else None,
+            "speedup_wall": speedup,
             "slowdown_wall": slowdown,
             "regressed": regressed,
             "max_slowdown": args.max_slowdown,
