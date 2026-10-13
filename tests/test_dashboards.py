@@ -2368,7 +2368,80 @@ def test_uistatus_row118_holds_flat_panels_only():
     tops = {p["id"] for p in dashboard["panels"]}
     assert 30 in tops, tops
 
+def test_analysis_input_latest_preserves_invalid_and_scope_identity():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-battery", 142)
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *args: "".join(str(v or "") for v in args))
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time,vehicle,source,decode_epoch,source_field,path,value_num,
+             unit,quality,ingest_time,envelope_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)""", [
+            (1100, "v", "fleet", "e1", "PackCurrent", "p", 12, None, "unit_unverified", 1101, "old"),
+            (1200, "v", "fleet", "e1", "PackCurrent", "p", None, None, "invalid", 1201, "bad"),
+            (1300, "v", "fleet", "e2", "PackCurrent", "p", 7, None, "unit_unverified", 1301, "other"),
+            (2100, "v", "fleet", "e2", "PackCurrent", "p", 99, "A", "ok", 2101, "future"),
+            (1400, "v", "can", "e2", "PackCurrent", "p", 88, "A", "ok", 1401, "wrong-source"),
+        ])
+        cursor = db.execute(query)
+        columns = [column[0] for column in cursor.description]
+        rows = {row["해석 버전"]: row for row in (
+            dict(zip(columns, values)) for values in cursor)}
+        assert set(rows) == {"e1", "e2"}
+        assert rows["e1"]["원본 숫자"] is None and rows["e1"]["품질"] == "invalid"
+        assert rows["e2"]["원본 숫자"] == 7 and rows["e2"]["원본 단위"] is None
+        assert (rows["e2"]["관측 시각"], rows["e2"]["DB 수신 시각"]) == (1300, 1301)
+
+
+def test_analysis_input_trends_keep_unit_and_quality_boundaries():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *args: "".join(str(v or "") for v in args))
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time,vehicle,source,decode_epoch,source_field,path,value_num,
+             unit,quality) VALUES (?,?,?,?,?,?,?,?,?)""", [
+            (1100, "v", "fleet", "e1", "PackCurrent", "p", -12, None, "unit_unverified"),
+            (1200, "v", "fleet", "e1", "PackCurrent", "p", 99, None, "invalid"),
+            (1300, "v", "fleet", "e1", "ChargerPower", "q", 7, "kW", "ok"),
+            (1400, "v", "fleet", "e1", "ChargerPower", "q", 99, "W", "ok"),
+        ])
+        current = db.execute(_physical_query(configs, "grafana-dash-battery", 143)).fetchall()
+        assert [(row[0], row[2]) for row in current] == [(1100, -12), (1200, None)]
+        power = db.execute(_physical_query(configs, "grafana-dash-battery", 145)).fetchall()
+        assert [(row[0], row[2]) for row in power] == [(1300, 7), (1400, None)]
+        db.executemany("""INSERT INTO vehicle_agg
+            (window_start,resolution,vehicle,path,source,decode_epoch,source_field,
+             quality,unit_key,avg_value,sample_count,unit,rollup_version)
+             VALUES (100,'1h','v','p','fleet','e1','PackCurrent',?,?,?,?,?,?)""", [
+            ("unit_unverified", "", 10, 1, None, 2),
+            ("ok", "", 20, 3, None, 2),
+            ("invalid", "", 999, 100, None, 2),
+            ("ok", "", 999, 100, None, None),
+        ])
+        rolled = db.execute(_physical_query(
+            configs, "grafana-dash-battery", 143, start=0, end=3000000)).fetchall()
+        assert len(rolled) == 1 and rolled[0][2] == 17.5
+
+
+def test_analysis_input_states_keep_boundary_and_invalid_transition():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *args: "".join(str(v or "") for v in args))
+        db.executemany("""INSERT INTO vehicle_signal
+            (event_time,vehicle,source,decode_epoch,source_field,value_text,
+             quality,ingest_time,envelope_id) VALUES (?,'v','fleet','e1','BMSState',?,?,?,'e')""", [
+            (900, "STANDBY", "ok", 901),
+            (1100, "ACTIVE", "ok", 1101),
+            (1200, "UNKNOWN", "invalid", 1201),
+            (2100, "FUTURE", "ok", 2101),
+        ])
+        rows = db.execute(_physical_query(configs, "grafana-dash-battery", 150)).fetchall()
+        assert [(row[0], row[2]) for row in rows] == [(900, "STANDBY"), (1100, "ACTIVE"), (1200, None)]
+
+
 if __name__ == "__main__":
+    test_analysis_input_latest_preserves_invalid_and_scope_identity()
+    test_analysis_input_trends_keep_unit_and_quality_boundaries()
+    test_analysis_input_states_keep_boundary_and_invalid_transition()
     test_last_reported_snapshots_keep_history_without_resurrecting_invalid()
     test_dashboard_and_folder_uids_are_disjoint()
     test_coverage_distinguishes_absence_from_observed_zero()
