@@ -1,18 +1,14 @@
 import assert from 'node:assert/strict';
-import { execFile } from 'node:child_process';
 import { once } from 'node:events';
-import fs from 'node:fs/promises';
-import { createServer } from 'node:http';
 import { chmod, mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
-import { promisify } from 'node:util';
 import opencode, { createEventMapper } from '../plugins/opencode2/index.js';
 import { install } from '../plugins/opencode2/install.mjs';
-import { openOutbox, readRoute } from '../plugins/outbox.mjs';
 import { serializeEvent } from '../plugins/otel.mjs';
 
 const native = (seq, type, data, created = 1000 + seq * 10) => ({
@@ -22,9 +18,6 @@ const sessionID = 'ses_main';
 const assistantMessageID = 'msg_answer';
 const tokens = { input: 10, output: 4, reasoning: 2, cache: { read: 7, write: 3 } };
 const pluginDirectory = resolve(dirname(fileURLToPath(import.meta.url)), '../plugins/opencode2');
-const execFileAsync = promisify(execFile);
-const senderPath = fileURLToPath(new URL('../plugins/sender.mjs', import.meta.url));
-const shellQuote = value => `'${value.replaceAll("'", "'\\''")}'`;
 
 async function bounded(operation, description, timeout = 30000) {
   let timer;
@@ -93,64 +86,38 @@ function nativeBus() {
   };
 }
 
-async function taskWorker(pid, root) {
-  try {
-    const { stdout } = await execFileAsync('ps', ['-p', String(pid), '-o', 'stat=', '-o', 'command='], {
-      timeout: 5000, maxBuffer: 16384,
-    });
-    const match = /^\s*(\S+)\s+([\s\S]*)$/.exec(stdout);
-    return Boolean(match && !match[1].startsWith('Z') && match[2].includes(senderPath) && match[2].includes(root));
-  } catch (error) {
-    if (error.code === 1 || error.code === 'ESRCH') return false;
-    throw error;
-  }
-}
-
-async function consumerFixture(t, held = false) {
+// Direct-mode loopback fixture: one HTTP request per send, no sender process,
+// no durable queue, no process cleanup.
+async function consumerFixture(t, respond = null, timeoutMs = 30000) {
   const directory = await mkdtemp(join(tmpdir(), 'datalake-opencode2-consumer-'));
-  const stateRoot = join(directory, 'state');
+  const legacyRoot = join(directory, 'state');
   const location = { directory: join(directory, 'location'), workspaceID: 'synthetic-workspace' };
   await mkdir(location.directory, { mode: 0o700 });
-  const registry = join(directory, 'worker-pids');
-  const nodeBinary = join(directory, 'tracked-node');
-  await writeFile(nodeBinary, `#!/bin/sh\numask 077\nprintf '%s\\t%s\\n' "$$" "$2" >> ${shellQuote(registry)}\nexec ${shellQuote(process.execPath)} "$@"\n`, { mode: 0o700 });
-  const requests = [];
-  const reply = response => { if (!response.destroyed && !response.writableEnded) response.writeHead(200).end('{}'); };
+  const bodies = [];
+  const held = [];
   const server = createServer(async (request, response) => {
     let body = '';
     for await (const chunk of request) body += chunk;
-    requests.push({ body, response });
-    if (!held) reply(response);
+    bodies.push(body);
+    const action = typeof respond === 'function' ? await respond(bodies.length, body) : respond;
+    if (action === 'hold') held.push(response);
+    else if (action) {
+      response.writeHead(action.status ?? 200, { 'content-type': 'application/json' });
+      response.end(action.payload ?? '{}');
+    } else response.writeHead(200, { 'content-type': 'application/json' }).end('{}');
   });
   let cleanup;
   t.after(async () => {
-    const errors = [];
-    try { if (cleanup) await bounded(cleanup(), 'consumer cleanup'); } catch (error) { errors.push(error); }
-    const workers = [];
-    try {
-      for (const line of (await readFile(registry, 'utf8')).trim().split('\n')) {
-        const [text, root] = line.split('\t');
-        const pid = Number(text);
-        assert.ok(Number.isSafeInteger(pid) && pid > 0 && pid !== process.pid && dirname(root) === stateRoot,
-          'Only isolated fixture worker metadata may be used');
-        workers.push([pid, root]);
-        if (await taskWorker(pid, root)) process.kill(pid, 'SIGKILL');
-      }
-    } catch (error) { if (error.code !== 'ENOENT' && error.code !== 'ESRCH') errors.push(error); }
+    if (cleanup) await bounded(cleanup(), 'consumer cleanup');
     server.closeAllConnections();
-    try {
-      await bounded(new Promise(resolveClose => server.close(resolveClose)), 'collector close');
-      await until(async () => (await Promise.all(workers.map(([pid, root]) => taskWorker(pid, root)))).every(value => !value),
-        'owned worker exit');
-    } catch (error) { errors.push(error); }
-    try { await rm(directory, { recursive: true, force: true }); } catch (error) { errors.push(error); }
-    if (errors.length) throw new AggregateError(errors, 'Isolated OpenCode consumer cleanup failed');
+    await bounded(new Promise(resolveClose => server.close(resolveClose)), 'collector close');
+    await rm(directory, { recursive: true, force: true });
   });
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const configPath = join(directory, 'otel.json');
   await writeFile(configPath, JSON.stringify({
-    endpoint: `http://127.0.0.1:${server.address().port}/v1/traces`, timeoutMs: 30000,
+    endpoint: `http://127.0.0.1:${server.address().port}/v1/traces`, timeoutMs,
   }), { mode: 0o600 });
 
   function start(events) {
@@ -158,7 +125,7 @@ async function consumerFixture(t, held = false) {
     const finished = Promise.withResolvers();
     cleanup = opencode.setup({
       location, app: { name: 'opencode-cli' },
-      options: { configPath, stateRoot, nodeBinary, profile: 'synthetic-profile' },
+      options: { configPath },
       event: {
         subscribe({ signal }) {
           if (typeof events.subscribe === 'function') {
@@ -190,20 +157,18 @@ async function consumerFixture(t, held = false) {
     assert.equal(typeof cleanup, 'function', 'Native setup synchronously returns its cleanup function');
     return { finished: finished.promise, cleanup };
   }
-  async function ledger() {
-    const names = await readdir(stateRoot);
-    const scopes = names.filter(name => /^[a-f0-9]{64}$/.test(name));
-    assert.equal(scopes.length, 1, 'This fixture owns one isolated native profile ledger');
-    const root = join(stateRoot, scopes[0]);
-    return { root, outbox: await openOutbox({ root, route: await readRoute(root) }) };
-  }
   return {
-    location, configPath, stateRoot, requests, start, ledger,
-    release() { held = false; for (const { response } of requests) reply(response); },
+    location, configPath, legacyRoot, bodies, held, start,
+    release() {
+      for (const response of held.splice(0)) {
+        response.writeHead(200, { 'content-type': 'application/json' });
+        response.end('{}');
+      }
+    },
   };
 }
 
-test('native consumer retries only unaccepted projections and preserves usage across later duplicates', async t => {
+test('direct consumer attempts each projection once over actual HTTP without private content', async t => {
   const fixture = await consumerFixture(t);
   const child = 'ses_child';
   const privateValue = 'OPENCODE_PRIVATE_NATIVE_CANARY';
@@ -223,94 +188,75 @@ test('native consumer retries only unaccepted projections and preserves usage ac
   ];
   const projections = events.flatMap(createEventMapper({ 'service.name': 'opencode-cli' }));
   const expected = projections.map(span => serializeEvent('opencode', span));
-  const stepIdentity = expected[projections.findIndex(span => span.eventId === `step:${assistantMessageID}`)].identity;
-  const childIdentity = expected[projections.findIndex(span => span.kind === 'subagent')].identity;
-  const sessionIdentity = expected[projections.findIndex(span => span.kind === 'session')].identity;
-  const failures = new Map([stepIdentity, childIdentity].map(identity => [identity, Promise.withResolvers()]));
-  const blocked = new Set(failures.keys());
-  const rename = fs.rename;
-  t.mock.method(fs, 'rename', async (source, target) => {
-    const identity = basename(target, '.json');
-    if (blocked.has(identity)) {
-      failures.get(identity).resolve();
-      throw Object.assign(new Error('Synthetic durable publication failure'), { code: 'EIO' });
-    }
-    return rename(source, target);
-  });
   const foreign = {
     ...native(100, 'session.usage.recorded', { sessionID: child, tokens, cost: 99 }),
     location: { ...fixture.location, workspaceID: 'other-workspace' },
   };
   const consumer = fixture.start([events[0], foreign, ...events.slice(1)]);
-  await bounded(failures.get(stepIdentity).promise, 'failed usage local handoff');
-  const { root, outbox } = await fixture.ledger();
-  const failedStatus = await outbox.status();
-  assert.equal(failedStatus.pending + failedStatus.done, 0,
-    'A failed billable projection is not a queued watermark');
-  blocked.delete(stepIdentity);
-  await bounded(failures.get(childIdentity).promise, 'failed second span local handoff');
-  const records = (await readdir(join(root, 'records'))).filter(name => /^[a-f0-9]{48}\.json$/.test(name));
-  assert.ok(records.includes(`${sessionIdentity}.json`), 'The first span of a partial batch is durably accepted');
-  assert.equal(records.includes(`${childIdentity}.json`), false, 'A failed second span remains unaccepted');
-  for (const name of records) {
-    assert.equal((await readFile(join(root, 'records', name), 'utf8')).includes(privateValue), false);
-  }
-  blocked.delete(childIdentity);
-  await bounded(consumer.finished, 'native stream completion after local recovery');
-  await until(async () => (await outbox.status()).done === expected.length, 'durable delivery of recovered projections');
-  assert.deepEqual(fixture.requests.map(({ body }) => body).sort(), expected.map(({ body }) => body).sort(),
+  await bounded(consumer.finished, 'native stream completion');
+  await bounded(consumer.cleanup(), 'direct shutdown after native completion');
+  await until(() => fixture.bodies.length >= expected.length, 'direct HTTP delivery of each projection');
+  assert.deepEqual([...fixture.bodies].sort(), expected.map(({ body }) => body).sort(),
     'Usage, title, compaction and parent spans each bill once with their original times and IDs');
-  assert.equal(fixture.requests.some(({ body }) => body.includes(privateValue)), false);
-  await consumer.cleanup();
+  assert.equal(fixture.bodies.some(body => body.includes(privateValue)), false);
+  assert.ok(!fixture.bodies.some(body => body.includes('other-workspace')));
 });
 
-test('native consumer and cleanup finish while collector HTTP acknowledgement is held', async t => {
-  const fixture = await consumerFixture(t, true);
+test('direct consumer never retries HTTP failures and duplicates send once', async t => {
+  const fixture = await consumerFixture(t, { status: 500, payload: '{}' });
   const events = [
     native(1, 'session.execution.started', { sessionID }),
     native(2, 'session.step.started', { sessionID, assistantMessageID, started: 1005 }),
     native(3, 'session.step.ended', { sessionID, assistantMessageID, tokens, cost: 0.012 }),
+    native(3, 'session.step.ended', { sessionID, assistantMessageID, tokens, cost: 0.012 }),
+    native(4, 'session.execution.succeeded', { sessionID }),
     native(4, 'session.execution.succeeded', { sessionID }),
   ];
-  const expected = events.flatMap(createEventMapper({ 'service.name': 'opencode-cli' }))
-    .map(span => serializeEvent('opencode', span));
+  const expected = new Map(
+    events.flatMap(createEventMapper({ 'service.name': 'opencode-cli' }))
+      .map(span => serializeEvent('opencode', span))
+      .map(serialized => [serialized.identity, serialized.body]),
+  );
   const consumer = fixture.start(events);
-  await until(() => fixture.requests.length > 0, 'held collector request');
-  await bounded(consumer.finished, 'native model event stream independent of HTTP');
-  const { outbox } = await fixture.ledger();
-  await bounded(consumer.cleanup(), 'local-only cleanup before HTTP acknowledgement');
-  assert.equal((await outbox.status()).pending, expected.length, 'Cleanup hands off remaining metadata locally');
-  assert.equal(fixture.requests[0].response.writableEnded, false);
-  assert.equal((await outbox.status()).done, 0);
-  fixture.release();
-  await until(async () => (await outbox.status()).done === expected.length, 'delivery after releasing collector');
-  assert.deepEqual(fixture.requests.map(({ body }) => body).sort(), expected.map(({ body }) => body).sort());
+  await bounded(consumer.finished, 'native stream completion despite HTTP rejection');
+  await bounded(consumer.cleanup(), 'direct shutdown after HTTP rejection');
+  await until(() => fixture.bodies.length >= expected.size, 'one HTTP attempt per identity');
+  await delay(100);
+  assert.equal(fixture.bodies.length, expected.size);
+  assert.deepEqual([...fixture.bodies].sort(), [...expected.values()].sort());
 });
 
-test('cleanup aborts failed local acceptance without waiting for a later retry', async t => {
-  const fixture = await consumerFixture(t);
+test('direct consumer treats collector partial success as a single-attempt rejection', async t => {
+  const fixture = await consumerFixture(t, { status: 200, payload: '{"partialSuccess":{"rejectedSpans":"1"}}' });
   const event = native(1, 'session.usage.recorded', { sessionID, source: 'title', tokens, cost: 0.001 });
   const [span] = createEventMapper({ 'service.name': 'opencode-cli' })(event);
-  const { identity } = serializeEvent('opencode', span);
-  const failed = Promise.withResolvers();
-  const rename = fs.rename;
-  t.mock.method(fs, 'rename', async (source, target) => {
-    if (basename(target) === `${identity}.json`) {
-      failed.resolve();
-      throw Object.assign(new Error('Synthetic full-duration local failure'), { code: 'EIO' });
-    }
-    return rename(source, target);
-  });
+  const expected = serializeEvent('opencode', span);
   const consumer = fixture.start([event, event]);
-  await bounded(failed.promise, 'local acceptance failure');
-  await bounded(consumer.cleanup(), 'aborting local retry');
-  const { outbox } = await fixture.ledger();
-  const status = await outbox.status();
-  assert.equal(status.pending + status.done, 0);
-  assert.deepEqual(fixture.requests, []);
+  await bounded(consumer.finished, 'native stream completion despite partial success');
+  await bounded(consumer.cleanup(), 'direct shutdown after partial success');
+  await until(() => fixture.bodies.length >= 1, 'partial-success HTTP attempt');
+  await delay(100);
+  assert.equal(fixture.bodies.length, 1);
+  assert.deepEqual(fixture.bodies, [expected.body]);
 });
 
-test('disabled private configuration leaves no raw native backlog or local export resources', async t => {
+test('direct shutdown waits for held collector ACKs only until the configured timeout', async t => {
+  const fixture = await consumerFixture(t, 'hold', 300);
+  const events = [
+    native(1, 'session.execution.started', { sessionID }),
+    native(2, 'session.step.ended', { sessionID, assistantMessageID, tokens, cost: 0.012 }),
+    native(3, 'session.execution.succeeded', { sessionID }),
+  ];
+  const consumer = fixture.start(events);
+  await until(() => fixture.bodies.length > 0, 'collector received a direct request');
+  const startedAt = Date.now();
+  await bounded(consumer.cleanup(), 'shutdown waits for in-flight HTTP until the configured timeout', 10000);
+  assert.ok(Date.now() - startedAt >= 250);
+  assert.ok(fixture.held.length > 0);
+  fixture.release();
+});
+
+test('disabled private configuration leaves no local export resources', async t => {
   for (const scenario of ['missing', 'malformed', 'invalid-endpoint', 'unsafe-mode', 'symlink']) {
     await t.test(scenario, async child => {
       const fixture = await consumerFixture(child);
@@ -320,111 +266,41 @@ test('disabled private configuration leaves no raw native backlog or local expor
       if (scenario === 'unsafe-mode') await chmod(fixture.configPath, 0o644);
       if (scenario === 'symlink') {
         const target = `${fixture.configPath}.target`;
-        await fs.rename(fixture.configPath, target);
+        await writeFile(target, await readFile(fixture.configPath, 'utf8'));
+        await rm(fixture.configPath);
         await symlink(target, fixture.configPath);
       }
       const bus = nativeBus();
-      const consumer = fixture.start(bus);
-      for (let seq = 1; seq <= 4096; seq++) {
+      let subscribed = false;
+      const tracked = { subscribe(...args) { subscribed = true; return bus.subscribe(...args); } };
+      const consumer = fixture.start(tracked);
+      for (let seq = 1; seq <= 64; seq++) {
         bus.publish(native(seq, 'session.text.delta', { sessionID, delta: 'PRIVATE_DISABLED_NATIVE_CONTENT' }));
       }
-      // A subscription that pulls one item and then retries would leave this
-      // native raw backlog behind even though no telemetry was accepted.
-      assert.equal(bus.unread, 0);
+      bus.close();
       await bounded(consumer.cleanup(), 'disabled export lifecycle cleanup');
-      await assert.rejects(readdir(fixture.stateRoot), { code: 'ENOENT' });
-      assert.deepEqual(fixture.requests, []);
+      assert.equal(subscribed, false, 'Disabled setup must not subscribe to the native bus');
+      await assert.rejects(readdir(fixture.legacyRoot), { code: 'ENOENT' });
+      assert.deepEqual(fixture.bodies, []);
     });
   }
 });
 
-test('local refusal keeps draining private native content and recovers the identical billable projection', async t => {
+test('direct mode leaves a legacy queue byte-unchanged and spawns no sender', async t => {
   const fixture = await consumerFixture(t);
-  const privateValue = 'OPENCODE_RAW_PUBSUB_PRIVATE_CANARY';
-  const event = native(1, 'session.usage.recorded', {
-    sessionID, tokens, cost: 0.001, text: privateValue,
-    input: { secret: privateValue }, providerState: { secret: privateValue },
-  });
-  const [span] = createEventMapper({ 'service.name': 'opencode-cli' })(event);
-  const expected = serializeEvent('opencode', span);
-  let blocked = true;
-  const failed = Promise.withResolvers();
-  const rename = fs.rename;
-  t.mock.method(fs, 'rename', async (source, target) => {
-    if (blocked && basename(target) === `${expected.identity}.json`) {
-      failed.resolve();
-      throw Object.assign(new Error('Synthetic temporary filesystem refusal'), { code: 'EIO' });
-    }
-    return rename(source, target);
-  });
-  const bus = nativeBus();
-  const consumer = fixture.start(bus);
-  bus.publish(event);
-  await bounded(failed.promise, 'initial refused billable projection');
-  for (let seq = 2; seq <= 6000; seq++) {
-    bus.publish(native(seq, 'session.text.delta', {
-      sessionID, assistantMessageID, delta: privateValue.repeat(64),
-      input: { secret: privateValue }, providerState: { secret: privateValue },
-    }));
-  }
-  bus.publish(event);
-  bus.close();
-  await bounded(consumer.finished, 'native pubsub drain while local acceptance is refused');
-  assert.equal(bus.unread, 0, 'Private native messages are consumed rather than accumulating behind local retries');
-  const { root, outbox } = await fixture.ledger();
-  const refused = await outbox.status();
-  assert.equal(refused.pending + refused.done, 0, 'Observed native usage is not falsely reported as accepted');
-  blocked = false;
-  await until(async () => (await outbox.status()).done === 1, 'billable recovery after filesystem repair');
-  assert.deepEqual(fixture.requests.map(({ body }) => body), [expected.body]);
-  for (const name of await readdir(join(root, 'records'))) {
-    if (/^[a-f0-9]{48}\.json$/.test(name)) {
-      assert.equal((await readFile(join(root, 'records', name), 'utf8')).includes(privateValue), false);
-    }
-  }
-  await consumer.cleanup();
-});
-
-test('bounded metadata overflow visibly refuses new IDs without evicting or replaying pending billing', async t => {
-  const fixture = await consumerFixture(t);
-  const events = Array.from({ length: 400 }, (_, index) => native(index + 1, 'session.usage.recorded', {
-    sessionID, tokens, cost: (index + 1) / 1000,
-    text: 'PRIVATE_OVERFLOW_NATIVE_CONTENT',
-  }));
-  const expected = events.slice(0, 256).flatMap(createEventMapper({ 'service.name': 'opencode-cli' }))
-    .map(span => serializeEvent('opencode', span));
-  let blocked = true;
-  const failed = Promise.withResolvers();
-  const rename = fs.rename;
-  t.mock.method(fs, 'rename', async (source, target) => {
-    if (blocked && basename(target) === `${expected[0].identity}.json`) {
-      failed.resolve();
-      throw Object.assign(new Error('Synthetic prolonged local refusal'), { code: 'EIO' });
-    }
-    return rename(source, target);
-  });
-  const warnings = [];
-  t.mock.method(console, 'error', (...args) => warnings.push(args.join(' ')));
-  const bus = nativeBus();
-  const consumer = fixture.start(bus);
-  bus.publish(events[0]);
-  await bounded(failed.promise, 'first pending metadata span');
-  for (const event of events.slice(1)) bus.publish(event);
-  for (const event of events.slice(0, 10)) bus.publish(event);
-  bus.close();
-  await bounded(consumer.finished, 'raw native drain at sanitized metadata capacity');
-  assert.equal(bus.unread, 0);
-  assert.equal(warnings.filter(warning => warning.includes('metadata buffer full')).length, 1,
-    'Overflow visibly refuses new metadata once instead of silently evicting earlier billing');
-  assert.equal(warnings.some(warning => warning.includes('PRIVATE_OVERFLOW_NATIVE_CONTENT')), false);
-  const { outbox } = await fixture.ledger();
-  const refused = await outbox.status();
-  assert.equal(refused.pending + refused.done, 0);
-  blocked = false;
-  await until(async () => (await outbox.status()).done === expected.length, 'accepted prefix billing recovery', 120000);
-  assert.deepEqual(fixture.requests.map(({ body }) => body).sort(), expected.map(({ body }) => body).sort(),
-    'Earlier pending IDs bill once, including the refused head; overflow IDs never claim acceptance');
-  await consumer.cleanup();
+  const legacy = join(fixture.legacyRoot, 'legacy-route');
+  await mkdir(legacy, { recursive: true });
+  const obstacle = join(legacy, 'queue.sqlite');
+  await writeFile(obstacle, Buffer.from([0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x00]));
+  const before = await readFile(obstacle);
+  const event = native(1, 'session.usage.recorded', { sessionID, source: 'title', tokens, cost: 0.001 });
+  const consumer = fixture.start([event]);
+  await bounded(consumer.finished, 'native stream completion beside legacy state');
+  await bounded(consumer.cleanup(), 'direct shutdown beside legacy state');
+  await until(() => fixture.bodies.length >= 1, 'direct HTTP delivery beside legacy state');
+  assert.deepEqual(await readFile(obstacle), before);
+  assert.deepEqual(await readdir(legacy), ['queue.sqlite']);
+  assert.deepEqual(await readdir(dirname(legacy)), ['legacy-route']);
 });
 
 
@@ -536,9 +412,16 @@ test('installer handles both native config files and refuses malformed/symlinked
   await writeFile(json, JSON.stringify({ plugins: [{ package: pluginDirectory, options: { preserved: true } }] }));
   await writeFile(jsonc, '{ "plugins": ["another-plugin"], /* comment */ }');
   const args = ['--home', home, '--apply'];
-  await install(args);
   assert.equal(JSON.parse(await readFile(json, 'utf8')).plugins[0].options.preserved, true);
-  assert.equal(await readFile(jsonc, 'utf8'), '{ "plugins": ["another-plugin"], /* comment */ }');
+  // Obsolete runtime queue options migrate away; the real install path keeps configPath.
+  await writeFile(json, JSON.stringify({ plugins: [{ package: pluginDirectory,
+    options: { configPath: join(home, 'otel.json'), stateRoot: '/tmp/legacy', profile: 'legacy', nodeBinary: '/tmp/legacy-node' } }] }));
+  await install(args);
+  const migrated = JSON.parse(await readFile(json, 'utf8')).plugins[0].options;
+  assert.ok(migrated.configPath);
+  assert.equal('stateRoot' in migrated, false);
+  assert.equal('profile' in migrated, false);
+  assert.equal('nodeBinary' in migrated, false);
   await writeFile(jsonc, '{ "plugins": [] , INVALID }');
   const before = await readFile(json, 'utf8');
   await assert.rejects(install(args), /valid JSONC/);

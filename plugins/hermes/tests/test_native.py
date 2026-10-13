@@ -1,4 +1,5 @@
 """Opt-in compatibility test against installed Hermes; only scratch profiles/loopback."""
+import json
 import os
 from pathlib import Path
 import sys
@@ -14,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @unittest.skipUnless(SOURCE, 'set HERMES_SOURCE to a verified Hermes checkout')
 class NativeLoadingTests(unittest.TestCase):
-    def test_real_loader_hooks_worker_and_profile_binding(self):
+    def test_real_loader_hooks_direct_send_and_profile_binding(self):
         sys.path.insert(0, SOURCE)
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
         from hermes_cli.plugins import PluginManager
@@ -59,23 +60,21 @@ class NativeLoadingTests(unittest.TestCase):
                             started_at=1700000000.125, ended_at=1700000001.25,
                             usage=dict(input_tokens=10, output_tokens=5, prompt_tokens=10),
                             response={'assistant_message': 'PRIVATE'}, request_messages=['PRIVATE'])
+                # Direct sends complete inside the hook; no worker drain to wait for.
                 manager.invoke_hook('post_api_request', **data)
+                self.assertEqual(len(received), 1)
                 with self.assertLogs('datalake.hermes', level='WARNING') as logs:
                     manager.invoke_hook('post_api_request', **data)
                     manager.invoke_hook('post_api_request', **dict(data, auxiliary=True))
+                self.assertEqual(len(received), 1)
                 self.assertNotIn('PRIVATE', str(logs.output))
                 manager.invoke_hook('post_auxiliary_call', **dict(data, streaming=True))
+                self.assertEqual(len(received), 1)
                 # Explicit opt-in retains standalone MoA synthesis, not a task blacklist.
                 manager.invoke_hook('post_auxiliary_call', **dict(data, api_request_id='aux-1', aux_task='moa_aggregator', streaming=False))
-                import sqlite3
-                with sqlite3.connect(home / 'usage-otel' / 'outbox.sqlite3') as db:
-                    self.assertEqual(db.execute('SELECT COUNT(*) FROM events').fetchone()[0], 2)
-                deadline = time.monotonic() + 3
-                while len(received) < 2 and time.monotonic() < deadline:
-                    time.sleep(0.02)
                 self.assertEqual(len(received), 2)
                 self.assertNotIn(b'PRIVATE', b''.join(received))
-                self.assertTrue((home / 'usage-otel' / 'outbox.sqlite3').exists())
+                self.assertEqual(list(home.rglob('*.sqlite3')), [])
                 start = time.monotonic()
                 manager.unload('datalake-usage')
                 self.assertLess(time.monotonic() - start, 0.5)
@@ -88,7 +87,7 @@ class NativeLoadingTests(unittest.TestCase):
             thread.join()
 
     def test_default_moa_overlap_bills_only_main_completion(self):
-        """Real aux emitter + native hooks + projector + downstream billable()."""
+        """Real aux emitter + native hooks + direct loopback bodies + downstream billable()."""
         sys.path.insert(0, SOURCE)
         sys.path.insert(0, str(ROOT.parents[1] / 'scripts'))
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
@@ -99,46 +98,60 @@ class NativeLoadingTests(unittest.TestCase):
         from types import SimpleNamespace
         from unittest.mock import patch
         import aggregate
-        import json
         import shutil
-        import sqlite3
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            (home / 'config.yaml').write_text('plugins:\n  entries:\n    datalake-usage:\n      settings:\n        export_paused: true\n        endpoint: http://127.0.0.1:1\n')
-            candidate = home / 'candidate' / 'datalake-usage'
-            shutil.copytree(ROOT, candidate, ignore=shutil.ignore_patterns('tests', '__pycache__'))
-            token = set_hermes_home_override(home)
-            manager = PluginManager()
-            try:
-                # Scratch outbox with export paused; no transport or production sends.
-                with patch.dict(os.environ, {'DATALAKE_HERMES_OTLP_HEADERS': '{}'}):
-                    manager._load_plugin(scan_directory(candidate.parent, 'user')[0])
-                self.assertIsNone(manager._plugins['datalake-usage'].error)
-                response = SimpleNamespace(model='gpt-test', choices=[], usage=dict(prompt_tokens=15, completion_tokens=5))
-                parent = dict(session_id='s', task_id='t', turn_id='turn', platform='cli')
-                with patch('agent.auxiliary_hooks._parent_turn_identity', return_value=parent), patch('agent.auxiliary_hooks._has_hook', return_value=True), patch('agent.auxiliary_hooks._fire', side_effect=manager.invoke_hook):
-                    # Same aux_task is used by main facade and standalone synthesizer:
-                    # installed auxiliary payload has no actor/call-site discriminator.
-                    for request in ('facade-aggregator', 'standalone-synthesizer'):
-                        hooks = _AuxCallHooks(aux_task='moa_aggregator', metadata=dict(api_request_id=request), client=SimpleNamespace(base_url=''), kwargs={}, provider='openai', model='gpt-test', api_mode='chat_completions', streaming=False)
-                        hooks.post(response)
-                main = dict(parent, api_request_id='main-request', model='gpt-test', provider='openai', started_at=1, ended_at=2, moa_references=[], usage=ApiRequestHooksMixin._usage_summary_for_api_request_hook(SimpleNamespace(provider='openai', api_mode='chat_completions'), response))
-                manager.invoke_hook('post_api_request', **main)
-                with sqlite3.connect(home / 'usage-otel' / 'outbox.sqlite3') as db:
-                    bodies = [json.loads(r[0]) for r in db.execute('SELECT body FROM events')]
-                spans = []
-                for body in bodies:
-                    span = body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
-                    row = dict(trace_id=span['traceId'], span_id=span['spanId'], span_name=span['name'])
-                    for attr in span['attributes']:
-                        value = attr['value']
-                        row['span_attributes.' + attr['key']] = int(value['intValue']) if 'intValue' in value else next(iter(value.values()))
-                    spans.append(aggregate.norm_span(row))
-                billed = aggregate.billable(spans)
-                self.assertEqual((len(billed), sum(s['input'] for s in billed), sum(s['output'] for s in billed)), (1, 15, 5))
-            finally:
-                manager.unload('datalake-usage')
-                reset_hermes_home_override(token)
+        received = []
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+            def do_POST(self):
+                received.append(self.rfile.read(int(self.headers['Content-Length'])))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{}')
+        server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                home = Path(directory)
+                # A legacy export_paused key in an old profile is ignored: direct sends are never paused.
+                (home / 'config.yaml').write_text('plugins:\n  entries:\n    datalake-usage:\n      settings:\n        export_paused: true\n        endpoint: http://127.0.0.1:' + str(server.server_port) + '\n')
+                candidate = home / 'candidate' / 'datalake-usage'
+                shutil.copytree(ROOT, candidate, ignore=shutil.ignore_patterns('tests', '__pycache__'))
+                token = set_hermes_home_override(home)
+                manager = PluginManager()
+                try:
+                    with patch.dict(os.environ, {'DATALAKE_HERMES_OTLP_HEADERS': '{}'}):
+                        manager._load_plugin(scan_directory(candidate.parent, 'user')[0])
+                    self.assertIsNone(manager._plugins['datalake-usage'].error)
+                    response = SimpleNamespace(model='gpt-test', choices=[], usage=dict(prompt_tokens=15, completion_tokens=5))
+                    parent = dict(session_id='s', task_id='t', turn_id='turn', platform='cli')
+                    with patch('agent.auxiliary_hooks._parent_turn_identity', return_value=parent), patch('agent.auxiliary_hooks._has_hook', return_value=True), patch('agent.auxiliary_hooks._fire', side_effect=manager.invoke_hook):
+                        # Same aux_task is used by main facade and standalone synthesizer:
+                        # installed auxiliary payload has no actor/call-site discriminator.
+                        for request in ('facade-aggregator', 'standalone-synthesizer'):
+                            hooks = _AuxCallHooks(aux_task='moa_aggregator', metadata=dict(api_request_id=request), client=SimpleNamespace(base_url=''), kwargs={}, provider='openai', model='gpt-test', api_mode='chat_completions', streaming=False)
+                            hooks.post(response)
+                    main = dict(parent, api_request_id='main-request', model='gpt-test', provider='openai', started_at=1, ended_at=2, moa_references=[], usage=ApiRequestHooksMixin._usage_summary_for_api_request_hook(SimpleNamespace(provider='openai', api_mode='chat_completions'), response))
+                    manager.invoke_hook('post_api_request', **main)
+                    bodies = [json.loads(raw) for raw in received]
+                    spans = []
+                    for body in bodies:
+                        span = body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
+                        row = dict(trace_id=span['traceId'], span_id=span['spanId'], span_name=span['name'])
+                        for attr in span['attributes']:
+                            value = attr['value']
+                            row['span_attributes.' + attr['key']] = int(value['intValue']) if 'intValue' in value else next(iter(value.values()))
+                        spans.append(aggregate.norm_span(row))
+                    billed = aggregate.billable(spans)
+                    self.assertEqual((len(billed), sum(s['input'] for s in billed), sum(s['output'] for s in billed)), (1, 15, 5))
+                finally:
+                    manager.unload('datalake-usage')
+                    reset_hermes_home_override(token)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
     def test_installed_main_and_aux_normalizers_preserve_provider_buckets(self):
         sys.path.insert(0, str(SOURCE))

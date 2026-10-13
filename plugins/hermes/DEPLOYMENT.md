@@ -1,5 +1,7 @@
 # Authorized production verification
 
+Historical queue-era deployment evidence. The current plugin sends direct HTTP and has no SQLite exporter, capacity ledger, pause setting, worker, or retry. This record does not verify the current direct-send implementation or its installation in the operating profile; see [README.md](README.md).
+
 Verified 2026-10-02 against Hermes `f42f579cf8bac4918ac9599bece71618afadd846`; native compatibility suite: **22 passed, no skips**. This record supersedes the earlier paused-export checkpoint in VERIFICATION.md. No GitHub push, Hermes core change, other-profile change, gateway restart, or manual aggregate run occurred.
 
 ## Running configuration and transport

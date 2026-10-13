@@ -103,93 +103,8 @@ class ProjectionTests(unittest.TestCase):
         self.assertIsNone(plugin.project(payload(response_model='https://PRIVATE'), 'scope-1'))
 
 
-class OutboxTests(unittest.TestCase):
-    def test_durable_immutable_dedup_and_exclusive_claim(self):
-        import tempfile
-        self.assertTrue(callable(getattr(plugin, 'Outbox', None)), 'durable outbox missing')
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'outbox.sqlite3'
-            first = plugin.Outbox(path, capacity=2)
-            body = plugin.project(payload(), 'scope-1')
-            self.assertTrue(first.put(body))
-            body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]['endTimeUnixNano'] = '999'
-            self.assertFalse(first.put(body))
-            second = plugin.Outbox(path, capacity=2)
-            claim = second.claim(now=10)
-            self.assertIsNotNone(claim)
-            self.assertNotIn('"endTimeUnixNano":"999"', claim[2])
-            self.assertIsNone(first.claim(now=10))
-            self.assertIsNone(first.claim(now=39))
-            reclaimed = first.claim(now=41)
-            self.assertEqual(claim[2], reclaimed[2])
-            self.assertFalse(second.finish(claim, success=True, now=41))
-            self.assertTrue(first.finish(reclaimed, success=True, now=41))
-            self.assertFalse(first.put(body))
-            self.assertIsNone(second.claim(now=100))
-            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            self.assertTrue(first.put(plugin.project(payload(api_request_id='request-2'), 'scope-1')))
-            self.assertFalse(first.put(plugin.project(payload(api_request_id='request-3'), 'scope-1')))
-
-    def test_private_outbox_rejects_symlink_directory_and_shared_files(self):
-        import os
-        import tempfile
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            target = root / 'target'
-            target.mkdir(mode=0o700)
-            linked = root / 'linked'
-            linked.symlink_to(target, target_is_directory=True)
-            with self.assertRaises(ValueError):
-                plugin.Outbox(linked / 'events.db')
-            unsafe = root / 'unsafe'
-            unsafe.mkdir(mode=0o755)
-            with self.assertRaises(ValueError):
-                plugin.Outbox(unsafe / 'events.db')
-            original = target / 'original.db'
-            original.touch(mode=0o600)
-            hardlink = target / 'linked.db'
-            os.link(original, hardlink)
-            with self.assertRaises(ValueError):
-                plugin.Outbox(hardlink)
-
-    def test_independent_processes_share_one_immutable_event(self):
-        import subprocess
-        import tempfile
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / 'events.db'
-            plugin.Outbox(path)
-            script = "import importlib.util,json,sys; s=importlib.util.spec_from_file_location('candidate',sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m); o=m.Outbox(sys.argv[2]); inserted=o.put(m.project(json.loads(sys.argv[3]),'scope-1')); c=o.claim(now=10); print(json.dumps([inserted, c]))"
-            processes = [subprocess.Popen([sys.executable, '-c', script, str(ROOT / '__init__.py'), str(path), json.dumps(payload())], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) for _ in range(4)]
-            results = []
-            for process in processes:
-                stdout, stderr = process.communicate(timeout=10)
-                self.assertEqual(process.returncode, 0, stderr)
-                results.append(json.loads(stdout))
-            self.assertEqual(sum(r[0] for r in results), 1)
-            claims = [r[1] for r in results if r[1] is not None]
-            self.assertEqual(len(claims), 1)
-            replay = plugin.Outbox(path).claim(now=41)
-            self.assertEqual(replay[2], claims[0][2])
-
-
-class TransportTests(unittest.TestCase):
-    def test_paused_export_preserves_pending_events_without_transport(self):
-        import tempfile
-        import time
-        from unittest.mock import patch
-        with tempfile.TemporaryDirectory() as directory:
-            with patch.object(plugin.Exporter, 'send_once', return_value=False) as send:
-                runtime = plugin.Runtime(Path(directory), dict(capacity=100, endpoint='http://127.0.0.1:1/v1/traces', headers={}, timeout=0.1, export_paused=True))
-                try:
-                    runtime.observe(payload())
-                    time.sleep(0.3)
-                    self.assertIsNotNone(runtime.outbox.claim(now=0))
-                finally:
-                    runtime.close()
-                send.assert_not_called()
-
-    def test_local_http_retry_partial_success_replays_identical_bytes(self):
-        import tempfile
+class DirectTransportTests(unittest.TestCase):
+    def test_direct_success_posts_exactly_one_body(self):
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
         self.assertTrue(callable(getattr(plugin, 'Exporter', None)), 'exporter missing')
@@ -199,34 +114,60 @@ class TransportTests(unittest.TestCase):
                 pass
             def do_POST(self):
                 received.append(self.rfile.read(int(self.headers['Content-Length'])))
-                self.send_response(503 if len(received) == 1 else 200)
+                self.send_response(200)
                 self.end_headers()
-                self.wfile.write(b'{"partialSuccess":{"rejectedSpans":"1","errorMessage":"PRIVATE"}}' if len(received) == 2 else b'{}')
+                self.wfile.write(b'{}')
         server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory:
-                outbox = plugin.Outbox(Path(directory) / 'outbox.sqlite3')
-                outbox.put(plugin.project(payload(response='PRIVATE'), 'scope-1'))
-                exporter = plugin.Exporter(outbox, f'http://127.0.0.1:{server.server_port}/v1/traces', {}, timeout=0.2)
-                with self.assertLogs('datalake.hermes', level='WARNING') as logs:
-                    self.assertFalse(exporter.send_once(now=10))
-                    self.assertFalse(exporter.send_once(now=11))
-                self.assertNotIn('PRIVATE', str(logs.output))
-                self.assertTrue(exporter.send_once(now=13))
-                self.assertFalse(exporter.send_once(now=100))
-                self.assertEqual(len(received), 3)
-                self.assertEqual(received[0], received[1])
-                self.assertEqual(received[1], received[2])
-                self.assertNotIn(b'PRIVATE', received[0])
+            exporter = plugin.Exporter(f'http://127.0.0.1:{server.server_port}/v1/traces', {}, timeout=2)
+            body = plugin.project(payload(response='PRIVATE'), 'scope-1')
+            self.assertTrue(exporter.send(body))
+            self.assertEqual(len(received), 1)
+            self.assertNotIn(b'PRIVATE', received[0])
+            self.assertEqual(json.loads(received[0]), body)
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
+    def test_http_failure_partial_and_malformed_are_dropped_without_retry(self):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        cases = [
+            ('http-503', 503, b'{}'),
+            ('partial-rejection', 200, b'{"partialSuccess":{"rejectedSpans":"1","errorMessage":"PRIVATE"}}'),
+            ('fractional-rejection', 200, b'{"partialSuccess":{"rejectedSpans":0.5}}'),
+            ('oversized', 200, b' ' * 65537),
+        ]
+        for name, status, reply in cases:
+            with self.subTest(case=name):
+                received = []
+                class Handler(BaseHTTPRequestHandler):
+                    def log_message(self, *args):
+                        pass
+                    def do_POST(self):
+                        received.append(self.rfile.read(int(self.headers['Content-Length'])))
+                        self.send_response(status)
+                        self.end_headers()
+                        try:
+                            self.wfile.write(reply)
+                        except (BrokenPipeError, ConnectionResetError):
+                            pass
+                server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    exporter = plugin.Exporter(f'http://127.0.0.1:{server.server_port}/v1/traces', {}, timeout=2)
+                    self.assertFalse(exporter.send(plugin.project(payload(), 'scope-1')))
+                    self.assertEqual(len(received), 1)
+                finally:
+                    server.shutdown()
+                    server.server_close()
+                    thread.join()
+
     def test_trickling_response_cannot_extend_export_deadline(self):
-        import tempfile
         import threading
         import time
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -249,48 +190,52 @@ class TransportTests(unittest.TestCase):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            with tempfile.TemporaryDirectory() as directory:
-                outbox = plugin.Outbox(Path(directory) / 'events.db')
-                outbox.put(plugin.project(payload(), 'scope-1'))
-                exporter = plugin.Exporter(outbox, f'http://127.0.0.1:{server.server_port}/v1/traces', {}, timeout=0.1)
-                start = time.monotonic()
-                with self.assertLogs('datalake.hermes', level='WARNING'):
-                    self.assertFalse(exporter.send_once(now=10))
-                self.assertLess(time.monotonic() - start, 0.5)
-                self.assertIsNotNone(outbox.claim(now=11))
+            exporter = plugin.Exporter(f'http://127.0.0.1:{server.server_port}/v1/traces', {}, timeout=0.1)
+            start = time.monotonic()
+            self.assertFalse(exporter.send(plugin.project(payload(), 'scope-1')))
+            self.assertLess(time.monotonic() - start, 0.5)
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
-    def test_fractional_partial_rejection_is_not_acknowledged(self):
+    def test_hook_duplicate_is_suppressed_in_memory_without_resend(self):
         import tempfile
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        received = []
         class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):
+            def log_message(self, *args):
                 pass
             def do_POST(self):
-                self.rfile.read(int(self.headers['Content-Length']))
+                received.append(self.rfile.read(int(self.headers['Content-Length'])))
                 self.send_response(200)
                 self.end_headers()
-                self.wfile.write(b'{"partialSuccess":{"rejectedSpans":0.5}}')
+                self.wfile.write(b'{}')
         server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
             with tempfile.TemporaryDirectory() as directory:
-                outbox = plugin.Outbox(Path(directory) / 'events.db')
-                outbox.put(plugin.project(payload(), 'scope-1'))
-                exporter = plugin.Exporter(outbox, f'http://127.0.0.1:{server.server_port}/v1/traces', {}, timeout=0.1)
-                with self.assertLogs('datalake.hermes', level='WARNING'):
-                    self.assertFalse(exporter.send_once(now=10))
-                self.assertIsNotNone(outbox.claim(now=11))
+                home = Path(directory)
+                runtime = plugin.Runtime(home, dict(endpoint=f'http://127.0.0.1:{server.server_port}/v1/traces', headers={}, timeout=2))
+                runtime.observe(payload())
+                with self.assertLogs('datalake.hermes', level='WARNING') as logs:
+                    runtime.observe(payload())
+                self.assertNotIn('PRIVATE', str(logs.output))
+                self.assertEqual(len(received), 1)
+                self.assertEqual(list(home.rglob('*.sqlite3')), [])
         finally:
             server.shutdown()
             server.server_close()
             thread.join()
 
+    def test_failed_hook_send_is_dropped_without_retry(self):
+        import tempfile
+        runtime = plugin.Runtime(Path(tempfile.mkdtemp()), dict(endpoint='http://127.0.0.1:1/v1/traces', headers={}, timeout=0.1))
+        with self.assertLogs('datalake.hermes', level='WARNING') as logs:
+            runtime.observe(payload())
+        self.assertNotIn('PRIVATE', str(logs.output))
 
 class ConfigTests(unittest.TestCase):
     def test_auxiliary_capture_requires_explicit_boolean_opt_in(self):
@@ -307,7 +252,7 @@ class ConfigTests(unittest.TestCase):
             self.assertFalse(plugin.settings(Context(False), Path(directory), environ={})['capture_auxiliary'])
             self.assertTrue(plugin.settings(Context(True), Path(directory), environ={})['capture_auxiliary'])
 
-    def test_export_pause_is_boolean_and_defaults_to_active(self):
+    def test_legacy_capacity_and_pause_keys_are_ignored(self):
         import tempfile
         class Context:
             def __init__(self, extra):
@@ -316,11 +261,10 @@ class ConfigTests(unittest.TestCase):
                 return self.values.get(key, default)
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            self.assertIs(plugin.settings(Context({}), home, environ={}).get('export_paused'), False)
-            self.assertTrue(plugin.settings(Context({'export_paused': True}), home, environ={})['export_paused'])
-            for value in ('false', 0, None):
-                with self.subTest(value=value), self.assertRaises(ValueError):
-                    plugin.settings(Context({'export_paused': value}), home, environ={})
+            config = plugin.settings(Context({'capacity': 100, 'export_paused': True}), home, environ={})
+            self.assertNotIn('capacity', config)
+            self.assertNotIn('export_paused', config)
+            self.assertEqual(config['endpoint'], 'http://127.0.0.1:4318/v1/traces')
 
     def test_profile_settings_secret_file_permissions_and_endpoint_validation(self):
         import os

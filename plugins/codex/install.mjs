@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
-import { copyFile, lstat, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { copyFile, lstat, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -73,11 +73,19 @@ export async function install(args = []) {
       await writeFile(markerPath, MARKER, { mode: 0o600, flag: 'wx' });
     }
     for (const path of ['.agents/plugins', 'plugin/.codex-plugin', 'plugin/codex']) await mkdir(join(plan.marketplace, path), { recursive: true, mode: 0o700 });
-    for (const path of ['otel.mjs', 'outbox.mjs', 'sender.mjs', '.codex-plugin/plugin.json', 'codex/hook.mjs', 'codex/usage.mjs', 'codex/hooks.json']) {
+    for (const path of ['otel.mjs', 'process-lock.mjs', '.codex-plugin/plugin.json', 'codex/hook.mjs', 'codex/usage.mjs', 'codex/hooks.json']) {
       const target = join(plan.pluginRoot, path);
       try { if ((await lstat(target)).isSymbolicLink()) throw new Error('플러그인 파일의 심볼릭 링크는 덮어쓰지 않습니다.'); }
       catch (error) { if (error.code !== 'ENOENT') throw error; }
       await copyFile(join(SOURCE_ROOT, path), target);
+    }
+    // Direct HTTP needs no bundled queue: drop only these two managed files.
+    // Runtime queue data lives outside the marketplace and is never touched.
+    for (const path of ['outbox.mjs', 'sender.mjs']) {
+      const target = join(plan.pluginRoot, path);
+      try { if ((await lstat(target)).isSymbolicLink()) throw new Error('플러그인 파일의 심볼릭 링크는 덮어쓰지 않습니다.'); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; else continue; }
+      await unlink(target).catch(error => { if (error.code !== 'ENOENT') throw error; });
     }
     await writeFile(join(plan.pluginRoot, 'codex/settings.json'), JSON.stringify({ configPath: plan.configPath, source: plan.source }) + '\n', { mode: 0o600 });
     await writeFile(join(plan.marketplace, '.agents/plugins/marketplace.json'), JSON.stringify({

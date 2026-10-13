@@ -4,7 +4,7 @@ import { readFile, writeFile, unlink, mkdir, stat, rename, open } from 'node:fs/
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, isAbsolute } from 'node:path';
 import { parseArgs } from 'node:util';
-import { createTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
+import { createDirectTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
 
 async function resolveConfigPath(explicit) {
   if (explicit) return explicit;
@@ -38,8 +38,11 @@ async function readToolState(sessionId, stepIdx, toolName, eventId) {
     try {
       const state = JSON.parse(await readFile(path, 'utf8'));
       if (state?.toolName !== toolName || (state.eventId && state.eventId !== eventId)) continue;
+      // A recorded completion for another tool identity is not this tool's state.
       if (state.event && (state.event.eventId !== eventId
         || state.event.sessionId !== String(sessionId) || state.event.kind !== 'tool.call')) continue;
+      // Legacy durable receipts (queued:true) prove a prior attempt: never replay.
+      if (state?.queued === true && state?.attempted === undefined) return { ...state, attempted: true };
       return state;
     } catch {}
   }
@@ -108,25 +111,27 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
   await mkdir(dir, { recursive: true, mode: 0o700 });
   const cPath = cursorPath(sessionId);
 
-  let cursor = { version: 2, lastProcessedIndex: -1, sentEventIds: [], queuedEventIds: [] };
+  let cursor = { version: 3, lastProcessedIndex: -1 };
   try {
-    cursor = JSON.parse(await readFile(cPath, 'utf8'));
+    cursor = { version: 3, lastProcessedIndex: -1, ...JSON.parse(await readFile(cPath, 'utf8')) };
   } catch {}
-  cursor.version = 2;
+  cursor.version = 3;
 
   const turns = [];
   const subagents = [];
-  // Historical sent IDs prove remote ACKs, not new local handoffs.
-  const sent = new Set(cursor.sentEventIds ?? []);
-  const queued = new Set(cursor.queuedEventIds ?? []);
-  async function enqueueOnce(event, output) {
-    if (sent.has(event.eventId) || queued.has(event.eventId)) return true;
-    if (!await telemetry.enqueue(event)) return false;
-    queued.add(event.eventId);
-    cursor.queuedEventIds = [...queued];
+  // Attempted-identity checkpoint: legacy sent/queued IDs and prior direct attempts
+  // all prove a prior attempt. A failed HTTP send is dropped with no replay, and the
+  // checkpoint advances regardless of ACK, exactly like the Codex/Claude hooks.
+  const attempted = new Set([...(cursor.sentEventIds ?? []), ...(cursor.queuedEventIds ?? []), ...(cursor.attemptedEventIds ?? [])]);
+  async function attemptOnce(event, output) {
+    if (attempted.has(event.eventId)) return true;
+    attempted.add(event.eventId);
+    let ok = false;
+    try { ok = await telemetry.send(event); } catch {}
+    cursor.attemptedEventIds = [...attempted].filter(id => !cursor.sentEventIds?.includes(id) && !cursor.queuedEventIds?.includes(id));
     await save(cPath, cursor);
-    output.push(event);
-    return true;
+    if (ok === true) output.push(event);
+    return ok === true;
   }
 
   try {
@@ -151,13 +156,11 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
         const contentText = step.content || '';
         const toolCallsText = step.tool_calls ? JSON.stringify(step.tool_calls) : '';
 
-        // 아직 전송되지 않은 새 턴인 경우 증분 전송
         if (stepIndex > cursor.lastProcessedIndex) {
           const turnTime = step.created_at ? new Date(step.created_at).getTime() : clock;
           const prevStep = steps[i - 1];
           const prevTime = prevStep?.created_at ? new Date(prevStep.created_at).getTime() : turnTime - 1000;
           const turnDurationMs = Math.max(100, turnTime - prevTime);
-
           const inputTokens = estimateTokens(accumulatedPromptChars);
           const reasoningTokens = estimateTokens(thinkingText);
           const outputTokens = estimateTokens(contentText + toolCallsText) + reasoningTokens;
@@ -212,18 +215,10 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
             }
           }
 
-          // Snapshot the entire step before its first local handoff, including retry times.
-          if (!cursor.pendingStep || cursor.pendingStep.index !== stepIndex) {
-            cursor.pendingStep = { index: stepIndex, events: stepEvents };
-            await save(cPath, cursor);
-          }
-          for (const event of cursor.pendingStep.events) {
-            if (!await enqueueOnce(event, event.kind === 'llm.turn' ? turns : subagents)) return { turns, subagents };
+          for (const event of stepEvents) {
+            await attemptOnce(event, event.kind === 'llm.turn' ? turns : subagents);
           }
           cursor.lastProcessedIndex = stepIndex;
-          delete cursor.pendingStep;
-          queued.clear();
-          cursor.queuedEventIds = [];
           await save(cPath, cursor);
         }
 
@@ -330,13 +325,16 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     let stopState;
     try { stopState = JSON.parse(await readFile(stopPath, 'utf8')); } catch {}
     if (!stopState) {
-      stopState = { version: 2, event: sessionEvent, queued: false };
+      stopState = { version: 3, event: sessionEvent, attempted: false };
       await save(stopPath, stopState);
     }
-    if (!stopState.queued && await telemetry.enqueue(stopState.event)) {
-      stopState.queued = true;
+    if ((!stopState.attempted && !stopState.queued) || stopState.event?.eventId !== sessionEvent.eventId) {
+      let ok = false;
+      try { ok = await telemetry.send(stopState.event); } catch {}
+      // Attempted once: never replayed by a repeated stop hook.
+      stopState.attempted = true;
       await save(stopPath, stopState);
-      events.push(stopState.event);
+      if (ok === true) events.push(stopState.event);
     }
   } else {
     // 3. PostToolUse: 도구 실행 완료 시 실제 소요시간 계산 및 직전 턴 증분 즉시 전송
@@ -366,15 +364,15 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
       },
     };
 
-    // Keep the first completion body and a local receipt after durable acceptance.
-    if (!toolState?.queued) {
-      const receipt = { version: 2, eventId, startTimeMs, toolName, event: toolEvent, queued: false };
-      await save(filePath, receipt);
-      if (await telemetry.enqueue(toolEvent)) {
-        receipt.queued = true;
-        await save(filePath, receipt);
-        events.push(toolEvent);
-      }
+    // Keep the first completion body; a failed direct send is attempted once, never replayed.
+    if (!toolState?.attempted && !toolState?.queued) {
+      const snapshot = { version: 3, eventId, startTimeMs, toolName, event: toolEvent, attempted: false };
+      await save(filePath, snapshot);
+      let ok = false;
+      try { ok = await telemetry.send(toolEvent); } catch {}
+      snapshot.attempted = true;
+      await save(filePath, snapshot);
+      if (ok === true) events.push(toolEvent);
     }
 
     // 실시간 증분 턴 전송 (세션 중 강제 종료 방지)
@@ -382,7 +380,7 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     events.push(...turns, ...subagents);
   }
 
-  await telemetry.flushLocal();
+  await telemetry.flush().catch(() => {});
   return events;
 }
 
@@ -406,7 +404,7 @@ if (isMain(import.meta.url)) {
     const raw = Buffer.concat(chunks).toString('utf8');
     const payload = raw.trim() ? JSON.parse(raw) : {};
     const configPath = await resolveConfigPath(values.config);
-    const telemetry = createTelemetry('agy', { configPath, profile: homedir() });
+    const telemetry = createDirectTelemetry('agy', { configPath });
     await handleHook(payload, {
       telemetry,
       isPreTool: values['pre-tool'],

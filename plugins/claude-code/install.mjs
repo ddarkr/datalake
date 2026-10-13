@@ -7,7 +7,7 @@ import { isMain } from '../otel.mjs';
 
 const pluginName = 'doda-datalake-otel';
 const root = fileURLToPath(new URL('../', import.meta.url));
-const ownedFiles = ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'claude-code/hook.mjs', 'otel.mjs', 'outbox.mjs', 'sender.mjs', 'claude-code/config-path.json'];
+const ownedFiles = ['.claude-plugin/plugin.json', 'hooks/hooks.json', 'claude-code/hook.mjs', 'otel.mjs', 'process-lock.mjs', 'claude-code/config-path.json'];
 const markerName = '.datalake-otel-install.json';
 const fail = message => { throw Object.assign(new Error(message), { code: 'DATALAKE_INSTALL' }); };
 
@@ -63,6 +63,12 @@ export async function install(argv = process.argv.slice(2)) {
   if (values.uninstall) {
     if (!exists) return;
     for (const file of [...ownedFiles, markerName]) await unlink(join(destination, file)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    // Direct HTTP needs no bundled queue: drop only these two previously managed files.
+    // Local session metadata and any runtime queue data elsewhere are never touched.
+    for (const file of ['outbox.mjs', 'sender.mjs']) {
+      if ((await lstat(join(destination, file)).catch(error => error.code === 'ENOENT' ? undefined : Promise.reject(error)))?.isSymbolicLink()) fail('설치 경로 내부의 심볼릭 링크를 따라 파일을 변경하지 않습니다.');
+      await unlink(join(destination, file)).catch(error => { if (error.code !== 'ENOENT') throw error; });
+    }
     for (const directory of ['.claude-plugin', 'hooks', 'claude-code', '']) {
       await rmdir(join(destination, directory)).catch(error => { if (!['ENOENT', 'ENOTEMPTY', 'EEXIST'].includes(error.code)) throw error; });
     }
@@ -74,6 +80,11 @@ export async function install(argv = process.argv.slice(2)) {
   for (const file of ownedFiles.slice(0, -1)) {
     await mkdir(dirname(join(destination, file)), { recursive: true, mode: 0o700 });
     await copyFile(join(root, file), join(destination, file));
+  }
+  // Upgrade path: remove obsolete managed queue modules left by previous installs.
+  for (const file of ['outbox.mjs', 'sender.mjs']) {
+    if ((await lstat(join(destination, file)).catch(error => error.code === 'ENOENT' ? undefined : Promise.reject(error)))?.isSymbolicLink()) fail('설치 경로 내부의 심볼릭 링크를 따라 파일을 변경하지 않습니다.');
+    await unlink(join(destination, file)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
   await writeFile(join(destination, 'claude-code', 'config-path.json'), JSON.stringify({ configPath }) + '\n', { mode: 0o600 });
   console.log('설치 완료: Claude Code를 재시작하거나 /reload-plugins를 실행하세요. 조직 정책이나 프로젝트의 명시적 비활성화 설정은 우회하지 않습니다.');
