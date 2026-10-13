@@ -327,5 +327,89 @@ class CoordinatorLogicTest(unittest.TestCase):
         plain, _, _ = agg._legacy_cfgs(cfg, [("w", "fleet", "f")])
         self.assertEqual(plain["exclude_scopes"], [])
 
+
+class RollupV2SqlTest(unittest.TestCase):
+    def test_rollup_preserves_quality_nulls_and_corrected_scope(self):
+        import sqlite3
+        from unittest.mock import patch
+
+        with sqlite3.connect(":memory:") as db:
+            def date_bin(interval, timestamp):
+                stamp = datetime.fromisoformat(timestamp)
+                if interval == "1h":
+                    stamp = stamp.replace(minute=0)
+                return stamp.replace(second=0, microsecond=0).strftime(
+                    "%Y-%m-%d %H:%M:%S.000000000")
+
+            db.create_function("date_bin", 2, date_bin)
+            db.execute("""CREATE TABLE vehicle_signal (
+                event_time TEXT, vehicle TEXT, path TEXT, source TEXT,
+                decode_epoch TEXT, source_field TEXT, quality TEXT,
+                unit TEXT, value_num REAL)""")
+            db.execute("""CREATE TABLE vehicle_agg (
+                window_start TEXT, resolution TEXT, vehicle TEXT, path TEXT,
+                source TEXT, decode_epoch TEXT, source_field TEXT, quality TEXT,
+                unit_key TEXT, avg_value REAL, min_value REAL, max_value REAL,
+                sample_count INTEGER, unit TEXT, rollup_version INTEGER)""")
+            db.executemany(
+                "INSERT INTO vehicle_signal VALUES (?, ?, 'speed', 'can', 'e',"
+                " 'speed', ?, ?, ?)",
+                [("2026-09-20 10:00:10.000000000", "v", "ok", "km/h", 10),
+                 ("2026-09-20 10:00:20.000000000", "v", "ok", "km/h", 20),
+                 ("2026-09-20 10:00:30.000000000", "v", "invalid", "km/h", 999),
+                 ("2026-09-20 10:00:40.000000000", "v", "ok", "m/s", 5),
+                 ("2026-09-20 10:01:00.000000000", "v", "ok", "km/h", None),
+                 ("2026-09-20 10:00:10.000000000", "other", "ok", "km/h", 75)])
+
+            def execute(_url, _auth, _database, statement, **_kwargs):
+                db.execute(statement.replace("::INTERVAL", ""))
+
+            hour = agg.parse_ts_ns("2026-09-20 10:00:00")
+            scopes = [(("v", "can", "e"), hour),
+                      (("other", "can", "e"), hour)]
+            with patch.object(agg, "request_sql", execute):
+                agg._rollup_hour_windows(("", "", ""), {}, scopes)
+                rows = db.execute("""SELECT quality, unit, avg_value, min_value,
+                    max_value, sample_count, rollup_version FROM vehicle_agg
+                    WHERE vehicle='v' AND resolution='1m'
+                    ORDER BY window_start, quality, unit""").fetchall()
+                self.assertEqual(rows, [
+                    ("invalid", "km/h", 999, 999, 999, 1, 2),
+                    ("ok", "km/h", 15, 10, 20, 2, 2),
+                    ("ok", "m/s", 5, 5, 5, 1, 2),
+                    ("ok", "km/h", None, None, None, 0, 2)])
+                db.execute("UPDATE vehicle_signal SET quality='ok'"
+                           " WHERE vehicle='v' AND quality='invalid'")
+                agg._rollup_hour_windows(("", "", ""), {}, scopes[:1])
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM vehicle_agg WHERE quality='invalid'"
+                ).fetchone(), (0,))
+                self.assertEqual(db.execute(
+                    "SELECT avg_value, sample_count FROM vehicle_agg"
+                    " WHERE vehicle='other' ORDER BY resolution"
+                ).fetchall(), [(75, 1), (75, 1)])
+                db.execute("""INSERT INTO vehicle_agg
+                    (window_start,resolution,vehicle,path,source,decode_epoch,
+                     avg_value,sample_count)
+                    VALUES ('2026-09-20 10:00:00.000000000','1h',
+                            'v','speed','can','e',999,10)""")
+
+                def interrupted(url, auth, database, statement, **kwargs):
+                    if statement.startswith("INSERT") and "date_bin('1h'" in statement:
+                        raise agg.SqlError("injected second-resolution failure")
+                    return execute(url, auth, database, statement, **kwargs)
+
+                with patch.object(agg, "request_sql", interrupted):
+                    with self.assertRaises(agg.SqlError):
+                        agg._rollup_hour_windows(("", "", ""), {}, scopes[:1])
+                self.assertEqual(db.execute(
+                    "SELECT avg_value FROM vehicle_agg WHERE rollup_version IS NULL"
+                ).fetchall(), [(999,)])
+                agg._rollup_hour_windows(("", "", ""), {}, scopes[:1])
+                self.assertEqual(db.execute(
+                    "SELECT COUNT(*) FROM vehicle_agg WHERE rollup_version IS NULL"
+                ).fetchone(), (0,))
+
+
 if __name__ == "__main__":
     unittest.main()

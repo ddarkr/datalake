@@ -149,6 +149,12 @@ def _battery_db():
         decode_epoch TEXT, source_field TEXT, value_num REAL,
         unit TEXT, quality TEXT, ingest_time TIMESTAMP,
         envelope_id TEXT, path TEXT, value_text TEXT, value_bool BOOLEAN)''')
+    db.execute('''CREATE TABLE vehicle_agg (
+        window_start TIMESTAMP, resolution TEXT, vehicle TEXT,
+        path TEXT, source TEXT, decode_epoch TEXT, source_field TEXT,
+        quality TEXT, unit_key TEXT, avg_value REAL, min_value REAL,
+        max_value REAL, sample_count INTEGER, unit TEXT,
+        rollup_version INTEGER)''')
     db.execute('''CREATE TABLE vehicle_identity (
         mapped_at TIMESTAMP, vehicle TEXT, canonical_vehicle TEXT)''')
     return db
@@ -401,9 +407,14 @@ def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
     import re as _re
     query = (panel["targets"][0]["rawSql"].replace("$$", "$")
             .replace("$__timeFilter(window_start)", f"window_start BETWEEN {start} AND {end}")
+            .replace("$__timeFilter(mx.event_time)", f"mx.event_time BETWEEN {start} AND {end}")
+            .replace("$__timeFilter(mn.event_time)", f"mn.event_time BETWEEN {start} AND {end}")
             .replace("$__timeFilter(s.event_time)", f"s.event_time BETWEEN {start} AND {end}")
             .replace("$__timeFilter(event_time)", f"event_time BETWEEN {start} AND {end}")
+            .replace("$__timeFilter(ingest_time)", f"ingest_time BETWEEN {start} AND {end}")
             .replace("$__unixEpochTo()", str(end))
+            .replace("$__unixEpochFrom()", str(start))
+            .replace("$__interval_ms", "3600000")
             .replace("${vehicle:sqlstring}", "''")
             .replace("${vehicle_ids:sqlstring}", "''")
             .replace("${source:sqlstring}", "''")
@@ -417,7 +428,37 @@ def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
                     r"NS_TIMESTAMP(\1)", query)
     query = _re.sub(r"CAST\(\s*([A-Za-z_][A-Za-z0-9_]*)\s+AS\s+TIMESTAMP\(9\)\s*\)",
                     r"NS_TIMESTAMP(\1)", query)
-    return query
+    # Rollup legs bin output to whole multiples of the 1m/1h source
+    # resolution; sqlite has no INTERVAL/date_bin, so test at identity
+    # binning (bin == the bucket column). Test-only transform, never SQL.
+    parts, idx = [], 0
+    while True:
+        found = query.find("date_bin(", idx)
+        if found < 0:
+            parts.append(query[idx:])
+            break
+        parts.append(query[idx:found])
+        depth, pos = 1, found + len("date_bin(")
+        while depth > 0:
+            if query[pos] == "(":
+                depth += 1
+            elif query[pos] == ")":
+                depth -= 1
+            pos += 1
+        inner = query[found + len("date_bin("):pos - 1]
+        level, split = 0, None
+        for m, ch in enumerate(inner):
+            if ch == "(":
+                level += 1
+            elif ch == ")":
+                level -= 1
+            elif ch == "," and level == 0:
+                split = m
+                break
+        assert split is not None, inner[:120]
+        parts.append(inner[split + 1:].strip())
+        idx = pos
+    return "".join(parts)
 
 def test_physical_cards_latest_analysis_and_new_raw_barriers():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
@@ -962,7 +1003,6 @@ def test_vehicle_coverage_separates_observation_from_receipt():
 def test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     query = _physical_query(configs, "grafana-dash-vehicle-overview", 11)
-    query = query.replace("date_bin(INTERVAL $__interval_ms MILLISECOND, event_time)", "event_time")
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
         db.executemany("""INSERT INTO vehicle_signal
@@ -1313,9 +1353,7 @@ def test_fleet_gear_and_charge_timelines_include_latest_invalid():
 
 def _scoped_graph_query(configs, dashboard_name, panel_id):
     """Numeric graph with expected-unit CASE and invalid-only NULL buckets."""
-    query = _physical_query(configs, dashboard_name, panel_id)
-    return query.replace("date_bin(INTERVAL $__interval_ms MILLISECOND, event_time)",
-                         "event_time")
+    return _physical_query(configs, dashboard_name, panel_id)
 
 
 def test_speed_soc_scope_separation_units_and_invalid_buckets():
@@ -1362,6 +1400,67 @@ def test_speed_soc_scope_separation_units_and_invalid_buckets():
         pairs = {(row["time"], row["value"]) for row in db.execute(soc)}
         assert (1100, None) in pairs, pairs
         assert (1200, 70.0) in pairs, pairs
+
+
+def test_rollup_weighted_mean_skips_invalid_and_legacy():
+    """Long-range speed leg weights buckets by sample_count (never avg-of-avgs);
+    invalid-only quality stays NULL and legacy rollup_version rows are skipped."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=3000000)
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.execute("""INSERT INTO vehicle_agg
+            (window_start, resolution, vehicle, path, source, decode_epoch,
+             source_field, quality, unit_key, avg_value, min_value, max_value,
+             sample_count, unit, rollup_version) VALUES
+            (100, '1h', 'c', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'reported_unverified', 'km/h', 10, 10, 10, 1, 'km/h', 2),
+            (100, '1h', 'c', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'ok', 'km/h', 20, 20, 20, 3, 'km/h', 2),
+            (100, '1h', 'c', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'invalid', 'km/h', 99, 99, 99, 2, 'km/h', 2),
+            (100, '1h', 'c', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'reported_unverified', 'km/h', 999, 999, 999, 5, 'km/h', NULL)""")
+        rows = db.execute(query).fetchall()
+        assert rows == [(100, 'c · can/e1', 17.5)], rows
+
+
+def test_rollup_missing_buckets_stay_missing_without_raw_fallback():
+    """A long range with raw rows but no rollup coverage returns no rows;
+    unprocessed buckets are never backfilled from raw."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    query = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=3000000)
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.execute("""INSERT INTO vehicle_signal
+            (event_time, vehicle, source, decode_epoch, source_field, path,
+             value_num, unit, quality) VALUES
+            (1100, 'c', 'can', 'e1', 'DI_vehicleSpeed',
+             'Vehicle.CAN.x257.DI_vehicleSpeed', 50, 'km/h', 'reported_unverified')""")
+        assert db.execute(query).fetchall() == []
+
+
+def test_rollup_resolution_thresholds_and_mixed_scopes():
+    """Mid ranges use the 1m leg only, long ranges the 1h leg only; scopes with
+    different source/epoch never merge into one weighted mean."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    mid = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=200000)
+    long = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=3000000)
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.execute("""INSERT INTO vehicle_agg
+            (window_start, resolution, vehicle, path, source, decode_epoch,
+             source_field, quality, unit_key, avg_value, min_value, max_value,
+             sample_count, unit, rollup_version) VALUES
+            (100, '1m', 'c', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'reported_unverified', 'km/h', 11, 11, 11, 1, 'km/h', 2),
+            (100, '1h', 'c', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'reported_unverified', 'km/h', 22, 22, 22, 1, 'km/h', 2),
+            (100, '1h', 'other', 'Vehicle.CAN.x257.DI_vehicleSpeed', 'can', 'e1',
+             'DI_vehicleSpeed', 'reported_unverified', 'km/h', 33, 33, 33, 1, 'km/h', 2)""")
+        assert db.execute(mid).fetchall() == [(100, 'c · can/e1', 11.0)]
+        rows = sorted(db.execute(long).fetchall())
+        assert rows == [(100, 'c · can/e1', 22.0), (100, 'other · can/e1', 33.0)], rows
 
 
 def test_ledger_overlap_window_and_nested_raw_scopes():
@@ -2297,6 +2396,9 @@ if __name__ == "__main__":
     test_can_latest_cards_keep_invalid_reports_and_separate_epochs()
     test_fleet_gear_and_charge_timelines_include_latest_invalid()
     test_speed_soc_scope_separation_units_and_invalid_buckets()
+    test_rollup_weighted_mean_skips_invalid_and_legacy()
+    test_rollup_missing_buckets_stay_missing_without_raw_fallback()
+    test_rollup_resolution_thresholds_and_mixed_scopes()
     test_ledger_overlap_window_and_nested_raw_scopes()
     test_dbc_divergence_exact_soc_aliases_with_unit_gate()
     test_battery_lifecycle_counts_only_valid_active_evidence()

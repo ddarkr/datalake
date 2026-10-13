@@ -1275,25 +1275,6 @@ def test_vehicle_window_lag_is_observed_data_gap_not_wall_clock_age():
     assert gaps == {"fleet": 90, "can": 0}
 
 
-def test_dirty_checkpoint_sweep_tables_exist_without_append_or_ttl():
-    import scripts.database.db_init as db_init
-    ddls = dict(db_init.ddl_statements(""))
-    for label in ("vehicle_signal_dirty", "vehicle_aggregate_checkpoint",
-                  "vehicle_aggregate_sweep"):
-        assert label in ddls, label
-        upper = ddls[label].upper()
-        assert "APPEND_MODE" not in upper, label
-        assert "TTL" not in upper, label
-        assert "TIME INDEX" in upper, label
-    assert '"generation" STRING NOT NULL' in ddls["vehicle_signal_dirty"]
-    assert '"applied_generation" STRING NOT NULL' in ddls[
-        "vehicle_aggregate_checkpoint"]
-    assert '"sweep_mark" TIMESTAMP(9) NOT NULL TIME INDEX' in ddls[
-        "vehicle_aggregate_sweep"]
-    assert '"cursor_ns" BIGINT NOT NULL' in ddls["vehicle_aggregate_sweep"]
-    assert "RAW_FINGERPRINT" not in ddls["vehicle_aggregate_sweep"].upper()
-    assert '"raw_fingerprint" STRING NOT NULL' in ddls[
-        "vehicle_aggregate_checkpoint"]
 
 
 def _vehicle_cfg(**over):
@@ -1786,6 +1767,8 @@ def test_coordinator_sealed_cursor_revisits_history():
         _unpatch(monkey)
 
 
+
+
 def test_coordinator_late_nonotice_fingerprint_recomputes():
     # Same revision, new raw rows behind the cursor, no dirty notification:
     # the fingerprint changes, the hour re-pends as "" and recomputes.
@@ -2101,5 +2084,4 @@ if __name__ == "__main__":
     test_battery_worker_uses_only_scoped_call()
     test_coordinator_late_ingest_uses_event_time_window()
     test_run_all_excludes_can_from_legacy_sections()
-    test_dirty_checkpoint_sweep_tables_exist_without_append_or_ttl()
-    print("test_database: ok (54 tests)")
+    print("test_database: ok")

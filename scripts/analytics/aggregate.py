@@ -1372,19 +1372,29 @@ def insert_rows(base_url, auth, db, table, columns, rows, batch=500):
 
 
 # --- SQL-built aggregations (sealed windows only; never the open bucket) ---
+#
+# vehicle_agg rollup format v2: grouped by (source_field, quality, unit) so
+# mixed-quality/unit summaries never merge. unit_key (tag) copies unit;
+# sample_count is COUNT(value_num) so null-only groups persist with count 0
+# and NULL avg/min/max. New rows carry rollup_version=2; legacy NULL rows
+# are never safe summaries (dashboards gate rollup_version=2).
+ROLLUP_FORMAT_VERSION = 2
+
 
 def vehicle_agg_sql(resolution, interval, cutoff, sealed, filt=""):
     res = "'" + resolution.replace("'", "''") + "'"
     return ("INSERT INTO vehicle_agg (window_start, resolution, vehicle, path, source,"
-            " decode_epoch, avg_value, min_value, max_value, sample_count, unit) SELECT"
+            " decode_epoch, source_field, quality, unit_key, avg_value, min_value,"
+            " max_value, sample_count, unit, rollup_version) SELECT"
             " date_bin('" + interval + "'::INTERVAL, event_time) AS window_start,"
             " " + res + " AS resolution, vehicle, path, source, decode_epoch,"
-            " AVG(value_num), MIN(value_num), MAX(value_num), COUNT(*), MAX(unit)"
-            " FROM vehicle_signal WHERE event_time >= '" + cutoff + "'"
-            " AND event_time < '" + sealed + "'"
-            " AND value_num IS NOT NULL" + filt
+            " source_field, quality, unit AS unit_key,"
+            " AVG(value_num), MIN(value_num), MAX(value_num), COUNT(value_num),"
+            " MAX(unit), " + str(ROLLUP_FORMAT_VERSION)
+            + " FROM vehicle_signal WHERE event_time >= '" + cutoff + "'"
+            + " AND event_time < '" + sealed + "'" + filt
             + " GROUP BY date_bin('" + interval + "'::INTERVAL, event_time),"
-            " vehicle, path, source, decode_epoch")
+            " vehicle, path, source, decode_epoch, source_field, quality, unit")
 
 
 def home_agg_sql(table, time_col, entity_col, value_col, resolution, interval,
@@ -3242,11 +3252,140 @@ def _vehicle_rollup(ctx, cfg, exclude=None):
     excluded = {s for s in excluded if s is not None}
     if excluded:
         filt = " AND NOT (" + _dirty_scope_predicate(excluded) + ")"
+    # Same scope columns exist on vehicle_agg, so the filter applies to both
+    # the deletes and the rebuilds: corrected quality/unit/source_field
+    # groups leave no stale rows, and coordinated CAN scopes are never
+    # touched here. Per-resolution deletes match each sealed range, so no
+    # transient gap past the 1h seal. NULL-version legacy rows are the
+    # durable rediscovery marker for the migration below: v2 rows are
+    # deleted first, then rebuilt, and legacy rows only finally — a
+    # crash/failure leaves the marker behind for rediscovery.
+    request_sql(base_url, auth, db,
+                "DELETE FROM vehicle_agg WHERE resolution = '1m'"
+                " AND rollup_version = 2"
+                " AND window_start >= '" + cut + "'"
+                " AND window_start < '" + seal_m + "'" + filt, timeout=120)
     request_sql(base_url, auth, db,
                 vehicle_agg_sql("1m", "60s", cut, seal_m, filt), timeout=120)
     request_sql(base_url, auth, db,
+                "DELETE FROM vehicle_agg WHERE resolution = '1h'"
+                " AND rollup_version = 2"
+                " AND window_start >= '" + cut + "'"
+                " AND window_start < '" + seal_h + "'" + filt, timeout=120)
+    request_sql(base_url, auth, db,
                 vehicle_agg_sql("1h", "1h", cut, seal_h, filt), timeout=120)
-    return 2
+    migrated = _migrate_legacy_hours(ctx, cfg, excluded)
+    request_sql(base_url, auth, db,
+                "DELETE FROM vehicle_agg WHERE resolution = '1m'"
+                " AND rollup_version IS NULL"
+                " AND window_start >= '" + cut + "'"
+                " AND window_start < '" + seal_m + "'" + filt, timeout=120)
+    request_sql(base_url, auth, db,
+                "DELETE FROM vehicle_agg WHERE resolution = '1h'"
+                " AND rollup_version IS NULL"
+                " AND window_start >= '" + cut + "'"
+                " AND window_start < '" + seal_h + "'" + filt, timeout=120)
+    return 2 + migrated
+
+
+# Bounded legacy (NULL rollup_version) migration for the legacy non-CAN
+# path. The coordinator owns CAN scopes; this covers the rest, whose old
+# history lies far outside the ~30h lookback.
+LEGACY_MIGRATE_HOURS = 24
+LEGACY_MIGRATE_LIST = 200
+LEGACY_EXPIRED_VERSION = -1
+
+
+def _migrate_legacy_hours(ctx, cfg, excluded):
+    """Rebuild NULL-version hours that still hold retained raw rows.
+
+    Discovery reads legacy 1h rows only (1h rows exist for every legacy
+    hour, one bounded query, oldest first), floored at the global raw
+    MIN(event_time) so universally raw-expired history costs one query and
+    is preserved as explicitly legacy. Per candidate hour: skip CAN scopes
+    (coordinator-owned); skip when no raw row survives (marked
+    rollup_version=-1 at most once — values and key untouched — so the hour
+    is never reselected; documented: it will NOT auto-retry if historical
+    raw arrives later, only the normal lookback covers new raw); else
+    marker-safe rebuild via _rollup_hour_windows (legacy rows deleted only
+    after both v2 INSERTs succeed, so any failure leaves the NULL marker
+    for rediscovery). Failures propagate like every other section. Returns
+    rebuilt hour count."""
+    base_url, auth, db = ctx
+    scope_filter = " AND source NOT IN (" + ",".join(
+        str_lit(source) for source in CAN_SOURCES) + ")"
+    if excluded:
+        scope_filter += " AND NOT (" + _dirty_scope_predicate(excluded) + ")"
+    try:
+        cols, rows = fetch_rows(
+            base_url, auth, db,
+            "SELECT vehicle, source, decode_epoch, window_start"
+            " FROM vehicle_agg WHERE resolution = '1h'"
+            " AND rollup_version IS NULL AND decode_epoch IS NOT NULL"
+            " AND window_start >= (SELECT date_bin('1h'::INTERVAL,"
+            " MIN(event_time)) FROM vehicle_signal)"
+            + scope_filter + " ORDER BY window_start LIMIT "
+            + str(LEGACY_MIGRATE_LIST))
+    except SqlError as e:
+        if is_missing_table(e):
+            return 0
+        raise
+    idx = {c: i for i, c in enumerate(cols)}
+
+    def col(row, name):
+        return row[idx[name]] if name in idx else None
+    candidates = []
+    for row in rows:
+        scope = _scope_tuple((col(row, "vehicle"), col(row, "source"),
+                              col(row, "decode_epoch")))
+        hour = parse_ts_ns(col(row, "window_start"))
+        if scope is None or hour is None:
+            continue
+        if scope in excluded or _is_can_scope(scope):
+            continue
+        key = (scope, floor_hour_ns(hour))
+        if key not in candidates:
+            candidates.append(key)
+        if len(candidates) >= LEGACY_MIGRATE_HOURS:
+            break
+    migrated = 0
+    for scope, hour_ns in candidates:
+        v, src, epoch = scope
+        try:
+            _, probe = fetch_rows(
+                base_url, auth, db,
+                "SELECT 1 FROM vehicle_signal WHERE vehicle = "
+                + str_lit(v) + " AND source = " + str_lit(src)
+                + " AND decode_epoch = " + str_lit(epoch)
+                + " AND event_time >= " + ns_to_sql_lit(hour_ns)
+                + " AND event_time < " + ns_to_sql_lit(hour_ns + HOUR_NS)
+                + " LIMIT 1")
+        except SqlError as e:
+            if is_missing_table(e):
+                return migrated
+            raise
+        if not probe:
+            _mark_legacy_expired(ctx, scope, hour_ns)
+            continue
+        _rollup_hour_windows(ctx, cfg, [(scope, hour_ns)])
+        migrated += 1
+    return migrated
+
+
+def _mark_legacy_expired(ctx, scope, hour_ns):
+    """Preserve raw-expired legacy values without repeatedly migrating them."""
+    base_url, auth, db = ctx
+    columns = ("window_start, resolution, vehicle, path, source, decode_epoch,"
+               " source_field, quality, unit_key, avg_value, min_value,"
+               " max_value, sample_count, unit")
+    request_sql(
+        base_url, auth, db,
+        "INSERT INTO vehicle_agg (" + columns + ", rollup_version) SELECT "
+        + columns + ", " + str(LEGACY_EXPIRED_VERSION)
+        + " FROM vehicle_agg WHERE rollup_version IS NULL"
+        + " AND window_start >= " + ns_to_sql_lit(hour_ns)
+        + " AND window_start < " + ns_to_sql_lit(hour_ns + HOUR_NS)
+        + " AND (" + _dirty_scope_predicate([scope]) + ")")
 
 
 # --- Durable CAN dirty-window coordinator (Analytics-owned schema) ---
@@ -3314,6 +3453,7 @@ def _config_revision(cfg):
     except Exception:
         modules = {}
     material = {
+        "rollup_format": ROLLUP_FORMAT_VERSION,
         "paths": {k: paths.get(k) for k in sorted(paths)},
         "trip_gap_min": cfg.get("trip_gap_min"),
         "trip_min_speed_kph": cfg.get("trip_min_speed_kph"),
@@ -3970,8 +4110,12 @@ def battery_section(ctx, cfg):
 def _rollup_hour_windows(ctx, cfg, scopes_hours):
     """SQL 1m/1h pushdown restricted to exact dirty hour buckets.
 
-    Each hour is recomputed with an exact [start, end) range plus exact
-    scope predicate, then merged by key. Returns hours successfully rolled."""
+    The NULL-version legacy rows are the durable rediscovery marker: the
+    first DELETE removes only rollup_version=2 rows in the exact scope/hour
+    window, then both v2 INSERTs run, and only finally are legacy rows
+    deleted. A crash/failure before the final cleanup leaves the NULL rows
+    behind, so the hour is rediscovered and rebuilt on the next pass.
+    Returns hours successfully rolled."""
     base_url, auth, db = ctx
     by_hour = {}
     for (scope, hour_ns) in scopes_hours:
@@ -3981,23 +4125,37 @@ def _rollup_hour_windows(ctx, cfg, scopes_hours):
         pred = _dirty_scope_predicate(by_hour[hour_ns])
         start_lit = ns_to_sql_lit(hour_ns)
         end_lit = ns_to_sql_lit(hour_ns + HOUR_NS)
+        window = ("window_start >= " + start_lit
+                  + " AND window_start < " + end_lit)
+        request_sql(base_url, auth, db,
+                    "DELETE FROM vehicle_agg WHERE " + window
+                    + " AND rollup_version = 2 AND (" + pred + ")",
+                    timeout=120)
         for resolution, interval in (("1m", "60s"), ("1h", "1h")):
             res = "'" + resolution.replace("'", "''") + "'"
             request_sql(
                 base_url, auth, db,
                 "INSERT INTO vehicle_agg (window_start, resolution, vehicle,"
-                " path, source, decode_epoch, avg_value, min_value,"
-                " max_value, sample_count, unit) SELECT"
+                " path, source, decode_epoch, source_field, quality, unit_key,"
+                " avg_value, min_value, max_value, sample_count, unit,"
+                " rollup_version) SELECT"
                 " date_bin('" + interval + "'::INTERVAL, event_time)"
                 " AS window_start, " + res + " AS resolution, vehicle, path,"
-                " source, decode_epoch, AVG(value_num), MIN(value_num),"
-                " MAX(value_num), COUNT(*), MAX(unit) FROM vehicle_signal"
+                " source, decode_epoch, source_field, quality, unit AS unit_key,"
+                " AVG(value_num), MIN(value_num), MAX(value_num),"
+                " COUNT(value_num), MAX(unit), " + str(ROLLUP_FORMAT_VERSION)
+                + " FROM vehicle_signal"
                 " WHERE event_time >= " + start_lit
                 + " AND event_time < " + end_lit
-                + " AND value_num IS NOT NULL AND (" + pred + ")"
+                + " AND (" + pred + ")"
                 " GROUP BY date_bin('" + interval + "'::INTERVAL,"
-                " event_time), vehicle, path, source, decode_epoch",
+                " event_time), vehicle, path, source, decode_epoch,"
+                " source_field, quality, unit",
                 timeout=120)
+        request_sql(base_url, auth, db,
+                    "DELETE FROM vehicle_agg WHERE " + window
+                    + " AND rollup_version IS NULL AND (" + pred + ")",
+                    timeout=120)
         ok.add(hour_ns)
     return ok
 

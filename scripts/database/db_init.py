@@ -420,12 +420,17 @@ def ddl_statements(otel_ttl):
   "path" STRING NOT NULL,
   "source" STRING NOT NULL,
   "decode_epoch" STRING NOT NULL,
+  "source_field" STRING NULL,
+  "quality" STRING NULL,
+  "unit_key" STRING NULL,
   "avg_value" Float64 NULL,
   "min_value" Float64 NULL,
   "max_value" Float64 NULL,
   "sample_count" Int64 NULL,
   "unit" STRING NULL,
-  PRIMARY KEY ("resolution", "vehicle", "path", "source", "decode_epoch")
+  "rollup_version" INT NULL,
+  PRIMARY KEY ("resolution", "vehicle", "path", "source", "decode_epoch",
+               "source_field", "quality", "unit_key")
 )"""))
     # Trip = drive cycle on speed presence with a gap split; charge = energy
     # gain while parked/charging. Tables are filled by aggregate.py only when
@@ -590,6 +595,14 @@ def alter_statements():
         ' "error_count" Int64',
         'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'
         ' "decode_epoch" STRING',
+        'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'
+        ' "source_field" STRING PRIMARY KEY',
+        'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'
+        ' "quality" STRING PRIMARY KEY',
+        'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'
+        ' "unit_key" STRING PRIMARY KEY',
+        'ALTER TABLE "vehicle_agg" ADD COLUMN IF NOT EXISTS'
+        ' "rollup_version" INT',
         'ALTER TABLE "trip_summary" ADD COLUMN IF NOT EXISTS'
         ' "source" STRING',
         'ALTER TABLE "trip_summary" ADD COLUMN IF NOT EXISTS'
