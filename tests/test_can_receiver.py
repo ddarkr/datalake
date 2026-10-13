@@ -425,6 +425,9 @@ class ReceiverBehavior(unittest.TestCase):
             with archive.connect() as conn:
                 conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
                              (big["event_id"], decoder.epoch, json.dumps(big)))
+                conn.execute("INSERT INTO archive_meta(key,value) VALUES('outbox_rows',1),('outbox_bytes',?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+                             (len(json.dumps(big).encode()),))
                 conn.commit()
             small_budget = len(encode_body(render_insert([big]))) - 1
             stuck = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", max_body_bytes=small_budget)
@@ -475,6 +478,9 @@ class ReceiverBehavior(unittest.TestCase):
             with archive.connect() as conn:
                 conn.executemany("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
                                  [(r["event_id"], decoder.epoch, json.dumps(r)) for r in rows])
+                conn.execute("INSERT INTO archive_meta(key,value) VALUES('outbox_rows',?),('outbox_bytes',?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+                             (len(rows), sum(len(json.dumps(r).encode()) for r in rows)))
                 conn.commit()
             sink = HTTPServer(("127.0.0.1", 0), CountingSink)
             thread = threading.Thread(target=sink.serve_forever, daemon=True)
@@ -591,15 +597,22 @@ class ReceiverBehavior(unittest.TestCase):
                              "collector_id": "fixture", "quality": "reported_unverified",
                              "mapping_revision": decoder.mapping_revision, "vehicle_firmware": "synthetic"})
                 with archive.connect() as conn:
+                    blob = json.dumps(dict(base, event_id="zz-oversized", value_text="x" * 5000))
                     conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-                                 ("zz-oversized", decoder.epoch, json.dumps(dict(base, event_id="zz-oversized",
-                                            value_text="x" * 5000))))
+                                 ("zz-oversized", decoder.epoch, blob))
+                    conn.execute("INSERT INTO archive_meta(key,value) VALUES('outbox_rows',1),('outbox_bytes',?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+                                 (len(blob.encode()),))
                     conn.commit()
                 tiny = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", max_body_bytes=64)
                 with self.assertRaises(DownstreamError):
                     archive.flush_once(tiny)
                 with archive.connect() as conn:
+                    doomed = conn.execute("SELECT row_json FROM outbox WHERE event_id='zz-oversized'").fetchone()
                     conn.execute("DELETE FROM outbox WHERE event_id='zz-oversized'")
+                    conn.execute("UPDATE archive_meta SET value=value-1 WHERE key='outbox_rows'")
+                    conn.execute("UPDATE archive_meta SET value=value-? WHERE key='outbox_bytes'",
+                                 (len(doomed[0].encode()),))
                     conn.commit()
                 sink.mode = "success"
                 # Dirty failure retains the whole prefix: hold the dirty ACK by
@@ -778,27 +791,36 @@ class ReceiverBehavior(unittest.TestCase):
                 self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
                                               (decoder.epoch,)).fetchone()[0], 2)
                 # Pending-driven, not plan-text: hiding one member from the
-                # shipped head query must divert the merge to the survivor
-                # without touching any raw row.
-                full = conn.execute(candidate_sql(), (decoder.epoch, decoder.epoch)).fetchall()
+                # shipped bounded frontier must divert the merge to the
+                # survivor without touching any raw row; reinsert goes
+                # through the maintained head contract (rebuild_pending),
+                # never a raw hand-insert without head_id.
+                full = conn.execute(candidate_sql(), (decoder.epoch,)).fetchall()
                 self.assertEqual(len(full), 2)
                 victim = conn.execute("SELECT session FROM decode_pending WHERE epoch=? LIMIT 1",
                                       (decoder.epoch,)).fetchone()[0]
                 survivor = conn.execute("SELECT session FROM decode_pending WHERE epoch=? AND session!=?",
                                         (decoder.epoch, victim)).fetchone()[0]
                 conn.execute("DELETE FROM decode_pending WHERE epoch=? AND session=?", (decoder.epoch, victim))
-                picked = conn.execute(candidate_sql(), (decoder.epoch, decoder.epoch)).fetchall()
+                conn.commit()
+            archive.rebuild_pending()
+            with archive.connect() as conn:
+                repaired = conn.execute(candidate_sql(), (decoder.epoch,)).fetchall()
+                self.assertEqual({row["session"] for row in repaired}, {victim, survivor})
+                conn.execute("DELETE FROM decode_pending WHERE epoch=? AND session=?", (decoder.epoch, victim))
+                picked = conn.execute(candidate_sql(10), (decoder.epoch,)).fetchall()
                 self.assertEqual([row["session"] for row in picked], [survivor])
-                conn.execute("INSERT OR IGNORE INTO decode_pending(session,epoch) VALUES(?,?)", (victim, decoder.epoch))
+            archive.rebuild_pending()
+            with archive.connect() as conn:
                 # Operational boundedness: actual VM steps of the shipped
-                # head lookup, not plan wording that shifts with aliases.
+                # bounded frontier (limit 1), not plan wording.
                 steps = {"n": 0}
 
                 def counter():
                     steps["n"] += 1
                     return False
                 conn.set_progress_handler(counter, 1000)
-                conn.execute(candidate_sql(), (decoder.epoch, decoder.epoch)).fetchall()
+                conn.execute(candidate_sql(1), (decoder.epoch,)).fetchall()
                 conn.set_progress_handler(None, 0)
                 self.assertLessEqual(steps["n"], 5)
             # All sessions complete, so the pending set drains to empty.

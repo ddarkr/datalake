@@ -139,6 +139,12 @@ class DemandPrefetch(unittest.TestCase):
                         return_value=1800000000000000001):
                 for name, c in arrival:
                     archive.accept(metas[name], [c])
+                with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                    archive.decode_once(decoder)
+                with archive.connect() as conn:
+                    self.assertEqual(conn.execute("SELECT seq FROM decode_partial").fetchall()[0][0], 1)
+                # Resume a committed partial after reopening the archive.
+                archive = Archive(path, disk_reserve_bytes=0)
                 drain(archive, decoder)
                 expected, states, totals = [], {}, {}
                 for name, c in arrival:
@@ -186,34 +192,60 @@ class DemandPrefetch(unittest.TestCase):
             with patch.object(decoder, "decode_some", move_cursor):
                 with self.assertRaisesRegex(ValueError, "decode cursor moved during decode"):
                     archive.decode_once(decoder, limit=1)
-            concurrent_state = {**status_before, "states": [
-                {**row, "next_seq": 99} if row["session_id"] == "late" else row
-                for row in status_before["states"]]}
-            self.assertEqual(full_snapshot(archive, decoder), concurrent_state)
-            # Undo only the fixture's committed cursor tamper before restart.
+            conflicted = full_snapshot(archive, decoder)
+            # The independent writer's cursor persists; our batch must not.
+            for key in ("outbox", "partial", "counters", "raw"):
+                self.assertEqual(conflicted[key], status_before[key], key)
             with archive.connect() as conn:
-                conn.execute("UPDATE decode_states SET next_seq=? WHERE session="
+                conn.execute("UPDATE decode_states SET next_seq=1 WHERE session="
                              "(SELECT id FROM sessions WHERE session_id='late') AND epoch=?",
-                             (next(row["next_seq"] for row in status_before["states"]
-                                   if row["session_id"] == "late"), decoder.epoch))
+                             (decoder.epoch,))
                 conn.commit()
             # Restart: reopened archive resumes and drains identically.
             reopened = Archive(path, disk_reserve_bytes=0)
-            with patch("scripts.ingest.can.can_receiver.time.time_ns",
-                       return_value=1800000000000000003):
-                with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
-                    while reopened.decode_once(decoder):
-                        pass
-                prior_state = json.loads(next(row["state_json"] for row in
-                                              status_before["states"] if row["session_id"] == "late"))
+            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0), patch(
+                    "scripts.ingest.can.can_receiver.time.time_ns", return_value=1800000000000000003):
+                while reopened.decode_once(decoder):
+                    pass
+                late_state = next(json.loads(s["state_json"]) for s in status_before["states"]
+                                  if s["session_id"] == "late")
                 rows, _, _ = decoder.decode(dict(BASE, session_id="late"),
                                              {"seq": 1, "offset_ns": 1,
-                                              "phase": "capture", "data": FRAME}, prior_state)
+                                              "phase": "capture", "data": FRAME}, late_state)
             with reopened.connect() as conn:
-                tail = [json.loads(r[0]) for r in
-                        conn.execute("SELECT row_json FROM outbox ORDER BY id")]
-            self.assertEqual(tail[-len(rows):], rows)
+                actual = [json.loads(r[0]) for r in
+                          conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            self.assertEqual(actual, [json.loads(r) for r in status_before["outbox"]] + rows)
 
+    def test_adaptive_hint_learns_speculative_waste(self):
+        """A byte-cap stop shrinks the next window instead of staying at 1000."""
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            big = FRAME + b"\r" * (65536 - len(FRAME))
+            metas = {k: dict(BASE, session_id="cap-%d" % k) for k in range(4)}
+            with patch("scripts.ingest.can.can_receiver.time.time_ns",
+                        return_value=1800000000000000001):
+                for k in range(4):
+                    archive.accept(metas[k], [{"seq": s, "offset_ns": k + s,
+                                               "phase": "capture", "data": big}
+                                              for s in range(20)])
+                    archive.accept(metas[k], [{"seq": s + 20, "offset_ns": 30 + s,
+                                               "phase": "capture", "data": FRAME}
+                                              for s in range(30)])
+            with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                archive.decode_once(decoder, limit=1000)
+                first_window = archive._decode_prefetch_limit
+            # 1MiB cap stops the prefix early with more work pending: the hint
+            # must shrink below the 1000 default.
+            self.assertLess(first_window, 1000)
+            drain(archive, decoder)
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0], 200)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
+                self.assertEqual([r[0] for r in conn.execute(
+                    "SELECT next_seq FROM decode_states ORDER BY session")], [50] * 4)
 
 
 if __name__ == "__main__":

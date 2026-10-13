@@ -155,6 +155,7 @@ SHA-256, CPU/wall 시간과 전체 child peak RSS를 비교합니다.
 `python -m unittest tests.test_can_prefetch`는 세션 간 도착 순서, byte/page 경계,
 부분 decode 재개와 cursor 충돌 시 rollback을 검사합니다.
 `python -m unittest discover -s tests -p test_can_processes.py`는 분리된 `serve`·`work` 실프로세스로 독립 기동·순서 무관 처리·worker 중복/`re-decode` 상호배제·역할 lock·종료 내구성을 검사합니다.
+`python -m unittest discover -s tests -p test_can_files.py`는 파일 범위의 내구성 ACK·중단 재개·인증/경로 경계와 worker 편입·기존 OTLP 중복 제거를 검사합니다. Pi 저장소의 `can_collection.test_go_runtime`은 실제 Go 파일 uploader를 이 receiver/importer에 연결합니다.
 `python tools/benchmark_can_decode.py --baseline-root <변경 전 checkout>
 --cases xsession_contig,xsession_roundrobin,xsession_uneven --chunks 12000
 --repeats 3`으로 1/4/100/400개 세션의 실제 읽기 증폭과 처리 시간을 비교합니다.

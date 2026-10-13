@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
-"""Pending-index benchmark: honest baseline vs current idle-poll cost.
+"""Pending-frontier benchmark: bounded heads vs full candidate cost.
 
 Seeds one archive per matrix cell with a single bulk transaction (same rows,
-event IDs, cursors, pending membership, and counters a real accept/decode run
-would leave), then measures the exact decode_once candidate on identical data:
+event IDs, cursors, pending membership with durable head_id, and counters a
+real accept/decode run would leave), then measures the single maintained
+frontier query at limit 1/1000 plus the unbounded reference on identical data.
+The legacy baseline side (optional --baseline-root) keeps its own original
+full-scan candidate in an isolated subprocess importing only baseline code.
 
-- current: pending-index candidate, in-process via Archive.decode_once
-- baseline: original full-scan candidate, in an isolated subprocess importing
-  only --baseline-root code (never the current tree)
-
-Matrix: completed {1000,10000,100000} x pending {0,5,1000}. Pending 0 times a
-true idle decode_once; otherwise one executed candidate probe per repeat
-without draining the tail. Detection, lock contention, and equivalence run on
-both sides with the same protocol.
+Matrix: completed {1000,10000,100000} x pending {1000,10000,100000}.
+Detection, lock contention, and equivalence run on both sides with the same
+protocol.
 
 Run: python tools/benchmark_can_pending.py \
        --matrix --baseline-root /path/to/pristine-checkout --repeats 20
-Single cell: ... tools/benchmark_can_pending.py --sessions 1000 --pending 5
+Single cell: ... tools/benchmark_can_pending.py --sessions 1000 --pending 1000
 Without --baseline-root every side is labeled current-only (no honest baseline).
 """
 import argparse
@@ -35,9 +33,9 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.ingest.can.can_receiver import Archive, candidate_sql  # noqa: E402
 
-SCHEMA = "can-pending-benchmark/2"
+SCHEMA = "can-pending-benchmark/3"
 MATRIX_SESSIONS = (1000, 10000, 100000)
-MATRIX_PENDING = (0, 5, 1000)
+MATRIX_PENDING = (1000, 10000, 100000)
 EPOCHS_PER_BODY = {"current": 2, "legacy": 1}
 FRAME = b"t12320200\r"
 META_BASE = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
@@ -62,16 +60,19 @@ def _stats(walls):
             "min_s": min(walls), "max_s": max(walls)}
 
 
-def _candidate_sql(side):
+def _candidate_sql(side, limit=None):
     if side == "current":
-        return candidate_sql()
+        return candidate_sql(limit)
     return FULL_BASELINE_CANDIDATE
+
 
 def _candidate_source(side):
     return "candidate_sql" if side == "current" else "inline-legacy-baseline"
 
 
-def _candidate_params(side, epoch):
+def _candidate_params(side, epoch, limit=None):
+    if side == "current":
+        return (epoch,)
     return (epoch,) * EPOCHS_PER_BODY[side]
 
 
@@ -129,11 +130,12 @@ def build_archive(directory, sessions, pending):
                        session_id="done-%d" % i, started_ns=META_BASE["started_ns"])
             conn.execute("INSERT INTO decode_states VALUES(?,?,?,?,?,?)",
                          (i + 1, epoch, 1, _json(own), _json(counts), len(rows)))
-        conn.executemany("INSERT INTO decode_pending(session,epoch) VALUES(?,?)",
-                         [(sessions + 1 + j, epoch) for j in range(pending)])
+        conn.executemany("INSERT INTO decode_pending(session,epoch,head_id) VALUES(?,?,?)",
+                         [(sessions + 1 + j, epoch, sessions + 1 + j) for j in range(pending)])
         counters = {"raw_chunks": total, "raw_bytes": len(FRAME) * total, "outbox_rows": 0,
                     "decoded_rows_total": len(rows) * sessions,
                     "acked_rows_total": len(rows) * sessions, "pending_migrated": 1,
+                    "pending_heads_v1": 1,
                     "last_receive_ns": now, "last_decode_ns": now, "last_full_ack_ns": now}
         conn.executemany("INSERT OR REPLACE INTO archive_meta(key,value) VALUES(?,?)",
                          list(counters.items()))
@@ -148,20 +150,20 @@ def _open_ro(path):
     conn.row_factory = sqlite3.Row
     return conn
 
-def candidate_probe(path, epoch, side):
+
+def frontier_probe(path, epoch, limit):
     with _open_ro(path) as conn:
-        row = conn.execute(_candidate_sql(side), _candidate_params(side, epoch)).fetchone()
-        if row is None:
-            return None
-        name = conn.execute("SELECT session_id FROM sessions WHERE id=?", (row["session"],)).fetchone()
-    return {"session_id": name["session_id"], "seq": row["seq"]}
-def candidate_plan(path, epoch, side):
-    with _open_ro(path) as conn:
-        return [list(r) for r in conn.execute(
-            "EXPLAIN QUERY PLAN " + _candidate_sql(side), _candidate_params(side, epoch))]
+        rows = conn.execute(candidate_sql(limit), (epoch,)).fetchall()
+        heads = len(rows)
+        first = None
+        if rows:
+            name = conn.execute("SELECT session_id FROM sessions WHERE id=?",
+                                (rows[0]["session"],)).fetchone()
+            first = {"session_id": name["session_id"], "seq": rows[0]["seq"]}
+    return {"heads_fetched": heads, "first": first}
 
 
-def candidate_vm_steps(path, epoch, side):
+def frontier_vm_steps(path, epoch, limit):
     steps = {"n": 0}
 
     def counter():
@@ -169,9 +171,17 @@ def candidate_vm_steps(path, epoch, side):
         return False
     with _open_ro(path) as conn:
         conn.set_progress_handler(counter, 1)
-        conn.execute(_candidate_sql(side), _candidate_params(side, epoch)).fetchall()
+        conn.execute(candidate_sql(limit), (epoch,)).fetchall()
     return steps["n"]
 
+
+def candidate_probe(path, epoch, side):
+    with _open_ro(path) as conn:
+        row = conn.execute(_candidate_sql(side), _candidate_params(side, epoch)).fetchone()
+        if row is None:
+            return None
+        name = conn.execute("SELECT session_id FROM sessions WHERE id=?", (row["session"],)).fetchone()
+    return {"session_id": name["session_id"], "seq": row["seq"]}
 
 def probe_timing(path, epoch, side, repeats):
     walls, cpus = [], []
@@ -181,6 +191,58 @@ def probe_timing(path, epoch, side, repeats):
         walls.append(time.monotonic() - wall0)
         cpus.append(time.process_time() - cpu0)
     return walls, cpus
+
+
+def candidate_vm_steps(path, epoch, side, limit=None):
+    steps = {"n": 0}
+
+    def counter():
+        steps["n"] += 1
+        return False
+    with _open_ro(path) as conn:
+        conn.set_progress_handler(counter, 1)
+        conn.execute(_candidate_sql(side, limit), _candidate_params(side, epoch, limit)).fetchall()
+    return steps["n"]
+
+
+def batch_decode_details(archive, decoder, limit):
+    """One bounded decode_once: chunks committed, wall/CPU, peak Python bytes."""
+    import tracemalloc
+    tracemalloc.start()
+    wall0, cpu0 = time.monotonic(), time.process_time()
+    progressed = archive.decode_once(decoder, limit=limit)
+    wall, cpu = time.monotonic() - wall0, time.process_time() - cpu0
+    _, peak = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return {"limit": limit, "chunks_committed": progressed,
+            "wall_s": wall, "cpu_s": cpu, "peak_python_bytes": peak}
+
+
+def delayed_batch_details(archive, decoder, limit, delay_s):
+    """Same batch with a fixed per-SQL-call delay: proves the read/CPU split."""
+    import contextlib as _contextlib
+    import sqlite3 as _sqlite3
+    import unittest.mock as _mock
+
+    class _DelayedConnection(_sqlite3.Connection):
+        def execute(self, sql, *params):
+            time.sleep(delay_s)
+            return super().execute(sql, *params)
+
+    def delayed_connect():
+        conn = _sqlite3.connect(archive.path, timeout=5, factory=_DelayedConnection)
+        try:
+            conn.row_factory = _sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=FULL")
+            conn.execute("PRAGMA foreign_keys=ON")
+        except _sqlite3.Error:
+            conn.close()
+            raise
+        return _contextlib.closing(conn)
+
+    with _mock.patch.object(archive, "connect", delayed_connect):
+        return batch_decode_details(archive, decoder, limit)
 
 
 def idle_timing(archive, decoder, repeats):
@@ -403,6 +465,16 @@ elif action in ("idle", "detect", "lock", "decode1"):
                           "counts_json": st["counts_json"], "rows": st["rows"],
                           "decoded_delta": after.get("decoded_rows_total", 0) - before.get("decoded_rows_total", 0),
                           "outbox_delta": after.get("outbox_rows", 0) - before.get("outbox_rows", 0)}))
+    elif action == "batch":
+        import tracemalloc
+        tracemalloc.start()
+        w0, c0 = time.monotonic(), time.process_time()
+        progressed = archive.decode_once(decoder, limit=payload["bl_limit"])
+        wall, cpu = time.monotonic() - w0, time.process_time() - c0
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        print(json.dumps({"limit": payload["bl_limit"], "chunks_committed": progressed,
+                          "wall_s": wall, "cpu_s": cpu, "peak_python_bytes": peak}))
 """
 
 def baseline_call(baseline_root, db, epoch, action, payload):
@@ -432,8 +504,14 @@ def measure_cell(directory, sessions, pending, repeats, secondary, baseline_root
     current, baseline = {"side": "current"}, {"side": "baseline" if baseline_root else "current-only"}
     current.update(candidate_query_source=_candidate_source("current"),
                    candidate_plan=candidate_plan(db, epoch, "current"),
-                   candidate_vm_steps=candidate_vm_steps(db, epoch, "current"),
-                   candidate_selected=candidate_probe(db, epoch, "current"))
+                   candidate_vm_steps_full=candidate_vm_steps(db, epoch, "current"),
+                   candidate_vm_steps_limit_1=candidate_vm_steps(db, epoch, "current", 1),
+                   candidate_vm_steps_limit_1000=candidate_vm_steps(db, epoch, "current", 1000),
+                   candidate_selected=candidate_probe(db, epoch, "current"),
+                   frontier_limit_1=frontier_probe(db, epoch, 1),
+                   frontier_limit_1_vm_steps=frontier_vm_steps(db, epoch, 1),
+                   frontier_limit_1000=frontier_probe(db, epoch, 1000),
+                   frontier_limit_1000_vm_steps=frontier_vm_steps(db, epoch, 1000))
     if pending == 0:
         walls, cpus = idle_timing(archive, decoder, repeats)
         current.update(poll_kind="idle_decode_once", poll_wall_s=_stats(walls), poll_cpu_s=_stats(cpus))
@@ -441,9 +519,14 @@ def measure_cell(directory, sessions, pending, repeats, secondary, baseline_root
         walls, cpus = probe_timing(db, epoch, "current", repeats)
         current.update(poll_kind="candidate_probe_no_drain", poll_wall_s=_stats(walls),
                        poll_cpu_s=_stats(cpus))
-    latencies, first = detection_rounds(archive, decoder, epoch, secondary, "cur-detect")
-    current.update(detection_s=_stats(latencies), new_chunk_first=first)
-    current.update(writer_lock=lock_probe(archive, secondary, hold_s, "cur-lock"))
+        batch_copy = str(Path(directory) / "batch_current.sqlite")
+        delayed_copy = str(Path(directory) / "batch_delayed.sqlite")
+        shutil.copy2(db, batch_copy)
+        shutil.copy2(db, delayed_copy)
+        current.update(batch_limit_1=batch_decode_details(Archive(batch_copy, disk_reserve_bytes=0), decoder, 1),
+                       batch_limit_default=batch_decode_details(Archive(batch_copy, disk_reserve_bytes=0), decoder, 1000),
+                       batch_delayed_limit_default=delayed_batch_details(
+                           Archive(delayed_copy, disk_reserve_bytes=0), decoder, 1000, 0.001))
     if baseline_root:
         sql, nepoch = FULL_BASELINE_CANDIDATE, EPOCHS_PER_BODY["legacy"]
         dbc = str(Path(directory) / "synthetic.dbc")
@@ -464,12 +547,12 @@ def measure_cell(directory, sessions, pending, repeats, secondary, baseline_root
             out = baseline_call(baseline_root, eq_baseline, epoch, "probe", base_payload)
             baseline.update(poll_kind="candidate_probe_no_drain",
                             poll_wall_s=_stats(out["walls"]), poll_cpu_s=_stats(out["cpus"]))
-        out = baseline_call(baseline_root, bl_db, epoch, "detect", base_payload)
-        baseline.update(detection_s=_stats(out["latencies"]), new_chunk_first=out["new_chunk_first"])
-        out = baseline_call(baseline_root, bl_db, epoch, "lock", base_payload)
-        baseline.update(writer_lock={
-            "uncontended_s": _stats(out["free"]), "contended_s": _stats(out["held"]),
-            "contention_delay_s": sum(out["held"]) / len(out["held"]) - sum(out["free"]) / len(out["free"])})
+            for bl_limit, key in ((1, "batch_limit_1"), (1000, "batch_limit_default")):
+                bl_batch = str(Path(directory) / ("batch_baseline_%d.sqlite" % bl_limit))
+                shutil.copy2(db, bl_batch)
+                baseline[key] = baseline_call(
+                    baseline_root, bl_batch, epoch, "batch",
+                    dict(base_payload, bl_limit=bl_limit))
     equivalence = None
     if pending:
         eq_archive = Archive(eq_current, disk_reserve_bytes=0)

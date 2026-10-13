@@ -96,11 +96,16 @@ def _seed(directory, name, rows):
     decoder = synthetic_decoder(directory)
     archive = Archive(Path(directory) / name, disk_reserve_bytes=0)
     archive.register_epoch(decoder)
+    canonicals = [json.dumps(r) for r in rows]
     with archive.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
             "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-            [(r["event_id"], decoder.epoch, json.dumps(r)) for r in rows],
+            [(r["event_id"], decoder.epoch, canonical) for r, canonical in zip(rows, canonicals)],
         )
+        # Lawful fixture initialization: seeded synthetic rows + counters in one txn.
+        from scripts.ingest.can.can_receiver import _outbox_bump
+        _outbox_bump(conn, len(rows), sum(len(c.encode()) for c in canonicals))
         conn.commit()
     return archive
 

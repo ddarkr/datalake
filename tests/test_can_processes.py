@@ -5,11 +5,8 @@ Run: python -m unittest discover -s tests -p test_can_processes.py
 - serve: --database --vehicle --collector-id --bind --port --http-timeout
   --disk-reserve-mib, CAN_OTLP_* only, ready {"receiver":"ready","port":N}.
 - work: --database --dbc --definitions --greptime-url --greptime-db plus
-  worker options (--worker-interval --greptime-timeout --outbox-limit
-  --max-body-bytes), GREPTIME_* only, ready {"worker":"ready"}.
-- status unchanged from the published base (sessions/raw_chunks/pending_rows/
-  epochs[{epoch,processed_chunks,remaining_chunks,decoded_rows,counts}]);
-  re-decode takes the worker role lock.
+  worker/backpressure/retry options, GREPTIME_* only, ready {"worker":"ready"}.
+- status unchanged; re-decode takes the worker role lock.
 - serve holds SH legacy .lock + EX .receiver.lock; work holds SH legacy
   .lock + EX .worker.lock; init serialized via bounded .init.lock wait.
 """
@@ -269,9 +266,9 @@ class SplitProcesses(unittest.TestCase):
                 _wait_status(db, lambda s: s["raw_chunks"] == 4)
                 work = _work(directory, db, "http://127.0.0.1:9")
                 try:
-                    # Epoch persisted by the work role: visible to a fresh status read.
+                    # Epoch persisted across the work connection: visible to a fresh status read.
                     state = _wait_status(db, lambda s: len(s["epochs"]) >= 1, label="epoch")
-                    self.assertEqual(len(state["epochs"]), 1)
+                    self.assertTrue(state["epochs"][0]["active_epoch"])
                     drained = _wait_status(db, lambda s: s["pending_rows"] == 4, label="decode")
                     self.assertEqual(drained["raw_chunks"], 4)
                 finally:
@@ -315,10 +312,9 @@ class SplitProcesses(unittest.TestCase):
 
     def test_worker_restart_resumes_partial_outbox_exact(self):
         # A dense chunk exceeding DECODE_ROW_BUDGET forces a real decode_partial
-        # row. Seed it deterministically via Archive.decode_once (in-process,
-        # no timing tricks), then prove real serve+work roles resume the same
-        # rows exactly once. Partial state is read via direct SQLite, since
-        # the published status contract carries no partial_rows field.
+        # row; backpressure (high_rows=1) pauses decode right after that commit,
+        # so the partial is observable deterministically. After restart with
+        # normal watermarks the resume must emit every row exactly once.
         with tempfile.TemporaryDirectory() as directory:
             db = Path(directory) / "raw.sqlite"
             serve = _serve(directory, db, _port())
@@ -327,31 +323,22 @@ class SplitProcesses(unittest.TestCase):
                 _post(serve.ready["port"], meta, _chunks(2))
                 _post(serve.ready["port"], meta, [{"seq": 2, "offset_ns": 2000,
                                                    "phase": "capture", "data": FRAME * 2500}])
-            finally:
-                serve.stop()
-            decoder = synthetic_decoder(str(directory))
-            sys.path.insert(0, str(ROOT))
-            try:
-                from scripts.ingest.can.can_receiver import Archive
-                archive = Archive(db, 0)
-                archive.register_epoch(decoder)
-                partial = 0
-                while True:
-                    progressed = archive.decode_once(decoder)
-                    partial = _partial_rows(db)
-                    if partial or not progressed:
-                        break
-                self.assertGreater(partial, 0)
-                self.assertGreaterEqual(_outbox_rows(db), 2000)
-            finally:
-                sys.path.remove(str(ROOT))
-            self.assertGreater(_partial_rows(db), 0)
-            serve = _serve(directory, db, _port())
-            try:
+                work = _work(directory, db, "http://127.0.0.1:9",
+                             extra_args=("--outbox-high-rows", "1", "--outbox-low-rows", "0"))
+                try:
+                    paused = _wait_status(db, lambda s: s.get("epochs") and
+                                          s["epochs"][0].get("partial_rows", 0) > 0,
+                                          label="persisted partial")
+                    self.assertGreaterEqual(paused["pending_rows"], 2000)
+                finally:
+                    work.stop()
+                mid = _status(db)
+                self.assertGreater(mid["epochs"][0]["partial_rows"], 0)
                 work = _work(directory, db, "http://127.0.0.1:9")
                 try:
-                    after = _wait_status(db, lambda s: s["pending_rows"] == 2502
-                                         and _partial_rows(db) == 0, label="resume")
+                    after = _wait_status(db, lambda s: s.get("epochs") and
+                                         s["epochs"][0].get("partial_rows", 0) == 0
+                                         and s["pending_rows"] == 2502, label="resume")
                     self.assertEqual(after["raw_chunks"], 3)
                     got = _read_only_rows(db)
                     self.assertEqual(len(got), 2502)

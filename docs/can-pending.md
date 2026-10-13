@@ -7,8 +7,9 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
 
 ## Design
 
-- `decode_pending(session, epoch)` holds exactly sessions with raw chunks at or
-  beyond the epoch cursor (or no cursor yet). Index on `(epoch)`.
+- `decode_pending(session, epoch, head_id)` holds exactly sessions with raw chunks at or
+  beyond the epoch cursor (or no cursor yet), plus the durable next-raw id.
+  Indexes on `(epoch)` and `(epoch, head_id)`.
 - Same-transaction maintenance, so crash/rollback cannot skew membership:
   - `accept()` refreshes the session for every registered epoch via the
     cursor-first `_reconcile_pending_session` (one PK cursor read plus one
@@ -19,9 +20,9 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
     partial-chunk sessions stay pending, full completions drop out.
   - `register_epoch(..., explicit=True)` populates the new epoch from all raw
     regardless of other epochs' cursors, so re-decode replays every original.
-- `candidate_sql()` returns `(id, session, seq)` for every pending session's
-  persisted next chunk, ordered by raw ID. It binds the epoch twice and uses
-  `CROSS JOIN` to keep `decode_pending` first; heads contain no raw BLOBs.
+- `candidate_sql(limit)` is the single maintained frontier query (at most
+  `limit` members via the `(epoch, head_id)` index, no BLOBs; omit limit
+  only for repair/diagnostics). No parallel legacy full-scan API remains.
 - A heap merges demand-sized indexed `(session, seq)` pages: each cold fetch
   takes the fair share of the remaining prefix need across frontier sessions
   without a buffered run (at most 64 chunks), so interleaved round-robin
@@ -31,9 +32,8 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
   heads. Unpaged heads remain in the merge, so page, byte and chunk limits
   cannot reorder sessions.
 - One read snapshot prefetches at most 1 MiB of raw bytes and `limit` chunks
-  across all sessions; the iterator may hold one additional wire-capped
-  64 KiB row while checking the byte limit. Lightweight head memory scales
-  with the number of pending sessions, not retained raw history.
+  across all sessions; head Python materialization is capped at the same
+  frontier limit, not the pending population.
 - Prefetch starts at 1,000 chunks and adapts to successfully committed work
   including pre-prefix speculative waste: a staged shortfall, a byte-cap stop,
   or fetched rows beyond staged chunks shrink the next window to useful work.
@@ -52,9 +52,10 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
   outbox rows in global arrival order, writes the final completed cursor and
   optional trailing partial per session, and bumps counters once per batch.
   Finishing a partial removes its checkpoint in the same transaction.
-- The 2,000-row budget and 50 ms staging deadline are unchanged. The deadline
-  is checked between decoded chunks, not a hard bound on prefetch, one chunk
-  or commit duration. Cursor CAS, disk reserve and FULL/WAL durability remain.
+- The 2,000-row budget and 50 ms CPU deadline are unchanged. The deadline
+  starts after the read snapshot closes and is checked between decoded
+  chunks, not a hard bound on prefetch, one chunk or commit duration.
+  Cursor CAS, disk reserve and FULL/WAL durability remain.
 - Benchmarks import the shipped `candidate_sql()` rather than carrying a
   second current-query implementation.
 - No raw deletion, no flush budget change.
@@ -68,8 +69,11 @@ cursors. Restart needs no replay beyond opening the archive.
 ## Migration / rebuild
 
 - `Archive.__init__` creates the table/index and runs one-time
-  `_migrate_pending` (marker `pending_migrated` in `archive_meta`): rebuilds
-  membership per existing epoch. Later opens are a single marker probe.
+  `_migrate_pending` (markers `pending_migrated` + `pending_heads_v1` in
+  `archive_meta`): rebuilds membership per existing epoch with durable
+  head ids. Legacy tables gain the column via `_ensure_pending_frontier`
+  (frontier index created only after the column exists). Later opens are
+  marker probes.
 - `Archive.rebuild_pending()` rescans all epochs in one transaction for
   archives modified by outside writers. Safe to rerun (idempotent).
 
@@ -152,18 +156,31 @@ evidence is uploaded even on a regression. An initial repository push explicitly
 records that no baseline exists; invalid or unavailable nonzero baselines fail.
 There are no production inputs, credentials or absolute production-rate claims.
 
-### Pending-history scaling
+### Pending-frontier bound (issue 9)
 
-All nine current-only cells used the same query source. Query work stayed
-constant as completed history grew; it scales with pending session count.
-Newly appended data remains behind older pending chunks, preserving arrival
-order rather than giving new sessions priority.
-
-| Completed sessions | Idle VM steps | 5 pending VM steps | 1,000 pending VM steps |
-| --- | ---: | ---: | ---: |
-| 1,000 | 171 | 360 | 38,170 |
-| 10,000 | 171 | 360 | 38,170 |
-| 100,000 | 171 | 360 | 38,170 |
+`decode_pending` carries a durable `head_id` (raw_chunks id at the epoch
+cursor) maintained atomically in `accept`/`register_epoch`/decode-commit via
+`_reconcile_pending_session`/`_refresh_pending_epoch`. `candidate_sql(limit)`
+is the single maintained frontier query: at most `limit` members through the
+`(epoch, head_id)` index (omit limit only for repair/diagnostics), so both
+Python materialization and SQL VM work scale with the batch frontier, not the
+pending population. `decode_once` seeds its #8 merge with the
+`prefetch_limit` smallest heads; refill still uses the indexed `(session,
+seq)` key with unpaged heads kept in the heap, so the P-chunk prefix never
+skips an unknown earlier head. The 50 ms deadline starts after the read
+snapshot closes, so a delayed read cannot force repeated 1-chunk commits.
+Legacy tables gain the column/index via `_ensure_pending_frontier` inside
+migration/rebuild (frontier index created only after the column exists);
+outside writers must run the explicit `rebuild_pending` repair — there is no
+routine full-pending scan fallback. Cursor CAS rollback is unchanged: a
+failed commit leaves cursors, outbox, counters and membership as before.
+Regression: `python -m unittest tests.test_can_frontier` plus the migrated
+`test_pending_index_reawakens_epochs_resume_and_rebuild` (bounded frontier
+selection via rebuild, limit-1 VM steps). Benchmark:
+`python tools/benchmark_can_pending.py --matrix --repeats 3
+--secondary-repeats 1 --lock-hold-s 0.02 [--baseline-root <pristine>]`
+reports per-cell frontier heads fetched and VM steps at limit 1/1000 plus
+batch wall/CPU/peak/chunks and decode equivalence.
 
 The packaged test `python -m tests.test_can_receiver_compose` passed against
 isolated GreptimeDB 1.2.1 with File storage: 10,201 synthetic chunks produced
@@ -175,3 +192,17 @@ volumes were created and removed. All nine Compose profiles also validated.
 
 These synthetic results and process-recovery checks do not establish sustained
 production receive/decode/Greptime throughput or a declining operating backlog.
+### Pipeline harness (issue 12, parent-run)
+
+`python tools/benchmark_can_pipeline.py --scenarios fast`
+(parent-run; synthetic loopback receive through the real Receiver into the
+real durable Archive/Decoder/Worker, full ACK through a real loopback
+Greptime sink including the dirty notify). Failure/recovery variants
+(`slow,outage-recovery,partial-recovery,dirty-recovery`), process
+SIGKILL/restart (committed-prefix durability only, never a power-loss claim),
+and `--compare-overhead` / `--baseline-root` comparisons are available; see
+the tool docstring for the full command list. Every scenario compares all
+canonical row bytes, event IDs, arrival order, cursors, partial checkpoints,
+outbox content, and durable counters against a sequential reference built
+from the same inputs with a frozen clock, never a length-only check.
+Minimal regression: `python -m unittest tests.test_can_pipeline_benchmark`.

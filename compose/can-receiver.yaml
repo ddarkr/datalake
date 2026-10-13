@@ -3,7 +3,7 @@ services:
     image: ${CAN_RECEIVER_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [can-receiver]
     labels:
-      datalake.can-receiver-revision: "14"
+      datalake.can-receiver-revision: "15"
     volumes:
       - receiver-venv:/opt/venv
       - receiver-code:/app
@@ -14,13 +14,15 @@ services:
         target: /source/can_decoder.py
       - source: can_otlp_wire_py
         target: /source/can_otlp_wire.py
+      - source: can_files_py
+        target: /source/can_files.py
     command:
       - /bin/sh
       - -ec
       - >-
         mkdir -p /app/scripts/ingest/can;
-        cp /source/can_receiver.py /source/can_decoder.py /source/can_otlp_wire.py /app/scripts/ingest/can/;
-        chmod 0444 /app/scripts/ingest/can/can_receiver.py /app/scripts/ingest/can/can_decoder.py /app/scripts/ingest/can/can_otlp_wire.py;
+        cp /source/can_receiver.py /source/can_decoder.py /source/can_otlp_wire.py /source/can_files.py /app/scripts/ingest/can/;
+        chmod 0444 /app/scripts/ingest/can/can_receiver.py /app/scripts/ingest/can/can_decoder.py /app/scripts/ingest/can/can_otlp_wire.py /app/scripts/ingest/can/can_files.py;
         printf '%s' 'cantools==40.7.1 opentelemetry-proto==1.38.0' > /tmp/.can_receiver_want;
         if test -f /opt/venv/.can_receiver_ready &&
         cmp -s /tmp/.can_receiver_want /opt/venv/.can_receiver_ready; then exit 0; fi;
@@ -37,7 +39,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: "14"
+      datalake.can-receiver-revision: "15"
     user: "10001:10001"
     read_only: true
     tmpfs:
@@ -84,7 +86,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: "14"
+      datalake.can-receiver-revision: "15"
     user: "10001:10001"
     read_only: true
     tmpfs:
@@ -104,6 +106,10 @@ services:
       GREPTIME_DB: ${GREPTIME_DB:-}
       GREPTIME_USER: ${GREPTIME_USER:-}
       GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
+      CAN_OUTBOX_HIGH_ROWS: ${CAN_OUTBOX_HIGH_ROWS:-20000}
+      CAN_OUTBOX_LOW_ROWS: ${CAN_OUTBOX_LOW_ROWS:-15000}
+      CAN_OUTBOX_HIGH_BYTES: ${CAN_OUTBOX_HIGH_BYTES:-33554432}
+      CAN_OUTBOX_LOW_BYTES: ${CAN_OUTBOX_LOW_BYTES:-25165824}
     working_dir: /app
     command:
       - /opt/venv/bin/python
@@ -128,6 +134,14 @@ services:
       - ${CAN_OUTBOX_LIMIT:-20000}
       - --max-body-bytes
       - ${CAN_MAX_BODY_BYTES:-4194304}
+      - --outbox-high-rows
+      - ${CAN_OUTBOX_HIGH_ROWS:-20000}
+      - --outbox-low-rows
+      - ${CAN_OUTBOX_LOW_ROWS:-15000}
+      - --outbox-high-bytes
+      - ${CAN_OUTBOX_HIGH_BYTES:-33554432}
+      - --outbox-low-bytes
+      - ${CAN_OUTBOX_LOW_BYTES:-25165824}
     restart: unless-stopped
     stop_grace_period: 90s
 
@@ -138,6 +152,8 @@ configs:
     x-source: scripts/ingest/can/can_decoder.py
   can_otlp_wire_py:
     x-source: scripts/ingest/can/can_otlp_wire.py
+  can_files_py:
+    x-source: scripts/ingest/can/can_files.py
 
 volumes:
   receiver-venv:

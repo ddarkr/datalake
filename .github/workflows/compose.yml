@@ -83,6 +83,7 @@ jobs:
           python -m tests.test_can_encoding
           python -m unittest tests.test_can_prefetch
           python -m unittest discover -s tests -p test_can_processes.py
+          python -m unittest discover -s tests -p test_can_files.py
           python -m tests.test_can_decoder
           python -m tests.test_can_otlp_wire
           python tools/demo.py regressions

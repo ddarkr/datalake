@@ -82,8 +82,8 @@ Arcane 등 Compose 관리 도구에서도 같은 `compose.yaml`과 환경변수�
 - 서버 `.env` 전체를 에이전트 장비에 복사하지 마세요. 수집 주소와 OTLP 인증만 전달합니다.
 - OMP와 opencode2는 설치 후에도 저장소 경로를 참조합니다. 저장소를 이동·삭제하지 마세요.
 - 플러그인 설치 후 클라이언트를 재시작하고 실제 새 세션을 확인해야 합니다. Codex는 훅 신뢰 승인도 필요합니다.
-- 공통 JavaScript 플러그인은 허용된 메타데이터를 로컬 영속 큐에 저장하고 별도 sender로 전송합니다. 로컬 수락은 collector ACK가 아니며, ACK 전까지 레코드는 보류 상태로 남습니다. Hermes의 SQLite outbox는 별도 계약을 따릅니다. 서버 Alloy 큐는 서버에 도착하지 못한 데이터를 복구하지 못합니다.
-- Linux native Node에서는 검증된 현재 실행 이미지를 `/proc/self/exe`로 고정해 sender를 시작하므로 도구 캐시의 쓰기 가능한 상위 경로를 신뢰하지 않습니다. 프로젝트 내부 Node와 안전하지 않은 PATH 후보는 사용하지 않으며, 안전한 런타임이 없으면 수락된 데이터는 보류 상태로 유지됩니다.
+- JavaScript·Hermes 플러그인은 호스트 또는 훅 프로세스 안에서 직접 HTTP 전송합니다. 영속 전송 큐·별도 sender·자동 재시도는 없으며 실패·오프라인·강제 종료 시 유실될 수 있습니다. 서버 Alloy 큐는 서버에 도착하지 못한 데이터를 복구하지 못합니다.
+- 기존 설치본의 큐와 이미 실행 중인 구 sender는 자동 이관·삭제·종료하지 않습니다. Codex·Claude의 복사된 설치본은 같은 설정·홈으로 재설치하고 장기 실행 호스트는 정상 재시작·재로딩하세요. 관측 checkpoint나 훅 종료를 collector ACK·DB 저장 증거로 취급하지 마세요.
 
 ### Home Assistant / MQTT
 
@@ -172,21 +172,55 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
   /opt/venv/bin/python -m scripts.ingest.can.can_receiver status --database /data/raw.sqlite3
 ```
 
-초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps·receiver·worker **세 서비스의 revision label**을 함께 갱신하세요. receiver와 worker는 독립적으로 재시작할 수 있습니다. 정상 ingest 중에는 어느 한쪽을 멈추기 위해 다른 쪽을 중지할 필요가 없으며, worker 공백 동안 받은 원본은 SQLite에 보존되었다가 worker 재기동 후 처리됩니다. 두 프로세스는 GIL을 공유하지 않지만 같은 SQLite archive를 공유 writer로 사용하므로 쓰기는 SQLite 잠금으로 직렬화됩니다. receiver·worker는 같은 archive에 공유 수명 lock과 각 역할 lock을 함께 사용하며, 같은 역할 중복 실행·구 combined 실행·`re-decode`와 worker 동시 실행은 시작 전에 거부됩니다. host endpoint는 기본 `127.0.0.1:4319/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
+초기 `can-receiver-deps`는 inline 코드를 `receiver-code` 볼륨에 준비한 뒤 pinned 의존성을 설치합니다. 읽기 전용 receiver 루트에 inline config를 직접 복사하지 않습니다. PyPI 네트워크는 첫 설치와 의존성 변경 시 필요하며, 코드 변경 시 deps·receiver·worker **세 서비스의 revision label**을 함께 갱신하세요. receiver와 worker는 독립적으로 재시작할 수 있습니다. 정상 ingest 중에는 어느 한쪽을 멈추기 위해 다른 쪽을 중지할 필요가 없으며, worker 공백 동안 받은 파일은 `/data/files`에, OTLP 원본은 SQLite에 보존되어 재기동 후 처리됩니다. 두 프로세스는 GIL을 공유하지 않지만 같은 SQLite archive를 공유 writer로 사용하므로 쓰기는 SQLite 잠금으로 직렬화됩니다. receiver·worker는 같은 archive에 공유 수명 lock과 각 역할 lock을 함께 사용하며, 같은 역할 중복 실행·구 combined 실행·`re-decode`와 worker 동시 실행은 시작 전에 거부됩니다. host endpoint는 기본 `127.0.0.1:4319`의 `/v1/files` 또는 `/v1/logs`입니다. 기존 SSH 터널과 CAN Basic 인증 경계를 유지하고 공개 인터페이스로 바인딩하지 마세요. Basic 인증만으로 전송이 암호화되지는 않습니다. 기존 Alloy AI privacy ingress는 raw CAN payload용 경로가 아닙니다.
+
+#### Pi 원본 파일 직접 수신
+
+Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보냅니다.
+허용 파일은 `capture.json`, `serial_chunks.jsonl`, `events.jsonl`이며 동일한 Basic 인증과
+`X-CAN-Vehicle`·`X-CAN-Collector` 경계를 적용합니다. `GET`은 내구성 저장 offset과
+마지막 최대 64 KiB의 SHA256을 반환합니다. `PUT`은 `Content-Length`,
+`X-CAN-Offset`, `X-CAN-SHA256`으로 범위를 검증하며 최대 4 MiB입니다.
+`capture.json`은 최대 64 KiB 전체 스냅샷이고, 다른 두 파일은 append-only입니다.
+파일·저장 위치를 동기화한 뒤에만 ACK하며 ACK 유실 재전송은 같은 바이트인지 확인합니다.
+
+원본과 메타데이터 버전은 기존 raw 볼륨의 `/data/files` 아래에 저장합니다.
+수신 프로세스는 JSONL·CAN을 파싱하지 않습니다. `can-worker`의 importer가 완성된 줄을
+정확한 정수 ns로 읽어 기존 `Archive.accept`에 편입하므로, 이전 OTLP로 받은 같은
+세션/seq는 중복 생성하지 않습니다. 줄 중간 bytes·실패한 수집 원본도 파일로 보존하며,
+시작 시각이 아직 없는 metadata는 해석 준비가 될 때까지 기다립니다.
+파일 ACK와 raw DB 편입·디코딩·Greptime ACK는 서로 다른 완료 경계입니다.
+기존 `/status`의 raw counter는 **편입된 청크**이며 파일 수신 bytes의 지표가 아닙니다.
+
+전환은 서버를 먼저 배포한 뒤 Pi uploader만 교체합니다. Pi 원본·기존 SQLite spool은
+보존하고 별도 `--state`에 작은 진행 정보만 저장합니다. 이전 spool의 import cursor는
+서버 ACK가 아니므로 재개 위치로 쓰지 않습니다. endpoint와 사설 HTTP opt-in을 함께
+`/v1/files`로 바꾸고 기존 batching 옵션을 제거해야 합니다. capture는 재시작하지 않습니다.
+기존 `/v1/logs`는 이전 클라이언트·복구 재전송용 수신 계약으로 계속 지원합니다.
+
+서버 디스크는 전체 원본 JSONL 파일과 기존 raw DB/outbox를 함께 수용해야 합니다.
+Pi의 protobuf 큐 용량을 JSONL 저장 용량으로 간주하지 마세요. 원본은 자동 삭제하지 않습니다.
+
 
 CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
 
 디코딩은 쓰기 잠금 밖에서 최대 1,000청크·2,000출력 행을 준비하고, 청크 사이의 경과 시간이 50ms를 넘으면 다음 commit으로 넘깁니다. 조밀한 청크도 parser 상태와 frame 경계 cursor로 이어서 처리하므로 한 청크의 모든 신호를 메모리에 펼치지 않습니다. commit 전 각 세션의 기존 cursor·상태를 다시 확인하며, parser 상태·decode cursor·outbox는 한 트랜잭션에서 함께 commit하거나 rollback합니다. 개별 frame·commit 시간을 포함한 엄격한 50ms 상한은 아니며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
 
-단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, `serve`의 ingress socket `--http-timeout` 기본값 15초와 별개입니다. `--greptime-timeout`·`--outbox-limit`·`--max-body-bytes`는 `work` 옵션입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
+단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, `serve`의 ingress socket `--http-timeout` 기본값 15초와 별개입니다. `--greptime-timeout`·`--outbox-limit`·`--max-body-bytes`·outbox watermark·재시도 간격은 `work` 옵션입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
 
 signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신까지 ACK되어야 outbox에서 제거합니다. 알림 실패는 `dirty_notify_failure`로 남고 signal 재전송은 같은 event ID로 중복 제거됩니다. 집계기는 완료된 시간창을 scope별 영속 sweep cursor로 순회하므로 알림 이전의 과거 CAN도 처리합니다. 시간창의 raw fingerprint·generation·분석 설정과 코드 revision이 이전 checkpoint와 같으면 재계산하지 않으며, 처리 중 입력이 바뀌거나 분석이 실패하면 checkpoint를 완료하지 않습니다. 이 확인은 해당 scope·시간창의 처리 기록이지 물리 교정 성공 증거가 아닙니다.
 
 `status`는 영속 누적 counter와 indexed cursor를 사용하며 원본 전체를 매번 세지 않습니다. `last_receive_ns`, `last_decode_ns`, `last_full_ack_ns`는 각각 raw 수신·해석·signal 및 dirty 알림 전체 ACK 시각입니다. storage-metrics는 raw volume을 read-only로 읽어 raw/WAL/outbox/파일시스템 여유와 제한된 오류 종류를 노출합니다. 누락·읽기 실패는 unknown이고 빈 정상 큐만 0입니다. 수신·디코드 commit 전 기본 64 MiB 여유에 staged write 예산을 더해 확인하며, 부족하면 `archive_disk_reserve`로 거부하고 기존 raw/outbox를 보존합니다. 이미 ACK된 outbox를 지우는 작업은 공간을 회수할 수 있도록 이 reserve 때문에 막지 않습니다.
+기본 `status`는 트리거 유지 `decode_epoch_state` 한 테이블과 영속 counter(`raw_chunks`, `sessions_total`, `outbox_rows`)만 읽습니다(O(보존 epoch 수), 세션/raw/decode 전체 스캔 없음). `active_epoch`는 `register_epoch`가 선택한 명시적 epoch이며 최신 rowid 추정이 아닙니다. `remaining_chunks`는 영속 전체 raw에서 epoch 처리량을 뺀 파생값이므로 raw 수신은 배치당 한 번의 counter 증가만 수행합니다. 각 epoch는 현재 처리 backlog(`active_backlog_chunks`)·이전 epoch 잔여(`retained_backlog_chunks`)를 구분하며, `decoded_rows_exact`는 완료 행에 미완료 dense 청크의 이미 방출된 `partial_rows`를 더한 값입니다(처리 청크 수는 그대로). 세션별 신호 합계는 명시적 상세 조회(`status --detail`)에서만 집계합니다. exporter 라벨은 고정된 `active`/`retained`, 단계, 오류 종류만 사용하며 epoch·세션·차량 식별자를 노출하지 않습니다.
 
 #### CAN archive 백업과 새 볼륨 복원
 
 DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE를 GET으로 검증한 뒤 성공하며 원격 자동 GC는 하지 않습니다.
+
+이 DB/definitions 백업 형식에는 `/data/files`의 직접 수신 원본·메타데이터 버전은 포함되지
+않습니다. 파일 백업까지 필요하면 수신·worker를 정상 종료한 상태의 raw 볼륨 전체 복사나
+일관된 파일시스템 snapshot을 함께 보관하세요. DB 백업 성공만으로 미편입 원본까지
+off-host에 보관했다고 판단하면 안 됩니다. Pi 원본을 지우는 근거로도 사용하지 않습니다.
 
 ```bash
 docker compose --env-file .env --profile backup run --rm can-backup backup
@@ -199,13 +233,13 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 
 복원본의 정의 SHA·연속 seq·epoch·cursor·outbox를 확인한 뒤 별도 receiver·worker로 검증하세요. 운영 archive를 복원본으로 교체(인계)할 때는 receiver와 worker **둘 다** 먼저 정상 종료하고, 같은 archive에 구·신 writer를 병렬 실행하지 마세요. `CAN_BACKUP_RESERVE_BYTES`와 `BACKUP_RESERVE_BYTES`는 각각 CAN·DB staging 예산에 추가할 여유 byte이며 기본 64 MiB입니다. 백업은 snapshot과 압축 작업 공간, 복원은 archive와 해제될 파일 및 대상 파일시스템별 공간을 사전 검사합니다. 공간 부족을 발견하면 기존 원본·복원 대상 데이터를 변경하지 않습니다.
 
-`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver·worker를 시작하고, 인증된 gzip OTLP의 영속 ACK·재시작·중복 재전송 보존을 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
+`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver·worker를 시작합니다. OTLP 영속 ACK·재시작·중복 보존과 파일 수신의 worker 중지·부분 파일 재시작·중복 범위 재전송·정확한 ns의 Greptime 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver·worker 인계
 
 1. 기존 receiver·worker의 raw volume 이름, identity·인증, 정의 두 파일의 SHA256, 상태·epoch를 비공개로 기록하고 SQLite-consistent 백업을 확보합니다. **온라인 백업은 SQLite backup API 등 일관성 있는 방식으로 수행하세요. WAL이 열린 `.db`만 `cp`하면 안 됩니다.** 오프라인 전체 볼륨 백업도 모든 writer(receiver·worker)를 먼저 중지해야 합니다.
-2. **기존 receiver와 worker 둘 다** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. uploader는 기존 로컬 spool·cursor·immutable 요청을 유지한 채 서버 공백 동안 재시도합니다.
-3. `CAN_RECEIVER_RAW_VOLUME`을 기존 raw volume의 정확한 이름으로 지정합니다. 새 빈 raw volume으로 교체하거나 DB를 복사·삭제하지 않습니다. 기존 `/data/raw.sqlite3`와 WAL/SHM, decode cursor·outbox·epoch를 그대로 사용하며 소유자 `10001:10001`와 private 모드를 확인합니다. 필요한 권한 조정은 writer를 멈춘 상태에서만 수행합니다.
+2. **기존 receiver와 worker 둘 다** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. 파일 uploader는 원본·진행 정보를, 이전 OTLP uploader는 기존 spool을 보존한 채 서버 공백 동안 재시도합니다.
+3. `CAN_RECEIVER_RAW_VOLUME`을 기존 raw volume의 정확한 이름으로 지정합니다. 새 빈 raw volume으로 교체하거나 DB를 복사·삭제하지 않습니다. 기존 `/data/raw.sqlite3`와 WAL/SHM, `/data/files`, decode cursor·outbox·epoch를 그대로 사용하며 소유자 `10001:10001`와 private 모드를 확인합니다. 필요한 권한 조정은 writer를 멈춘 상태에서만 수행합니다.
 4. 동일한 정의 바이트를 private definitions volume에 공급합니다. 서버 이전을 이유로 새 epoch를 만들거나 `re-decode`를 실행하지 않습니다. 같은 raw·정의 볼륨으로 새 receiver와 worker를 시작합니다. **같은 raw archive에 구·신 receiver·worker를 병렬 실행하지 마세요.**
 5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 원본은 어느 쪽에서도 삭제하지 않습니다. rollback도 새 receiver·worker를 종료한 뒤 동일 볼륨·정의로 기존 버전을 단독 기동합니다.
 
@@ -298,6 +332,7 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - `기록 없음`은 정상이나 0을 의미하지 않습니다. 수집 미설정·누락·조회 범위를 먼저 확인하세요.
 - AI 비용은 도구가 보고한 값과, 비용이 없을 때 적용 가능한 공개 단가의 보충 추정치입니다. 청구서가 아니며 가격을 결정할 수 없는 사용량은 미산정으로 남습니다. 보충 단가는 LiteLLM 공개 가격표를 조회·캐시합니다.
 - native telemetry와 플러그인의 사용량은 식별 가능한 범위에서 native 우선 정책으로 처리합니다. 서로 다른 수집 범위를 섞으면 일부 사용량이 누락될 수 있습니다.
+- 분류별 막대·범례·툴팁에는 도구명·클라이언트명·모델명 또는 차량/수집원/해석 버전/신호를 표시합니다. `호출 수`·`세션 수` 같은 지표명으로 모든 분류를 덮지 않습니다. Grafana의 표 형식 막대는 `${__data.fields.<분류 열>}`, 시계열은 `${__field.labels.<분류 열>}`을 사용하며, 입력·출력 토큰처럼 측정값이 여러 개면 모델명과 지표명을 함께 표시합니다. Compose 원본에서는 `$`를 `$$`로 이스케이프합니다. 합계 카드와 표의 지표명은 유지하고 실제 범례·툴팁을 확인하세요.
 - 전체 현황의 원본 트레이스 조사는 선택 범위의 마지막 48시간에 제한됩니다. 관측된 스팬 수는 사용자 HTTP 요청 수가 아니며, 허용 목록 밖의 HTTP 경로·SQL 본문·스팬 이벤트를 복원할 수 없습니다.
 - 기본 `OTEL_TTL`은 빈 값으로 **raw OTel 무기한 보존**입니다. 30~90일이 자동 적용되는 것이 아닙니다. 보존 기간을 줄이면 기존 데이터도 만료될 수 있습니다. 정책·점검·적용 절차는 [OTel 보존](otel-retention.md)을 따릅니다.
 - AI 집계는 장기 보존합니다. 홈 원본은 설정된 대상에 기본 `HOME_RAW_TTL=90d`를 사용하며 `0s`로 만료를 끌 수 있습니다. 원본 CAN의 S3 보존 정책은 별도로 관리하세요.
@@ -312,8 +347,9 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - 차량을 선택하면 숨김 `vehicle_ids` 변수가 `vehicle_identity`의 명시적 매핑과 선택한 원본 ID를 한 번 조회합니다. 패널은 그 목록을 SQL 값으로 사용하므로 모든 원본 행에서 별칭 하위 쿼리를 반복하지 않습니다. 차량 선택·시간 범위 변경 시 목록을 다시 조회하며 등록되지 않은 ID도 그대로 조회됩니다. 매핑을 추가한 뒤에는 대시보드를 다시 로드해 차량 목록과 원본 ID 목록을 갱신하세요. 조회 범위 표는 관측/수신 시각과 기간 내 행 수를 한 번의 집계로 계산하고, 차량·수집원·해석 버전별 결과는 계속 분리합니다.
 - CAN의 정확한 경로·신호명이 대응하는 잔량, 남은 에너지, 기어, 충전 상태와 외기온은 `reported_unverified`인 **미검증 보고값**으로 표시합니다. 최신 무효 값·단위 불일치·알 수 없는 enum은 과거 정상 값으로 대체하지 않으며, CAN 보고값 표에는 원본 단위·품질·관측 및 수신 시각을 남깁니다. 잔량 그래프는 `%` 단위의 허용된 보고값만 평균에 포함하고 유효 값이 없는 구간은 비웁니다.
 - `CP_CHARGE_ENABLED`는 충전 허용 보고이지 실제 충전 중이라는 판정이 아닙니다. CAN 원시 전압·전류가 있어도 교정과 분석 결과가 없는 전력은 판단 불가로 남고, 대응하는 원본 신호가 없는 온도도 만들어내지 않습니다.
-- 전력·팩 전압 카드의 미분석 입력 검사는 원본 field 이름 override를 놓치지 않도록 같은 `vehicle/source/decode_epoch`의 전체 raw frontier를 사용합니다. 분석과 무관한 새 신호도 이전 숫자를 가릴 수 있는 보수적 제한이며, 서로 다른 scope의 입력은 섞지 않습니다.
 - 전기 분석의 `current_fields`·`voltage_fields`는 명시된 순서에서 물리적으로 사용 가능한 표본이 있는 한 필드만 선택합니다. 미교정 첫 필드가 단위·품질이 유효한 다음 명시 필드를 가리지 않으며, 필드끼리 표본을 합치거나 목록 밖의 대체 필드를 자동으로 사용하지 않습니다. 유효 표본이 없으면 기존 판단 불가를 유지합니다. 용량·전류 부호·SOC 기준점·온도 교정과 건강도 모델이 없는 값은 추정해서 채우지 않습니다.
+- 전력·팩 전압 카드의 미분석 입력 검사는 원본 field 이름 override를 놓치지 않도록 같은 `vehicle/source/decode_epoch`의 전체 raw frontier를 사용합니다. 분석과 무관한 새 신호도 이전 숫자를 가릴 수 있는 보수적 제한이며, 서로 다른 scope의 입력은 섞지 않습니다.
+
 - gauge·stat 카드는 표시 이름 기준으로 측정값만 선택합니다(`보고값`, `값`, `실내`·`외기`). 비어 있는 셀 번호나 다른 메타데이터를 별도의 판단 불가 수치로 렌더링하지 않습니다. 셀 전압·배터리 온도의 근거 표는 카드와 같은 시간·유효 조건으로 원본 관측 시각과 교정 버전을 보여줍니다. 측정값 자체가 없거나 무효이면 기존 `기록 없음`·`판단 불가` 라벨을 유지합니다.
 
 ### CAN 원본 신호 대시보드
@@ -334,18 +370,18 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
   지연 쿼리 진단 테이블은 최초 기록 전에는 없을 수 있습니다. 생성 여부를 먼저 확인하고, 미생성 테이블은 오류나 0건으로 바꾸지 않고 결과 없음으로 표시합니다.
 - **수집기 운영**: 스크랩 수집량·소요, 원격쓰기 대기·재시도·전송 시차, WAL·구성 요소 상태를 봅니다. 기존 OTel 큐·스팬 단계 차트와 중복하지 않고 연결합니다. 없는 계열은 unknown이며 0을 합성하지 않습니다.
 - **저장소 운영**: 로컬 여유·WAL 증가와 결합된 객체 인벤토리·입출력 지연·오류를 봅니다. 결합 인벤토리는 실제 SST·백업·과거 객체를 함께 세므로 백업 전용 용량·성공 이력·복원 검증으로 해석하지 않습니다. 복원 검증은 known 플래그만 보며 검증 시각 지표가 없으므로 복원 성공 시점을 주장하지 않습니다.
-
 ### 관측·분석·입력 전제 읽기
 
 - 원본 관측과 파생 분석을 구분합니다. 분석 화면의 최신 개정·상태·단위 표가 비어 있으면 조회 범위에 분석 기록이 없다는 뜻이며, 입력 부재나 추정 전제 부족을 단정하지 않습니다. 대체값으로 채우지 말고 집계 실행과 선택 범위를 확인하세요. 주행·충전 요약이 비어 있어도 주행거리·효율·충전 세션을 추정하지 않습니다. 홈 입력이 비어 있으면 집계 대상 지정부터 확인합니다.
 - 차량·수집 경로·해석 버전 범위를 결과에 유지합니다. 차량 목록은 명시적 별칭만 묶으며, Fleet과 CAN 보고는 출처별로 함께 보되 합산하지 않습니다. 최신 무효 보고를 과거 정상값으로 대체하지 않습니다.
 - 표시 잔량·남은 에너지·최고/최저 셀 전압·배터리 최고/최저 온도·실내외 온도 카드는 관측·수신·전송 묶음 순서의 `LAST_VALUE(... ORDER BY ...)`로 마지막 보고를 고릅니다. 최신 NULL도 유지하며 유효 값만 먼저 걸러 과거 값을 되살리지 않습니다. 표시 잔량 카드는 수집 범위를 다시 읽는 조인 없이 한 번 집계하고, 배터리 최고·최저 온도는 각각 `pack_max`·`pack_min`을 명시적으로 표시합니다. 온도 교정의 후속 입력 울타리는 같은 스냅샷의 최고·최저 관측 시각을 재사용하므로 동일 원시 필드를 두 번 더 읽지 않습니다.
-- `source_field`는 일반 컬럼이므로 원시 신호가 많으면 필드 선택에도 전체 이력을 읽을 수 있습니다. 스키마 초기화는 해당 컬럼에 `INVERTED INDEX`를 선언하며, 기존 SST는 운영 변경 허가 후 별도 구축해야 합니다. 구축 후에도 조회 개선은 보장되지 않습니다. GreptimeDB 1.2.1의 기본 `last_row` 병합은 여러 입력 소스가 겹치는 범위에서 일반 컬럼 조건을 병합 전에 적용하지 않습니다. 최신 덮어쓰기·NULL을 보존하기 위한 동작이므로 속도를 위해 `append_mode`나 `last_non_null`로 바꾸지 않습니다. 최신 NULL·무효 보고도 숨기지 않습니다.
+- `source_field`는 일반 컬럼이므로 원시 신호가 많으면 필드 선택에도 전체 이력을 읽을 수 있습니다. 스키마 초기화는 해당 컬럼에 `INVERTED INDEX`를 선언하며, 기존 SST는 운영 변경 허가 후 `ADMIN BUILD_INDEX('vehicle_signal')`로 별도 구축해야 합니다. 구축 후에도 조회 개선은 보장되지 않습니다. GreptimeDB 1.2.1의 기본 `last_row` 병합은 여러 입력 소스가 겹치는 범위에서 일반 컬럼 조건을 병합 전에 적용하지 않습니다([네이티브 구현](https://github.com/GreptimeTeam/greptimedb/blob/v1.2.1/src/mito2/src/read/scan_region.rs)). 최신 덮어쓰기·NULL을 보존하기 위한 동작이므로 속도를 위해 `append_mode`나 `last_non_null`로 바꾸지 마세요. 구축은 저장 이력을 읽는 I/O 작업이므로 초기화마다 자동 실행하지 않으며, 적용 후 전체 수집원 온도 카드의 실제 조회 시간과 최신 무효 값 유지 여부를 다시 확인하세요. 태그인 `path`·`source`로 범위를 줄일 때도 비표준 경로·다른 수집원의 유효 입력과 무효화 울타리를 빠뜨리지 않아야 합니다.
 - 배터리 최고·최저 온도 카드(51·52)는 Fleet의 `Vehicle.Powertrain.TractionBattery.ModuleTempMax`·`ModuleTempMin` 표준 경로로 제한합니다. `path`·`source` 태그 조건으로 무관한 CAN 이력 읽기를 줄이되, 지원 경로 안의 최신 NULL·무효 보고와 후속 입력 울타리는 유지합니다. 교정 결과도 Fleet scope만 표시하며 비표준 경로·CAN 입력은 이 카드에 포함하지 않습니다. CAN 온도 보고는 **CAN 배터리 신호** 화면에서 확인하세요. 다른 매핑을 지원하려면 해당 태그 경로와 교정 범위를 함께 확장해야 합니다.
 - 수집 경로 선택기의 `CASE`는 알 수 없는 태그 문자열을 `CONCAT(source, '')`로 반환합니다. GreptimeDB 1.2.1에서는 태그를 그대로 반환하는 분기가 `Utf8`·`Dictionary(UInt32, Utf8)` 스트림 스키마 불일치를 일으킬 수 있습니다. 오류를 숨기거나 수집원을 제외하지 않고 문자열 결과 타입을 맞춥니다.
 - 배터리 분석 결과는 기존 `vehicle_analysis` 스키마 그대로 조회합니다(새 테이블 없음). 계산 불가 지표도 첫 관측부터 `value=NULL`, `status='unavailable'`, 사유 `reason` + 기존 revision·scope·교정/모델/커버리지 메타데이터 행으로 저장되므로 사유가 조회 가능하며, 건강 값은 저장하지 않습니다. 저장 트레이드오프: 생성된 모든 unavailable identity가 보관되므로 희소 구간·scope의 NULL 행만큼 쓰기량이 늡니다. 최신 뷰는 `(vehicle, source, decode_epoch, analysis_id, metric, window_start)`별 `computed_at DESC, revision DESC`이며, 최신 실패가 과거 건강값을 되살리지 않고 복구는 같은 논리 identity를 갱신합니다. 집계 로그의 `unavailable_stored`는 저장된 NULL 사유 행 수입니다.
 - `기록 없음`은 성공한 패널 조회 결과가 0행이라는 뜻이며 0이 아닙니다. NULL 값 + `unavailable` 상태 + 사유 텍스트가 있는 행은 이유가 명시된 계산 불가이므로 빈 셀을 0·정상으로 읽지 말고 사유 열을 확인하세요. 분석 표가 통째로 비어 있어도 입력 부재·분석 대기·교정 부재 중 어느 하나를 단정할 수 없습니다. 조회 실패는 Grafana 오류로 표시하며 `기록 없음`으로 바꾸지 않습니다.
 - 현재 전력·전압(110·111)은 선택 끝까지 완료되어야 하는 최신 시간 구간과 입력 울타리를 만족할 때만 수치를 표시합니다. 최신 완료 구간이 오래되거나 그 뒤 원시 입력이 있으면 NULL이며, 선택 끝 이후의 미래 원시는 판정에서 제외합니다. 마지막 완료 구간(112)은 신선도와 무관한 이력으로 관측·구간·계산 시각을 함께 표시합니다. 최신 실패를 과거 유효값으로 대체하지 않습니다.
+
 - 근거 표(113)는 분석 identity별 관측·구간·계산 시각을 구분합니다. 원본 잔량·에너지·실내외 온도는 선택 끝 이내의 최종 보고를 보며, 선택 범위 이전의 오래된 보고도 관측 시각과 함께 표시합니다. CAN 별칭은 미검증 보고값이지 교정된 건강 지표가 아닙니다.
 - 이유 상태(114)는 저장된 `status`와 `reason`에서만 도출합니다. 교정 부재·최신 무효·관측 부족·모델 부재를 구분하며, 시각이 맞지 않는 `unmatched`·`unsynchronized`를 보고 충돌로 단정하지 않습니다. 계산 불가 수치는 항상 NULL입니다.
 - 완료 구간과 후속 입력(115)은 선택 범위에 실제 원시 관측이 있을 때만 비교합니다. 분석 기록이 없으면 `분석 기록 없음 · 확인 필요`, 최신 완료 구간 뒤에 선택 끝 이내의 원시 관측이 있으면 `재분석 필요`입니다. 이미 최신 완료 구간으로 덮인 관측을 오래된 구간과 비교해 대기로 표시하지 않으며, 기록 부재만으로 실행 대기나 설정 부족을 단정하지 않습니다.
@@ -420,3 +456,11 @@ COMPOSE_PROJECT_NAME=datalake-recovery docker compose --env-file .env up -d
 | 백업·복원 거부 | DB 실제 정지, 오프라인 확인 플래그, 빈 복원 대상, S3 객체 충돌 |
 
 진단 로그를 공유할 때도 토큰·비밀번호·인증 헤더·개인 데이터가 포함되지 않았는지 확인하세요.
+
+## CAN decoded-outbox backpressure (issue #11)
+
+- decoded outbox 행 수와 canonical UTF-8 바이트에 high/low watermark를 둡니다. 기본값은 행 20000/15000, 바이트 32/24 MiB이며 `CAN_OUTBOX_HIGH_ROWS/LOW_ROWS/HIGH_BYTES/LOW_BYTES`(`work` 플래그 `--outbox-high-rows` 등)로 조정합니다. high에서 **decode만 pause**하고 raw 수신은 기존 reserve/인증/원자적 commit 정책 그대로 계속 받습니다.
+- 경계 진동 방지: pause 중에는 행·바이트가 모두 low 이하로 내려가야 재개합니다. 이미 staged된 batch는 최대 한 `DECODE_ROW_BUDGET` batch만큼 high를 초과할 수 있습니다(문서화된 최대 overshoot). ACK 삭제·checkpoint 여유는 disk reserve가 그대로 담당하며, 이 기능은 raw 전체 저장량을 무한히 안전하게 만들지 않습니다.
+- commit→wake 힌트(`accept→decode`, `decode→upload`, full-ACK 삭제→decode)는 idle sleep만 건너뛰는 최적화입니다. 분리 실행에서는 `accept→decode` 힌트가 프로세스를 넘지 않으므로(수신 프로세스 내 threading.Event), worker는 주기적 영속 상태 재조회로 새 raw를 발견합니다. `decode→upload`와 full-ACK→decode 힌트는 worker 내부에서 그대로 동작합니다. SQLite 상태가 최종 근거이므로 notify 유실·restart·race에서도 주기적 테이블 재조회로 진행합니다. 실패한 downstream은 자체 retry 간격으로만 재시도하고 신규 raw 알림마다 busy retry하지 않습니다.
+- 바이트 카운터(`archive_meta.outbox_bytes`)는 decode-insert와 delete(flush full-ACK) 각각과 같은 transaction에서 유지되며, rollback 시 함께 취소됩니다. 기존 archive는 기동 시 outbox 테이블에서 1회 backfill합니다(`Archive` init의 `_migrate_outbox_bytes`). 핫패스 사용량(`outbox_usage()`)은 archive_meta 카운터를 읽고, 정합 검증용 전체 스캔은 `outbox_table_usage()`를 사용합니다.
+- 측정 harness(부모 실행): `python -m unittest discover -s tests -p test_can_backpressure.py`, 저유량 accept→decode→full ACK p50/p95/p99와 장애 중 DB/WAL/outbox 증가·회복 drain rate·raw 수신 지연 비교는 `tools/benchmark_can_pipeline.py` harness로 수행합니다.

@@ -75,11 +75,14 @@ class FakeGreptime:
 
 with tempfile.TemporaryDirectory(prefix="can-enc-seed-") as work:
     archive = rec.Archive(str(Path(work) / "bench.sqlite"), disk_reserve_bytes=0)
+    canonicals = [json.dumps(r) for r in rows]
     with archive.connect() as conn:
         conn.execute("INSERT INTO epochs VALUES(?,?)", ("synthetic-v1", "synthetic-v1"))
+        conn.execute("BEGIN IMMEDIATE")
         conn.executemany(
             "INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-            [(r["event_id"], "synthetic-v1", json.dumps(r)) for r in rows])
+            [(r["event_id"], "synthetic-v1", c) for r, c in zip(rows, canonicals)])
+        rec._outbox_bump(conn, len(rows), sum(len(c.encode()) for c in canonicals))
         conn.commit()
     fake = FakeGreptime()
     t0, c0 = time.monotonic(), time.process_time()

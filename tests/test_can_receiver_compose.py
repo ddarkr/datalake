@@ -10,6 +10,7 @@ Run: python -m tests.test_can_receiver_compose
 """
 import base64
 import gzip
+import hashlib
 import http.client
 import json
 import os
@@ -34,6 +35,7 @@ REQUIRED_SOURCES = (
     "scripts/ingest/can/can_receiver.py",
     "scripts/ingest/can/can_decoder.py",
     "scripts/ingest/can/can_otlp_wire.py",
+    "scripts/ingest/can/can_files.py",
     "scripts/database/db_init.py",
     "scripts/database/greptime_preflight.py",
     "compose/can-receiver.yaml",
@@ -353,9 +355,62 @@ def main():
             wait_for(lambda: status()["pending_rows"] == 0, 300, "post-outage drain")
             assert _count(greptime_host, auth, db_name, "vehicle_signal") == len(expected)
 
+            # File receipt is independent of worker availability and preserves
+            # a partial JSONL tail; only the worker turns it into signal rows.
+            meta_d = {"schema_version": 1, "vehicle": "fixture", "collector_id": "fixture",
+                      "session_id": "fixture-files", "started_ns": START_C + 1_000_000_000,
+                      "vehicle_firmware": "synthetic"}
+            chunks_d = [{"seq": 0, "offset_ns": 7, "phase": "capture", "data": b"t12320200\r"}]
+            original = b'{"seq":0,"t_s":0.000000007,"phase":"capture","data_b64":"' + \
+                base64.b64encode(chunks_d[0]["data"]) + b'"}\n'
+            capture = json.dumps({
+                "schema_version": 1, "started_utc": time.strftime(
+                    "%Y-%m-%dT%H:%M:%SZ", time.gmtime(meta_d["started_ns"] // 1_000_000_000)),
+                "vehicle_firmware": "synthetic", "chunks": 1, "complete": True,
+                "raw_file_sha256": hashlib.sha256(original).hexdigest(),
+            }).encode()
+
+            def put_file(name, offset, body, full):
+                url = endpoint.removesuffix("/v1/logs") + "/v1/files/fixture-files/" + name
+                request = urllib.request.Request(url, data=body, method="PUT", headers={
+                    "Authorization": status_auth, "Content-Type": "application/octet-stream",
+                    "X-CAN-Vehicle": "fixture", "X-CAN-Collector": "fixture",
+                    "X-CAN-Offset": str(offset), "X-CAN-SHA256": hashlib.sha256(body).hexdigest()})
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    assert response.status == 200
+                    ack = json.load(response)
+                assert ack == {"version": 1, "session_id": "fixture-files", "file": name,
+                               "offset": len(full),
+                               "tail_sha256": hashlib.sha256(full[-65536:]).hexdigest()}, ack
+
+            compose("stop", "can-worker")
+            put_file("capture.json", 0, capture, capture)
+            split = len(original) // 2
+            put_file("serial_chunks.jsonl", 0, original[:split], original[:split])
+            assert status()["raw_chunks"] == total_chunks + OUTAGE_CHUNKS
+            compose("restart", "can-receiver")
+            endpoint = "http://" + compose("port", "can-receiver", "4319").strip() + "/v1/logs"
+            wait_for(unauthorized, 60, "receiver after partial file restart")
+            # Lost-ACK duplicate and subsequent append must retain exact bytes.
+            put_file("serial_chunks.jsonl", 0, original[:split], original[:split])
+            put_file("serial_chunks.jsonl", split, original[split:], original)
+            put_file("events.jsonl", 0, b"", b"")
+            assert status()["raw_chunks"] == total_chunks + OUTAGE_CHUNKS
+            compose("start", "can-worker")
+            file_expected = expect_rows([(meta_d, chunks_d)])
+            wait_for(lambda: status()["raw_chunks"] == total_chunks + OUTAGE_CHUNKS + 1
+                     and status()["pending_rows"] == 0
+                     and _count(greptime_host, auth, db_name, "vehicle_signal") ==
+                     len(expected) + len(file_expected), 120, "file import and real Greptime ACK")
+            for event_id, (event_ns, value_num, _, _, _) in file_expected.items():
+                assert _count(greptime_host, auth, db_name, "vehicle_signal",
+                              "event_id='" + event_id + "' AND event_time=" + str(event_ns)
+                              + " AND value_num=" + repr(value_num)) == 1
+            print("direct files: worker-off durable ACK, partial restart/replay, exact ns and real Greptime ACK passed")
+
             print("split receiver+worker: offline durability, %d chunks/%d rows, dense resume,"
                   " real greptime rows/dirty ACK, restart dedup, outage retention+drain passed"
-                  % (total_chunks + OUTAGE_CHUNKS, len(expected)))
+                  % (total_chunks + OUTAGE_CHUNKS + 1, len(expected) + len(file_expected)))
             print("sources: " + ",".join(REQUIRED_SOURCES))
             print("images: " + GREPTIME_IMAGE + "," + RECEIVER_IMAGE)
             print("command: python -m tests.test_can_receiver_compose")
