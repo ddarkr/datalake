@@ -209,6 +209,49 @@ class ReceiverArchiveTest(unittest.TestCase):
             os.environ["CAN_RECEIVER_DISK_RESERVE_BYTES"] = "not-a-number"
             self.assertNotIn("datalake_receiver_disk_reserve_bytes", sm.receiver_metrics(archive))
 
+    def test_epoch_state_fixed_labels_without_identities(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "raw.sqlite3"
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute("CREATE TABLE epochs(epoch TEXT PRIMARY KEY, mapping_revision TEXT NOT NULL)")
+                conn.execute("CREATE TABLE decode_epoch_state(epoch TEXT PRIMARY KEY,"
+                             "processed_chunks INTEGER NOT NULL,"
+                             "decoded_rows INTEGER NOT NULL, partial_rows INTEGER NOT NULL,"
+                             "pending_sessions INTEGER NOT NULL)")
+                conn.execute("INSERT INTO epochs VALUES('new-epoch','v1')")
+                conn.execute("INSERT INTO epochs VALUES('old-epoch','v1')")
+                conn.execute("INSERT INTO decode_epoch_state VALUES('new-epoch',5,50,2,1)")
+                conn.execute("INSERT INTO decode_epoch_state VALUES('old-epoch',3,30,0,0)")
+                conn.executescript(SCHEMA)
+                conn.execute(
+                    "INSERT INTO sessions(vehicle,collector_id,session_id,meta_json) VALUES(?,?,?,?)",
+                    ("synthetic-vehicle", "synthetic-collector", "s1", "{}"))
+                conn.execute("CREATE TABLE archive_meta(key TEXT PRIMARY KEY, value INTEGER)")
+                conn.execute("INSERT INTO archive_meta VALUES('raw_chunks',8)")
+                conn.execute("INSERT INTO archive_meta VALUES('sessions_total',1)")
+                conn.execute("INSERT INTO archive_meta VALUES('active_epoch','old-epoch')")
+                conn.commit()
+            finally:
+                conn.close()
+            metrics = sm.receiver_metrics(str(path))
+            # Active = explicit archive_meta selection; labels fixed, never epoch/session/vehicle values.
+            self.assertEqual(metrics['datalake_receiver_epoch_processed_chunks{scope="active"}'], 3)
+            self.assertEqual(metrics['datalake_receiver_epoch_processed_chunks{scope="retained"}'], 5)
+            self.assertEqual(metrics['datalake_receiver_epoch_remaining_chunks{scope="active"}'], 5)
+            self.assertEqual(metrics['datalake_receiver_epoch_remaining_chunks{scope="retained"}'], 3)
+            self.assertEqual(metrics['datalake_receiver_epoch_decoded_rows_exact{scope="retained"}'], 52)
+            self.assertEqual(metrics['datalake_receiver_epoch_active_backlog_chunks{scope="active"}'], 5)
+            self.assertEqual(metrics['datalake_receiver_epoch_retained_backlog_chunks{scope="retained"}'], 3)
+            self.assertEqual(metrics['datalake_receiver_epoch_retained_backlog_chunks{scope="active"}'], 0)
+            self.assertNotIn("new-epoch", json.dumps(metrics))
+            self.assertNotIn("old-epoch", json.dumps(metrics))
+
+    def test_legacy_archive_without_epoch_state_omits_epoch_gauges(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metrics = sm.receiver_metrics(make_archive(directory))
+            self.assertNotIn("datalake_receiver_epoch_processed_chunks", " ".join(metrics))
+
 
 if __name__ == "__main__":
     raise SystemExit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)

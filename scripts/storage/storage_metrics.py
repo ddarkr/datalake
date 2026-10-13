@@ -26,6 +26,9 @@ Metrics (port 9105, internal only):
   datalake_receiver_last_receive/decode/full_ack_timestamp_seconds
                                            (only when known, never invented)
   datalake_receiver_decoded/acked_rows_total (receipt vs decode vs DB commit)
+  datalake_receiver_epoch_*{scope="active"|"retained"} (trigger-kept epoch
+                                           state; fixed active/retained labels,
+                                           never epoch/session/vehicle values)
 
 Only successful inventories publish values; a failure keeps the last good
 values with success=0 (visibly stale, never a fake zero). The receiver
@@ -136,9 +139,11 @@ def refresh_once(client, bucket):
         _S.update(bytes=total, objects=count,
                   timestamp=int(time.time()), success=1)
 
-_RECEIVER_KINDS = ("decode_failure", "greptime_failure", "greptime_partial_ack",
-                   "greptime_timeout", "greptime_row_too_large", "archive_disk_reserve",
-                   "dirty_notify_failure")
+_RECEIVER_KINDS = ("decode_failure", "decode_state_conflict", "decode_partial_conflict",
+                   "greptime_failure", "greptime_partial_ack",
+                   "greptime_timeout", "greptime_row_too_large", "canonical_serialize_failure",
+                   "sqlite_locked", "sqlite_full", "sqlite_corrupt",
+                   "archive_disk_reserve", "dirty_notify_failure")
 _RECEIVER_FRESHNESS = (("last_receive_ns", "datalake_receiver_last_receive_timestamp_seconds"),
                        ("last_decode_ns", "datalake_receiver_last_decode_timestamp_seconds"),
                        ("last_full_ack_ns", "datalake_receiver_last_full_ack_timestamp_seconds"))
@@ -215,11 +220,19 @@ def operational_metrics(path="/ops"):
 
 _META_KEYS = ("raw_chunks", "raw_bytes", "outbox_rows", "last_receive_ns",
               "last_decode_ns", "last_full_ack_ns", "decoded_rows_total",
-              "acked_rows_total")
+              "acked_rows_total", "sessions_total", "active_epoch")
 _META_COUNTS = {"raw_chunks": "datalake_receiver_raw_chunks",
                 "raw_bytes": "datalake_receiver_raw_bytes",
                 "decoded_rows_total": "datalake_receiver_decoded_rows_total",
                 "acked_rows_total": "datalake_receiver_acked_rows_total"}
+_EPOCH_GAUGES = {"processed_chunks": "datalake_receiver_epoch_processed_chunks",
+                 "remaining_chunks": "datalake_receiver_epoch_remaining_chunks",
+                 "active_backlog_chunks": "datalake_receiver_epoch_active_backlog_chunks",
+                 "retained_backlog_chunks": "datalake_receiver_epoch_retained_backlog_chunks",
+                 "decoded_rows": "datalake_receiver_epoch_decoded_rows",
+                 "partial_rows": "datalake_receiver_epoch_partial_rows",
+                 "decoded_rows_exact": "datalake_receiver_epoch_decoded_rows_exact",
+                 "pending_sessions": "datalake_receiver_epoch_pending_sessions"}
 
 
 def _valid_count(value):
@@ -253,7 +266,7 @@ def _receiver_meta(conn):
         return facts, True
     try:
         rows = conn.execute(
-            "SELECT key,value FROM archive_meta WHERE key IN (?,?,?,?,?,?,?,?)",
+            "SELECT key,value FROM archive_meta WHERE key IN (?,?,?,?,?,?,?,?,?,?)",
             _META_KEYS).fetchall()
     except sqlite3.Error:
         return facts, True
@@ -264,10 +277,14 @@ def _receiver_meta(conn):
         if not isinstance(key, str):
             return facts, True
         if key in _META_KEYS and key not in facts:
-            if not isinstance(value, int) or isinstance(value, bool):
+            if key == "active_epoch":
+                if not isinstance(value, str):
+                    return facts, True
+            elif not isinstance(value, int) or isinstance(value, bool):
                 return facts, True
             facts[key] = value
     return facts, malformed
+
 
 
 def receiver_metrics(archive=None, reserve_bytes=None):
@@ -304,12 +321,15 @@ def receiver_metrics(archive=None, reserve_bytes=None):
         try:
             conn.execute("PRAGMA query_only=ON")
             conn.execute("BEGIN")  # Counters and oldest row share one read-only snapshot.
-            sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
-            if not _valid_count(sessions):
-                raise sqlite3.Error("invalid session count")
             meta, meta_malformed = _receiver_meta(conn)
             if meta_malformed:
                 raise sqlite3.Error("malformed archive_meta")
+            if "sessions_total" in meta:
+                sessions = meta["sessions_total"]
+            else:  # legacy archive before migration: single indexed COUNT only
+                sessions = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+            if not _valid_count(sessions):
+                raise sqlite3.Error("invalid session count")
             for _key in _META_COUNTS:
                 if _key in meta and not _valid_count(meta[_key]):
                     raise sqlite3.Error("invalid archive_meta count")
@@ -340,6 +360,38 @@ def receiver_metrics(archive=None, reserve_bytes=None):
                         if not _valid_count(count):
                             raise sqlite3.Error("invalid worker error count")
                         seen[kind] = (count, last_ns if _valid_ns(last_ns) else None)
+            try:
+                epoch_state = conn.execute(
+                    "SELECT epoch,processed_chunks,decoded_rows,partial_rows,pending_sessions,"
+                    "COALESCE(decoded_rows,0)+COALESCE(partial_rows,0) FROM decode_epoch_state LIMIT 64").fetchall()
+            except sqlite3.Error:
+                epoch_state = None  # legacy archive before migration: epoch gauges stay unknown
+            epoch_rows = []
+            if epoch_state is not None:
+                order = [row[0] for row in conn.execute("SELECT epoch FROM epochs ORDER BY rowid").fetchall()]
+                active = meta.get("active_epoch")
+                if not isinstance(active, str):
+                    active = order[-1] if order else None
+                raw_total = meta.get("raw_chunks")
+                if raw_total is None or not _valid_count(raw_total):
+                    raise sqlite3.Error("invalid raw counter for epoch remaining")
+                for _key in ("sessions_total",):
+                    if _key in meta and not _valid_count(meta[_key]):
+                        raise sqlite3.Error("invalid archive_meta count")
+                by_epoch = {}
+                for erow in epoch_state:
+                    if (not isinstance(erow, (tuple, list)) or len(erow) != 6 or not isinstance(erow[0], str)
+                            or any(not _valid_count(v) for v in erow[1:])):
+                        raise sqlite3.Error("invalid epoch state row")
+                    by_epoch[erow[0]] = erow[1:]
+                for epoch in order:
+                    if epoch not in by_epoch:
+                        raise sqlite3.Error("missing epoch state row")
+                    processed, decoded, partial, pending_sessions, exact = by_epoch[epoch]
+                    remaining = raw_total - processed
+                    if remaining < 0:
+                        raise sqlite3.Error("invalid epoch remaining")
+                    epoch_rows.append((epoch == active, processed, remaining, decoded, partial, pending_sessions, exact))
             oldest_event_ns = oldest_ingest_ns = None
             if oldest is not None:
                 row = conn.execute(
@@ -378,6 +430,19 @@ def receiver_metrics(archive=None, reserve_bytes=None):
     for key, metric in _META_COUNTS.items():
         if key in meta:
             values[metric] = meta[key]  # validated inside the caught domain
+    if epoch_rows:
+        active_totals, retained_totals = [0] * 6, [0] * 6
+        for is_active, processed, remaining, decoded, partial, pending_sessions, exact in epoch_rows:
+            slot = active_totals if is_active else retained_totals
+            for index, value in enumerate((processed, remaining, decoded, partial, pending_sessions, exact)):
+                slot[index] += value
+        names = ("processed_chunks", "remaining_chunks", "decoded_rows", "partial_rows",
+                 "pending_sessions", "decoded_rows_exact")
+        for role, totals in (("active", active_totals), ("retained", retained_totals)):
+            for name, total in zip(names, totals):
+                values['%s{scope="%s"}' % (_EPOCH_GAUGES[name], role)] = total
+            values['%s{scope="%s"}' % (_EPOCH_GAUGES["active_backlog_chunks"], role)] = totals[1] if role == "active" else 0
+            values['%s{scope="%s"}' % (_EPOCH_GAUGES["retained_backlog_chunks"], role)] = 0 if role == "active" else totals[1]
     for key, metric in _RECEIVER_FRESHNESS:
         if _valid_ns(meta.get(key)):
             values[metric] = meta[key] / 1e9
