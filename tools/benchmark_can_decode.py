@@ -27,8 +27,10 @@ commit() calls as commits. The report compares observed
 fetched/staged amplification, read queries, fetched bytes and commits
 alongside wall/CPU time. Fails on any outbox / decode_states /
 decode_partial / counter content mismatch (full compare, never
-length-only), or when a case's current median wall time exceeds its
-baseline median by more than --max-slowdown (default 0.25). Repeats
+length-only; counters the baseline never stored are normalized from the
+snapshot itself, and only one-time migration bookkeeping is excluded), or
+when a case's current median wall time exceeds its baseline median by more
+than --max-slowdown (default 0.25). Repeats
 alternate baseline-first / current-first order to reduce runner drift.
 --json-out writes the same report to a file even on failure for artifact
 publishing.
@@ -372,9 +374,26 @@ def _run_side(side_root, case, chunks, fixed_ns, instrument):
     return json.loads(proc.stdout)
 
 
+def _scope(snapshot):
+    # Compare derived counters even when the legacy archive did not store them.
+    # Full drain leaves one state per accepted session; this benchmark never ACKs.
+    counters = dict(snapshot["counters"])
+    for key in ("decoded_total_v2", "epoch_state_migrated", "pending_heads_v1"):
+        counters.pop(key, None)
+    if "sessions_total" not in counters:
+        counters["sessions_total"] = len(snapshot["states"])
+    if "active_epoch" not in counters:
+        counters["active_epoch"] = snapshot["epoch"]
+    if "outbox_bytes" not in counters:
+        counters["outbox_bytes"] = sum(
+            len(row["row"].encode("utf-8")) for row in snapshot["outbox"])
+    return {**snapshot, "counters": counters}
+
+
 def _digest(snapshot):
-    raw = json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
-    return snapshot, hashlib.sha256(raw).hexdigest()
+    view = _scope(snapshot)
+    raw = json.dumps(view, sort_keys=True, separators=(",", ":")).encode()
+    return view, hashlib.sha256(raw).hexdigest()
 
 
 def _rates(side):

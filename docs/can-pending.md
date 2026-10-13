@@ -101,7 +101,10 @@ cursors. Restart needs no replay beyond opening the archive.
   /path/to/pre-batch-checkout --chunks 10000 --repeats 3`. Each side runs its
   own receiver/decoder in an isolated subprocess. Seeding is outside timed
   decoding, wall-clock nanoseconds are fixed, and full ordered rows (including
-  ingest timestamps), cursors, partials and persisted counters must match.
+  ingest timestamps), cursors, partials and counters must match. Counters the
+  baseline never stored are normalized from the snapshot itself (sessions_total
+  from drained states, active_epoch from the snapshot epoch, outbox_bytes from
+  summed canonical row bytes); only one-time migration bookkeeping is excluded.
   Reports use median wall/CPU time; a separate instrumented pass observes
   cursor-fetched raw rows/bytes, read queries, connections and commits in both
   source trees. Retained-prefetch statistics are not baseline I/O evidence.
