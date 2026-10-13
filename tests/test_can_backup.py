@@ -73,6 +73,7 @@ class FakeS3:
     def __init__(self, objects=None, fail_copy_at=None, fail_put_key=None,
                  corrupt=None):
         self.objects = dict(objects or {})
+        self.metadata = {}
         self.fail_copy_at = fail_copy_at
         self.fail_put_key = fail_put_key
         self.corrupt = dict(corrupt or {})
@@ -95,6 +96,10 @@ class FakeS3:
             out["IsTruncated"] = False
         return out
 
+    def head_object(self, Bucket, Key):
+        return {"ContentLength": len(self.objects[Key]),
+                "Metadata": self.metadata.get(Key, {})}
+
     def get_object(self, Bucket, Key):
         blob = self.corrupt.get(Key, self.objects[Key])
         stream = FakeStream(blob)
@@ -113,6 +118,7 @@ class FakeS3:
                 chunks.append(c)
             Body = b"".join(chunks)
         self.objects[Key] = bytes(Body)
+        self.metadata[Key] = dict(Metadata or {})
         return {}
 
     def copy_object(self, Bucket, CopySource, Key):

@@ -64,6 +64,7 @@ class CountingStore:
 
     def __init__(self, objects=None):
         self.objects = dict(objects or {})
+        self.metadata = {}
         self.reset()
 
     def reset(self):
@@ -80,7 +81,9 @@ class CountingStore:
         # Match S3: missing keys fail instead of returning a fake size.
         if Key not in self.objects:
             raise KeyError(Key)
-        return {"ETag": '"bench"', "ContentLength": len(self.objects[Key])}
+        return {"ETag": '"' + hashlib.sha256(self.objects[Key]).hexdigest() + '-2"',
+                "ContentLength": len(self.objects[Key]),
+                "Metadata": self.metadata.get(Key, {})}
 
     def get_object(self, Bucket, Key):
         # Missing keys raise KeyError, which backup.fetch_complete maps to
@@ -98,11 +101,15 @@ class CountingStore:
         if hasattr(Body, "read"):
             Body = Body.read()
         self.objects[Key] = bytes(Body)
+        self.metadata[Key] = dict(Metadata or {})
         return {}
 
-    def copy_object(self, Bucket, CopySource, Key):
+    def copy_object(self, Bucket, CopySource, Key, CopySourceIfMatch=None):
+        if CopySourceIfMatch is not None:
+            assert self.head_object(Bucket, CopySource["Key"])["ETag"] == CopySourceIfMatch
         self.copies += 1
         self.objects[Key] = self.objects[CopySource["Key"]]
+        self.metadata[Key] = dict(self.metadata.get(CopySource["Key"], {}))
         return {}
 
     def delete_objects(self, Bucket, Delete):
@@ -235,11 +242,12 @@ def live_snapshot_hashes(bkmod, client, bucket, live_pfx):
 
 
 def sst_snapshot_hashes(bkmod, client, bucket, backup_pfx, bid):
-    """COMPLETE SST digests for one generation (manifest ground truth)."""
+    """Explicit benchmark-only byte verification, outside measured backup I/O."""
     complete, err = bkmod.fetch_complete(client, bucket, backup_pfx, bid)
     assert err is None, bid + ": " + str(err)[:120]
-    return {o["key"]: o["sha256"] for o in complete["sst"]}
-    return out
+    snap = bkmod.snapshot_prefix(backup_pfx, bid)
+    return {o["key"]: bkmod.s3_stream_hash(client, bucket, snap + o["key"])[0]
+            for o in complete["sst"]}
 
 
 def load_baseline(root):
@@ -332,10 +340,9 @@ def run_backup(bkmod, client, env, label):
 def restore_one(bkmod, client, env, bid, want_hash, label, live_pfx):
     """Restore into an empty isolated root; compare all file + SST hashes.
 
-    Compares every restored file hash plus the live SST snapshot hashes after
-    restore (not just the tar): live snapshot objects under the isolated live
-    prefix are hashed remotely and matched against the COMPLETE SST digests.
-    Returns the role name with hashes and match flags.
+    Compares every restored file hash plus streamed SST bytes against the
+    snapshot objects. These explicit benchmark reads are not production
+    backup verification and are outside measured backup request counts.
     """
     e = dict(env, BACKUP_FILE=bid)
     e = {k: v for k, v in e.items() if not k.startswith("_")}

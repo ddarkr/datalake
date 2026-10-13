@@ -121,7 +121,7 @@ docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d
 ```
 
-원본은 MF4, ingress sidecar, manifest를 함께 저장합니다. 객체 경로는 `raw/vehicle/<id>/can/YYYY/MM/DD/<manifest-sha256>/<원래 파일명>`이며, 업로드한 세 파일의 검증이 끝나기 전에는 로컬 spool을 제거하지 않습니다. 디코딩된 신호는 SQLite outbox를 거쳐 DB로 전달합니다.
+원본은 MF4, ingress sidecar, manifest를 함께 저장합니다. 객체 경로는 `raw/vehicle/<id>/can/YYYY/MM/DD/<manifest-sha256>/<원래 파일명>`이며, 로컬 manifest의 hash pin을 검사하고 업로드한 세 파일의 HEAD 크기·`sha256` metadata가 모두 일치한 뒤에만 로컬 spool을 제거합니다. 검증용 전체 GET은 하지 않으며, metadata는 원격 바이트 checksum이 아닙니다. 기존 객체의 metadata가 없거나 다르면 덮어쓰지 않고 로컬 파일을 유지합니다. 디코딩된 신호는 SQLite outbox를 거쳐 DB로 전달합니다.
 
 DBC·VSS·펌웨어 pin 변경 시 recorder와 decoder를 먼저 정지하고 `DECODE_EPOCH`를 갱신한 뒤 재기동하세요. 실행 중인 decoder와 recorder가 서로 다른 정의를 사용하게 만드는 hot swap은 지원하지 않습니다.
 
@@ -215,7 +215,7 @@ signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신�
 
 #### CAN archive 백업과 새 볼륨 복원
 
-DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE를 GET으로 검증한 뒤 성공하며 원격 자동 GC는 하지 않습니다.
+DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE 업로드는 HEAD 크기·hash metadata로 확인하며 검증용 전체 GET이나 원격 자동 GC는 하지 않습니다. 복원 다운로드와 로컬 파일의 SHA256 검증은 유지합니다.
 
 이 DB/definitions 백업 형식에는 `/data/files`의 직접 수신 원본·메타데이터 버전은 포함되지
 않습니다. 파일 백업까지 필요하면 수신·worker를 정상 종료한 상태의 raw 볼륨 전체 복사나
@@ -437,7 +437,7 @@ docker compose --env-file .env up -d
 `BACKUP_OFFLINE_CONFIRMED=1`은 실제 정지를 대신하지 않습니다. 스크립트는 DB가 응답하면 작업을 거부합니다.
 
 - 백업 범위는 `greptime-data`, `greptime-etc`와 S3 모드의 SST 객체입니다. **Grafana 사용자 설정, Alloy 큐, 차량 spool/outbox, `.env`는 이 백업에 포함되지 않습니다.** 별도 보관 정책이 필요합니다.
-- S3 모드는 SST와 archive를 SHA256·크기로 검증하고 완료 표식을 남깁니다. live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
+- S3 모드는 SST를 HEAD → 조건부 서버 측 COPY → HEAD 크기·metadata 확인으로 백업하며 원본/복사본 전체 GET을 하지 않습니다. SST 기록은 크기와 원본·복사본 ETag입니다(ETag는 객체 identity이며 전체 바이트 SHA256이 아닙니다). archive·sidecar·manifest·완료 표식 업로드도 HEAD 크기·로컬 hash metadata로 확인합니다. 이 방식은 동일 크기의 원격 비트 손상을 직접 검출하지 못합니다. live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
 - inventory JSON(`manifest.json`의 archive 내/원격 사본과 `COMPLETE`)은 **각각 비압축 UTF-8 64 MiB 이하**여야 합니다. 백업 생성과 로컬·원격 복원에 같은 한도를 적용하며 초과한 백업은 성공으로 보고하지 않습니다. 8,000개 이상의 SST도 이 바이트 한도 안이면 복원할 수 있습니다. checksum sidecar는 1 MiB 이하입니다. JSON 읽기는 한도와 chunk 크기로 제한하고 원격 응답 스트림은 성공·실패 모두 닫습니다. **archive 전체나 SST 데이터 총량에는 이 JSON 한도를 적용하지 않습니다.**
 - `BACKUP_KEEP=7`은 로컬 백업 세대 수입니다. 원격 보존은 기본 `off`이며 별도 승인된 `enforce`에서만 삭제합니다. [원격 보존 정책과 dry-run 절차](backup-retention.md)를 확인하고, 복구에 필요한 prefix에 임의 만료 정책을 설정하지 마세요.
 
@@ -454,7 +454,7 @@ COMPOSE_PROJECT_NAME=datalake-recovery docker compose --env-file .env up -d
 
 복원은 비어 있지 않은 대상 볼륨을 거부하며 강제 덮어쓰기 옵션은 없습니다. 같은 S3 live prefix를 쓰는 기존 DB와 복원 DB를 동시에 실행하지 마세요. 복원 후 현재 `.env`로 인증 설정이 다시 생성됩니다.
 
-성공한 복원은 백업 볼륨의 `BACKUP_DIR/restore-verification.json`에 `{timestamp_seconds, backup_id}`를 atomic 교체로 기록합니다. 이는 archive 내용과 SST의 SHA256·크기 검증 및 대상 파일 복원이 끝났다는 **마지막 오프라인 성공 기록**이며, DB 재기동·SQL 조회·데이터 수집이 정상이라는 증거가 아닙니다. 실패하면 이전 성공 기록을 유지하고 파일이 없으면 검증 이력은 unknown입니다. 최신 복원 시도가 성공했다는 뜻으로 해석하지 말고 종료 코드도 확인하세요.
+성공한 복원은 백업 볼륨의 `BACKUP_DIR/restore-verification.json`에 `{timestamp_seconds, backup_id}`를 atomic 교체로 기록합니다. 이는 archive SHA256·크기, SST HEAD identity·크기(기존 SHA256 형식의 SST 백업은 종전 hash 검증)와 대상 파일 복원이 끝났다는 **마지막 오프라인 성공 기록**이며, DB 재기동·SQL 조회·데이터 수집이 정상이라는 증거가 아닙니다. 실패하면 이전 성공 기록을 유지하고 파일이 없으면 검증 이력은 unknown입니다. 최신 복원 시도가 성공했다는 뜻으로 해석하지 말고 종료 코드도 확인하세요.
 
 `File` 모드에서 같은 호스트의 백업을 사용하려면 기존 백업 볼륨의 실제 이름을 `BACKUP_VOLUME_NAME`에, `BACKUP_VOLUME_EXTERNAL=true`를 복구용 환경설정에 지정하세요. 다른 호스트로 옮길 때는 백업 archive와 checksum도 안전하게 이전해야 합니다.
 

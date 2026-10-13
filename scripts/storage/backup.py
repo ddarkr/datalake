@@ -30,10 +30,10 @@ point-in-time snapshot: after the DB resumes, compaction/GC may delete SSTs
 the local files referenced. A restorable S3 backup is all of one backup id:
 the local tar (WAL/metadata, embeds manifest.json incl. the SST snapshot
 record) + the immutable SST snapshot prefix
-s3://<bucket>/<S3_BACKUP_PREFIX>/<backup-id>/sst/ + the verified off-host tar
+s3://<bucket>/<S3_BACKUP_PREFIX>/<backup-id>/sst/ + the off-host tar
 copy + a COMPLETE marker carrying tar_sha256/sidecar_sha256/manifest_sha256
-and the full SST digest list. Every restore path (downloaded AND local tars)
-is refused unless the tar, sidecar, embedded manifest, snapshot objects and
+and the full SST size/ETag list. Every restore path (downloaded AND local tars)
+is refused unless the tar, sidecar, embedded manifest, snapshot records and
 COMPLETE record all agree. Retention of the backup prefix is a dependency of
 restore: never set lifecycle expiry on it; besides its own failed-run writes
 (rollback), this tool deletes remote objects only via explicit retention
@@ -41,12 +41,12 @@ enforce+approval (refs/RETIRING-guarded generation retirement). The raw MF4
 bucket is separate and never touched. With GREPTIME_STORAGE_TYPE=File the local
 tar is the whole backup (same offline/tar/restore contract, no S3).
 
-Content verification (never ETag): object copies and uploads are verified by
-streaming SHA256 GETs in 1 MiB chunks (multipart CopyObject ETags differ
-legitimately, so ETags are never compared). Large objects are never read
-wholly into memory: the tar downloads stream to a .tmp file with incremental
-hashing and only atomically replace into place after the COMPLETE digest
-matches. Ownership/rollback: the backup id namespace is proven empty before
+Backup verification does not download object bodies: server-side copies use
+HEAD size/metadata and an ETag source precondition; uploads use HEAD size and
+locally computed SHA256 metadata. Metadata is not a remote byte checksum,
+and multipart ETags are identity tokens, not whole-object content hashes.
+Restore tar downloads stream to a .tmp file and atomically replace only after
+the COMPLETE digest matches. Ownership/rollback: the backup id namespace is proven empty before
 the first write, every destination key is registered BEFORE its write, and
 any failure deletes the whole owned set including a half-written COMPLETE
 marker (no dangling COMPLETE can point at rolled-back objects).
@@ -55,10 +55,10 @@ namespace is never written into. Restores require the SAME root —
 cross-root migration is not claimed.
 
 S3 backup order: offline check -> claim fresh id (local + remote namespace
-empty) -> copy each live object to the snapshot prefix (per-object streaming
-SHA verify; failure deletes the owned set) -> write local tar (0600) +
-.sha256 sidecar -> upload tar + sidecar + manifest copy (GET-and-hash
-verified) -> write COMPLETE marker (tracked, verified) -> only then prune
+empty) -> server-side copy each live object to the snapshot prefix (HEAD
+verification; failure deletes the owned set) -> write local tar (0600) +
+.sha256 sidecar -> upload tar + sidecar + manifest copy (HEAD verified)
+-> write COMPLETE marker (tracked, HEAD verified) -> only then prune
 old LOCAL generations (never the file just written; remote objects are never
 pruned). Overlapping live/backup prefixes fail closed. Missing S3 settings
 fail closed: a local-only S3 tar is unrestorable, so it is not written.
@@ -72,9 +72,9 @@ from a failed upload is NOT restorable) -> schema/identity/boundary checks
 (no force flag, legacy archives without an SST record refused, duplicate SST
 keys refused, snapshot prefix must equal backup-prefix/backup-id/sst
 exactly) -> refuse when local targets are non-empty; live SST keys already
-matching the manifest size+SHA256 are reused, missing snapshot keys are
-copied back and streaming-verified against the manifest digest, conflicting
-live contents refuse without overwriting (failure deletes only own writes)
+matching recorded size/ETag identity are reused, missing snapshot keys are
+copied back and HEAD-verified; historical SHA256 snapshots keep their original
+restore checks. Conflicting live objects refuse without overwriting (failure deletes only own writes)
 -> staged tar populate; any failure also removes the SST keys just written
 and rolls targets back to empty.
 Prefixes without COMPLETE are incomplete and ignored (safe to delete by hand).
@@ -330,23 +330,26 @@ def rollback_owned(client, bucket, owned):
         pass
 
 
-def s3_copy_content_verified(client, bucket, src, dst):
-    """Copy then stream-verify both sides by content hash (never ETag:
-    multipart CopyObject ETags legitimately differ from source ETags)."""
-    src_sha, src_size = s3_stream_hash(client, bucket, src)
-    client.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src}, Key=dst)
-    dst_sha, dst_size = s3_stream_hash(client, bucket, dst)
-    if dst_sha != src_sha or dst_size != src_size:
-        raise IOError("copy verify mismatch: %s -> %s" % (src, dst))
-    return src_sha, src_size
+def s3_copy_head_verified(client, bucket, src, dst):
+    """Server-side copy with source identity guard and HEAD size check; no GET."""
+    source = client.head_object(Bucket=bucket, Key=src)
+    client.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src},
+                       CopySourceIfMatch=source["ETag"], Key=dst)
+    target = client.head_object(Bucket=bucket, Key=dst)
+    if (target["ContentLength"] != source["ContentLength"]
+            or target.get("Metadata", {}) != source.get("Metadata", {})):
+        raise IOError("copy HEAD mismatch: %s -> %s" % (src, dst))
+    return {"size": source["ContentLength"], "source_etag": source["ETag"],
+            "etag": target["ETag"]}
 
 
 def s3_put_bytes_verified(client, bucket, key, blob):
-    client.put_object(Bucket=bucket, Key=key, Body=blob, ContentLength=len(blob))
-    got_sha, got_size = s3_stream_hash(client, bucket, key)
-    want = hashlib.sha256(blob).hexdigest()
-    if got_sha != want or got_size != len(blob):
-        raise IOError("upload verify mismatch: " + key)
+    digest = hashlib.sha256(blob).hexdigest()
+    client.put_object(Bucket=bucket, Key=key, Body=blob, ContentLength=len(blob),
+                      Metadata={"sha256": digest})
+    head = client.head_object(Bucket=bucket, Key=key)
+    if head["ContentLength"] != len(blob) or head.get("Metadata", {}).get("sha256") != digest:
+        raise IOError("upload HEAD mismatch: " + key)
 
 
 def s3_put_file_verified(client, bucket, key, path, digest, size):
@@ -354,9 +357,9 @@ def s3_put_file_verified(client, bucket, key, path, digest, size):
         client.put_object(Bucket=bucket, Key=key, Body=f,
                           ContentLength=size,
                           Metadata={"sha256": digest})
-    got_sha, got_size = s3_stream_hash(client, bucket, key)
-    if got_sha != digest or got_size != size:
-        raise IOError("upload verify mismatch: " + key)
+    head = client.head_object(Bucket=bucket, Key=key)
+    if head["ContentLength"] != size or head.get("Metadata", {}).get("sha256") != digest:
+        raise IOError("upload HEAD mismatch: " + key)
 
 
 def snapshot_prefix(backup_prefix, backup_id):
@@ -543,7 +546,7 @@ def cmd_backup():
         "root": ident["root"],
         "backup_prefix": ident["backup_prefix"],
         "labels": list(LABELS),
-        "tool": "backup.py v4",
+        "tool": "backup.py v5",
     }
     owned = []
     snap = None
@@ -561,8 +564,8 @@ def cmd_backup():
                 seen.add(rel)
                 dst = snap + rel
                 owned.append(dst)  # registered BEFORE the write
-                sha, size = s3_copy_content_verified(s3, bucket, obj["Key"], dst)
-                snap_objects.append({"key": rel, "size": size, "sha256": sha})
+                record = s3_copy_head_verified(s3, bucket, obj["Key"], dst)
+                snap_objects.append({"key": rel, **record})
             manifest["sst_snapshot"] = {
                 "bucket": bucket,
                 "src_prefix": root_pfx,
@@ -593,8 +596,7 @@ def cmd_backup():
                 "sidecar_sha256": sidecar_sha,
                 "manifest_sha256": manifest_sha,
                 "sst_count": len(snap_objects),
-                "sst": [{"key": o["key"], "size": o["size"], "sha256": o["sha256"]}
-                        for o in snap_objects],
+                "sst": snap_objects,
             }, sort_keys=True).encode("utf-8")
             if len(complete) > CONTROL_CAP:
                 raise IOError("COMPLETE exceeds control size limit (%d bytes)" % CONTROL_CAP)
@@ -678,8 +680,12 @@ def validate_sst_record(obj):
         return "sst record unsafe key: " + obj["key"]
     if not isinstance(obj.get("size"), int) or obj["size"] < 0:
         return "sst record bad size: " + obj["key"]
-    if not isinstance(obj.get("sha256"), str) or not SHA_RE.match(obj["sha256"]):
-        return "sst record bad sha256: " + obj["key"]
+    if "sha256" in obj:
+        if not isinstance(obj["sha256"], str) or not SHA_RE.match(obj["sha256"]):
+            return "sst record bad sha256: " + obj["key"]
+    elif not all(isinstance(obj.get(field), str) and obj[field]
+                 for field in ("etag", "source_etag")):
+        return "sst record missing ETag identity: " + obj["key"]
     return None
 
 
@@ -943,8 +949,8 @@ def check_against_complete(path, side_digest, raw_manifest, sst_objs, complete):
         return "sidecar bytes differ from COMPLETE record (refusing)"
     if hashlib.sha256(raw_manifest).hexdigest() != complete["manifest_sha256"]:
         return "embedded manifest differs from COMPLETE record (refusing)"
-    want = sorted((o["key"], o["size"], o["sha256"]) for o in sst_objs)
-    got = sorted((o["key"], o["size"], o["sha256"]) for o in complete["sst"])
+    want = sorted(sst_objs, key=lambda o: o["key"])
+    got = sorted(complete["sst"], key=lambda o: o["key"])
     if want != got:
         return "SST list differs from COMPLETE record (refusing)"
     return None
@@ -1039,13 +1045,11 @@ def download_remote_backup(d, client, bucket, bp, want):
 
 
 def s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
-    """Restore snapshot objects under the live root, reusing pre-existing
-    keys whose size+SHA256 already match the manifest. Only missing keys
-    are copied (each verified against the manifest digest); a pre-existing
-    key with different contents is a conflict and refuses without
-    overwriting anything. Each destination is registered BEFORE its write;
-    failure deletes only keys this run actually wrote, never pre-existing
-    or unrelated live objects."""
+    """Restore missing SSTs, refuse conflicting live keys, roll back own writes.
+
+    New snapshots use HEAD size/ETag identities, not byte hashes. Historical
+    SHA256 snapshots retain their original restore verification contract.
+    """
     planned = [root_pfx + o["key"] for o in objs]
     if len(set(planned)) != len(planned):
         raise IOError("duplicate SST destination (refusing)")
@@ -1056,20 +1060,36 @@ def s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
         for obj in objs:
             dst = root_pfx + obj["key"]
             src = snap_pfx + obj["key"]
-            if dst in live:
+            if "sha256" not in obj:
+                source = s3.head_object(Bucket=bucket, Key=src)
+                if source["ContentLength"] != obj["size"] or source["ETag"] != obj["etag"]:
+                    raise IOError("snapshot identity mismatch: " + obj["key"])
+                if dst in live:
+                    target = s3.head_object(Bucket=bucket, Key=dst)
+                    if (target["ContentLength"] == obj["size"]
+                            and target["ETag"] in (obj["source_etag"], obj["etag"])):
+                        continue
+                    raise IOError("live object conflicts with snapshot (refusing,"
+                                  " not overwriting): " + obj["key"])
+                written.append(dst)
+                copied = s3_copy_head_verified(s3, bucket, src, dst)
+                if copied["size"] != obj["size"] or copied["source_etag"] != obj["etag"]:
+                    raise IOError("restored object identity mismatch: " + obj["key"])
+            else:
+                if dst in live:
+                    got_sha, got_size = s3_stream_hash(s3, bucket, dst)
+                    if got_sha == obj["sha256"] and got_size == obj["size"]:
+                        continue
+                    raise IOError("live object conflicts with snapshot (refusing,"
+                                  " not overwriting): " + obj["key"])
+                written.append(dst)  # registered BEFORE the write
+                s3.copy_object(Bucket=bucket,
+                               CopySource={"Bucket": bucket, "Key": src},
+                               Key=dst)
                 got_sha, got_size = s3_stream_hash(s3, bucket, dst)
-                if got_sha == obj["sha256"] and got_size == obj["size"]:
-                    continue  # intact SST already live: reuse, write nothing
-                raise IOError("live object conflicts with snapshot (refusing,"
-                              " not overwriting): " + obj["key"])
-            written.append(dst)  # registered BEFORE the write
-            s3.copy_object(Bucket=bucket,
-                           CopySource={"Bucket": bucket, "Key": src},
-                           Key=dst)
-            got_sha, got_size = s3_stream_hash(s3, bucket, dst)
-            if got_sha != obj["sha256"] or got_size != obj["size"]:
-                raise IOError("restored object differs from manifest digest: "
-                              + obj["key"])
+                if got_sha != obj["sha256"] or got_size != obj["size"]:
+                    raise IOError("restored object differs from manifest digest: "
+                                  + obj["key"])
     except Exception:
         rollback_owned(s3, bucket, written)
         raise

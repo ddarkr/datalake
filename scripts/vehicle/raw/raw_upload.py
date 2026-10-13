@@ -2,18 +2,20 @@
 """Sealed triple (MF4 + ingress sidecar + manifest) -> S3 uploader.
 
 Ack rule: local closed JSONL + sealed .mf4 + .ingress.jsonl.gz + .mf4.manifest
-are deleted only after ALL THREE remote objects verify (PUT then re-GET,
-stream-hash, compare). Remote user-metadata hash is recorded but never
-trusted alone. Any failure on any leg keeps ALL locals. Before uploading,
-the sealed MF4 bytes must equal the manifest mf4_sha256 AND the sidecar
-bytes must equal ingress_sidecar_sha256 AND the sidecar must gunzip to the
-exact closed JSONL bytes (ingress_sha256); any drift quarantines the segment
-and uploads nothing (fail-closed: post-seal corruption is never backed up as
-truth, originals are never deleted). Uploads are idempotent: remote keys are
-content-addressed by SHA256(manifest bytes) -- which already pins MF4 +
-sidecar -- so a crash between upload and delete re-uploads to the same key
-on restart. Only complete triples are pending; staging *.tmp and partial
-sets are invisible to the uploader.
+are deleted only after ALL THREE remote objects verify (PUT then HEAD:
+ContentLength equals local size AND user-metadata sha256 equals local
+digest). Remote user-metadata hash is the previously-written Metadata
+sha256; objects without a matching digest fail closed (kept, never
+deleted, never trusted). Any failure on any leg keeps ALL locals. Before
+uploading, the sealed MF4 bytes must equal the manifest mf4_sha256 AND the
+sidecar bytes must equal ingress_sidecar_sha256 AND the sidecar must gunzip
+to the exact closed JSONL bytes (ingress_sha256); any drift quarantines the
+segment and uploads nothing (fail-closed: post-seal corruption is never
+backed up as truth, originals are never deleted). Uploads are idempotent:
+remote keys are content-addressed by SHA256(manifest bytes) -- which already
+pins MF4 + sidecar -- so a crash between upload and delete re-uploads to
+the same key on restart. Only complete triples are pending; staging *.tmp
+and partial sets are invisible to the uploader.
 """
 
 import hashlib
@@ -149,36 +151,31 @@ def _is_missing(ex):
     code, _ = _err_code(ex)
     if code == "NoSuchBucket":
         return False
-    return code in ("NoSuchKey", "NotFound")
+    return code in ("404", "NoSuchKey", "NotFound")
 
 
 def _remote_matches(resp, size, digest):
-    """True only when remote length (when reported) and SHA256 both match."""
-    body = resp["Body"]
+    """True only when HEAD length and user-metadata sha256 both match."""
     try:
-        length = resp.get("ContentLength")
-        if length is not None and int(length) != size:
+        if int(resp.get("ContentLength")) != size:
             return False
-        h = hashlib.sha256()
-        for chunk in body.iter_chunks(chunk_size=8 << 20):
-            h.update(chunk)
-        return h.hexdigest() == digest
-    finally:
-        try:
-            body.close()
-        except Exception:
-            pass
+    except (TypeError, ValueError):
+        return False
+    meta = resp.get("Metadata") or {}
+    # No digest recorded (legacy object): fail closed, never trust.
+    return meta.get("sha256") == digest
 
 
 def upload_verified(client, bucket, key, path, digest, max_retries):
     """Verified write to a content-addressed key: never overwrites truth.
 
-    Pre-check GET first: identical size+SHA256 reuses the live object;
-    different bytes are a conflict (kept, never overwritten); any other GET
-    error is unreadable (retried, never mistaken for missing). Only genuine
-    missing-key permits PUT, then post-PUT GET-and-hash must match. True
-    only on verified bytes; any False keeps all locals (run_once deletes
-    only on full-triple ack).
+    Pre-check HEAD first: identical size+Metadata sha256 reuses the live
+    object; different size/digest (including missing digest) is a conflict
+    (kept, never overwritten); any other HEAD error is unreadable
+    (retried, never mistaken for missing). Only genuine missing-key
+    permits PUT, then post-PUT HEAD must match. True only on verified
+    HEAD; any False keeps all locals (run_once deletes only on
+    full-triple ack).
     # ponytail: key safety rests on content addressing, not PUT atomicity --
     concurrent compliant writers sharing a key hold identical triple bytes
     (same manifest digest), so a plain S3 PUT is safe; noncompliant external
@@ -189,9 +186,9 @@ def upload_verified(client, bucket, key, path, digest, max_retries):
     for attempt in range(max_retries + 1):
         try:
             try:
-                existing = client.get_object(Bucket=bucket, Key=key)
-            except Exception as gex:
-                if not _is_missing(gex):
+                existing = client.head_object(Bucket=bucket, Key=key)
+            except Exception as hexc:
+                if not _is_missing(hexc):
                     raise
                 existing = None
             if existing is not None:
@@ -205,10 +202,10 @@ def upload_verified(client, bucket, key, path, digest, max_retries):
                 client.put_object(Bucket=bucket, Key=key, Body=fh,
                                   ContentLength=size,
                                   Metadata={"sha256": digest})
-            if _remote_matches(client.get_object(Bucket=bucket, Key=key),
+            if _remote_matches(client.head_object(Bucket=bucket, Key=key),
                                size, digest):
                 return True
-            minc("dropped_verify")  # checksum mismatch: keep local, retry
+            minc("dropped_verify")  # HEAD mismatch: keep local, retry
             print("verify mismatch %s (attempt %d)" % (key, attempt),
                   file=sys.stderr)
         except Exception as ex:

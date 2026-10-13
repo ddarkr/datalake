@@ -21,11 +21,11 @@
 # Automated S3 workflow (all inside scripts/storage/backup.py, boto3 pinned via
 # backup-deps venv; real B2 unverified — needs live credentials):
 # S3 backup: offline check -> SST objects copied from s3://BUCKET/ROOT/ to
-#   the immutable s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/sst/ (SHA256+size
-#   streamed and verified per object; failure rolls back own copies) -> local tar (0600,
+#   the immutable s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/sst/ (source HEAD,
+#   conditional server-side COPY, destination HEAD size/metadata; no body GET) -> local tar (0600,
 #   embeds manifest.json incl. the SST record) + .sha256 -> tar + sidecar +
 #   manifest uploaded to s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/ and
-#   GET-and-hash verified -> COMPLETE marker written -> only then old local
+#   HEAD size/digest-metadata verified -> COMPLETE marker written -> only then old local
 #   generations pruned (never the file just written). Remote pruning is
 #   opt-in, requires reviewed dry-run and explicit approval, and keeps pins.
 #   Overlapping live/backup prefixes fail closed. File mode keeps the same offline/tar/restore
@@ -33,10 +33,10 @@
 # S3 restore: offline check -> missing local archive auto-downloads the
 #   selected (BACKUP_FILE id/name) or newest COMPLETE remote backup and
 #   SHA-verifies it -> refuses non-empty local targets (no force flag) ->
-#   reuses live SST objects only after matching SHA256+size; conflicts or
-#   unreadable objects fail closed -> restores missing SSTs with per-object
-#   verification -> staged tar populate. Failure deletes only this run's
-#   writes. Legacy archives without an SST record are unrestorable in S3 mode.
+#   reuses live SSTs matching recorded size/ETag identity; conflicts or
+#   unreadable objects fail closed -> restores missing SSTs with HEAD checks
+#   (historical SHA256 snapshots retain their original restore checks) -> staged
+#   tar populate. Failure deletes only this run's writes. Metadata is not byte proof.
 # Never set lifecycle expiry on the backup prefix; the raw MF4 bucket is
 # separate and never touched.
 # Fresh-host/disaster recovery: fresh COMPOSE_PROJECT_NAME (empty volumes by
@@ -107,7 +107,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "2"
+      datalake.backup-revision: "3"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -161,7 +161,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "2"
+      datalake.backup-revision: "3"
     depends_on:
       backup-deps:
         condition: service_completed_successfully

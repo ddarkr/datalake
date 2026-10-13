@@ -3,7 +3,8 @@
 Covers: frame codec provenance, segment rotation/recovery, MF4 bus-logging
 round-trip via MF4Reader (payload/FD/RTR/error, pre-rename verify gate,
 crash-resume reuse, torn-tail salvage vs mid-corruption quarantine),
-deterministic remote keys, triple-upload ack rule (all locals kept on any
+deterministic remote keys, triple-upload ack rule (all locals deleted only
+on HEAD size+Metadata-sha256 ack of all three legs; all locals kept on any
 failure, manifest-pin drift fail-closed to quarantine, partial sets
 invisible), replay safety gate.
 """
@@ -378,31 +379,31 @@ class MF4Test(unittest.TestCase):
                 os.path.join(dirs["sealed"], stem + ".stage.tmp")))
 
 class _Missing(Exception):
-    """Mimics botocore ClientError for a missing key (NoSuchKey)."""
-    def __init__(self):
+    """Mimics botocore ClientError for a missing key."""
+    def __init__(self, code="NoSuchKey"):
         super().__init__("missing key")
-        self.response = {"Error": {"Code": "NoSuchKey"},
+        self.response = {"Error": {"Code": code},
                          "ResponseMetadata": {"HTTPStatusCode": 404}}
 
 
-class FakeBody:
-    def __init__(self, data):
-        self.data = data
-        self.closed = False
-
-    def iter_chunks(self, chunk_size=1 << 20):
-        yield self.data
-
-    def close(self):
-        self.closed = True
+class _HeadError(Exception):
+    """Mimics a non-missing botocore failure (never means missing)."""
+    def __init__(self, code, status):
+        super().__init__("head failed: %s" % code)
+        self.response = {"Error": {"Code": code},
+                         "ResponseMetadata": {"HTTPStatusCode": status}}
 
 
 class FakeS3:
-    def __init__(self, corrupt=False, fail_put=0, unreadable=False):
+    """HEAD + PUT fake: store maps (Bucket, Key) -> (bytes, metadata)."""
+    def __init__(self, corrupt=False, fail_put=0, unreadable=False,
+                 missing_code="NoSuchKey", head_error=None):
         self.store = {}
         self.corrupt = corrupt
         self.fail_put = fail_put
         self.unreadable = unreadable
+        self.missing_code = missing_code
+        self.head_error = head_error
         self.puts = 0
 
     def put_object(self, Bucket, Key, Body, ContentLength, Metadata):
@@ -410,18 +411,20 @@ class FakeS3:
             self.fail_put -= 1
             raise ConnectionError("boom")
         self.puts += 1
-        self.store[(Bucket, Key)] = Body.read()
+        self.store[(Bucket, Key)] = (Body.read(), dict(Metadata or {}))
 
-    def get_object(self, Bucket, Key):
+    def head_object(self, Bucket, Key):
         if self.unreadable:
             raise ConnectionError("denied")
+        if self.head_error is not None:
+            raise self.head_error
         try:
-            data = self.store[(Bucket, Key)]
+            data, meta = self.store[(Bucket, Key)]
         except KeyError:
-            raise _Missing()
+            raise _Missing(self.missing_code)
         if self.corrupt:
-            data = b"tampered" + data
-        return {"Body": FakeBody(data), "ContentLength": len(data)}
+            data = b"tampered" + data  # wrong length: HEAD size mismatches
+        return {"ContentLength": len(data), "Metadata": dict(meta)}
 
 
 class UploadTest(unittest.TestCase):
@@ -483,7 +486,7 @@ class UploadTest(unittest.TestCase):
     def test_mismatch_keeps_all_locals(self):
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
-            cli = FakeS3(corrupt=True)
+            cli = FakeS3(corrupt=True)  # post-PUT HEAD size mismatches
             n = upl.run_once(cli, "b", spool, "m3", 0)
             self.assertEqual(n, 1)
             for kept in (p, s, m, cp):  # unacked: everything stays
@@ -553,19 +556,69 @@ class UploadTest(unittest.TestCase):
                                       (s, upl.sidecar_key(key)),
                                       (m, upl.manifest_key(key))):
                 with open(leg_path, "rb") as fh:
-                    cli.store[("b", leg_key)] = b"CONFLICT" + fh.read()
+                    blob = fh.read()
+                # Same byte length, wrong digest: HEAD metadata conflicts.
+                clashing = bytes(b ^ 0xFF for b in blob)
+                cli.store[("b", leg_key)] = (clashing, {"sha256": "0" * 64})
             before = dict(cli.store)
             self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
             self.assertEqual(cli.store, before)  # conflict: bytes untouched
             for kept in (p, s, m, cp):
                 self.assertTrue(os.path.exists(kept))
 
+    def test_missing_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            for leg_path, leg_key in ((p, key),
+                                      (s, upl.sidecar_key(key)),
+                                      (m, upl.manifest_key(key))):
+                with open(leg_path, "rb") as fh:
+                    cli.store[("b", leg_key)] = (fh.read(), {})  # legacy
+            before = dict(cli.store)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, before)  # no digest: never trusted
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_wrong_size_fails_closed(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            with open(p, "rb") as fh:
+                cli.store[("b", key)] = (fh.read() + b"\x00",
+                                         {"sha256": upl.sha256_file(p)})
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_head_404_code_means_missing(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(missing_code="404")  # botocore HEAD 404: upload
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for gone in (p, s, m, cp):
+                self.assertFalse(os.path.exists(gone))
+
+    def test_head_nonmissing_error_never_deleted(self):
+        for err in (_HeadError("Forbidden", 403),
+                    _HeadError("NoSuchBucket", 404)):
+            with tempfile.TemporaryDirectory() as spool:
+                p, s, m, cp = self._triple(spool)
+                cli = FakeS3(head_error=err)  # never means missing
+                self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+                self.assertEqual(cli.store, {})
+                for kept in (p, s, m, cp):
+                    self.assertTrue(os.path.exists(kept))
+
     def test_unreadable_live_object_retried_never_deleted(self):
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
             cli = FakeS3(unreadable=True)
             self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
-            self.assertEqual(cli.store, {})  # denied reads: nothing uploaded
+            self.assertEqual(cli.store, {})  # denied HEAD: nothing uploaded
             for kept in (p, s, m, cp):
                 self.assertTrue(os.path.exists(kept))
 

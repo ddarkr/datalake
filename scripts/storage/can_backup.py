@@ -23,8 +23,8 @@ tar bytes are exactly the hashed bytes. The tar holds the snapshot
 raw.sqlite3 + definitions/ + manifest.json; tar member modes are normalized
 (0600/0700) and the manifest carries the authoritative mode/uid/gid.
 
-Off-host (S3 mode): tar + sidecar + manifest are uploaded and GET-and-hash
-verified (streaming SHA256, never ETag: multipart ETags legitimately differ),
+Off-host (S3 mode): tar + sidecar + manifest uploads are confirmed with HEAD
+size + locally computed SHA256 metadata (no verification-only body GET),
 then a COMPLETE marker binds tar/sidecar/manifest/archive/definitions
 digests. Restore refuses anything the COMPLETE record does not bind,
 including local tars from failed uploads. boto checksum settings and all S3

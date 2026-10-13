@@ -86,11 +86,27 @@ prefix가 남아 restore가 선택하지 않고, 재실행이 이름 기준으�
 백업을 실패로 바꾸지 않습니다.
 ## 검증 유지와 비용 범위
 
- 복사·업로드 검증은 스트리밍 SHA-256이며 ETag를 비교하지 않습니다.
- 세대마다 SST 전체를 복사하는 독립 full snapshot이며, 공유 SST/content-addressed
-최적화를 도입하지 않습니다. retention은 누적 저장 바이트를 줄일 뿐 세대당
-COPY/GET I/O는 그대로이며, 매 백업 I/O 절감은 명시적 후속 최적화 범위입니다.
-무결성 검증을 빼거나 안전하지 않은 shared-object GC로 대체하지 않습니다.
+백업 시 SST는 HEAD → 조건부 서버 측 COPY → HEAD 크기·metadata 확인으로
+처리합니다. 원본·복사본의 전체 SHA256 GET과 archive 업로드 후 재다운로드는
+하지 않습니다. 업로드 객체는 로컬 SHA256을 metadata로 기록하고 HEAD에서
+크기와 함께 확인합니다. metadata는 원격 바이트 checksum이 아니며, 동일 크기의
+비트 손상까지 검출하는 종전 full GET 검증과 동등하지 않습니다.
+
+새 SST manifest/COMPLETE에는 크기와 원본·복사본 ETag를 기록합니다. ETag는
+identity/precondition 토큰으로만 사용하며 multipart ETag를 전체 바이트 hash로
+비교하지 않습니다. 새 백업 복원도 SST body GET 없이 HEAD/COPY를 사용합니다.
+기존 SHA256 형식의 백업은 종전 복원 검증을 유지하며, archive 다운로드 시
+SHA256 검증도 유지합니다.
+
+[IDrive e2의 API 문서](https://www.idrive.com/s3-storage-e2/s3-compatible-api)는
+HEAD와 COPY를 설명하지만 `ChecksumSHA256`의 PUT/COPY/HEAD 동작은 확인하지
+못했습니다. 실제 공급자 검증 없이 checksum 지원을 가정하지 않습니다.
+표본검사·주기적 scrub은 자동으로 실행하지 않습니다.
+
+세대마다 SST 전체를 복사하는 독립 full snapshot 구조는 그대로입니다.
+retention은 누적 저장 바이트를 줄이고, 이번 변경은 검증용 다운로드를 제거합니다.
+증분/content-addressed 공유 SST와 참조 기반 GC는 도입하지 않습니다.
+
 ## 운영 정책
 
 - 백업 prefix에 만료 lifecycle을 설정하지 마세요. versioned bucket의 noncurrent
@@ -107,8 +123,8 @@ COPY/GET I/O는 그대로이며, 매 백업 I/O 절감은 명시적 후속 최�
 `--user`, `--password-env`를 지정하면 같은 경로를 실제 S3 호환 서버에서
 실행합니다. 전용 bucket/prefix만 사용하세요.
 
-로컬 MinIO에서 원본과 변경 구현 모두 세대별 full snapshot의 요청 수는
-같았습니다. 중복 제거 또는 복사 비용 개선을 주장하지 않습니다.
+아래는 **HEAD 전환 전** 로컬 MinIO에서 측정한 보존 정책 검증 기록입니다.
+현재 구현의 요청 수나 검증 읽기 bytes를 나타내지 않습니다.
 
 | 입력 | LIST | GET | COPY | PUT | 검증 읽기 bytes (변경 구현) |
 | --- | ---: | ---: | ---: | ---: | ---: |

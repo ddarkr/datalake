@@ -11,9 +11,9 @@ Behavioral checks (each fails against the named defect, passes fixed):
   (2) Rollback ownership: corrupt snapshot copy / corrupt upload / corrupt
       COMPLETE write leave zero owned keys behind (incl. the COMPLETE
       marker itself — no dangling COMPLETE).
-  (3) Content (streaming SHA256), never ETag: multipart-style ETags do not
-      break backup/restore; bit-rotted snapshot copies and uploads are
-      caught by hash; short-read truncations fail rather than verify.
+  (3) No verification downloads during backup: server-side COPY checks source
+      identity and HEAD size; uploads check HEAD size/digest metadata. Restore
+      hashes downloaded archives and still verifies historical SHA256 SST records.
   (4) Namespace claim: a second backup into an occupied remote id fails
       closed and deletes nothing of the existing backup.
   (5) Exact download: nested prefix inventory never resolves as the
@@ -119,14 +119,15 @@ class FakeS3:
     """Same surface backup.py drives: list/head/get/put/copy/delete.
 
     get_object returns a bounded-read-only stream tracked for close assertions.
-    corrupt dict maps Key -> bytes actually stored on GET (simulating
-    bit-rot the stream hash must catch). put_store maps Key -> bytes the
-    fake keeps regardless of what was sent (simulating a lying transport).
+    corrupt dict maps Key -> GET bytes for restore download corruption.
+    put_store maps Key -> stored bytes for size-mismatch rollback checks.
     """
 
     def __init__(self, objects=None, fail_copy_at=None, fail_put_key=None,
                  corrupt=None, put_store=None, drop_tail=None):
         self.objects = dict(objects or {})
+        self.metadata = {}
+        self.etags = {}
         self.fail_copy_at = fail_copy_at
         self.fail_put_key = fail_put_key
         self.corrupt = dict(corrupt or {})
@@ -154,9 +155,8 @@ class FakeS3:
 
     def head_object(self, Bucket, Key):
         blob = self.objects[Key]
-        import hashlib as _h
-        fake_etag = '"deadbeef-multipart-style"'
-        return {"ETag": fake_etag, "ContentLength": len(blob)}
+        return {"ETag": self.etags.get(Key, '"' + hashlib.sha256(blob).hexdigest() + '-2"'),
+                "ContentLength": len(blob), "Metadata": self.metadata.get(Key, {})}
 
     def get_object(self, Bucket, Key):
         blob = self.corrupt.get(Key, self.objects[Key])
@@ -178,14 +178,18 @@ class FakeS3:
                 chunks.append(c)
             Body = b"".join(chunks)
         self.objects[Key] = self.put_store.get(Key, bytes(Body))
+        self.metadata[Key] = dict(Metadata or {})
         return {}
 
-    def copy_object(self, Bucket, CopySource, Key):
+    def copy_object(self, Bucket, CopySource, Key, CopySourceIfMatch=None):
+        if CopySourceIfMatch is not None:
+            assert self.head_object(Bucket, CopySource["Key"])["ETag"] == CopySourceIfMatch
         if self.fail_copy_at is not None and self.copies >= self.fail_copy_at:
             raise IOError("injected copy failure")
         self.copies += 1
         self.objects[Key] = self.put_store.get(
             Key, self.objects[CopySource["Key"]])
+        self.metadata[Key] = dict(self.metadata.get(CopySource["Key"], {}))
         return {}
 
     def delete_objects(self, Bucket, Delete):
@@ -1006,8 +1010,8 @@ def test_local_tar_from_failed_upload_refused():
 
 
 def test_corrupt_snapshot_copy_rolls_back():
-    # Transport stores different bytes than copied: hash must catch it,
-    # and the corrupt object must be in the rollback set.
+    # Transport stores a different size than copied; HEAD must catch it
+    # and the destination must be in the rollback set.
     fake = FakeS3(sst_fixture())
     tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
     try:
@@ -1016,8 +1020,8 @@ def test_corrupt_snapshot_copy_rolls_back():
         # copy_object path: pre-seed corrupt destination for first SST key.
         orig_copy = fake.copy_object
 
-        def lying_copy(Bucket, CopySource, Key):
-            r = orig_copy(Bucket, CopySource, Key)
+        def lying_copy(Bucket, CopySource, Key, CopySourceIfMatch=None):
+            r = orig_copy(Bucket, CopySource, Key, CopySourceIfMatch)
             fake.objects[Key] = b"corrupt-bytes"
             return r
         fake.copy_object = lying_copy
@@ -1053,9 +1057,15 @@ def test_corrupt_upload_rolls_back_including_complete():
 
 
 def test_multipart_etag_style_does_not_break():
-    # Fake head_object always returns a bogus multipart-style ETag; the
-    # workflow must still pass because it never compares ETags.
+    # Source and copied object may have different multipart ETags.
+    # They are identity tokens, not interchangeable whole-object hashes.
     fake = FakeS3(sst_fixture())
+    original_copy = fake.copy_object
+    def multipart_copy(**kw):
+        result = original_copy(**kw)
+        fake.etags[kw["Key"]] = '"' + hashlib.sha256(fake.objects[kw["Key"]]).hexdigest() + '-3"'
+        return result
+    fake.copy_object = multipart_copy
     tmp, _src, tgt, bdir, env = fresh_layout("S3", fake)
     try:
         setenv(env)
@@ -1071,17 +1081,25 @@ def test_multipart_etag_style_does_not_break():
         restore_env()
 
 
-def test_bitrotted_snapshot_copy_detected():
-    # GET returns different bytes than stored (bit-rot on the wire):
-    # streaming hash must fail the backup, not bless it.
+def test_backup_never_downloads_payloads_and_restore_only_fetches_controls():
     fake = FakeS3(sst_fixture())
-    tmp, _src, _tgt, bdir, env = fresh_layout("S3", fake)
+    tmp, _src, tgt, bdir, env = fresh_layout("S3", fake)
+    original_get = fake.get_object
+    def no_backup_get(**kw):
+        raise AssertionError("backup must not download: " + kw["Key"])
     try:
         setenv(env)
-        first = sorted(sst_fixture())[0]
-        fake.corrupt[first] = b"bit-rot"
-        assert bk.cmd_backup() == 3
-        assert [k for k in fake.objects if k.startswith("test-backups/")] == []
+        fake.get_object = no_backup_get
+        assert bk.cmd_backup() == 0
+        manifest = read_manifest(newest_tar(bdir))
+        assert all("sha256" not in obj for obj in manifest["sst_snapshot"]["objects"])
+        def controls_only(**kw):
+            assert not kw["Key"].startswith("test-root/") and "/sst/" not in kw["Key"]
+            return original_get(**kw)
+        fake.get_object = controls_only
+        fake.objects = {k: v for k, v in fake.objects.items() if not k.startswith("test-root/")}
+        assert bk.cmd_restore() == 0
+        assert hash_tree(tgt) == hash_tree(os.path.join(tmp, "src"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -1988,10 +2006,11 @@ def test_local_tar_restore_holds_ref_until_snapshot_used():
         held_during_copy = []
         orig_copy = fake.copy_object
 
-        def spy_copy(Bucket, CopySource, Key):
+        def spy_copy(Bucket, CopySource, Key, CopySourceIfMatch=None):
             held_during_copy.append(
                 [k for k in fake.objects if k.startswith(rbase + bk.REFS_DIR)])
-            return orig_copy(Bucket=Bucket, CopySource=CopySource, Key=Key)
+            return orig_copy(Bucket=Bucket, CopySource=CopySource, Key=Key,
+                             CopySourceIfMatch=CopySourceIfMatch)
 
         fake.copy_object = spy_copy
         try:
@@ -2014,6 +2033,43 @@ def test_local_tar_restore_holds_ref_until_snapshot_used():
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
+
+def test_head_snapshot_refuses_same_size_identity_changes():
+    for victim in ("live/data.sst", "snapshot/data.sst"):
+        fake = FakeS3({"live/data.sst": b"abcd"})
+        record = {"key": "data.sst", **bk.s3_copy_head_verified(
+            fake, "bucket", "live/data.sst", "snapshot/data.sst")}
+        fake.objects[victim] = b"wxyz"
+        before = dict(fake.objects)
+        try:
+            bk.s3_restore_snapshot(fake, "bucket", "live/",
+                                   {"snap_prefix": "snapshot/"}, [record])
+        except IOError:
+            pass
+        else:
+            raise AssertionError("changed SST identity accepted")
+        assert fake.objects == before
+
+
+def test_historical_sha256_snapshot_restores_and_rejects_corruption():
+    original = b"abcd"
+    record = {"key": "data.sst", "size": len(original),
+              "sha256": hashlib.sha256(original).hexdigest()}
+    fake = FakeS3({"snapshot/data.sst": original})
+    assert bk.validate_sst_record(record) is None
+    assert bk.s3_restore_snapshot(fake, "bucket", "live/",
+                                  {"snap_prefix": "snapshot/"}, [record]) == ["live/data.sst"]
+    assert fake.objects["live/data.sst"] == original
+    fake.objects["live/data.sst"] = b"wxyz"
+    try:
+        bk.s3_restore_snapshot(fake, "bucket", "live/",
+                               {"snap_prefix": "snapshot/"}, [record])
+    except IOError:
+        pass
+    else:
+        raise AssertionError("historical digest mismatch accepted")
+    assert fake.objects["live/data.sst"] == b"wxyz"
+
 
 if __name__ == "__main__":
     test_backup_refuses_running_db()
@@ -2040,7 +2096,7 @@ if __name__ == "__main__":
     test_corrupt_snapshot_copy_rolls_back()
     test_corrupt_upload_rolls_back_including_complete()
     test_multipart_etag_style_does_not_break()
-    test_bitrotted_snapshot_copy_detected()
+    test_backup_never_downloads_payloads_and_restore_only_fetches_controls()
     test_occupied_remote_namespace_fails_closed()
     test_latest_restore_uses_creation_order_within_one_second()
     test_nested_inventory_never_resolves_as_archive()
@@ -2056,6 +2112,8 @@ if __name__ == "__main__":
     test_restore_rejects_identity_change()
     test_prune_never_deletes_just_written()
     test_unreadable_live_sst_is_never_overwritten_or_deleted()
+    test_head_snapshot_refuses_same_size_identity_changes()
+    test_historical_sha256_snapshot_restores_and_rejects_corruption()
     test_large_sst_inventory_roundtrips_local_and_remote()
     test_inventory_limit_is_shared_by_backup_and_restore()
     test_oversized_complete_is_not_missing_and_closes_body()
@@ -2078,4 +2136,4 @@ if __name__ == "__main__":
     test_resume_aborted_writer_deletes_complete_first()
     test_generation_race_threading_refs()
     test_local_tar_restore_holds_ref_until_snapshot_used()
-    print("test_backup: ok (62 tests)")
+    print("test_backup: ok (64 tests)")
