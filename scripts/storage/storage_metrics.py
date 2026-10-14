@@ -205,20 +205,11 @@ def operational_metrics(path="/ops"):
         values[prefix + "_status_timestamp_seconds"] = stamp
         for key in ("interval_seconds", "running", "success",
                     "last_start_timestamp_seconds", "last_success_timestamp_seconds",
-                    "last_failure_timestamp_seconds",
-                    "vehicle_window_observation_timestamp_seconds",
-                    "vehicle_window_observation_success"):
+                    "last_failure_timestamp_seconds"):
             value = state.get(key)
             if (not isinstance(value, bool) and isinstance(value, (int, float))
                     and math.isfinite(value) and value >= 0):
                 values[prefix + "_" + key] = value
-        if (state.get("vehicle_window_observation_success") == 1
-                and isinstance(state.get("vehicle_window_lag_seconds"), dict)):
-            for source, value in state.get("vehicle_window_lag_seconds", {}).items():
-                if (isinstance(value, (int, float)) and not isinstance(value, bool)
-                        and math.isfinite(value) and value >= 0):
-                    values[prefix + "_vehicle_window_lag_seconds{source="
-                           + json.dumps(source, ensure_ascii=True) + "}"] = value
     return values
 
 

@@ -412,7 +412,7 @@ class RollupV2SqlTest(unittest.TestCase):
                         patch.object(agg, "_read_dirty_generation", return_value="new"), \
                         patch.object(agg, "_config_revision", return_value="rev"), \
                         patch.object(agg, "_trip_charge_scope_windows", return_value={}), \
-                        patch.object(agg, "_battery_scope_work", return_value={}), \
+                        patch.object(agg, "battery_section", side_effect=AssertionError("automatic CAN battery")), \
                         patch.object(agg, "_commit_checkpoint",
                                      side_effect=lambda *args: committed.append(args)):
                     db.execute("DELETE FROM vehicle_agg WHERE vehicle='v'")

@@ -143,12 +143,10 @@ class OperationalMarkersTest(unittest.TestCase):
             self.assertEqual(metrics()["datalake_aggregate_status_timestamp_seconds"], 100)
             path.write_text(json.dumps({"timestamp_seconds": 500, "running": 0,
                                        "success": 0, "last_success_timestamp_seconds": 100,
-                                       "last_failure_timestamp_seconds": 500,
-                                       "vehicle_window_observation_success": 0}))
+                                       "last_failure_timestamp_seconds": 500}))
             failed = metrics()
             self.assertEqual(failed["datalake_aggregate_success"], 0)
             self.assertEqual(failed["datalake_aggregate_last_success_timestamp_seconds"], 100)
-            self.assertFalse(any("lag_seconds" in key for key in failed))
             path.write_text("{broken")
             self.assertEqual(metrics()["datalake_aggregate_status_known"], 0)
             self.assertNotIn("datalake_aggregate_success", metrics())

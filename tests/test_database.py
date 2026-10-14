@@ -1221,30 +1221,26 @@ def test_operational_status_failure_recovery_and_atomic_replace():
             progress("vehicle")
             current = agg.read_status(path)
             assert current["running"] == 1 and current["section"] == "vehicle"
-            return {"vehicle": 2}, [], {"vehicle": 0.1}, {"observation_success": 1}
+            return {"vehicle": 2}, [], {"vehicle": 0.1}
 
         with patch.object(agg.time, "time", return_value=100), \
                 patch.object(agg.os, "replace", replace), \
-                patch.object(agg, "run_all", success), \
-                patch.object(agg, "vehicle_window_lag", lambda ctx: {"fleet": 12}):
+                patch.object(agg, "run_all", success):
             agg.run_pass(("", "", ""), {"interval_s": 300}, path)
         good = agg.read_status(path)
         assert good["success"] == 1 and good["running"] == 0
         last_success = good["last_success_timestamp_seconds"]
         with patch.object(agg.time, "time", return_value=200), \
-                patch.object(agg, "run_all", lambda *args: ({}, ["vehicle"], {}, {})), \
-                patch.object(agg, "vehicle_window_lag", side_effect=agg.SqlError("unreachable")):
+                patch.object(agg, "run_all", lambda *args: ({}, ["vehicle"], {})):
             agg.run_pass(("", "", ""), {"interval_s": 300}, path)
         failed = agg.read_status(path)
         assert failed["success"] == 0 and failed["running"] == 0
         assert failed["last_success_timestamp_seconds"] == last_success
-        assert failed["vehicle_window_observation_success"] == 0
         with patch.object(agg.time, "time", return_value=300):
             agg.startup_failure(path)
         assert agg.read_status(path)["last_success_timestamp_seconds"] == last_success
         with patch.object(agg.time, "time", return_value=400), \
-                patch.object(agg, "run_all", success), \
-                patch.object(agg, "vehicle_window_lag", lambda ctx: {}):
+                patch.object(agg, "run_all", success):
             agg.run_pass(("", "", ""), {"interval_s": 300}, path)
         recovered = agg.read_status(path)
         assert recovered["success"] == 1
@@ -1261,20 +1257,6 @@ def test_operational_status_failure_recovery_and_atomic_replace():
                 raise AssertionError("failed replacement must fail")
         assert agg.read_status(path) == recovered
         assert not list(Path(directory).glob(".aggregate-status-*"))
-
-
-def test_vehicle_window_lag_is_observed_data_gap_not_wall_clock_age():
-    import datetime as dt
-    raw = [("fleet", dt.datetime(2026, 10, 1, 12, 5, 30)),
-           ("can", dt.datetime(2026, 10, 1, 12, 0, 20)),
-           ("new", dt.datetime(2026, 10, 1, 12, 0))]
-    summaries = [("fleet", dt.datetime(2026, 10, 1, 12, 3)),
-                 ("can", dt.datetime(2026, 10, 1, 12, 0))]
-    with patch.object(agg, "fetch_rows", side_effect=[([], raw), ([], summaries)]):
-        gaps = agg.vehicle_window_lag(("", "", ""))
-    assert gaps == {"fleet": 90, "can": 0}
-
-
 
 
 def _vehicle_cfg(**over):
@@ -1306,7 +1288,7 @@ def _fake_db(dirty_rows=(), checkpoint_rows=(), generations=None):
 
 def _patch_coordinator(monkey, fakes, fail_at=None):
     dirty, checkpoints, read, commit, committed = fakes
-    calls = {"rollup": [], "trip": [], "battery": []}
+    calls = {"rollup": [], "trip": []}
     def work(name):
         def apply(ctx, cfg, pending):
             calls[name].append(pending)
@@ -1316,8 +1298,7 @@ def _patch_coordinator(monkey, fakes, fail_at=None):
     for name, fn in (("_load_dirty", dirty), ("_load_checkpoints", checkpoints),
                      ("_read_dirty_generation", read), ("_commit_checkpoint", commit),
                      ("_rollup_hour_windows", work("rollup")),
-                     ("_trip_charge_scope_windows", work("trip")),
-                     ("_battery_scope_work", work("battery"))):
+                     ("_trip_charge_scope_windows", work("trip"))):
         p = patch.object(agg, name, fn)
         monkey.append(p)
         p.start()
@@ -1343,7 +1324,8 @@ def test_coordinator_notified_generation_only():
         try:
             calls, committed = _patch_coordinator(monkey, _fake_db(
                 [(scope, hour, generation)], stored, {key: generation}))
-            assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == expected
+            with patch.object(agg, "battery_section", side_effect=AssertionError("automatic CAN battery")):
+                assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == expected
             assert len(committed) == expected
             assert all(len(v) == expected for v in calls.values())
             if expected:
@@ -1363,14 +1345,12 @@ def test_coordinator_unnotified_raw_is_not_discovered():
         return _records(["vehicle", "source", "decode_epoch"], [])
     with patch.object(agg, "request_sql", side_effect=sql), \
             patch.object(agg, "_rollup_hour_windows") as rollup, \
-            patch.object(agg, "_trip_charge_scope_windows") as trip, \
-            patch.object(agg, "_battery_scope_work") as battery:
+            patch.object(agg, "_trip_charge_scope_windows") as trip:
         assert agg._distinct_scopes(("", "", ""), _vehicle_cfg()) == set()
         assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == 0
         assert not raw_reads
         rollup.assert_not_called()
         trip.assert_not_called()
-        battery.assert_not_called()
 
 
 def test_coordinator_midpass_generation_change_and_failure_do_not_checkpoint():
@@ -1385,7 +1365,7 @@ def test_coordinator_midpass_generation_change_and_failure_do_not_checkpoint():
             [(scope, hour, "gen1")], generations=generations))
         def arriving(ctx, cfg, pending):
             generations[key] = "gen2"
-        with patch.object(agg, "_battery_scope_work", arriving):
+        with patch.object(agg, "_trip_charge_scope_windows", arriving):
             assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == 0
         assert committed == []
         _unpatch(monkey)
@@ -1411,32 +1391,6 @@ def test_coordinator_late_ingest_uses_event_time_window():
     assert lit.startswith("'2026-") and lit.endswith("'"), lit
 
 
-def test_battery_worker_uses_only_scoped_call():
-    # The real coordinator worker maps pending hours to Only=True scoped
-    # battery windows (exact [hour, hour+1h) per scope); any BatteryError
-    # propagates so no checkpoint advances.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 90 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    pending = {(scope, old): ""}
-    seen = {}
-
-    def fake_section(ctx, cfg):
-        seen.update(cfg)
-        assert cfg["battery_scope_windows"] == {
-            scope: [(old, old + agg.HOUR_NS - 1)]}, cfg
-        assert cfg["battery_scope_windows_only"] is True, cfg
-        return 3
-
-    with patch.object(agg, "battery_section", fake_section):
-        assert agg._battery_scope_work(("", "", ""), _vehicle_cfg(),
-                                       pending) == {(scope, old): True}
-    assert seen["battery_scope_windows_only"] is True
-
-
-
-
 def test_coordinator_earlier_unit_survives_later_failure_and_retry():
     now = __import__("datetime").datetime(2026, 9, 20, 12)
     seal = agg.floor_hour_ns(agg.dt_to_ns(now))
@@ -1450,12 +1404,12 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
         _patch_coordinator(monkey, fakes)
         units = []
 
-        def battery(ctx, cfg, pending):
+        def trip(ctx, cfg, pending):
             units.append(list(pending))
             if (scope, hours[1]) in pending:
                 raise agg.SqlError("later unit fails")
 
-        with patch.object(agg, "_battery_scope_work", battery):
+        with patch.object(agg, "_trip_charge_scope_windows", trip):
             try:
                 agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now=now)
             except agg.SqlError:
@@ -1656,9 +1610,7 @@ if __name__ == "__main__":
     test_price_loader_caches_refresh_failure_and_rejects_bad_payload()
     test_session_batch_replacement_isolation_and_failure_keeps_anchor()
     test_operational_status_failure_recovery_and_atomic_replace()
-    test_vehicle_window_lag_is_observed_data_gap_not_wall_clock_age()
     test_coordinator_notified_generation_only()
     test_coordinator_unnotified_raw_is_not_discovered()
     test_coordinator_midpass_generation_change_and_failure_do_not_checkpoint()
-    test_battery_worker_uses_only_scoped_call()
     test_coordinator_late_ingest_uses_event_time_window()

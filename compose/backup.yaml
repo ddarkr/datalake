@@ -71,7 +71,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "5"
+      datalake.storage-metrics-revision: "6"
     depends_on:
       backup-deps:
         condition: service_completed_successfully

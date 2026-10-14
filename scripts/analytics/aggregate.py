@@ -3448,8 +3448,8 @@ def _mark_legacy_expired(ctx, scope, hour_ns):
 # The receiver rewrites vehicle_signal_dirty AFTER a raw-signal full ACK
 # (window_start = UTC hour floor of the ORIGINAL event_time); Analytics
 # commits vehicle_aggregate_checkpoint only AFTER the matching rollup +
-# trip/charge + battery work for that generation succeeds (or is explicitly
-# unavailable under an unchanged config). Observe generation BEFORE work,
+# trip/charge work for that generation succeeds (or is explicitly
+# unavailable). Observe generation BEFORE work,
 # commit AFTER. Failure or a mid-pass generation change leaves the hour dirty.
 #
 # CAN scopes (source 'can') never run the legacy global sections: their
@@ -3995,9 +3995,7 @@ def home_section(ctx, cfg):
 def battery_section(ctx, cfg):
     """Run pure battery analyzers into vehicle_analysis. Import is lazy so
     unit tests importing aggregate never require sibling analyzer files;
-    missing battery_runtime fails the section (loud), never silent zeros.
-    A coordinated BatteryError (scope_windows non-empty) is a section
-    failure: the dirty checkpoint must not advance."""
+    missing battery_runtime fails the section (loud), never silent zeros."""
     import importlib
     runtime = importlib.import_module("scripts.analytics.battery.battery_runtime")
     return runtime.run_battery(ctx, cfg)
@@ -4082,21 +4080,6 @@ def _trip_charge_scope_windows(ctx, cfg, pending):
     return ok
 
 
-def _battery_scope_work(ctx, cfg, pending):
-    """Battery recompute for coordinated scopes; Only=True scoped call.
-    Any BatteryError propagates (no checkpoint). Unavailable-only success
-    returns a row count and the checkpoint may advance."""
-    if not pending:
-        return {}
-    windows = {}
-    for (scope, hour_ns) in pending:
-        windows.setdefault(scope, []).append((hour_ns, hour_ns + HOUR_NS - 1))
-    sub = dict(cfg)
-    sub["battery_scope_windows"] = windows
-    sub["battery_scope_windows_only"] = True
-    battery_section(ctx, sub)
-    return dict.fromkeys(pending, True)
-
 def vehicle_history_section(ctx, cfg, now=None):
     """Process notified sealed hours, checkpointing each successful generation."""
     now_ns = dt_to_ns(now or utcnow())
@@ -4114,7 +4097,6 @@ def vehicle_history_section(ctx, cfg, now=None):
         unit = {key: observed}
         _rollup_hour_windows(ctx, cfg, [key])
         _trip_charge_scope_windows(ctx, cfg, unit)
-        _battery_scope_work(ctx, cfg, unit)
         if _config_revision(cfg) != revision:
             return committed
         if _read_dirty_generation(ctx, scope, hour_ns) != observed:
@@ -4161,65 +4143,6 @@ def startup_failure(path=STATUS_PATH):
     write_status(status, path)
 
 
-def vehicle_window_lag(ctx):
-    """Observed event-window gap, not execution age or receipt/ingest lag."""
-    base_url, auth, db = ctx
-    _, raw = fetch_rows(base_url, auth, db,
-                        "SELECT source, MAX(event_time) FROM vehicle_signal"
-                        " WHERE value_num IS NOT NULL GROUP BY source")
-    _, summaries = fetch_rows(base_url, auth, db,
-                              "SELECT source, MAX(window_start) FROM vehicle_agg"
-                              " WHERE resolution='1m' GROUP BY source")
-    ends = {source: parse_ts(ts) for source, ts in summaries}
-    gaps = {}
-    for source, ts in raw:
-        latest, window = parse_ts(ts), ends.get(source)
-        if source and latest is not None and window is not None:
-            gaps[source] = max(0, (latest - window).total_seconds() - 60)
-    return gaps
-
-
-def vehicle_freshness(ctx):
-    """Stopped/hung-pass observability: per-source event age plus dirty
-    backlog. Raw MAX(event_time) is exact ns; a missing side stays unknown
-    (never zero-filled). Dirty backlog counts un-checkpointed hours under
-    the current config revision."""
-    base_url, auth, db = ctx
-    out = {"observation_success": 0}
-    try:
-        cols, rows = fetch_rows(
-            base_url, auth, db,
-            "SELECT source, MAX(event_time) FROM vehicle_signal"
-            " GROUP BY source")
-    except SqlError as e:
-        if is_missing_table(e):
-            return out
-        raise
-    now_ns = time.time_ns()
-    ages = {}
-    for source, ts in rows:
-        latest = parse_ts_ns(ts)
-        if source and latest is not None:
-            ages[source] = max(0.0, (now_ns - latest) / 1_000_000_000.0)
-    out["event_age_seconds"] = ages
-    try:
-        dcols, drows = fetch_rows(
-            base_url, auth, db,
-            "SELECT COUNT(*) FROM " + DIRTY_TABLE)
-        ccols, crows = fetch_rows(
-            base_url, auth, db,
-            "SELECT COUNT(*) FROM " + CHECKPOINT_TABLE)
-        dirty_n = drows[0][0] if drows and drows[0] else None
-        done_n = crows[0][0] if crows and crows[0] else None
-        if isinstance(dirty_n, int) and isinstance(done_n, int):
-            out["dirty_backlog_hours"] = max(0, dirty_n - done_n)
-    except SqlError as e:
-        if not is_missing_table(e):
-            raise
-    out["observation_success"] = 1
-    return out
-
-
 def run_pass(ctx, cfg, path=STATUS_PATH):
     previous = read_status(path)
     status = {key: previous[key] for key in (
@@ -4236,18 +4159,9 @@ def run_pass(ctx, cfg, path=STATUS_PATH):
 
     failed = ["pass"]
     try:
-        counts, failed, durations, freshness = run_all(ctx, cfg, progress)
-        try:
-            if "vehicle_discovery" in failed:
-                raise SqlError("vehicle discovery unavailable")
-            status["vehicle_window_lag_seconds"] = vehicle_window_lag(ctx)
-            status["vehicle_window_observation_timestamp_seconds"] = time.time()
-            status["vehicle_window_observation_success"] = 1
-        except Exception:
-            status["vehicle_window_observation_success"] = 0
+        counts, failed, durations = run_all(ctx, cfg, progress)
         status["section_durations_seconds"] = durations
         status["section_counts"] = counts
-        status["vehicle_freshness"] = freshness
         return counts, failed
     except Exception as error:
         sys.stderr.write("aggregate: error: pass: " + str(error)[:200] + "\n")
@@ -4268,7 +4182,6 @@ def run_all(ctx, cfg, progress=None):
     failed = []
     counts = {}
     durations = {}
-    freshness = {}
 
     def run_section(name, fn):
         if progress is not None:
@@ -4306,7 +4219,7 @@ def run_all(ctx, cfg, progress=None):
         failed.extend(("vehicle_discovery", "vehicle", "trip_charge",
                        "vehicle_history", "battery"))
         sys.stderr.write("aggregate: vehicle discovery failed; dependent sections skipped\n")
-        return counts, failed, durations, {"observation_success": 0}
+        return counts, failed, durations
     durations["vehicle_discovery"] = time.monotonic() - started
     legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
     run_section("vehicle", lambda: vehicle_section(ctx, legacy))
@@ -4314,11 +4227,7 @@ def run_all(ctx, cfg, progress=None):
     run_section("vehicle_history",
                 lambda: vehicle_history_section(ctx, cfg))
     run_section("battery", lambda: battery_section(ctx, legacy_bat))
-    try:
-        freshness = vehicle_freshness(ctx)
-    except Exception:
-        freshness = {"observation_success": 0}
-    return counts, failed, durations, freshness
+    return counts, failed, durations
 
 def main():
     try:

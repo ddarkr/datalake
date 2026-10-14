@@ -28,8 +28,7 @@ class PassFailureContainmentTest(unittest.TestCase):
                 dependent = [stack.enter_context(patch.object(agg, name))
                              for name in ("vehicle_section", "trip_section",
                                           "vehicle_history_section", "battery_section",
-                                          "_legacy_cfgs", "vehicle_freshness",
-                                          "vehicle_window_lag")]
+                                          "_legacy_cfgs")]
                 counts, failed = agg.run_pass(CTX, CFG, path)
                 self.assertEqual(counts, {"ai": 1, "logs": 1, "home": 1})
                 for fn in independent:
@@ -43,11 +42,9 @@ class PassFailureContainmentTest(unittest.TestCase):
             self.assertEqual(bad["success"], 0)
             self.assertEqual(bad["running"], 0)
             self.assertEqual(bad["last_success_timestamp_seconds"], 50.0)
-            self.assertEqual(bad["vehicle_window_observation_success"], 0)
             with patch.object(agg.time, "time", return_value=200.0), \
                     patch.object(agg, "run_all", return_value=(
-                        {"vehicle": 2}, [], {"vehicle": 0.1}, {})), \
-                    patch.object(agg, "vehicle_window_lag", return_value={}):
+                        {"vehicle": 2}, [], {"vehicle": 0.1})):
                 _, failed = agg.run_pass(CTX, CFG, path)
             self.assertEqual(failed, [])
             good = agg.read_status(path)
@@ -84,11 +81,6 @@ class CadenceTest(unittest.TestCase):
                      "trip_section", "vehicle_history_section",
                      "home_section", "battery_section"):
             stack.enter_context(patch.object(agg, name, return_value=1))
-        stack.enter_context(patch.object(agg, "vehicle_freshness",
-                                         return_value={
-                                             "observation_success": 1}))
-        stack.enter_context(patch.object(agg, "vehicle_window_lag",
-                                         return_value={}))
         stack.enter_context(patch.object(agg.run_pass, "__defaults__",
                                          (path,)))
         stack.enter_context(patch.object(agg.startup_failure,
@@ -185,7 +177,6 @@ class RunOnceTest(unittest.TestCase):
                     patch.object(agg, "ai_section", return_value=1), \
                     patch.object(agg, "log_section", return_value=1), \
                     patch.object(agg, "home_section", return_value=1), \
-                    patch.object(agg, "vehicle_window_lag", return_value={}), \
                     patch.object(agg.run_pass, "__defaults__", (path,)), \
                     patch.object(agg.startup_failure, "__defaults__",
                                  (path,)), \
@@ -214,9 +205,6 @@ class RunOnceTest(unittest.TestCase):
                                  return_value=1), \
                     patch.object(agg, "home_section", return_value=1), \
                     patch.object(agg, "battery_section", return_value=1), \
-                    patch.object(agg, "vehicle_freshness",
-                                 return_value={"observation_success": 1}), \
-                    patch.object(agg, "vehicle_window_lag", return_value={}), \
                     patch.object(agg.run_pass, "__defaults__", (path,)), \
                     patch.object(agg.startup_failure, "__defaults__",
                                  (path,)), \
