@@ -1,23 +1,31 @@
 #!/usr/bin/env python3
 """Sealed triple (MF4 + ingress sidecar + manifest) -> S3 uploader.
 
-Ack rule: local closed JSONL + sealed .mf4 + .ingress.jsonl.gz + .mf4.manifest
-are deleted only after ALL THREE remote objects verify (PUT then HEAD:
-ContentLength equals local size AND user-metadata sha256 equals local
-digest). Remote user-metadata hash is the previously-written Metadata
-sha256; objects without a matching digest fail closed (kept, never
-deleted, never trusted). Any failure on any leg keeps ALL locals. Before
-uploading, the sealed MF4 bytes must equal the manifest mf4_sha256 AND the
-sidecar bytes must equal ingress_sidecar_sha256 AND the sidecar must gunzip
-to the exact closed JSONL bytes (ingress_sha256); any drift quarantines the
-segment and uploads nothing (fail-closed: post-seal corruption is never
-backed up as truth, originals are never deleted). Uploads are idempotent:
-remote keys are content-addressed by SHA256(manifest bytes) -- which already
-pins MF4 + sidecar -- so a crash between upload and delete re-uploads to
-the same key on restart. Only complete triples are pending; staging *.tmp
-and partial sets are invisible to the uploader.
+Acknowledgment rule: locals (closed JSONL + sealed .mf4 + .ingress.jsonl.gz
++ .mf4.manifest) are deleted only after ALL THREE remote objects prove
+server-validated integrity. Each PUT sends the local SHA256 as S3
+ChecksumSHA256 and the PUT response must echo the same value back; the
+post-PUT HEAD must then report that ChecksumSHA256 with ContentLength equal
+to the local size and user-metadata sha256 equal to the local digest.
+Metadata alone never verifies bytes: reusing a live object requires its
+HEAD ChecksumSHA256 to match too (legacy/checksum-less objects fail closed:
+kept, never trusted). A missing or unsupported server checksum is an
+explicit failure -- locals kept, no GET body readback fallback, ever.
+Before uploading, the sealed MF4 bytes must equal the manifest mf4_sha256
+AND the sidecar bytes must equal ingress_sidecar_sha256 AND the sidecar must
+gunzip to the exact closed JSONL bytes (ingress_sha256); any drift
+found before upload quarantines the segment without uploading. The exact
+manifest bytes, validated digests and sizes remain pinned for every PUT and
+replay HEAD. The same guard rechecks those pins before local deletion;
+post-preflight drift keeps or quarantines all locals, never acknowledges it.
+Uploads are idempotent: remote keys are content-addressed by
+SHA256(manifest bytes) -- which already pins MF4 + sidecar -- so a crash
+between upload and delete re-uploads to the same key on restart. Only
+complete triples are pending; staging *.tmp and partial sets are invisible
+to the uploader.
 """
 
+import base64
 import hashlib
 import os
 import signal
@@ -28,10 +36,15 @@ import urllib.parse
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from scripts.storage.s3_cost import CountingS3
+
 try:
     from scripts.storage.storage_metrics import bucket_inventory as _bucket_inventory
-except ImportError:  # validation helper absent: uploads continue regardless
+except ImportError:  # inventory helper absent: uploads unaffected
     _bucket_inventory = None
+
+_S3_WRAPPED = None  # registered CountingS3 renderer; None = not yet wrapped
+_S3_SOURCE = None  # underlying client already wrapped; reuse avoids double hooks
 
 _M = {"pending_files": 0, "pending_bytes": 0, "uploaded_files": 0,
       "uploaded_bytes": 0, "failed": 0, "dropped_verify": 0,
@@ -58,7 +71,10 @@ class _H(BaseHTTPRequestHandler):
             return
         with _MLOCK:
             snap = {k: v for k, v in dict(_M).items() if v is not None}
+            wrapped = _S3_WRAPPED
         body = "".join("raw_uploader_%s %s\n" % kv for kv in sorted(snap.items()))
+        if wrapped is not None:
+            body += wrapped.render_metrics()
         raw = body.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/plain; version=0.0.4")
@@ -154,8 +170,36 @@ def _is_missing(ex):
     return code in ("404", "NoSuchKey", "NotFound")
 
 
+def sha256_b64_of_hex(digest):
+    """Base64 ChecksumSHA256 for an S3 PUT from a hex sha256 digest."""
+    return base64.b64encode(bytes.fromhex(digest)).decode("ascii")
+
+
+def _checksum_ok(resp, want_b64):
+    """True only when the server reports the expected full-object checksum."""
+    return bool(want_b64) and (resp or {}).get("ChecksumSHA256") == want_b64
+
+
+def _head(client, bucket, key):
+    """HEAD with ChecksumMode ENABLED (MinIO-proven: else no checksum).
+
+    A client lacking the kwarg raises TypeError -> IOError so the leg
+    fails closed explicitly (locals kept, never metadata-only trust).
+    """
+    try:
+        return client.head_object(Bucket=bucket, Key=key,
+                                  ChecksumMode="ENABLED")
+    except TypeError:
+        raise IOError("HEAD ChecksumMode unsupported for %s" % key)
+
+
 def _remote_matches(resp, size, digest):
-    """True only when HEAD length and user-metadata sha256 both match."""
+    """True only when HEAD carries size, metadata digest AND server checksum.
+
+    Metadata sha256 alone never verifies bytes: reuse demands the server's
+    own ChecksumSHA256 for the same local digest. Legacy/checksum-less
+    objects fail closed (kept, never trusted).
+    """
     try:
         if int(resp.get("ContentLength")) != size:
             return False
@@ -163,30 +207,65 @@ def _remote_matches(resp, size, digest):
         return False
     meta = resp.get("Metadata") or {}
     # No digest recorded (legacy object): fail closed, never trust.
-    return meta.get("sha256") == digest
+    if meta.get("sha256") != digest:
+        return False
+    return _checksum_ok(resp, sha256_b64_of_hex(digest))
 
 
-def upload_verified(client, bucket, key, path, digest, max_retries):
+def _put_checked(client, bucket, key, path, size, digest):
+    """PUT with ChecksumSHA256; response echo required, no GET readback."""
+    want = sha256_b64_of_hex(digest)
+    with open(path, "rb") as fh:
+        resp = client.put_object(Bucket=bucket, Key=key, Body=fh,
+                                 ContentLength=size,
+                                 Metadata={"sha256": digest},
+                                 ChecksumSHA256=want) or {}
+    if not _checksum_ok(resp, want):
+        raise IOError("missing server checksum on PUT %s" % key)
+
+
+def wrap_client(client):
+    """Always wrap in CountingS3; reuse the same wrapper across run/restart.
+
+    s3_cost is a required packaged dependency (compose mounts it): import
+    failures fail startup honestly instead of acking unmetered uploads.
+    """
+    global _S3_WRAPPED, _S3_SOURCE
+    if isinstance(client, CountingS3):
+        _S3_WRAPPED, _S3_SOURCE = client, getattr(client, "_client", client)
+        return client
+    if _S3_WRAPPED is not None and _S3_SOURCE is client:
+        return _S3_WRAPPED
+    _S3_WRAPPED = CountingS3(client, "raw")
+    _S3_SOURCE = client
+    return _S3_WRAPPED
+
+
+def upload_verified(client, bucket, key, path, digest, max_retries, *, size=None):
     """Verified write to a content-addressed key: never overwrites truth.
 
-    Pre-check HEAD first: identical size+Metadata sha256 reuses the live
-    object; different size/digest (including missing digest) is a conflict
-    (kept, never overwritten); any other HEAD error is unreadable
-    (retried, never mistaken for missing). Only genuine missing-key
-    permits PUT, then post-PUT HEAD must match. True only on verified
-    HEAD; any False keeps all locals (run_once deletes only on
-    full-triple ack).
+    Triple uploads pass the preflight size; standalone callers may omit it.
+    Pre-check HEAD first: size + Metadata sha256 + server ChecksumSHA256
+    reuses the live object; any mismatch (including missing checksum or
+    missing digest) is a conflict (kept, never overwritten); any other
+    HEAD error is unreadable (retried, never mistaken for missing). Only
+    genuine missing-key permits PUT with ChecksumSHA256; the PUT response
+    must echo the checksum and the post-PUT HEAD must report it. Missing
+    or unsupported server checksums fail closed explicitly -- locals kept,
+    never a GET body readback fallback. True only on verified HEAD; any
+    False keeps all locals (run_once deletes only on full-triple ack).
     # ponytail: key safety rests on content addressing, not PUT atomicity --
     concurrent compliant writers sharing a key hold identical triple bytes
     (same manifest digest), so a plain S3 PUT is safe; noncompliant external
     writers must not share the archive prefix.
     """
-    size = os.path.getsize(path)
+    if size is None:
+        size = os.path.getsize(path)
     delay = 2.0
     for attempt in range(max_retries + 1):
         try:
             try:
-                existing = client.head_object(Bucket=bucket, Key=key)
+                existing = _head(client, bucket, key)
             except Exception as hexc:
                 if not _is_missing(hexc):
                     raise
@@ -195,21 +274,16 @@ def upload_verified(client, bucket, key, path, digest, max_retries):
                 if _remote_matches(existing, size, digest):
                     return True
                 minc("dropped_verify")
-                print("immutable conflict %s: live object differs, kept"
-                      % (key,), file=sys.stderr)
+                print("immutable conflict: live object differs, kept",
+                      file=sys.stderr)
                 return False
-            with open(path, "rb") as fh:
-                client.put_object(Bucket=bucket, Key=key, Body=fh,
-                                  ContentLength=size,
-                                  Metadata={"sha256": digest})
-            if _remote_matches(client.head_object(Bucket=bucket, Key=key),
-                               size, digest):
+            _put_checked(client, bucket, key, path, size, digest)
+            if _remote_matches(_head(client, bucket, key), size, digest):
                 return True
             minc("dropped_verify")  # HEAD mismatch: keep local, retry
-            print("verify mismatch %s (attempt %d)" % (key, attempt),
-                  file=sys.stderr)
+            print("verify mismatch (attempt %d)" % attempt, file=sys.stderr)
         except Exception as ex:
-            print("upload %s attempt %d: %s" % (key, attempt, ex),
+            print("upload attempt %d: %s" % (attempt, type(ex).__name__),
                   file=sys.stderr)
         if attempt < max_retries:
             time.sleep(delay)
@@ -245,8 +319,9 @@ def inventory_loop(client, bucket, interval, stop):
 
 def _load_manifest(manifest_path):
     import json as _json
-    with open(manifest_path, encoding="utf-8") as fh:
-        return _json.load(fh)
+    with open(manifest_path, "rb") as fh:
+        blob = fh.read()
+    return _json.loads(blob), blob
 
 
 def pending(spool):
@@ -365,25 +440,51 @@ def gunzip_compare(sidecar_path, want_digest, closed_path=None,
     return True, ""
 
 
-def fail_closed_check(mf4_path, sidecar_path, manifest_path, closed_path):
-    """Verify sealed bytes against the manifest pin BEFORE any upload.
-    Returns (ok, reason): ok only when MF4 == mf4_sha256, sidecar ==
-    ingress_sidecar_sha256, and sidecar gunzips to bytes == ingress_sha256
-    (and to the closed JSONL on disk when still present). The sidecar leg
-    streams with bounded chunks (gunzip_compare); no proportional bytes
-    object is ever built."""
+def fail_closed_check(mf4_path, sidecar_path, manifest_path, closed_path,
+                      snap=None):
+    """Return (ok, reason, snapshot) for the complete sealed triple.
+
+    Parse the exact manifest bytes once, pin its address and the validated
+    MF4/sidecar digests and sizes. Passing that snapshot rechecks the same
+    pins without parsing a replacement manifest or adopting changed bytes.
+    gunzip_compare also preserves the closed-ingress byte-for-byte guard.
+    Only the small manifest is buffered; payload checks remain streamed.
+    """
     try:
-        man = _load_manifest(manifest_path)
+        if snap is None:
+            man, blob = _load_manifest(manifest_path)
+            if not isinstance(man, dict):
+                return False, "manifest is not an object", None
+            for field in ("mf4_sha256", "ingress_sha256",
+                          "ingress_sidecar_sha256"):
+                if not man.get(field):
+                    return False, "manifest missing " + field, None
+            snap = {
+                "manifest_bytes": blob,
+                "manifest_digest": hashlib.sha256(blob).hexdigest(),
+                "mf4_digest": man["mf4_sha256"],
+                "sidecar_digest": man["ingress_sidecar_sha256"],
+                "ingress_digest": man["ingress_sha256"],
+                "sizes": (os.path.getsize(mf4_path),
+                          os.path.getsize(sidecar_path), len(blob)),
+            }
+        else:
+            with open(manifest_path, "rb") as fh:
+                if fh.read() != snap["manifest_bytes"]:
+                    return False, "manifest drifted after preflight", None
+        for path, size, digest, label in (
+                (mf4_path, snap["sizes"][0], snap["mf4_digest"], "MF4"),
+                (sidecar_path, snap["sizes"][1], snap["sidecar_digest"],
+                 "sidecar")):
+            if os.path.getsize(path) != size or sha256_file(path) != digest:
+                return False, "sealed %s drifted from manifest pin" % label, None
+        ok, reason = gunzip_compare(sidecar_path, snap["ingress_digest"],
+                                    closed_path)
     except (OSError, ValueError) as ex:
-        return False, "manifest unreadable: %s" % (ex,)
-    for field in ("mf4_sha256", "ingress_sha256", "ingress_sidecar_sha256"):
-        if not man.get(field):
-            return False, "manifest missing " + field
-    if sha256_file(mf4_path) != man["mf4_sha256"]:
-        return False, "sealed MF4 drifted from manifest pin"
-    if sha256_file(sidecar_path) != man["ingress_sidecar_sha256"]:
-        return False, "sealed sidecar drifted from manifest pin"
-    return gunzip_compare(sidecar_path, man["ingress_sha256"], closed_path)
+        return False, "sealed triple unreadable: %s" % (ex,), None
+    if not ok:
+        return False, reason, None
+    return True, "", snap
 
 
 def quarantine(spool, paths):
@@ -411,29 +512,46 @@ def run_once(client, bucket, spool, vehicle, max_retries):
     mset("pending_files", len(triples))
     mset("pending_bytes", nbytes)
     for mf4_path, sidecar_path, manifest_path, closed_path in triples:
-        ok, reason = fail_closed_check(mf4_path, sidecar_path, manifest_path,
-                                       closed_path)
+        ok, reason, snap = fail_closed_check(mf4_path, sidecar_path,
+                                            manifest_path, closed_path)
         if not ok:
-            print("fail-closed %s: %s (quarantined, originals kept)"
-                  % (mf4_path, reason), file=sys.stderr)
+            print("preflight rejected: %s (quarantined, originals kept)"
+                  % reason.split(":", 1)[0], file=sys.stderr)
             quarantine(spool, [mf4_path, sidecar_path, manifest_path,
                                closed_path])
             minc("failed")
             continue
-        manifest_digest = sha256_file(manifest_path)  # pins MF4 + sidecar
-        key = remote_key(mf4_path, vehicle, manifest_digest)
-        legs = [(key, mf4_path), (sidecar_key(key), sidecar_path),
-                (manifest_key(key), manifest_path)]
-        digests = [sha256_file(p) for _, p in legs]
+        # Fixed preflight pins: the key and every PUT checksum reuse the
+        # validated digests, never a drifted re-hash (a correct server
+        # rejects a drifted body under the pinned ChecksumSHA256).
+        key = remote_key(mf4_path, vehicle, snap["manifest_digest"])
+        legs = [(key, mf4_path, snap["mf4_digest"], snap["sizes"][0]),
+                (sidecar_key(key), sidecar_path, snap["sidecar_digest"],
+                 snap["sizes"][1]),
+                (manifest_key(key), manifest_path, snap["manifest_digest"],
+                 snap["sizes"][2])]
         acked = True
-        for (k, p), digest in zip(legs, digests):
-            if not upload_verified(client, bucket, k, p, digest, max_retries):
+        for k, p, digest, size in legs:
+            if not upload_verified(client, bucket, k, p, digest, max_retries,
+                                   size=size):
                 minc("failed")  # any leg fails: ALL locals stay
                 acked = False
                 break
         if not acked:
             continue
-        size = sum(os.path.getsize(p) for _, p in legs)
+        # Final revalidation (same check, no second convention): drift
+        # after preflight -- including replay reuse with no PUT -- must
+        # never delete changed locals or adopt a replacement manifest.
+        ok, reason, _ = fail_closed_check(mf4_path, sidecar_path,
+                                         manifest_path, closed_path,
+                                         snap=snap)
+        if not ok:
+            print("final guard rejected: %s (quarantined, originals kept)"
+                  % reason.split(":", 1)[0], file=sys.stderr)
+            quarantine(spool, [mf4_path, sidecar_path, manifest_path,
+                               closed_path])
+            minc("failed")
+            continue
         for p in [mf4_path, sidecar_path, manifest_path, closed_path]:
             if p is None:
                 continue
@@ -442,7 +560,7 @@ def run_once(client, bucket, spool, vehicle, max_retries):
             except OSError:
                 pass
         minc("uploaded_files")
-        minc("uploaded_bytes", size)
+        minc("uploaded_bytes", sum(snap["sizes"]))
         mset("last_upload", int(time.time()))
     return len(triples)
 
@@ -471,7 +589,7 @@ def main(argv):
                      daemon=True).start()
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
-    client = make_client()
+    client = wrap_client(make_client())
     threading.Thread(target=lambda: inventory_loop(
         client, bucket, ei("RAW_INVENTORY_INTERVAL_SEC", 3600), stop),
         daemon=True).start()
@@ -482,7 +600,7 @@ def main(argv):
         try:
             run_once(client, bucket, spool, vehicle, retries)
         except Exception as ex:
-            print("sweep error: %s" % ex, file=sys.stderr)
+            print("sweep error: %s" % type(ex).__name__, file=sys.stderr)
         for _ in range(interval * 2):
             if stop:
                 break

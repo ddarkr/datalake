@@ -92,6 +92,7 @@ def main():
     otlp_password = os.environ.get("OTLP_PASSWORD", "")
     storage = os.environ.get("GREPTIME_STORAGE_TYPE", "S3").strip()
     page_cache = os.environ.get("GREPTIME_PAGE_CACHE_SIZE", "512MB")
+    write_cache_size = os.environ.get("GREPTIME_WRITE_CACHE_SIZE", "10GiB")
     write_buf = os.environ.get("GREPTIME_WRITE_BUFFER_SIZE", "128MB")
     flush_interval = os.environ.get("GREPTIME_AUTO_FLUSH_INTERVAL", "10m")
     out_dir = os.environ.get("OUT_DIR", "/out")
@@ -117,6 +118,8 @@ def main():
         fail("GREPTIME_STORAGE_TYPE must be S3 or File")
     if not SIZE_RE.match(page_cache):
         fail("GREPTIME_PAGE_CACHE_SIZE must be a size like 512MB")
+    if not SIZE_RE.match(write_cache_size):
+        fail("GREPTIME_WRITE_CACHE_SIZE must be a size like 10GiB")
     if not SIZE_RE.match(write_buf):
         fail("GREPTIME_WRITE_BUFFER_SIZE must be a size like 128MB")
     if not DURATION_RE.match(flush_interval):
@@ -222,6 +225,7 @@ def main():
         f"global_write_buffer_size = {toml_str(write_buf)}",
         f"auto_flush_interval = {toml_str(flush_interval)}",
         f"enable_write_cache = {'true' if storage == 'S3' else 'false'}",
+        f"write_cache_size = {toml_str(write_cache_size)}",
         "",
         "[logging]",
         'dir = "/data/logs"',

@@ -71,7 +71,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "4"
+      datalake.storage-metrics-revision: "5"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -83,16 +83,24 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       S3_REGION: ${S3_REGION:-}
       STORAGE_METRICS_INTERVAL_SEC: ${STORAGE_METRICS_INTERVAL_SEC:-3600}
+      STORAGE_COST_FREE_EGRESS_MULTIPLIER: ${STORAGE_COST_FREE_EGRESS_MULTIPLIER:-3}
+      STORAGE_COST_EGRESS_USD_PER_GB: ${STORAGE_COST_EGRESS_USD_PER_GB:-0.01}
+      STORAGE_COST_MAX_MONTHLY_EGRESS_GIB: ${STORAGE_COST_MAX_MONTHLY_EGRESS_GIB:-2400}
+      STORAGE_COST_MAX_MONTHLY_OVERAGE_USD: ${STORAGE_COST_MAX_MONTHLY_OVERAGE_USD:-0}
       CAN_RECEIVER_ARCHIVE: /can-raw/raw.sqlite3
       CAN_RECEIVER_DISK_RESERVE_BYTES: "67108864"
     volumes:
       - backup-venv:/opt/venv:ro
       - greptime-data:/greptime-data:ro
       - backup-data:/ops:ro
+      - can-backup-data:/can-ops:ro
       - can-receiver-raw:/can-raw:ro
     configs:
       - source: storage_metrics_py
         target: /app/scripts/storage/storage_metrics.py
+        mode: 0444
+      - source: s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
         mode: 0444
       - source: greptime_preflight
         target: /app/scripts/database/greptime_preflight.py
@@ -142,6 +150,9 @@ services:
       - source: backup_py
         target: /app/scripts/storage/backup.py
         mode: 0444
+      - source: s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
+        mode: 0444
       - source: greptime_preflight
         target: /app/scripts/database/greptime_preflight.py
     working_dir: /app
@@ -161,7 +172,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "3"
+      datalake.backup-revision: "4"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -197,6 +208,9 @@ services:
       - source: backup_py
         target: /app/scripts/storage/backup.py
         mode: 0444
+      - source: s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
+        mode: 0444
       - source: greptime_preflight
         target: /app/scripts/database/greptime_preflight.py
     working_dir: /app
@@ -211,6 +225,8 @@ configs:
     x-source: scripts/storage/can_backup.py
   storage_metrics_py:
     x-source: scripts/storage/storage_metrics.py
+  s3_cost_py:
+    x-source: scripts/storage/s3_cost.py
 
 
 volumes:

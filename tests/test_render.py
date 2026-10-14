@@ -72,6 +72,12 @@ def test_final_forbids_remote_mounts():
 
 
 
+def test_core_passes_write_cache_size_to_preflight():
+    fragment = render.load_fragment(str(ROOT / "compose/core.yaml"))
+    env = fragment["services"]["db-init"]["environment"]
+    assert env["GREPTIME_WRITE_CACHE_SIZE"] == "${GREPTIME_WRITE_CACHE_SIZE:-10GiB}"
+
+
 def test_preflight_fails_fast_without_password(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "GREPTIME_PASSWORD"}
     env.update(GREPTIME_STORAGE_TYPE="File", OUT_DIR=str(tmp_path))
@@ -103,6 +109,24 @@ def test_preflight_rejects_bad_size(tmp_path):
     assert "GREPTIME_PAGE_CACHE_SIZE" in r.stderr
 
 
+def test_preflight_rejects_bad_write_cache_size(tmp_path):
+    env = dict(base_env(tmp_path), GREPTIME_WRITE_CACHE_SIZE="huge")
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode != 0
+    assert "GREPTIME_WRITE_CACHE_SIZE" in r.stderr
+
+
+def test_preflight_defaults_write_cache_size_to_10_gib(tmp_path):
+    env = base_env(tmp_path)
+    env.pop("GREPTIME_WRITE_CACHE_SIZE", None)
+    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
+    assert r.returncode == 0, r.stderr
+    with open(tmp_path / "greptimedb.toml", "rb") as f:
+        doc = tomllib.load(f)
+    mito = doc["region_engine"][0]["mito"] if isinstance(doc.get("region_engine"), list) else doc["region_engine"]["mito"]
+    assert mito["write_cache_size"] == "10GiB"
+
+
 def test_preflight_rejects_hostless_endpoint_without_echo(tmp_path):
     env = dict(base_env(tmp_path), GREPTIME_STORAGE_TYPE="S3",
                S3_ENDPOINT_URL="https://?private=endpoint-canary",
@@ -117,6 +141,7 @@ def test_preflight_rejects_hostless_endpoint_without_echo(tmp_path):
 
 def test_preflight_file_mode_writes_exact_config(tmp_path):
     env = dict(base_env(tmp_path), GREPTIME_PAGE_CACHE_SIZE="256MB",
+               GREPTIME_WRITE_CACHE_SIZE="12GiB",
                GREPTIME_WRITE_BUFFER_SIZE="64MB",
                GREPTIME_AUTO_FLUSH_INTERVAL="20m")
     pw = env["GREPTIME_PASSWORD"]
@@ -134,6 +159,7 @@ def test_preflight_file_mode_writes_exact_config(tmp_path):
         if isinstance(doc.get("region_engine"), list) \
         else doc["region_engine"]["mito"]
     assert mito["page_cache_size"] == "256MB"
+    assert mito["write_cache_size"] == "12GiB"
     assert mito["global_write_buffer_size"] == "64MB"
     assert mito["auto_flush_interval"] == "20m"
     assert doc["wal"]["sync_write"] is True

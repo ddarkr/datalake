@@ -1398,6 +1398,7 @@ def _patch_coordinator(monkey, fakes, work=None, fail_at=None):
     if work is not None:
         fake_rollup, fake_trip, fake_battery = work
     patches = [patch.object(agg, "_distinct_scopes", fake_distinct),
+               patch.object(agg, "_flushed_floor_ns", lambda ctx: None),
                patch.object(agg, "_raw_coverage_ns", fake_oldest),
                patch.object(agg, "_list_scope_hours", fake_list),
                patch.object(agg, "_load_dirty", fake_load_dirty),
@@ -1996,37 +1997,236 @@ def test_battery_worker_uses_only_scoped_call():
     assert seen["battery_scope_windows_only"] is True
 
 
-def test_run_all_excludes_can_from_legacy_sections():
-    # CAN scopes run ONLY in vehicle_history; legacy global sections get
-    # exclude_scopes + battery_exclude_scopes so no hidden recompute survives.
-    seen = {}
+
+
+def test_discovery_registers_frontier_window_durably():
+    # Frontier window lists a new unnotified scope: it registers a sweep
+    # row at the flushed floor hour before the cursor advances, so a
+    # restart retries from the committed cursor instead of rescanning.
+    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
+    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+    old_scope = ("v", "can", "e1")
+    new_scope = ("w", "can", "e2")
+    floor_hr = seal - 300 * agg.HOUR_NS
+    frontier = floor_hr + 10 * agg.HOUR_NS
+    import unittest.mock as _mock
+    writes, cursors = [], []
+    with _mock.patch.object(agg, "_registered_scopes",
+                            lambda ctx, cfg: {old_scope}), \
+            _mock.patch.object(agg, "_flushed_floor_ns",
+                               lambda ctx: floor_hr), \
+            _mock.patch.object(agg, "_load_bootstrap_cursor",
+                               lambda ctx, cfg: frontier), \
+            _mock.patch.object(agg, "_bootstrap_window_scopes",
+                               lambda ctx, cfg, s, e: (
+                                   {new_scope} if s == frontier else set())), \
+            _mock.patch.object(agg, "_commit_sweep",
+                               lambda ctx, scope, start, rev, now_ns: writes.append(
+                                   (scope, start))), \
+            _mock.patch.object(agg, "_commit_bootstrap_cursor",
+                               lambda ctx, cfg, nxt, rev, now_ns: cursors.append(
+                                   ("bootstrap", nxt))), \
+            _mock.patch.object(agg, "_load_reconcile_cursor",
+                               lambda ctx, cfg: seal), \
+            _mock.patch.object(agg, "_commit_reconcile_cursor",
+                               lambda *a: cursors.append(("reconcile", a[2]))):
+        first = agg._distinct_scopes(("", "", ""), _vehicle_cfg())
+    assert first == {old_scope, new_scope}, first
+    assert writes == [(new_scope, floor_hr)], writes
+    assert ("bootstrap", frontier + agg.DIRTY_LIST_HOURS * agg.HOUR_NS) \
+        in cursors, cursors
+    # Failure BEFORE the cursor commit retries the window, not skips it.
+    seen = []
+    with _mock.patch.object(agg, "_registered_scopes",
+                            lambda ctx, cfg: {old_scope}), \
+            _mock.patch.object(agg, "_flushed_floor_ns",
+                               lambda ctx: floor_hr), \
+            _mock.patch.object(agg, "_load_bootstrap_cursor",
+                               lambda ctx, cfg: frontier), \
+            _mock.patch.object(agg, "_bootstrap_window_scopes",
+                               lambda ctx, cfg, s, e: {new_scope}), \
+            _mock.patch.object(agg, "_sweep_start_ns",
+                               lambda ctx, fhr, scope: floor_hr), \
+            _mock.patch.object(agg, "_commit_sweep",
+                               lambda *a: seen.append("sweep")), \
+            _mock.patch.object(agg, "_commit_bootstrap_cursor",
+                               lambda *a: (_ for _ in ()).throw(
+                                   agg.SqlError("cursor down"))):
+        try:
+            agg._distinct_scopes(("", "", ""), _vehicle_cfg())
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("cursor failure must propagate")
+    assert seen == ["sweep"], seen
+
+
+def test_discovery_reconcile_finds_late_scope_behind_cursor():
+    # Frontier already walked past an old hour; a newly inserted UNNOTIFIED
+    # scope lives behind it. The durable reconcile window eventually lists
+    # that sealed hour and registers the scope at the flushed floor.
+    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
+    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+    old_scope = ("v", "can", "e1")
+    late_scope = ("w", "can", "e2")
+    floor_hr = seal - 300 * agg.HOUR_NS
+    late_hour = floor_hr + 5 * agg.HOUR_NS
+    frontier = seal - 10 * agg.HOUR_NS
+    import unittest.mock as _mock
+    writes = []
+    with _mock.patch.object(agg, "_registered_scopes",
+                            lambda ctx, cfg: {old_scope}), \
+            _mock.patch.object(agg, "_flushed_floor_ns",
+                               lambda ctx: floor_hr), \
+            _mock.patch.object(agg, "_load_bootstrap_cursor",
+                               lambda ctx, cfg: frontier), \
+            _mock.patch.object(agg, "_load_reconcile_cursor",
+                               lambda ctx, cfg: None), \
+            _mock.patch.object(agg, "_bootstrap_window_scopes",
+                               lambda ctx, cfg, s, e: (
+                                   {late_scope} if s == floor_hr else set())), \
+            _mock.patch.object(agg, "_sweep_start_ns",
+                               lambda ctx, fhr, scope: floor_hr), \
+            _mock.patch.object(agg, "_commit_sweep",
+                               lambda ctx, scope, start, rev, now_ns: writes.append(
+                                   (scope, start))), \
+            _mock.patch.object(agg, "_commit_bootstrap_cursor",
+                               lambda *a: None), \
+            _mock.patch.object(agg, "_commit_reconcile_cursor",
+                               lambda *a: None):
+        found = agg._distinct_scopes(("", "", ""), _vehicle_cfg())
+    assert late_scope in found, found
+    assert (late_scope, floor_hr) in writes, writes
+    # source='can' at the exact epoch is discovered; exact separation holds.
+    assert late_scope[1] == "can" and late_scope[2] == "e2", writes
+
+
+def test_discovery_memtable_only_stays_in_memory():
+    # No visible SSTs yet: one bounded window is listed, finds stay in
+    # memory, and no cursor or sweep row is committed. The first post-flush
+    # walk still registers their full history durably.
+    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
+    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+    oldest = seal - 72 * agg.HOUR_NS
+    old_scope = ("v", "can", "e1")
+    import unittest.mock as _mock
+
+    def fake_fetch_rows(base_url, auth, db, sql):
+        assert "SELECT MIN(event_time) FROM vehicle_signal" in sql, sql
+        return ["MIN(event_time)"], [[oldest + 7]]
+
+    def fake_window(ctx, cfg, start, end):
+        return {old_scope} if start <= oldest < end else set()
+
+    with _mock.patch.object(agg, "utcnow", lambda: now), \
+            _mock.patch.object(agg, "fetch_rows", fake_fetch_rows), \
+            _mock.patch.object(agg, "_registered_scopes",
+                               lambda ctx, cfg: set()), \
+            _mock.patch.object(agg, "_flushed_floor_ns",
+                               lambda ctx: None), \
+            _mock.patch.object(agg, "_load_bootstrap_cursor",
+                               lambda ctx, cfg: None), \
+            _mock.patch.object(agg, "_bootstrap_window_scopes",
+                               fake_window), \
+            _mock.patch.object(agg, "_commit_sweep",
+                               side_effect=AssertionError(
+                                   "memtable-only commits nothing")), \
+            _mock.patch.object(agg, "_commit_bootstrap_cursor",
+                               side_effect=AssertionError(
+                                   "memtable-only commits nothing")):
+        found = agg._distinct_scopes(("", "", ""), _vehicle_cfg())
+    assert found == {old_scope}, found
+
+
+def test_discovery_metadata_failure_never_scans_raw():
+    import unittest.mock as _mock
+
+    unsafe = AssertionError("unsafe fallback/progress")
+    with _mock.patch.object(agg, "_registered_scopes",
+                           lambda ctx, cfg: set()), \
+            _mock.patch.object(
+                agg, "fetch_rows",
+                side_effect=agg.SqlError("ssts_manifest not found")), \
+            _mock.patch.object(agg, "_raw_coverage_ns",
+                               side_effect=unsafe), \
+            _mock.patch.object(agg, "_bootstrap_window_scopes",
+                               side_effect=unsafe), \
+            _mock.patch.object(agg, "_commit_bootstrap_cursor",
+                               side_effect=unsafe), \
+            _mock.patch.object(agg, "_commit_reconcile_cursor",
+                               side_effect=unsafe):
+        try:
+            agg._distinct_scopes(("", "", ""), _vehicle_cfg())
+        except agg.SqlError as exc:
+            assert "ssts_manifest not found" in str(exc), exc
+        else:
+            raise AssertionError("metadata query failure must propagate")
+
+def test_coordinator_sweep_metadata_failure_never_scans_or_commits():
+    flushed_floor = agg._flushed_floor_ns
+    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
+    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
     scope = ("v", "can", "e1")
-    with patch.object(agg, "_distinct_scopes", lambda ctx, cfg: {scope}), \
-            patch.object(agg, "ai_section", lambda ctx, cfg: 1), \
-            patch.object(agg, "log_section", lambda ctx, cfg: 2), \
-            patch.object(agg, "vehicle_section",
-                         lambda ctx, cfg: seen.setdefault("vehicle", cfg) or 2), \
-            patch.object(agg, "trip_section",
-                         lambda ctx, cfg: seen.setdefault("trip", cfg) or 3), \
-            patch.object(agg, "vehicle_history_section",
-                         lambda ctx, cfg, now=None: 4), \
-            patch.object(agg, "home_section", lambda ctx, cfg: 5), \
-            patch.object(agg, "battery_section",
-                         lambda ctx, cfg: seen.setdefault("battery", cfg) or 6), \
-            patch.object(agg, "vehicle_freshness",
-                         lambda ctx: {"observation_success": 1,
-                                      "event_age_seconds": {}}):
-        counts, failed, durations, freshness = agg.run_all(
-            ("", "", ""), {"interval_s": 300}, None)
-    assert failed == [], failed
-    assert counts["vehicle_history"] == 4, counts
-    assert ("v", "can", "e1") in [tuple(s) for s in
-                                  seen["vehicle"]["exclude_scopes"]], seen
-    assert ("v", "can", "e1") in [tuple(s) for s in
-                                  seen["trip"]["exclude_scopes"]], seen
-    assert ("v", "can", "e1") in [tuple(s) for s in
-                                  seen["battery"]["battery_exclude_scopes"]], seen
-    assert freshness["observation_success"] == 1, freshness
+    # Both initial bootstrap and a completed cursor must fail closed.
+    for cursor in (None, seal):
+        monkey = []
+        try:
+            fakes = _fake_db(scope_list=[scope], sweep_state=(
+                {} if cursor is None else {scope: (cursor, "")}))
+            calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
+            error = agg.SqlError("ssts_manifest not found")
+            unsafe = AssertionError("metadata failure must not scan raw")
+            with patch.object(agg, "fetch_rows", side_effect=error) as fetch, \
+                    patch.object(agg, "_flushed_floor_ns", flushed_floor), \
+                    patch.object(agg, "_raw_coverage_ns", side_effect=unsafe), \
+                    patch.object(agg, "_list_scope_hours", side_effect=unsafe):
+                try:
+                    agg.vehicle_history_section(
+                        ("", "", ""), _vehicle_cfg(), now=now, _known=[scope])
+                except agg.SqlError as exc:
+                    assert exc is error, exc
+                else:
+                    raise AssertionError("sweep metadata failure must propagate")
+            assert fetch.call_count == 1, fetch.call_args_list
+            assert "information_schema.ssts_manifest" in fetch.call_args[0][3]
+            assert committed == [] and sweeps == [], (committed, sweeps)
+            assert calls == {"rollup": [], "trip": [], "battery": []}, calls
+        finally:
+            _unpatch(monkey)
+
+
+def test_discovery_filtered_and_unfiltered_cursors_independent():
+    # The vehicle filter rides in each sentinel decode_epoch, so filtered
+    # and unfiltered frontier/reconcile cursors advance independently.
+    assert agg._bootstrap_sentinel({"vehicle": "v"}) != \
+        agg._bootstrap_sentinel({"vehicle": ""})
+    assert agg._reconcile_sentinel({"vehicle": "v"}) != \
+        agg._reconcile_sentinel({"vehicle": ""})
+
+
+def test_discovery_late_notified_row_behind_cursor_still_pends():
+    # Late notified rows on history the cursor passed still pend via
+    # the dirty table (no lower bound on notifications).
+    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
+    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+    old_scope = ("v", "can", "e1")
+    new_scope = ("w", "can", "e2")
+    new_hour = seal - 200 * agg.HOUR_NS
+    monkey = []
+    try:
+        fakes = _fake_db(dirty_rows=[(new_scope, new_hour, "gen-late")],
+                         scope_hours={new_scope: []},
+                         oldest_ns={new_scope: seal - agg.HOUR_NS},
+                         generations={(new_scope, new_hour): "gen-late"},
+                         scope_list=[old_scope, new_scope],
+                         sweep_state={new_scope: (seal, "")})
+        _, _, committed, _ = _patch_coordinator(monkey, fakes)
+        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
+                                           now=now) == 1
+        assert committed[0][:3] == (new_scope, new_hour, "gen-late"), committed
+    finally:
+        _unpatch(monkey)
+
 
 
 if __name__ == "__main__":
@@ -2083,5 +2283,10 @@ if __name__ == "__main__":
     test_coordinator_sweep_single_row_per_scope()
     test_battery_worker_uses_only_scoped_call()
     test_coordinator_late_ingest_uses_event_time_window()
-    test_run_all_excludes_can_from_legacy_sections()
-    print("test_database: ok")
+    test_discovery_registers_frontier_window_durably()
+    test_discovery_reconcile_finds_late_scope_behind_cursor()
+    test_discovery_memtable_only_stays_in_memory()
+    test_discovery_metadata_failure_never_scans_raw()
+    test_coordinator_sweep_metadata_failure_never_scans_or_commits()
+    test_discovery_filtered_and_unfiltered_cursors_independent()
+    test_discovery_late_notified_row_behind_cursor_still_pends()

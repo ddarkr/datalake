@@ -540,7 +540,12 @@ def ddl_statements(otel_ttl):
     # Per-hour raw fingerprints live on the checkpoint rows (same
     # scope/hour key), never as an accumulating per-scope string. Listing
     # is config-independent (it only finds hours holding raw rows); the
-    # checkpoint table stays the only proof of completed work.
+    # checkpoint table stays the only proof of completed work. Reserved
+    # scopes ("__scope_bootstrap__" / "__scope_reconcile__", each with a
+    # matching source and "<name>:<vehicle filter>" decode_epoch) hold the
+    # discovery frontier cursor and the sealed-history reconcile cursor in
+    # the same row shape: analytics skips both as non-CAN scopes, so no
+    # schema change is needed.
     ddls.append(("vehicle_aggregate_sweep", """CREATE TABLE IF NOT EXISTS "vehicle_aggregate_sweep" (
   "sweep_mark" TIMESTAMP(9) NOT NULL TIME INDEX,
   "vehicle" STRING NOT NULL,

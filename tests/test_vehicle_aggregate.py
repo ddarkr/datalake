@@ -328,6 +328,124 @@ class CoordinatorLogicTest(unittest.TestCase):
         self.assertEqual(plain["exclude_scopes"], [])
 
 
+class ScopeDiscoveryTest(unittest.TestCase):
+    def _run(self, registry, windows, now, reconcile_windows=None,
+             floor=None, cursor=None, reconcile=None):
+        from unittest.mock import patch
+        seen, committed = [], []
+        cfg = {"max_rows": 100, "vehicle": ""}
+        seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+        floor_hr = seal - 100 * agg.HOUR_NS if floor is None else floor
+        frontier = [floor_hr if cursor is None else cursor]
+        rc_state = [floor_hr if reconcile is None else reconcile]
+
+        def fake_registry(ctx, cfg):
+            seen.append("registry")
+            return set(registry)
+
+        def fake_cursor(ctx, cfg):
+            seen.append("cursor")
+            return frontier[0]
+
+        def fake_reconcile_cursor(ctx, cfg):
+            seen.append("reconcile-cursor")
+            return rc_state[0]
+
+        def fake_floor(ctx):
+            seen.append("floor")
+            return floor_hr
+
+        def fake_window(ctx, cfg, start, end):
+            seen.append(("window", start, end))
+            table = (reconcile_windows if start == rc_state[0]
+                     and reconcile_windows is not None else windows)
+            return set(table.get(start, table.get("any", ())))
+
+        def fake_start(ctx, fhr, scope):
+            seen.append(("start", scope))
+            return floor_hr
+
+        def fake_sweep(ctx, scope, start, rev, now_ns):
+            committed.append((scope, start))
+
+        def fake_cursor_commit(ctx, cfg, nxt, rev, now_ns):
+            committed.append(("__cursor__", nxt))
+            frontier[0] = nxt
+
+        def fake_reconcile_commit(ctx, cfg, nxt, rev, now_ns):
+            committed.append(("__reconcile__", nxt))
+            rc_state[0] = nxt
+
+        with patch.object(agg, "_registered_scopes", fake_registry), \
+                patch.object(agg, "_load_bootstrap_cursor", fake_cursor), \
+                patch.object(agg, "_load_reconcile_cursor",
+                             fake_reconcile_cursor), \
+                patch.object(agg, "_flushed_floor_ns", fake_floor), \
+                patch.object(agg, "_bootstrap_window_scopes", fake_window), \
+                patch.object(agg, "_sweep_start_ns", fake_start), \
+                patch.object(agg, "_commit_sweep", fake_sweep), \
+                patch.object(agg, "_commit_bootstrap_cursor",
+                             fake_cursor_commit), \
+                patch.object(agg, "_commit_reconcile_cursor",
+                             fake_reconcile_commit):
+            return (agg._distinct_scopes(("", "", ""), cfg), seen,
+                    committed, floor_hr)
+
+    def test_registry_hit_lists_bounded_windows_only(self):
+        now = datetime(2026, 9, 20, 12, 0, 0)
+        scope = ("v", "can", "e")
+        out, seen, committed, _start = self._run(
+            {scope}, {"any": set()}, now)
+        self.assertEqual(out, {scope})
+        self.assertIn("floor", seen)
+        self.assertNotIn(("start", scope), seen)
+        self.assertTrue(any(isinstance(s, tuple) and s[0] == "window"
+                            for s in seen))
+        self.assertTrue(any(c[0] == "__cursor__" for c in committed))
+
+    def test_new_scope_registers_before_cursor_advances(self):
+        now = datetime(2026, 9, 20, 12, 0, 0)
+        scope = ("n", "can", "e2")
+        out, _seen, committed, floor_hr = self._run(
+            set(), {"any": {scope}}, now)
+        self.assertEqual(out, {scope})
+        kinds = [c[0] for c in committed]
+        self.assertEqual(kinds, [scope, "__cursor__", "__reconcile__"])
+        self.assertEqual(committed[0], (scope, floor_hr))
+
+    def test_late_scope_behind_frontier_found_by_reconcile(self):
+        now = datetime(2026, 9, 20, 12, 0, 0)
+        seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+        floor_hr = seal - 300 * agg.HOUR_NS
+        old = ("v", "can", "e1")
+        late = ("w", "can", "e2")
+        frontier = seal - 10 * agg.HOUR_NS
+        out, _seen, committed, _f = self._run(
+            {old}, {frontier: set()}, now, reconcile_windows={floor_hr: {late}},
+            floor=floor_hr, cursor=frontier, reconcile=None)
+        self.assertIn(late, out)
+        self.assertIn((late, floor_hr), committed)
+
+    def test_sweep_default_reuses_known_without_raw_scan(self):
+        from unittest.mock import patch
+        now = datetime(2026, 9, 20, 12, 0, 0)
+        scope = ("v", "can", "e")
+        seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+        hour = seal - agg.HOUR_NS
+        with patch.object(agg, "_registered_scopes",
+                          side_effect=AssertionError("raw scan")), \
+                patch.object(agg, "_sweep_floor_hr",
+                             lambda ctx: hour), \
+                patch.object(agg, "_list_scope_hours",
+                             lambda ctx, cfg, s, start, end: (
+                                 [(hour, 1, hour, None)], end)), \
+                patch.object(agg, "_read_dirty_generation",
+                             lambda ctx, s, h: None):
+            pending, _listed = agg._sweep_pending(
+                ("", "", ""), {"max_rows": 100, "vehicle": ""}, seal, {},
+                "rev", agg.dt_to_ns(now), _sweeps={}, _known=[scope])
+        self.assertIn((scope, hour), pending)
+
 class RollupV2SqlTest(unittest.TestCase):
     def test_rollup_preserves_quality_nulls_and_corrected_scope(self):
         import sqlite3

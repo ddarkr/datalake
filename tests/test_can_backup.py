@@ -69,14 +69,21 @@ class FakeStream:
         self.closed = True
 
 
+def _b64(blob):
+    import base64 as _b64mod
+    return _b64mod.b64encode(hashlib.sha256(blob).digest()).decode("ascii")
+
+
 class FakeS3:
+    """Checksum-authoritative fake: PUT requires ChecksumSHA256, HEAD echoes it."""
     def __init__(self, objects=None, fail_copy_at=None, fail_put_key=None,
-                 corrupt=None):
+                 corrupt=None, no_checksum=None):
         self.objects = dict(objects or {})
         self.metadata = {}
         self.fail_copy_at = fail_copy_at
         self.fail_put_key = fail_put_key
         self.corrupt = dict(corrupt or {})
+        self.no_checksum = set(no_checksum or ())
         self.copies = 0
         self.streams = []
 
@@ -96,9 +103,12 @@ class FakeS3:
             out["IsTruncated"] = False
         return out
 
-    def head_object(self, Bucket, Key):
-        return {"ContentLength": len(self.objects[Key]),
-                "Metadata": self.metadata.get(Key, {})}
+    def head_object(self, Bucket, Key, ChecksumMode=None):
+        out = {"ContentLength": len(self.objects[Key]),
+               "Metadata": self.metadata.get(Key, {})}
+        if Key not in self.no_checksum:
+            out["ChecksumSHA256"] = _b64(self.objects[Key])
+        return out
 
     def get_object(self, Bucket, Key):
         blob = self.corrupt.get(Key, self.objects[Key])
@@ -106,7 +116,8 @@ class FakeS3:
         self.streams.append(stream)
         return {"Body": stream, "ContentLength": len(blob)}
 
-    def put_object(self, Bucket, Key, Body, ContentLength=None, Metadata=None):
+    def put_object(self, Bucket, Key, Body, ContentLength=None, Metadata=None,
+                   ChecksumSHA256=None, **kw):
         if self.fail_put_key is not None and Key == self.fail_put_key:
             raise IOError("injected put failure")
         if hasattr(Body, "read"):
@@ -117,11 +128,17 @@ class FakeS3:
                     break
                 chunks.append(c)
             Body = b"".join(chunks)
-        self.objects[Key] = bytes(Body)
+        stored = bytes(Body)
+        if ChecksumSHA256 is not None and ChecksumSHA256 != _b64(stored):
+            raise IOError("XAmzContentChecksumMismatch: " + Key)
+        self.objects[Key] = stored
         self.metadata[Key] = dict(Metadata or {})
-        return {}
+        out = {}
+        if Key not in self.no_checksum:
+            out["ChecksumSHA256"] = _b64(stored)
+        return out
 
-    def copy_object(self, Bucket, CopySource, Key):
+    def copy_object(self, Bucket, CopySource, Key, **kw):
         if self.fail_copy_at is not None and self.copies >= self.fail_copy_at:
             raise IOError("injected copy failure")
         self.copies += 1
@@ -132,7 +149,6 @@ class FakeS3:
         for o in Delete["Objects"]:
             self.objects.pop(o["Key"], None)
         return {}
-
 
 _SAVED = dict(os.environ)
 _ORIG_MAKE_S3 = bk.make_s3_client
@@ -155,7 +171,7 @@ def use_fake(fake):
     if fake is None:
         bk.make_s3_client = _ORIG_MAKE_S3
     else:
-        bk.make_s3_client = lambda: fake
+        bk.make_s3_client = lambda *args, **kwargs: fake
 
 
 def make_live(base):
@@ -687,6 +703,80 @@ def test_restore_applies_exact_dir_modes_no_widening():
         restore_env()
 
 
+def test_s3_checksum_corrupt_same_size_put_fails():
+    # Same-size transport corruption must fail via server ChecksumSHA256
+    # and roll back the whole owned set.
+    fake = FakeS3({})
+    tmp, _db, _defs, bdir, _rr, _rd, before, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        orig = fake.put_object
+
+        def corrupt_put(Bucket, Key, Body, ContentLength=None, Metadata=None, **kw):
+            if hasattr(Body, "read"):
+                chunks = []
+                while True:
+                    c = Body.read(1 << 20)
+                    if not c:
+                        break
+                    chunks.append(c)
+                Body = b"X" * len(b"".join(chunks))
+            else:
+                Body = b"X" * len(bytes(Body))
+            return orig(Bucket=Bucket, Key=Key, Body=Body,
+                        ContentLength=ContentLength, Metadata=Metadata, **kw)
+        fake.put_object = corrupt_put
+        assert cb.cmd_backup() == 3
+        assert fake.objects == {}, \
+            "corrupt PUT must roll back all owned writes: %r" % (sorted(fake.objects),)
+        assert dump_state(env["CAN_ARCHIVE_PATH"],
+                          env["CAN_DEFINITIONS_DIR"]) == before
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_s3_unsupported_checksum_fails_safely():
+    # A store without ChecksumSHA256 support fails closed (no GET fallback),
+    # keeping the live source intact and writing no remote objects.
+    fake = FakeS3({})
+    tmp, _db, _defs, bdir, _rr, _rd, before, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        orig_head = fake.head_object
+        fake.head_object = lambda **kw: {k: v for k, v in orig_head(**kw).items()
+                                         if k != "ChecksumSHA256"}
+        assert cb.cmd_backup() == 3
+        assert fake.objects == {}
+        assert dump_state(env["CAN_ARCHIVE_PATH"],
+                          env["CAN_DEFINITIONS_DIR"]) == before
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+def test_can_failed_put_persists_cost_report():
+    fake = FakeS3({})
+    tmp, _db, _defs, bdir, _rr, _rd, before, env = fresh_layout("S3", fake)
+    try:
+        setenv(env)
+        def failed_put(**kw):
+            raise IOError("failed PUT")
+        fake.put_object = failed_put
+        assert cb.cmd_backup() == 3
+        reports = []
+        for name in os.listdir(bdir):
+            if name.startswith("s3-cost-can-backup-"):
+                with open(os.path.join(bdir, name)) as stream:
+                    reports.append(json.load(stream))
+        assert reports
+        assert any(r["snapshot"]["errors"].get("PutObject", 0) for r in reports)
+        assert fake.objects == {}
+        assert dump_state(env["CAN_ARCHIVE_PATH"], env["CAN_DEFINITIONS_DIR"]) == before
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
 if __name__ == "__main__":
     test_file_mode_roundtrip_exact()
     test_uncommitted_write_excluded_and_source_kept()
@@ -702,4 +792,7 @@ if __name__ == "__main__":
     test_restore_rejects_unsafe_dir_mode_and_traversal()
     test_restore_preflight_checks_each_target_filesystem()
     test_restore_applies_exact_dir_modes_no_widening()
-    print("test_can_backup: ok (14 tests)")
+    test_s3_checksum_corrupt_same_size_put_fails()
+    test_s3_unsupported_checksum_fails_safely()
+    test_can_failed_put_persists_cost_report()
+    print("test_can_backup: ok (17 tests)")
