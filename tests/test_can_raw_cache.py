@@ -229,7 +229,6 @@ class RawCache(unittest.TestCase):
                 sink.shutdown()
                 sink.server_close()
                 thread.join(3)
-
     def test_admission_and_sqlite_cap_apply_after_reopen(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "raw.sqlite"
