@@ -245,6 +245,12 @@ cold 증거는 재기동 완료 후 **실제 query window 안의 성공한 SST G
 
 외부 저장소 기여자는 required-check 권한이 없으므로, 위 로컬 명령으로 동일한 게이트를 먼저 실행한 뒤 결과를 PR 설명에 첨부하세요. 공개 CI는 운영 배포를 수행하지 않습니다.
 
+## 가벼운 PR 성능 비교
+
+[합성 성능 비교](performance.md)는 관련 코드 PR에서 동일 runner의 base/head를
+짧게 비교합니다. 성능 변화는 advisory, 정답 불일치는 실패입니다. 대량·반복·제어된
+재시작/재전송 검사는 수동 실행만 제공하며 정기 schedule은 없습니다.
+
 ## 합성 런타임 통합 검사
 
 로컬 Docker Engine/Desktop과 Compose 2.24.4 이상에서 아래 명령을 사용합니다. 호스트 CLI에는 Python 3.12 stdlib만 필요합니다. generated `compose.yaml`을 사용하므로 소스를 변경했다면 위 순서대로 재생성한 뒤 실행하세요.
