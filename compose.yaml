@@ -973,7 +973,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '16'
+      datalake.can-receiver-revision: '17'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -999,7 +999,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '16'
+      datalake.can-receiver-revision: '17'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -1027,6 +1027,8 @@ services:
     - serve
     - --database
     - /data/raw.sqlite3
+    - --raw-cache-mib
+    - ${CAN_RAW_CACHE_MIB:-256}
     - --vehicle
     - ${CAN_VEHICLE:-}
     - --collector-id
@@ -1047,7 +1049,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '16'
+      datalake.can-receiver-revision: '17'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -1080,6 +1082,8 @@ services:
     - work
     - --database
     - /data/raw.sqlite3
+    - --raw-cache-mib
+    - ${CAN_RAW_CACHE_MIB:-256}
     - --dbc
     - /definitions/observed.dbc
     - --definitions
@@ -34884,8 +34888,8 @@ configs:
       """Authenticated OTLP raw archive and resumable CAN-to-Greptime worker.
 
       A successful /v1/logs response acknowledges SQLite raw durability, not Greptime.
-      Raw chunks are never deleted. Run from /app with ``python -m scripts.ingest.can.can_receiver serve|work|status|re-decode``:
-      serve only receives raw, work only decodes/uploads.
+      CLI serve/work defaults to a bounded raw cache; programmatic archives may retain
+      raw for explicit replay. Run with ``python -m scripts.ingest.can.can_receiver serve|work|status|re-decode``.
       """
       from __future__ import annotations
 
@@ -34942,6 +34946,8 @@ configs:
        id INTEGER PRIMARY KEY, session INTEGER NOT NULL REFERENCES sessions(id),
        seq INTEGER NOT NULL, offset_ns INTEGER NOT NULL, phase TEXT NOT NULL,
        data BLOB NOT NULL, UNIQUE(session,seq));
+      CREATE TABLE IF NOT EXISTS raw_pruned (
+       session INTEGER PRIMARY KEY REFERENCES sessions(id), next_seq INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS epochs (
        epoch TEXT PRIMARY KEY, mapping_revision TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS decode_states (
@@ -35378,9 +35384,12 @@ configs:
           return statements
 
       class Archive:
-          def __init__(self, path, disk_reserve_bytes=64 * 1024 * 1024):
+          def __init__(self, path, disk_reserve_bytes=64 * 1024 * 1024, max_database_bytes=None):
+              if max_database_bytes is not None and (type(max_database_bytes) is not int or max_database_bytes < 4 * 1024 * 1024):
+                  raise ConfigurationError("raw_cache_must_be_at_least_4_mib")
               self.path = _archive_path(path)
               self.disk_reserve_bytes = disk_reserve_bytes
+              self.max_database_bytes = max_database_bytes
               # Secure parent init BEFORE lock creation; narrow init lock only here.
               _prepare_archive_dir(self.path)
               with _init_guarded(self.path):
@@ -35391,6 +35400,13 @@ configs:
                       os.fchmod(fd, 0o600)
                   finally:
                       os.close(fd)
+                  if self.max_database_bytes is not None:
+                      # The init guard serializes the one-time format conversion.
+                      with contextlib.closing(sqlite3.connect(self.path, timeout=5)) as conn:
+                          conn.execute("PRAGMA journal_mode=DELETE")
+                          if conn.execute("PRAGMA auto_vacuum").fetchone()[0] != 1:
+                              conn.execute("PRAGMA auto_vacuum=FULL")
+                              conn.execute("VACUUM")
                   with self.connect() as conn:
                       conn.executescript(SCHEMA)
                       conn.execute("BEGIN IMMEDIATE")
@@ -35401,6 +35417,7 @@ configs:
                       _migrate_session_count(conn)
                       _migrate_epoch_state(conn)
                       _migrate_active_epoch(conn)
+                      _meta_set(conn, "max_database_bytes", self.max_database_bytes or 0)
                       conn.commit()
               # Wake hints live on the Archive so accept/decode/flush commits and the
               # Worker share one pair created once here (no racy lazy attach).
@@ -35432,13 +35449,63 @@ configs:
               conn = sqlite3.connect(self.path, timeout=5)
               try:
                   conn.row_factory = sqlite3.Row
-                  conn.execute("PRAGMA journal_mode=WAL")
+                  conn.execute("PRAGMA journal_mode=" + ("DELETE" if self.max_database_bytes is not None else "WAL"))
+                  if self.max_database_bytes is not None:
+                      page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+                      limit = self.max_database_bytes // page_size
+                      if conn.execute("PRAGMA max_page_count=%d" % limit).fetchone()[0] > limit:
+                          raise ConfigurationError("existing_database_exceeds_raw_cache_limit")
                   conn.execute("PRAGMA synchronous=FULL")
                   conn.execute("PRAGMA foreign_keys=ON")
-              except sqlite3.Error:
+              except (sqlite3.Error, ConfigurationError):
                   conn.close()
                   raise
               return contextlib.closing(conn)
+
+          def _reserve_raw_cache(self, conn, chunks):
+              if self.max_database_bytes is None or not chunks:
+                  return
+              used = (conn.execute("PRAGMA page_count").fetchone()[0]
+                      - conn.execute("PRAGMA freelist_count").fetchone()[0]) * conn.execute("PRAGMA page_size").fetchone()[0]
+              required = sum(len(c["data"]) + 128 for c in chunks) + 16384
+              # ponytail: reserve 25% for decode/outbox writes; tune only if real batches outgrow it.
+              if used + required > self.max_database_bytes * 3 // 4:
+                  raise Rejection(503, "raw_cache_full")
+
+          def prune_once(self, limit=10000):
+              """Drop a bounded decoded prefix only after the outbox drains; keep retry tail and parser state."""
+              if self.max_database_bytes is None:
+                  return 0
+              removed = 0
+              with self.connect() as conn:
+                  conn.execute("BEGIN IMMEDIATE")
+                  if conn.execute("SELECT 1 FROM outbox LIMIT 1").fetchone() is not None:
+                      return 0
+                  epochs = conn.execute("SELECT COUNT(*) FROM epochs").fetchone()[0]
+                  if not epochs:
+                      return 0
+                  candidates = conn.execute(
+                      "SELECT s.id,MIN(MIN(d.next_seq),s.next_seq-10000) AS stop "
+                      "FROM sessions s JOIN decode_states d ON d.session=s.id "
+                      "GROUP BY s.id HAVING COUNT(*)=? AND stop>0", (epochs,)).fetchall()
+                  for session, stop in candidates:
+                      rows = conn.execute(
+                          "SELECT id,seq,length(data) FROM raw_chunks WHERE session=? AND seq<? "
+                          "ORDER BY seq LIMIT ?", (session, stop, limit - removed)).fetchall()
+                      if not rows:
+                          continue
+                      conn.executemany("DELETE FROM raw_chunks WHERE id=?", [(r[0],) for r in rows])
+                      conn.execute(
+                          "INSERT INTO raw_pruned VALUES(?,?) ON CONFLICT(session) DO UPDATE SET "
+                          "next_seq=MAX(next_seq,excluded.next_seq)", (session, rows[-1][1] + 1))
+                      _meta_bump(conn, "pruned_chunks", len(rows))
+                      _meta_bump(conn, "raw_bytes", -sum(r[2] for r in rows))
+                      removed += len(rows)
+                      if removed == limit:
+                          break
+                  conn.commit()
+              return removed
+
 
           def reserve(self, additional=0):
               if shutil.disk_usage(self.path.parent).free < self.disk_reserve_bytes + additional:
@@ -35465,6 +35532,7 @@ configs:
                   if session is None:
                       if chunks[0]["seq"] != 0:
                           raise Rejection(409, "sequence_gap")
+                      self._reserve_raw_cache(conn, chunks)
                       self.reserve(sum(len(c["data"]) for c in chunks))
                       cursor = conn.execute(
                           "INSERT INTO sessions(vehicle,collector_id,session_id,meta_json) VALUES(?,?,?,?)",
@@ -35478,10 +35546,16 @@ configs:
                       session_id, next_seq, last_offset = session["id"], session["next_seq"], session["last_offset_ns"]
                       if any(c["seq"] >= next_seq for c in chunks):
                           self.reserve(sum(len(c["data"]) for c in chunks if c["seq"] >= next_seq))
+                          self._reserve_raw_cache(conn, [c for c in chunks if c["seq"] >= next_seq])
                   added = 0
+                  pruned = conn.execute("SELECT next_seq FROM raw_pruned WHERE session=?", (session_id,)).fetchone()
                   for chunk in chunks:
                       seq, offset, phase, data = (chunk[k] for k in ("seq", "offset_ns", "phase", "data"))
                       if seq < next_seq:
+                          # Completed history is no longer available for byte-conflict comparison.
+                          # Its authenticated retry is ACKed, never reinserted or decoded again.
+                          if pruned is not None and seq < pruned[0]:
+                              continue
                           old = conn.execute(
                               "SELECT offset_ns,phase,data FROM raw_chunks WHERE session=? AND seq=?",
                               (session_id, seq),
@@ -35521,6 +35595,8 @@ configs:
                       if existing[0] != decoder.mapping_revision:
                           raise ConfigurationError("decoder_epoch_mapping_conflict")
                   else:
+                      if conn.execute("SELECT 1 FROM raw_pruned LIMIT 1").fetchone() is not None:
+                          raise ConfigurationError("re-decode_requires_unpruned_raw")
                       if not explicit and conn.execute("SELECT 1 FROM epochs LIMIT 1").fetchone():
                           raise ConfigurationError("new_decoder_epoch_requires_re-decode")
                       conn.execute("INSERT INTO epochs VALUES(?,?)", (decoder.epoch, decoder.mapping_revision))
@@ -35910,6 +35986,7 @@ configs:
           def status(self, detail=False):
               facts = archive_status(self.path, detail=detail)
               facts["disk_reserve_bytes"] = self.disk_reserve_bytes
+              facts["max_database_bytes"] = self.max_database_bytes
               return facts
 
 
@@ -36073,6 +36150,9 @@ configs:
                    "epochs": epochs, "errors": errors, "oldest_pending_id": oldest, "backlog_chunks": backlog,
                    "freshness": freshness, "counters": counters, "disk_reserve_bytes": None,
                    "db_bytes": None, "wal_bytes": None, "disk_free_bytes": None}
+          facts["pruned_chunks"] = meta.get("pruned_chunks", 0)
+          facts["retained_raw_chunks"] = raw - facts["pruned_chunks"]
+          facts["max_database_bytes"] = meta.get("max_database_bytes", 0) or None
           try:
               facts["db_bytes"] = path.stat().st_size
               wal = path.with_name(path.name + "-wal")
@@ -36430,6 +36510,8 @@ configs:
               while not self.stop_event.is_set():
                   try:
                       done = self.archive.flush_once(self.greptime, self.outbox_limit, self.max_body_bytes)
+                      if self.archive.prune_once():
+                          continue
                   except DownstreamError as exc:
                       self._error(classify_error(exc))
                       # Own retry backoff only: new-work hints must not busy-retry a failed downstream.
@@ -36827,7 +36909,8 @@ configs:
           path = _archive_path(args.database)
           _prepare_archive_dir(path)
           with role_locks(path):
-              yield Archive(path, args.disk_reserve_mib * 1024 * 1024)
+              yield Archive(path, args.disk_reserve_mib * 1024 * 1024,
+                            max_database_bytes=args.raw_cache_mib * 1024 * 1024 if args.raw_cache_mib else None)
 
 
       def _run_serve(args):
@@ -36926,10 +37009,12 @@ configs:
           serve.add_argument("--port", type=int, default=4319)
           serve.add_argument("--http-timeout", type=float, default=15)
           serve.add_argument("--disk-reserve-mib", type=int, default=64)
+          serve.add_argument("--raw-cache-mib", type=int, default=256, help="SQLite cache cap; 0 retains raw for archival replay")
           for command in (work, replay):
               command.add_argument("--dbc", required=True)
               command.add_argument("--definitions", required=True)
               command.add_argument("--disk-reserve-mib", type=int, default=64)
+              command.add_argument("--raw-cache-mib", type=int, default=256 if command is work else 0)
           work.add_argument("--greptime-url", required=True)
           work.add_argument("--greptime-db", required=True)
           work.add_argument("--worker-interval", type=float, default=1)
@@ -36949,6 +37034,8 @@ configs:
               os.umask(0o077)
               if args.disk_reserve_mib < 0:
                   raise ConfigurationError("disk_reserve_must_be_nonnegative")
+              if args.raw_cache_mib < 0:
+                  raise ConfigurationError("raw_cache_must_be_nonnegative")
               if args.command == "serve":
                   return _run_serve(args)
               if args.command == "work":

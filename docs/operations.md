@@ -163,7 +163,7 @@ docker start -a can-definitions-load
 docker rm can-definitions-load
 ```
 
-볼륨 루트는 UID/GID `10001:10001`, `0700`, 정의 파일은 같은 소유자의 `0600`입니다. receiver는 UID/GID `10001:10001`로 실행하며 루트 파일시스템, 정의·코드·venv 볼륨은 read-only입니다. raw SQLite `/data/raw.sqlite3`와 관련 WAL/SHM도 비공개로 보존합니다. 내용 정렬·재직렬화·줄바꿈 변경도 epoch를 바꿀 수 있으므로 운영 중 정의를 덮어쓰지 마세요.
+볼륨 루트는 UID/GID `10001:10001`, `0700`, 정의 파일은 같은 소유자의 `0600`입니다. receiver는 UID/GID `10001:10001`로 실행하며 루트 파일시스템, 정의·코드·venv 볼륨은 read-only입니다. raw SQLite `/data/raw.sqlite3`는 비공개 처리 캐시이며 기본 상한은 256 MiB입니다. 내용 정렬·재직렬화·줄바꿈 변경도 epoch를 바꿀 수 있으므로 운영 중 정의를 덮어쓰지 마세요.
 
 ```bash
 docker compose --env-file .env --profile can-receiver config --quiet
@@ -198,13 +198,21 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 `/v1/files`로 바꾸고 기존 batching 옵션을 제거해야 합니다. capture는 재시작하지 않습니다.
 기존 `/v1/logs`는 이전 클라이언트·복구 재전송용 수신 계약으로 계속 지원합니다.
 
-서버 디스크는 전체 원본 JSONL 파일과 기존 raw DB/outbox를 함께 수용해야 합니다.
-Pi의 protobuf 큐 용량을 JSONL 저장 용량으로 간주하지 마세요. 원본은 자동 삭제하지 않습니다.
+서버 디스크는 전체 원본 JSONL 파일과 제한된 raw DB/outbox를 함께 수용해야 합니다.
+Pi의 protobuf 큐 용량을 JSONL 저장 용량으로 간주하지 마세요. `/data/files`의 수신 원본 파일은 자동 삭제하지 않습니다.
+
+#### SQLite 원본 처리 캐시
+
+`serve`와 `work`의 `--raw-cache-mib` 및 Compose의 `CAN_RAW_CACHE_MIB` 기본값은 **256 MiB**입니다. 모든 쓰기 연결의 `max_page_count`로 SQLite 본체를 제한하고, 수신은 디코딩·outbox용 25% 공간을 남깁니다. 부족하면 `503 raw_cache_full`로 거절하여 클라이언트가 재시도합니다. worker는 signal·dirty 전체 ACK로 outbox가 비었을 때 모든 epoch가 디코딩한 prefix를 최대 10,000청크씩 정리합니다. 세션별 최근 10,000청크와 parser tail·미완료 청크·미처리 원본·실패 outbox·세션 순번은 유지합니다. 신호를 만들지 않는 원본도 주기적으로 정리합니다.
+
+캐시 모드는 `auto_vacuum=FULL`로 빈 페이지를 회수하고 `DELETE` journal로 WAL 누적을 피합니다. rollback journal은 트랜잭션 동안 임시 공간을 사용합니다. 기존 DB의 첫 적용은 `VACUUM` 형식 변환이므로 두 역할을 멈추고 임시 공간을 확보하세요. 상한보다 큰 미처리 DB는 자동 삭제하지 않고 시작을 거부합니다. `/data/files`와 디스크 전체 사용량의 상한은 아닙니다.
+
+`status.raw_chunks`는 누적 수신량, `retained_raw_chunks`는 보존 청크, `pruned_chunks`는 정리량, `raw_bytes`는 보존 payload bytes, `max_database_bytes`는 본체 상한입니다. 정리된 순번의 인증된 재전송은 재저장 없이 ACK하며 bytes 충돌 비교는 불가능합니다. 보존 순번의 충돌 검증은 유지합니다. 정리된 과거의 새 epoch 재해석은 `re-decode_requires_unpruned_raw`로 거절합니다. 장기 아카이브가 필요한 별도 운영만 두 역할에 `--raw-cache-mib 0`을 명시하세요. 프로그램에서 직접 만든 `Archive`와 기본 `re-decode`는 무제한 아카이브 모드지만 정리된 과거를 복구하지는 못합니다.
 
 
 CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
 
-디코딩은 쓰기 잠금 밖에서 최대 1,000청크·2,000출력 행을 준비하고, 청크 사이의 경과 시간이 50ms를 넘으면 다음 commit으로 넘깁니다. 조밀한 청크도 parser 상태와 frame 경계 cursor로 이어서 처리하므로 한 청크의 모든 신호를 메모리에 펼치지 않습니다. commit 전 각 세션의 기존 cursor·상태를 다시 확인하며, parser 상태·decode cursor·outbox는 한 트랜잭션에서 함께 commit하거나 rollback합니다. 개별 frame·commit 시간을 포함한 엄격한 50ms 상한은 아니며, 원본 보존과 `WAL`/`synchronous=FULL`은 유지합니다.
+디코딩은 쓰기 잠금 밖에서 최대 1,000청크·2,000출력 행을 준비하고, 청크 사이의 경과 시간이 50ms를 넘으면 다음 commit으로 넘깁니다. 조밀한 청크도 parser 상태와 frame 경계 cursor로 이어서 처리하므로 한 청크의 모든 신호를 메모리에 펼치지 않습니다. commit 전 각 세션의 기존 cursor·상태를 다시 확인하며, parser 상태·decode cursor·outbox는 한 트랜잭션에서 함께 commit하거나 rollback합니다. 개별 frame·commit 시간을 포함한 엄격한 50ms 상한은 아니며 `synchronous=FULL`은 유지합니다.
 
 단일 ordered 디코더와 단일 업로드 워커는 같은 영속 outbox를 독립적으로 처리합니다. Greptime 응답이 지연되어도 디코딩은 계속됩니다. 업로드는 최대 20,000행과 URL-encoded HTTP body 4 MiB를 모두 만족하는 가장 긴 순서 보존 prefix를 전송하며, 배치를 채우려고 기다리지 않습니다. `--outbox-limit`은 1–20,000행, `--max-body-bytes`는 body byte 예산입니다. 한 행만으로 byte 예산을 초과하면 `greptime_row_too_large`로 남기고 해당 행을 건너뛰거나 삭제하지 않습니다. DB 요청의 `--greptime-timeout` 기본값은 60초이며, `serve`의 ingress socket `--http-timeout` 기본값 15초와 별개입니다. `--greptime-timeout`·`--outbox-limit`·`--max-body-bytes`·outbox watermark·재시도 간격은 `work` 옵션입니다. 전체 행 수가 ACK된 배치만 outbox에서 제거하고, 오류·부분 ACK·`greptime_timeout`은 배치 전체를 보존합니다. 정수 nanosecond는 `TIMESTAMP(9)` 대상 column에 정수 literal로 전달하여 정밀도를 유지하면서 GreptimeDB 1.2.1의 literal INSERT fast path를 사용합니다. 정상 종료는 진행 중인 업로드 완료 또는 DB timeout까지 archive 소유권을 유지합니다. SQLite 원본의 수신 ACK는 Greptime 저장 완료를 뜻하지 않습니다.
 
@@ -241,7 +249,7 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 2. **기존 receiver와 worker 둘 다** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. 파일 uploader는 원본·진행 정보를, 이전 OTLP uploader는 기존 spool을 보존한 채 서버 공백 동안 재시도합니다.
 3. `CAN_RECEIVER_RAW_VOLUME`을 기존 raw volume의 정확한 이름으로 지정합니다. 새 빈 raw volume으로 교체하거나 DB를 복사·삭제하지 않습니다. 기존 `/data/raw.sqlite3`와 WAL/SHM, `/data/files`, decode cursor·outbox·epoch를 그대로 사용하며 소유자 `10001:10001`와 private 모드를 확인합니다. 필요한 권한 조정은 writer를 멈춘 상태에서만 수행합니다.
 4. 동일한 정의 바이트를 private definitions volume에 공급합니다. 서버 이전을 이유로 새 epoch를 만들거나 `re-decode`를 실행하지 않습니다. 같은 raw·정의 볼륨으로 새 receiver와 worker를 시작합니다. **같은 raw archive에 구·신 receiver·worker를 병렬 실행하지 마세요.**
-5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 원본은 어느 쪽에서도 삭제하지 않습니다. rollback도 새 receiver·worker를 종료한 뒤 동일 볼륨·정의로 기존 버전을 단독 기동합니다.
+5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 인계 자체는 원본을 삭제하지 않으며, 이후 SQLite 정리는 위 캐시 정책을 따릅니다. rollback도 새 receiver·worker를 종료한 뒤 동일 볼륨·정의로 기존 버전을 단독 기동합니다.
 
 의도적으로 정의를 변경하는 재해석은 worker를 먼저 중지하고 새 정의를 검토한 뒤 아래처럼 같은 venv·볼륨의 단독 컨테이너에서 실행합니다. `re-decode`는 worker 역할 lock을 사용하므로 `can-worker` 실행 중에는 동시에 시작하지 마세요. 이 작업은 새 decode epoch를 명시적으로 등록하므로 단순 배포 인계와 구분합니다. 정의 파일 교체는 worker를 중지한 상태에서만 수행합니다. receiver는 계속 수신할 수 있으며 worker 시작 전에 받은 원본도 이후 처리됩니다.
 
@@ -254,7 +262,7 @@ docker compose --env-file .env --profile can-receiver run --rm --no-deps can-wor
 docker compose --env-file .env --profile can-receiver up -d can-worker
 ```
 
-완전한 OTLP ACK는 **서버 raw SQLite의 durable 수락**이지 Greptime commit이 아닙니다. downstream 장애 시 raw와 outbox가 남으며, ACK는 차량 원본 삭제 허가가 아닙니다. 자동 raw GC를 추가하지 말고 SQLite archive·차량 원본을 보존하세요. epoch·정수 nanosecond·quality를 유지하며 `reported_unverified` 등을 집계 편의를 위해 `valid`로 바꾸지 않습니다.
+완전한 OTLP ACK는 **서버 raw SQLite의 durable 수락**이지 Greptime commit이 아닙니다. downstream 장애 시 raw와 outbox가 남으며, ACK는 차량 원본 삭제 허가가 아닙니다. SQLite는 위 처리 캐시 정책에 따라 완료 원본만 정리합니다. epoch·정수 nanosecond·quality를 유지하며 `reported_unverified` 등을 집계 편의를 위해 `valid`로 바꾸지 않습니다.
 
 다음 해석 대상은 세션별 cursor와 기존 `(session, seq)` 인덱스로 찾고, 후보 중 원본 도착 순서가 가장 빠른 chunk를 처리합니다. 보존한 원본 전체를 chunk마다 재검색하지 않습니다. 이 조회 최적화는 decode epoch·cursor 형식·영속 커밋을 바꾸지 않으므로 재해석이나 archive 마이그레이션이 필요하지 않습니다.
 
