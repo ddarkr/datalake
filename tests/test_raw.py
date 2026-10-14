@@ -3,9 +3,10 @@
 Covers: frame codec provenance, segment rotation/recovery, MF4 bus-logging
 round-trip via MF4Reader (payload/FD/RTR/error, pre-rename verify gate,
 crash-resume reuse, torn-tail salvage vs mid-corruption quarantine),
-deterministic remote keys, triple-upload ack rule (all locals kept on any
-failure, manifest-pin drift fail-closed to quarantine, partial sets
-invisible), replay safety gate.
+deterministic remote keys, triple-upload ack rule (all locals deleted only
+on server-ChecksumSHA256 + HEAD size + Metadata-sha256 ack of all three
+legs; all locals kept on any failure, manifest-pin drift fail-closed to
+quarantine, partial sets invisible), replay safety gate.
 """
 import json
 import os
@@ -378,50 +379,99 @@ class MF4Test(unittest.TestCase):
                 os.path.join(dirs["sealed"], stem + ".stage.tmp")))
 
 class _Missing(Exception):
-    """Mimics botocore ClientError for a missing key (NoSuchKey)."""
-    def __init__(self):
+    """Mimics botocore ClientError for a missing key."""
+    def __init__(self, code="NoSuchKey"):
         super().__init__("missing key")
-        self.response = {"Error": {"Code": "NoSuchKey"},
+        self.response = {"Error": {"Code": code},
                          "ResponseMetadata": {"HTTPStatusCode": 404}}
 
 
-class FakeBody:
-    def __init__(self, data):
-        self.data = data
-        self.closed = False
-
-    def iter_chunks(self, chunk_size=1 << 20):
-        yield self.data
-
-    def close(self):
-        self.closed = True
+class _HeadError(Exception):
+    """Mimics a non-missing botocore failure (never means missing)."""
+    def __init__(self, code, status):
+        super().__init__("head failed: %s" % code)
+        self.response = {"Error": {"Code": code},
+                         "ResponseMetadata": {"HTTPStatusCode": status}}
 
 
 class FakeS3:
-    def __init__(self, corrupt=False, fail_put=0, unreadable=False):
+    """HEAD + PUT fake with server ChecksumSHA256 semantics.
+
+    store maps (Bucket, Key) -> (bytes, metadata, checksum_b64) where the
+    checksum is the actual SHA256 of the stored bytes. put_object demands
+    ChecksumSHA256 and rejects a corrupt upload body like a server would;
+    head_object reports the checksum of the (possibly corrupted) bytes.
+    """
+    def __init__(self, corrupt=False, fail_put=0, unreadable=False,
+                 missing_code="NoSuchKey", head_error=None,
+                 no_checksum=False, wrong_checksum=False,
+                 unsupported_checksum=False, same_size_corrupt=False,
+                 put_no_echo=False):
         self.store = {}
         self.corrupt = corrupt
         self.fail_put = fail_put
         self.unreadable = unreadable
+        self.missing_code = missing_code
+        self.head_error = head_error
+        self.no_checksum = no_checksum
+        self.wrong_checksum = wrong_checksum
+        self.unsupported_checksum = unsupported_checksum
+        self.same_size_corrupt = same_size_corrupt
+        self.put_no_echo = put_no_echo
         self.puts = 0
+        self.gets = 0
 
-    def put_object(self, Bucket, Key, Body, ContentLength, Metadata):
+    @staticmethod
+    def _b64(data):
+        import base64 as _b64
+        import hashlib as _hl
+        return _b64.b64encode(_hl.sha256(data).digest()).decode("ascii")
+
+    def put_object(self, Bucket, Key, Body, ContentLength, Metadata,
+                   ChecksumSHA256=None):
         if self.fail_put > 0:
             self.fail_put -= 1
             raise ConnectionError("boom")
+        if self.unsupported_checksum:
+            raise _HeadError("InvalidRequest", 400)
+        blob = Body.read()
+        actual = self._b64(blob)
+        if ChecksumSHA256 != actual:
+            # Server rejects an upload whose bytes fail checksum validation.
+            raise IOError("checksum mismatch on PUT")
         self.puts += 1
-        self.store[(Bucket, Key)] = Body.read()
+        self.store[(Bucket, Key)] = (blob, dict(Metadata or {}), actual)
+        if self.put_no_echo:
+            return {}
+        return {"ChecksumSHA256": actual}
 
-    def get_object(self, Bucket, Key):
+    def head_object(self, Bucket, Key, ChecksumMode=None):
         if self.unreadable:
             raise ConnectionError("denied")
+        if self.head_error is not None:
+            raise self.head_error
         try:
-            data = self.store[(Bucket, Key)]
+            data, meta, csum = self.store[(Bucket, Key)]
         except KeyError:
-            raise _Missing()
+            raise _Missing(self.missing_code)
+        # MinIO-proven semantics: checksum returned only with ENABLED.
+        enabled = (ChecksumMode == "ENABLED")
         if self.corrupt:
-            data = b"tampered" + data
-        return {"Body": FakeBody(data), "ContentLength": len(data)}
+            data = b"tampered" + data  # wrong length: HEAD size mismatches
+        elif self.same_size_corrupt:
+            data = bytes(b ^ 0xFF for b in data)  # equal size, wrong bytes
+        out = {"ContentLength": len(data), "Metadata": dict(meta)}
+        if enabled:
+            out["ChecksumSHA256"] = self._b64(data)
+        if self.no_checksum:
+            out.pop("ChecksumSHA256", None)
+        elif self.wrong_checksum:
+            out["ChecksumSHA256"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        return out
+
+    def get_object(self, Bucket, Key):  # tripwire: readback must never happen
+        self.gets += 1
+        raise AssertionError("GET body readback is forbidden in raw upload")
 
 
 class UploadTest(unittest.TestCase):
@@ -483,7 +533,7 @@ class UploadTest(unittest.TestCase):
     def test_mismatch_keeps_all_locals(self):
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
-            cli = FakeS3(corrupt=True)
+            cli = FakeS3(corrupt=True)  # post-PUT HEAD size mismatches
             n = upl.run_once(cli, "b", spool, "m3", 0)
             self.assertEqual(n, 1)
             for kept in (p, s, m, cp):  # unacked: everything stays
@@ -491,11 +541,13 @@ class UploadTest(unittest.TestCase):
 
     def test_manifest_leg_failure_keeps_all(self):
         class ManifestDown(FakeS3):
-            def put_object(self, Bucket, Key, Body, ContentLength, Metadata):
+            def put_object(self, Bucket, Key, Body, ContentLength, Metadata,
+                           ChecksumSHA256=None):
                 if Key.endswith(".manifest.json"):
                     raise ConnectionError("manifest down")
                 return super().put_object(Bucket, Key, Body, ContentLength,
-                                          Metadata)
+                                          Metadata,
+                                          ChecksumSHA256=ChecksumSHA256)
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
             cli = ManifestDown()
@@ -553,19 +605,86 @@ class UploadTest(unittest.TestCase):
                                       (s, upl.sidecar_key(key)),
                                       (m, upl.manifest_key(key))):
                 with open(leg_path, "rb") as fh:
-                    cli.store[("b", leg_key)] = b"CONFLICT" + fh.read()
+                    blob = fh.read()
+                # Same byte length, wrong digest: HEAD metadata conflicts.
+                clashing = bytes(b ^ 0xFF for b in blob)
+                cli.store[("b", leg_key)] = (
+                    clashing, {"sha256": "0" * 64}, FakeS3._b64(clashing))
             before = dict(cli.store)
             self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
             self.assertEqual(cli.store, before)  # conflict: bytes untouched
             for kept in (p, s, m, cp):
                 self.assertTrue(os.path.exists(kept))
 
+    def test_missing_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            for leg_path, leg_key in ((p, key),
+                                      (s, upl.sidecar_key(key)),
+                                      (m, upl.manifest_key(key))):
+                with open(leg_path, "rb") as fh:
+                    blob = fh.read()
+                cli.store[("b", leg_key)] = (blob, {}, FakeS3._b64(blob))
+            before = dict(cli.store)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, before)  # no digest: never trusted
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_wrong_size_fails_closed(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            with open(p, "rb") as fh:
+                blob = fh.read() + b"\x00"
+            cli.store[("b", key)] = (blob, {"sha256": upl.sha256_file(p)},
+                                     FakeS3._b64(blob))
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_head_404_code_means_missing(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(missing_code="404")  # botocore HEAD 404: upload
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for gone in (p, s, m, cp):
+                self.assertFalse(os.path.exists(gone))
+
+    def test_head_nonmissing_error_never_deleted(self):
+        for err in (_HeadError("Forbidden", 403),
+                    _HeadError("NoSuchBucket", 404)):
+            with tempfile.TemporaryDirectory() as spool:
+                p, s, m, cp = self._triple(spool)
+                cli = FakeS3(head_error=err)  # never means missing
+                self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+                self.assertEqual(cli.store, {})
+                for kept in (p, s, m, cp):
+                    self.assertTrue(os.path.exists(kept))
+
+    def test_failed_upload_logs_no_private_key_path_or_remote_error(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as spool:
+            paths = self._triple(spool, name="private_vehicle_marker_segment")
+            cli = FakeS3(head_error=_HeadError("private_remote_error_marker", 403))
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                upl.run_once(cli, "b", spool, "private_vehicle_marker", 0)
+            for marker in (spool, "private_vehicle_marker", "private_remote_error_marker"):
+                self.assertNotIn(marker, captured.getvalue())
+            self.assertEqual(cli.store, {})
+            self.assertTrue(all(os.path.exists(path) for path in paths))
+
     def test_unreadable_live_object_retried_never_deleted(self):
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
             cli = FakeS3(unreadable=True)
             self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
-            self.assertEqual(cli.store, {})  # denied reads: nothing uploaded
+            self.assertEqual(cli.store, {})  # denied HEAD: nothing uploaded
             for kept in (p, s, m, cp):
                 self.assertTrue(os.path.exists(kept))
 
@@ -610,6 +729,232 @@ class UploadTest(unittest.TestCase):
                 self.assertIn(("b", k), cli.store)
             for gone in (p2, s2, m2, cp2):
                 self.assertFalse(os.path.exists(gone))
+
+    def test_equal_size_corruption_fails_closed_never_deletes(self):
+        # Same ContentLength and same metadata digest, but the stored bytes
+        # differ: only the server checksum distinguishes them. Ack must
+        # refuse and every local must stay.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(same_size_corrupt=True)
+            n = upl.run_once(cli, "b", spool, "m3", 0)
+            self.assertEqual(n, 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+            self.assertEqual(cli.gets, 0)  # no GET body readback, ever
+
+    def test_metadata_match_without_server_checksum_fails_closed(self):
+        # A live object with matching size+metadata but no server checksum
+        # (checksum-less backend) must NOT ack or delete locals.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            cli = FakeS3(no_checksum=True)
+            for leg_path, leg_key in ((p, key),
+                                      (s, upl.sidecar_key(key)),
+                                      (m, upl.manifest_key(key))):
+                with open(leg_path, "rb") as fh:
+                    blob = fh.read()
+                cli.store[("b", leg_key)] = (
+                    blob, {"sha256": upl.sha256_file(leg_path)},
+                    FakeS3._b64(blob))
+            before = dict(cli.store)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, before)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_unsupported_checksum_fails_closed_keeps_locals(self):
+        # Backend rejecting ChecksumSHA256 is an explicit failure: no trust,
+        # no GET fallback, all locals retained on every leg.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(unsupported_checksum=True)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, {})
+            self.assertEqual(cli.gets, 0)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_put_response_without_checksum_keeps_locals(self):
+        # PUT accepted bytes but returned no checksum echo: unverified.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(put_no_echo=True)
+            # _put_checked alone: missing echo raises through retries.
+            digest = upl.sha256_file(p)
+            with self.assertRaises(IOError):
+                upl._put_checked(cli, "b", "k", p, os.path.getsize(p),
+                                 digest)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_replay_after_verified_ack_needs_no_put_no_readback(self):
+        # Fresh complete triple acks; a crash-restored replay reuses all
+        # three legs with no extra PUT and no GET body read.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            saved = {}
+            for f in (p, s, m):
+                with open(f, "rb") as fh:
+                    saved[f] = fh.read()
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            for (k, path), digest in zip(
+                    ((key, p), (upl.sidecar_key(key), s),
+                     (upl.manifest_key(key), m)),
+                    [upl.sha256_file(x) for x in (p, s, m)]):
+                self.assertTrue(
+                    upl.upload_verified(cli, "b", k, path, digest, 0))
+            puts = cli.puts
+            for (k, path), digest in zip(
+                    ((key, p), (upl.sidecar_key(key), s),
+                     (upl.manifest_key(key), m)),
+                    [upl.sha256_file(x) for x in (p, s, m)]):
+                self.assertTrue(
+                    upl.upload_verified(cli, "b", k, path, digest, 0))
+            self.assertEqual(cli.puts, puts)  # replay: reuse, no PUT
+            self.assertEqual(cli.gets, 0)  # replay: no body readback
+
+    def test_any_leg_unsupported_checksum_preserves_all_locals(self):
+        # Manifest leg PUT rejected for checksum support: MF4/sidecar may
+        # already be stored, but the triple is unacked -- all locals stay.
+        class ManifestUnsupported(FakeS3):
+            def put_object(self, Bucket, Key, Body, ContentLength,
+                           Metadata, ChecksumSHA256=None):
+                if Key.endswith(".manifest.json"):
+                    raise _HeadError("InvalidRequest", 400)
+                return super().put_object(
+                    Bucket, Key, Body, ContentLength, Metadata,
+                    ChecksumSHA256=ChecksumSHA256)
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = ManifestUnsupported()
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+            self.assertEqual(cli.gets, 0)
+
+
+
+class RawBindingTest(unittest.TestCase):
+    def _triple(self, spool):
+        import gzip
+        import hashlib
+        sealed = os.path.join(spool, "sealed")
+        closed = os.path.join(spool, "closed")
+        os.makedirs(sealed)
+        os.makedirs(closed)
+        stem = "m3_20260921T140000Z_binding"
+        p = os.path.join(sealed, stem + ".mf4")
+        s = os.path.join(sealed, stem + ".ingress.jsonl.gz")
+        m = p + ".manifest.json"
+        cp = os.path.join(closed, stem + ".jsonl")
+        ingress = b'{"seq":1}\n'
+        blobs = {p: b"sealed MF4 bytes", s: gzip.compress(ingress, mtime=0),
+                 cp: ingress}
+        blobs[m] = json.dumps({
+            "mf4_sha256": hashlib.sha256(blobs[p]).hexdigest(),
+            "ingress_sha256": hashlib.sha256(ingress).hexdigest(),
+            "ingress_sidecar_sha256": hashlib.sha256(blobs[s]).hexdigest(),
+        }, sort_keys=True).encode()
+        for path, blob in blobs.items():
+            with open(path, "wb") as fh:
+                fh.write(blob)
+        return (p, s, m, cp), blobs
+
+    def test_preflight_returns_exact_pins_and_parses_manifest_once(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as spool:
+            paths, blobs = self._triple(spool)
+            p, s, m, cp = paths
+            with patch.object(upl, "_load_manifest", wraps=upl._load_manifest) as load:
+                ok, reason, snap = upl.fail_closed_check(*paths)
+                self.assertTrue(ok, reason)
+                self.assertEqual(snap["manifest_bytes"], blobs[m])
+                self.assertEqual(snap["manifest_digest"], upl.sha256_file(m))
+                self.assertEqual(snap["mf4_digest"], upl.sha256_file(p))
+                self.assertEqual(snap["sidecar_digest"], upl.sha256_file(s))
+                self.assertEqual(snap["sizes"], tuple(len(blobs[x]) for x in (p, s, m)))
+                ok, reason, checked = upl.fail_closed_check(*paths, snap=snap)
+                self.assertTrue(ok, reason)
+                self.assertIs(checked, snap)
+                self.assertEqual(load.call_count, 1)
+
+    def test_post_preflight_drift_never_acks_or_deletes_fresh_or_replay(self):
+        from unittest.mock import patch
+        for replay in (False, True):
+            for timing in ("preflight", "last_ack"):
+                for leg in range(4):
+                    with self.subTest(replay=replay, timing=timing, leg=leg):
+                        with tempfile.TemporaryDirectory() as spool:
+                            paths, blobs = self._triple(spool)
+                            p, s, m, cp = paths
+                            cli = FakeS3()
+                            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+                            keys = (key, upl.sidecar_key(key), upl.manifest_key(key))
+                            if replay:
+                                for k, path in zip(keys, paths[:3]):
+                                    self.assertTrue(upl.upload_verified(
+                                        cli, "b", k, path, upl.sha256_file(path), 0))
+                            before = dict(cli.store)
+                            puts = cli.puts
+                            uploaded = upl._M["uploaded_files"]
+                            failed = upl._M["failed"]
+                            target = paths[leg]
+                            # Whitespace-only manifest drift preserves every
+                            # JSON pin while changing its content address.
+                            changed = (blobs[target] + b" " if target == m else
+                                       bytes([blobs[target][0] ^ 0xFF]) +
+                                       blobs[target][1:])
+                            real_check = upl.fail_closed_check
+                            real_upload = upl.upload_verified
+
+                            def drift():
+                                with open(target, "wb") as fh:
+                                    fh.write(changed)
+
+                            def check_then_drift(*args, **kwargs):
+                                result = real_check(*args, **kwargs)
+                                if result[0] and kwargs.get("snap") is None:
+                                    drift()
+                                return result
+
+                            def upload_then_drift(*args, **kwargs):
+                                result = real_upload(*args, **kwargs)
+                                if result and args[2] == keys[2]:
+                                    drift()
+                                return result
+
+                            if timing == "preflight":
+                                hook = patch.object(upl, "fail_closed_check",
+                                                    side_effect=check_then_drift)
+                            else:
+                                hook = patch.object(upl, "upload_verified",
+                                                    side_effect=upload_then_drift)
+                            with hook:
+                                self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+                            self.assertEqual(upl._M["uploaded_files"], uploaded)
+                            self.assertGreater(upl._M["failed"], failed)
+                            self.assertEqual(cli.gets, 0)
+                            for path in paths:
+                                kept = path if os.path.exists(path) else os.path.join(
+                                    spool, "quarantine", os.path.basename(path))
+                                self.assertTrue(os.path.exists(kept))
+                                with open(kept, "rb") as fh:
+                                    self.assertEqual(fh.read(), changed if path == target
+                                                     else blobs[path])
+                            # Any remote legs must contain the original pinned
+                            # bytes, including the exact manifest serialization.
+                            for (_, k), (data, meta, checksum) in cli.store.items():
+                                path = paths[keys.index(k)]
+                                self.assertEqual(data, blobs[path])
+                                self.assertEqual(checksum, FakeS3._b64(blobs[path]))
+                            if replay:
+                                self.assertEqual(cli.puts, puts)
+                                self.assertEqual(cli.store, before)
+                            elif timing == "last_ack":
+                                self.assertEqual(cli.puts, 3)
 
 
 class EndpointGateTest(unittest.TestCase):

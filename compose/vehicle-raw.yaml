@@ -71,6 +71,8 @@ services:
   raw-uploader:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
+    labels:
+      datalake.raw-uploader-revision: "1"
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully
@@ -80,6 +82,9 @@ services:
         mode: 0444
       - source: raw_storage_metrics_py
         target: /app/scripts/storage/storage_metrics.py
+        mode: 0444
+      - source: raw_s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
         mode: 0444
     volumes:
       - vehicle-venv:/opt/venv:ro
@@ -112,6 +117,8 @@ configs:
     x-source: scripts/vehicle/raw/can_validation.py
   raw_storage_metrics_py:
     x-source: scripts/storage/storage_metrics.py
+  raw_s3_cost_py:
+    x-source: scripts/storage/s3_cost.py
 
 volumes:
   vehicle-venv:

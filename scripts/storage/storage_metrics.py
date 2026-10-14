@@ -26,6 +26,8 @@ Metrics (port 9105, internal only):
   datalake_receiver_last_receive/decode/full_ack_timestamp_seconds
                                            (only when known, never invented)
   datalake_receiver_decoded/acked_rows_total (receipt vs decode vs DB commit)
+  datalake_storage_cost_*            (policy + bounded retained-run gauges;
+                                      never billing-month/account coverage)
   datalake_receiver_epoch_*{scope="active"|"retained"} (trigger-kept epoch
                                            state; fixed active/retained labels,
                                            never epoch/session/vehicle values)
@@ -48,6 +50,8 @@ import os
 import json
 import math
 import re
+
+from scripts.storage.s3_cost import load_cost_reports
 import shutil
 import signal
 import sqlite3
@@ -477,6 +481,93 @@ def receiver_metrics(archive=None, reserve_bytes=None):
     return values
 
 
+# Defaults apply ONLY when unset. Invalid configured policy is unknown,
+# not silently replaced by a zero budget or a plausible provider default.
+def cost_policy_metrics():
+    values = {}
+    known = True
+    for env, metric, default, factor in (
+        ("STORAGE_COST_FREE_EGRESS_MULTIPLIER", "free_egress_multiplier", 3.0, 1),
+        ("STORAGE_COST_EGRESS_USD_PER_GB", "egress_usd_per_gb", 0.01, 1),
+        ("STORAGE_COST_MAX_MONTHLY_EGRESS_GIB", "max_monthly_egress_bytes", 2400, 1024**3),
+        ("STORAGE_COST_MAX_MONTHLY_OVERAGE_USD", "max_monthly_overage_usd", 0.0, 1),
+    ):
+        raw = os.environ.get(env)
+        try:
+            value = default if raw in (None, "") else float(raw)
+            value *= factor
+            if not math.isfinite(value) or value < 0:
+                raise ValueError("invalid policy")
+        except (ValueError, OverflowError):
+            known = False
+            continue
+        values["datalake_storage_cost_" + metric] = value
+    values["datalake_storage_cost_policy_known"] = int(known)
+    return values
+
+
+_COST_REPORT_DIRS = ("/ops", "/can-ops/can")
+_REPORT_MAX_AGE_SECONDS = 48 * 3600
+
+
+def cost_report_metrics(dirs=_COST_REPORT_DIRS, now=None):
+    """Retained-run gauges, not cumulative counters or calendar-month totals.
+
+    End-of-run reports cannot establish uninterrupted capture, account scope,
+    or month coverage: complete stays 0 even with fresh valid reports. Invalid,
+    truncated, missing or stale inputs also set known=0. Values that are present
+    are lower bounds from retained reports and MUST NOT be used with increase().
+    """
+    now = time.time() if now is None else now
+    reports = [load_cost_reports(path, now=now) for path in dict.fromkeys(dirs)]
+    valid = sum(report["valid"] for report in reports)
+    invalid = sum(report["invalid"] for report in reports)
+    stamps = [report["newest_timestamp"] for report in reports if report["newest_timestamp"] is not None]
+    oldest = [report["oldest_timestamp"] for report in reports if report["oldest_timestamp"] is not None]
+    newest = max(stamps) if stamps else None
+    truncated = any(report["truncated"] for report in reports)
+    fresh = (bool(reports) and all(
+        report["newest_timestamp"] is not None
+        and 0 <= now - report["newest_timestamp"] <= _REPORT_MAX_AGE_SECONDS
+        for report in reports))
+    known = (valid > 0 and invalid == 0 and not truncated and fresh
+             and all(report["configured"] for report in reports))
+    out = {"datalake_storage_cost_report_known": int(known),
+           "datalake_storage_cost_report_complete": 0,
+           "datalake_storage_cost_report_truncated": int(truncated),
+           "datalake_storage_cost_report_files": valid,
+           "datalake_storage_cost_report_invalid_files": invalid}
+    if newest is not None:
+        out["datalake_storage_cost_report_timestamp_seconds"] = newest
+        out["datalake_storage_cost_report_oldest_timestamp_seconds"] = min(oldest)
+    totals = {}
+    for report in reports:
+        for comp, agg in report["totals"].items():
+            current = totals.setdefault(comp, {"requests": {}, "attempts": {}, "retries": {}, "errors": {},
+                        "read_bytes": 0, "write_bytes": 0, "copy_bytes": 0,
+                        "unknown": {"get": 0, "put": 0, "copy": 0}, "http_observed": True})
+            for section in ("requests", "attempts", "retries", "errors"):
+                for op, count in agg[section].items():
+                    current[section][op] = current[section].get(op, 0) + count
+            for field in ("read_bytes", "write_bytes", "copy_bytes"):
+                current[field] += agg[field]
+            for kind, count in agg["unknown"].items():
+                current["unknown"][kind] += count
+            current["http_observed"] &= agg["http_observed"]
+    for comp, agg in sorted(totals.items()):
+        for section in ("requests", "attempts", "retries", "errors"):
+            for op in sorted(agg["requests"]):
+                out['datalake_storage_cost_report_retained_%s{component="%s",operation="%s"}'
+                    % (section, comp, op)] = agg[section].get(op, 0)
+        for field in ("read_bytes", "write_bytes", "copy_bytes"):
+            out['datalake_storage_cost_report_retained_%s{component="%s"}' % (field, comp)] = agg[field]
+        for kind, count in agg["unknown"].items():
+            out['datalake_storage_cost_report_unknown_byte_operations{component="%s",kind="%s"}'
+                % (comp, kind)] = count
+        out['datalake_storage_cost_report_http_attempts_known{component="%s"}' % comp] = int(agg["http_observed"])
+    return out
+
+
 def render():
     with _SLOCK:
         snap = dict(_S)
@@ -492,6 +583,8 @@ def render():
     lines.extend("%s %d" % item for item in filesystem_metrics().items())
     lines.extend("%s %s" % item for item in operational_metrics().items())
     lines.extend("%s %s" % item for item in receiver_metrics().items())
+    lines.extend("%s %s" % item for item in cost_policy_metrics().items())
+    lines.extend("%s %s" % item for item in cost_report_metrics().items())
     return "".join(l + "\n" for l in lines)
 
 

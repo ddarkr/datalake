@@ -121,7 +121,7 @@ docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d
 ```
 
-원본은 MF4, ingress sidecar, manifest를 함께 저장합니다. 객체 경로는 `raw/vehicle/<id>/can/YYYY/MM/DD/<manifest-sha256>/<원래 파일명>`이며, 업로드한 세 파일의 검증이 끝나기 전에는 로컬 spool을 제거하지 않습니다. 디코딩된 신호는 SQLite outbox를 거쳐 DB로 전달합니다.
+원본은 MF4, ingress sidecar, manifest를 함께 저장합니다. 객체 경로는 `raw/vehicle/<id>/can/YYYY/MM/DD/<manifest-sha256>/<원래 파일명>`이며, 로컬 manifest의 hash pin을 검사하고 각 PUT의 명시적 `ChecksumSHA256` 응답과 HEAD 크기·checksum·`sha256` metadata가 모두 일치한 뒤에만 로컬 spool을 제거합니다. 기존 객체 재사용도 서버 checksum을 요구합니다. 부재·불일치·미지원·읽기 실패는 덮어쓰지 않고 로컬 파일을 유지하며 검증용 전체 GET fallback은 없습니다. metadata만으로 원격 바이트를 검증하지 않으며 IDrive/B2 호환성은 주장하지 않습니다. 디코딩된 신호는 SQLite outbox를 거쳐 DB로 전달합니다.
 
 DBC·VSS·펌웨어 pin 변경 시 recorder와 decoder를 먼저 정지하고 `DECODE_EPOCH`를 갱신한 뒤 재기동하세요. 실행 중인 decoder와 recorder가 서로 다른 정의를 사용하게 만드는 hot swap은 지원하지 않습니다.
 
@@ -215,7 +215,7 @@ signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신�
 
 #### CAN archive 백업과 새 볼륨 복원
 
-DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE를 GET으로 검증한 뒤 성공하며 원격 자동 GC는 하지 않습니다.
+DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE는 명시적 `ChecksumSHA256` PUT 응답과 HEAD checksum·크기로 검증합니다. 서버 checksum 부재·불일치·미지원은 로컬 archive를 보존하고 실패하며 metadata-only 성공이나 검증용 전체 GET fallback은 없습니다. 원격 자동 GC는 하지 않으며 복원 다운로드와 로컬 SHA256 검증은 유지합니다.
 
 이 DB/definitions 백업 형식에는 `/data/files`의 직접 수신 원본·메타데이터 버전은 포함되지
 않습니다. 파일 백업까지 필요하면 수신·worker를 정상 종료한 상태의 raw 볼륨 전체 복사나
@@ -370,6 +370,10 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
   지연 쿼리 진단 테이블은 최초 기록 전에는 없을 수 있습니다. 생성 여부를 먼저 확인하고, 미생성 테이블은 오류나 0건으로 바꾸지 않고 결과 없음으로 표시합니다.
 - **수집기 운영**: 스크랩 수집량·소요, 원격쓰기 대기·재시도·전송 시차, WAL·구성 요소 상태를 봅니다. 기존 OTel 큐·스팬 단계 차트와 중복하지 않고 연결합니다. 없는 계열은 unknown이며 0을 합성하지 않습니다.
 - **저장소 운영**: 로컬 여유·WAL 증가와 결합된 객체 인벤토리·입출력 지연·오류를 봅니다. 결합 인벤토리는 실제 SST·백업·과거 객체를 함께 세므로 백업 전용 용량·성공 이력·복원 검증으로 해석하지 않습니다. 복원 검증은 known 플래그만 보며 검증 시각 지표가 없으므로 복원 성공 시점을 주장하지 않습니다.
+- 비용 보고의 `datalake_storage_cost_report_retained_*`는 보관된 실행 보고의 부분 합계 **gauge**입니다. 임시 프로세스의 요청 수·이 보고 gauge에 `rate`/`increase`를 적용하지 않습니다. `report_complete=0`은 항상 전체 월/계정 범위 미증명이며, 누락·오래된 보고·불명 바이트는 0 비용이 아닙니다. native OpenDAL과 상주 SDK의 누적 counter는 출처별로 따로 보며 합산하지 않습니다.
+- 비용 창의 숨김 변수 `cost_day_seconds`·`cost_month_seconds`는 UTC DB 시계의 실제 자정·월초에서 계산하고 새로고침 때 갱신합니다(URL·임의 값 재지정 불가). 최근 30일은 별도 rolling 창입니다. 이력 검증은 `INFRA_SCRAPE_INTERVAL=30s`에서만 표본 수·시작/끝 경계·계열별 간격을 확인하며 다른 custom cadence는 unknown입니다. 당월 31일 연장과 초과 USD는 확인된 범위의 조건부 시나리오이며 계정 전체 청구가 아닙니다.
+- 비용 카드의 **Greptime S3 native**는 OpenDAL `operation="read",scheme="s3"`로 한정합니다. 읽기·rate·최신성·시작/끝 경계·표본 수 모두 같은 S3 계열만 사용하므로 local cache/fs 읽기는 비용·무료 allowance 전망에 포함하지 않습니다. 이는 S3 계정 전체나 SDK/백업 보고를 합친 값이 아닙니다.
+- `greptime-storage-budget`의 native 비교는 각 checkout의 실제 preflight/cache 설정과 같은 합성 입력을 사용합니다. 격리 DB의 flush·실제 compaction 완료 뒤, 그 DB만 정지하고 두 객체 cache를 지운 다음 같은 컨테이너·볼륨을 재시작해 20개 cold 조회와 두 번의 warm 조회를 비교합니다. GreptimeDB 1.2.1은 S3 write cache를 강제로 켜므로 설정값만으로 cold라고 주장하지 않습니다. cold 조회 창의 성공한 SST GET 바이트가 양수이고 독립 oracle 및 cold/warm 결과가 일치해야 합니다. primary SST·WAL·인증·MinIO·meter는 cache 정리 대상이 아니며 운영 cache를 정리하는 절차가 아닙니다.
 ### 관측·분석·입력 전제 읽기
 
 - 원본 관측과 파생 분석을 구분합니다. 분석 화면의 최신 개정·상태·단위 표가 비어 있으면 조회 범위에 분석 기록이 없다는 뜻이며, 입력 부재나 추정 전제 부족을 단정하지 않습니다. 대체값으로 채우지 말고 집계 실행과 선택 범위를 확인하세요. 주행·충전 요약이 비어 있어도 주행거리·효율·충전 세션을 추정하지 않습니다. 홈 입력이 비어 있으면 집계 대상 지정부터 확인합니다.
@@ -399,7 +403,7 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - 배터리 조회는 같은 구간·scope의 이벤트를 먼저 읽고 분석에 필요한 `source_field`만 가져옵니다. 경고 이벤트가 없는 오프라인 구간에는 경고 문맥용 전체 신호 조회를 생략하지만, 필드와 무관한 scope 탐색은 유지해 기존 결과의 무효화를 빠뜨리지 않습니다. 실제 경고가 있거나 온라인 가용성 검사가 필요하면 기존 문맥을 보존합니다. `BATTERY_MAX_ROWS`는 필요한 입력의 누적 메모리 한도이며, 초과하면 부분 결과나 dirty checkpoint를 저장하지 않습니다.
 - 선택된 신호가 없어도 조회에서 확인한 scope를 경고 분석에 전달하므로, 이전 경고 값은 입력 부재에 맞춰 무효화됩니다. `battery.conditions.diagnostics`의 수치는 분석에 전달된 신호 집합을 설명하며 전체 CAN 원본 행 수나 수집 완전성 지표가 아닙니다.
 - `datalake_aggregate_vehicle_window_lag_seconds{source=...}`는 DB의 source별 최신 numeric raw event와 최신 `1m` 요약 window 끝 사이 양의 초 차이입니다. 최신 관측 watermark 간의 실제 event-window gap이지만 모든 차량/path의 처리 완전성이나 ingest/DB ack 지연을 증명하지 않습니다. DB 조회 실패는 `vehicle_window_observation_success=0` 및 lag 없음이고, raw/요약 중 하나가 없으면 unknown입니다. observation timestamp가 오래되면 lag도 stale입니다.
-- status/restore 파일이 없거나 파싱 불가하면 `datalake_aggregate_status_known=0` / `datalake_restore_verification_known=0`이며 시각·성공을 만들어내지 않습니다. `datalake_restore_verification_timestamp_seconds`는 마지막 성공한 **오프라인 archive/SST SHA·내용 검증 및 staged 복원 완료** 시각입니다. 이후 DB 재기동·SQL 확인 성공을 뜻하지 않습니다. 오래된 성공, 새 실패, 진행 중, 미관측을 각각 구분하세요.
+- status/restore 파일이 없거나 파싱 불가하면 `datalake_aggregate_status_known=0` / `datalake_restore_verification_known=0`이며 시각·성공을 만들어내지 않습니다. `datalake_restore_verification_timestamp_seconds`는 마지막 성공한 **오프라인 archive SHA·SST identity 검증 및 staged 복원 완료** 시각입니다(legacy SHA256 SST는 hash 검증). 이후 DB 재기동·SQL 확인 성공을 뜻하지 않습니다. 오래된 성공, 새 실패, 진행 중, 미관측을 각각 구분하세요.
 
 ## 백업과 복구
 
@@ -419,9 +423,12 @@ docker compose --env-file .env up -d
 `BACKUP_OFFLINE_CONFIRMED=1`은 실제 정지를 대신하지 않습니다. 스크립트는 DB가 응답하면 작업을 거부합니다.
 
 - 백업 범위는 `greptime-data`, `greptime-etc`와 S3 모드의 SST 객체입니다. **Grafana 사용자 설정, Alloy 큐, 차량 spool/outbox, `.env`는 이 백업에 포함되지 않습니다.** 별도 보관 정책이 필요합니다.
-- S3 모드는 SST와 archive를 SHA256·크기로 검증하고 완료 표식을 남깁니다. live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
+- S3 모드는 SST를 `<S3_BACKUP_PREFIX>/_sst/` 공유 pool에 증분 저장합니다. 첫 실행에는 기존 SST를 모두 서버 측 COPY하고, 이후에는 bucket·live root/key·크기·원본 ETag가 같은 SST를 재사용해 신규 identity만 복사합니다. 각 세대의 manifest/COMPLETE는 전체 복원 목록을 담으므로 이전 세대 archive를 순차 적용하지 않습니다. 기존 full SST 백업도 복원할 수 있습니다. WAL·설정 tar와 DB offline 조건은 그대로입니다.
+- S3 SST는 소스 identity로 주소화한 공유 pool에 HEAD → 조건부 서버 측 COPY → HEAD 검증으로 보관합니다. 비교 가능한 서버 checksum은 대조하지만 primary SST의 checksum 부재는 조건부 identity COPY를 허용하며 내용 digest 증명은 아닙니다. 새 per-SST `.json` 없이 검증된 COMPLETE inventory를 guard당 한 번 읽어 재사용하고, 정규 pool 키로 orphan·GC 재시도를 발견합니다. 원본/복사본 전체 GET은 하지 않습니다. archive·sidecar·manifest·완료 표식 PUT은 응답과 HEAD의 명시적 `ChecksumSHA256` 일치를 요구하며 미지원은 로컬을 보존하고 실패합니다(GET fallback 없음). live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
+- backup/retention은 `_locks/` claim으로 직렬화하고 복원은 세대 `refs/`로 참조를 보호합니다. 승인된 retention만 남은 세대가 참조하지 않는 pool 객체를 정리합니다. 강제 종료 시 남은 claim/ref는 자동 만료시키지 않으며, 소유 작업의 종료를 확인하기 전에는 제거하지 마세요. 공급자의 강한 LIST/GET 일관성이 전제입니다.
 - inventory JSON(`manifest.json`의 archive 내/원격 사본과 `COMPLETE`)은 **각각 비압축 UTF-8 64 MiB 이하**여야 합니다. 백업 생성과 로컬·원격 복원에 같은 한도를 적용하며 초과한 백업은 성공으로 보고하지 않습니다. 8,000개 이상의 SST도 이 바이트 한도 안이면 복원할 수 있습니다. checksum sidecar는 1 MiB 이하입니다. JSON 읽기는 한도와 chunk 크기로 제한하고 원격 응답 스트림은 성공·실패 모두 닫습니다. **archive 전체나 SST 데이터 총량에는 이 JSON 한도를 적용하지 않습니다.**
-- `BACKUP_KEEP=7`은 로컬 백업 세대 수입니다. 원격 보존은 기본 `off`이며 별도 승인된 `enforce`에서만 삭제합니다. [원격 보존 정책과 dry-run 절차](backup-retention.md)를 확인하고, 복구에 필요한 prefix에 임의 만료 정책을 설정하지 마세요.
+- `BACKUP_KEEP=7`은 로컬 세대 수입니다. 원격 보존은 기본 `off`이고 별도 승인된 `enforce`만 세대 retirement와 미참조 pool GC를 수행합니다. 강한 LIST 일관성에 의존하는 고유 claim 직렬화에 TTL 탈취는 없으며, unknown/unreadable inventory와 검증 불가 legacy 참조는 삭제를 차단합니다. pin·reader 참조는 보존합니다. [원격 보존 정책](backup-retention.md)을 확인하고 복구 prefix에 임의 만료 lifecycle을 설정하지 마세요.
+- `storage-cost-budget`은 합성 backup+RAW 비용 모델의 CI 게이트이며 운영 청구·배포 승인이 아닙니다. 정책(`config/cost-budget.json`)은 1200GiB, 월 4회, RAW 200GiB/월을 가정합니다. 가격은 decimal GB(1GB=10^9 bytes)로 계산하고 저장료는 `max($6/월, GB-month×$0.006)`, egress는 고정 1200GiB 기준 3배 allowance 뒤 `$0.01/GB`를 가정합니다. query·restore·other egress=0은 관측된 0이 아닌 모델 입력이며 CAN은 별도 게이트입니다. 계정의 다른 사용량과 실제 요금제·무료 allowance 범위를 확인해야 합니다([가격 출처](https://www.idrive.com/s3-storage-e2/faq-pricing#egress-policy), 정책 확인일 2026-10-14).
 
 ### 새 프로젝트로 복원
 
@@ -436,7 +443,7 @@ COMPOSE_PROJECT_NAME=datalake-recovery docker compose --env-file .env up -d
 
 복원은 비어 있지 않은 대상 볼륨을 거부하며 강제 덮어쓰기 옵션은 없습니다. 같은 S3 live prefix를 쓰는 기존 DB와 복원 DB를 동시에 실행하지 마세요. 복원 후 현재 `.env`로 인증 설정이 다시 생성됩니다.
 
-성공한 복원은 백업 볼륨의 `BACKUP_DIR/restore-verification.json`에 `{timestamp_seconds, backup_id}`를 atomic 교체로 기록합니다. 이는 archive 내용과 SST의 SHA256·크기 검증 및 대상 파일 복원이 끝났다는 **마지막 오프라인 성공 기록**이며, DB 재기동·SQL 조회·데이터 수집이 정상이라는 증거가 아닙니다. 실패하면 이전 성공 기록을 유지하고 파일이 없으면 검증 이력은 unknown입니다. 최신 복원 시도가 성공했다는 뜻으로 해석하지 말고 종료 코드도 확인하세요.
+성공한 복원은 백업 볼륨의 `BACKUP_DIR/restore-verification.json`에 `{timestamp_seconds, backup_id}`를 atomic 교체로 기록합니다. 이는 archive SHA256·크기, SST HEAD identity·크기(기존 SHA256 형식의 SST 백업은 종전 hash 검증)와 대상 파일 복원이 끝났다는 **마지막 오프라인 성공 기록**이며, DB 재기동·SQL 조회·데이터 수집이 정상이라는 증거가 아닙니다. 실패하면 이전 성공 기록을 유지하고 파일이 없으면 검증 이력은 unknown입니다. 최신 복원 시도가 성공했다는 뜻으로 해석하지 말고 종료 코드도 확인하세요.
 
 `File` 모드에서 같은 호스트의 백업을 사용하려면 기존 백업 볼륨의 실제 이름을 `BACKUP_VOLUME_NAME`에, `BACKUP_VOLUME_EXTERNAL=true`를 복구용 환경설정에 지정하세요. 다른 호스트로 옮길 때는 백업 archive와 checksum도 안전하게 이전해야 합니다.
 
