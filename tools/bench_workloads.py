@@ -86,6 +86,10 @@ def run_workload(name, size, directory, fault=False):
 def _prepare_can(size, root, fault):
     from scripts.ingest.can.can_decoder import Decoder
     from scripts.ingest.can.can_receiver import Archive
+    from unittest.mock import patch
+
+    if fault and size < 2:
+        raise ValueError("CAN fault workload requires at least two frames")
 
     dbc = root / "fixture.dbc"
     dbc.write_text('VERSION "synthetic"\n\nNS_ :\n\nBS_:\n\nBU_: Fixture\n\n'
@@ -126,8 +130,13 @@ def _prepare_can(size, root, fault):
         current = archive
         _equal(current.accept(meta, chunks), len(chunks), "CAN accepted chunks")
         if fault:
-            # Persist a bounded partial cursor and reopen before resuming it.
-            _check(current.decode_once(decoder, limit=1) > 0, "CAN first decode")
+            # Fault injection only: limit rows, not chunks, then restore the
+            # revision's real budget before resuming the remaining decode.
+            with patch("scripts.ingest.can.can_receiver.DECODE_ROW_BUDGET", 1):
+                _check(current.decode_once(decoder, limit=1) > 0, "CAN first decode")
+            with current.connect() as conn:
+                _equal(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0],
+                       1, "CAN persisted partial cursor before reopen")
             current = Archive(path, disk_reserve_bytes=0)
             current.register_epoch(decoder)
         _equal(current.accept(meta, chunks), 0, "CAN duplicate acceptance")

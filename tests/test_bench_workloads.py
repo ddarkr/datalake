@@ -37,13 +37,43 @@ class BenchmarkWorkloads(unittest.TestCase):
             urlopen.assert_not_called()
 
     def test_can_dense_chunk_partial_resume(self):
+        from scripts.ingest.can.can_receiver import Archive
+        decode_once = Archive.decode_once
         results = []
         for fault in (False, True):
-            with tempfile.TemporaryDirectory() as directory:
+            first_decode = []
+
+            def observed_decode(archive, *args, **kwargs):
+                result = decode_once(archive, *args, **kwargs)
+                if not first_decode:
+                    with archive.connect() as conn:
+                        first_decode.append((
+                            conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0],
+                            conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0],
+                        ))
+                return result
+
+            with tempfile.TemporaryDirectory() as directory, \
+                 patch.object(Archive, "decode_once", observed_decode):
                 result = bench.run_workload("can", 129, directory, fault=fault)
                 self.assertEqual(result["golden"]["raw_chunks"], 2)
                 self.assertEqual(result["golden"]["rows"], 129)
+                if fault:
+                    partials, emitted = first_decode[0]
+                    self.assertEqual(partials, 1)
+                    self.assertGreater(emitted, 0)
+                    self.assertLess(emitted, 128)
                 results.append(result["golden"])
+        self.assertEqual(results[0], results[1])
+
+    def test_can_fault_requires_resumable_chunk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "at least two frames"):
+                bench.prepare("can", 1, directory, fault=True)
+        results = []
+        for fault in (False, True):
+            with tempfile.TemporaryDirectory() as directory:
+                results.append(bench.run_workload("can", 2, directory, fault=fault)["golden"])
         self.assertEqual(results[0], results[1])
 
     def test_ai_null_zero_and_known_totals(self):

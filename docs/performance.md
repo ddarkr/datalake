@@ -55,6 +55,12 @@ operation 밖입니다. operation의 correctness 검사 시간은 측정에 포�
 `fault`는 통제된 SQLite reopen, 중복·순서 변경 replay와 로컬 ACK 삭제 모사입니다.
 SIGKILL, 전원 손실, downstream outage, 실제 network ACK나 저장장치 오류를 재현하지 않습니다.
 
+CAN fault는 첫 decode의 행 예산만 1로 제한해 chunk 내부에서 멈추고, 영속
+`decode_partial`이 존재하는지 확인한 뒤 archive를 다시 엽니다. 나머지 decode는
+해당 revision의 원래 행 예산으로 실행합니다. 이 fault 주입 비용도 측정에 포함되며,
+운영 기본 예산의 처리량 측정으로 해석하면 안 됩니다. CAN fault fixture는 최소
+2개 프레임이 필요하고, 1개 프레임 요청은 거부합니다.
+
 | 지표 | 의미와 한계 |
 | --- | --- |
 | `wall_seconds` | timed operation 경과 시간. process 시작과 fixture 준비 제외 |
