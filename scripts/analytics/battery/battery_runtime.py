@@ -210,7 +210,62 @@ def _sql_ts(timestamp_ns):
     return "'" + ns_to_sql_ts(timestamp_ns) + "'"
 
 
+def _sql_diagnostic(stmt, elapsed, failed):
+    # Strip every literal before identifying SQL structure; never log input SQL.
+    structure = re.sub(r"'(?:''|[^'])*'", "?", stmt)
+    shape = " ".join(re.sub(r"\b\d+(?:\.\d+)?\b", "?",
+                            structure).upper().split())
+    verb = structure.lstrip().split(None, 1)[0].upper() if structure.strip() else ""
+    if verb not in {"SELECT", "INSERT", "DELETE", "CREATE", "ALTER", "DROP", "SHOW"}:
+        verb = "OTHER"
+    tables = sorted(set(re.findall(
+        r"\b(?:vehicle_signal|vehicle_event|vehicle_analysis|ssts_manifest)\b",
+        structure, re.IGNORECASE)))
+    # Mask literals/comments at their original offsets so identifier contents
+    # cannot impersonate predicates, including INSERT data and quoted strings.
+    masked = re.sub(r"'(?:''|[^'])*'|--[^\n]*|/\*.*?\*/",
+                    lambda m: ("?" if m.group().startswith("'") else " ")
+                    + " " * (len(m.group()) - 1), stmt, flags=re.DOTALL)
+    bounds = []
+    for predicate in re.finditer(
+            r'\b(?:WHERE|AND|OR|ON|HAVING)\s+\(*\s*'
+            r'(?:[A-Za-z_][A-Za-z_0-9]*\.)?'
+            r'"?(?:event_time|window_start|window_end|computed_at)"?'
+            r'\s*(?:>=|<=|>|<|=)\s*(\?)', masked, re.IGNORECASE):
+        literal = re.match(
+            r"'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z?)'",
+            stmt[predicate.start(1):])
+        if literal is None:
+            continue
+        candidate = literal.group(1)
+        try:
+            parse_time_bound(candidate, allow_empty=False)
+        except BatteryConfigError:
+            continue
+        bounds.append(candidate.replace(" ", "T").rstrip("Z") + "Z")
+        if len(bounds) == 2:
+            break
+    print("sql: status=%s operation=%s table=%s fingerprint=%s "
+          "range=%s elapsed_seconds=%.3f" % (
+              "failed" if failed else "ok", verb, ",".join(tables) or "other",
+              hashlib.sha256(shape.encode("utf-8")).hexdigest()[:16],
+              ",".join(bounds) or "none", elapsed), file=sys.stderr)
+
+
 def request_sql(base_url, auth, db, stmt, timeout=60):
+    started = time.monotonic()
+    failed = True
+    try:
+        result = _request_sql(base_url, auth, db, stmt, timeout)
+        failed = False
+        return result
+    finally:
+        elapsed = time.monotonic() - started
+        if failed or elapsed >= 1:
+            _sql_diagnostic(stmt, elapsed, failed)
+
+
+def _request_sql(base_url, auth, db, stmt, timeout=60):
     url = base_url.rstrip("/") + "/v1/sql?db=" + urllib.parse.quote(db,
                                                                    safe="")
     body = urllib.parse.urlencode({"sql": stmt}).encode("utf-8")
@@ -1018,10 +1073,12 @@ def _subtract_context(intervals, context):
 
 
 def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                  fields=None, scopes=None):
+                  fields=None, scopes=None, exclude_scopes=None):
     filt = _vehicle_filter(vehicle) + _field_predicate(fields)
     if scopes:
         filt += " AND (" + _scope_predicate(scopes) + ")"
+    if exclude_scopes:
+        filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
     stmt = ("SELECT " + ", ".join(SIGNAL_COLS) + " FROM " + SIGNAL_TABLE
             + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
             + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -1087,7 +1144,7 @@ def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
 
 
 def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
-                        max_rows, scopes=None):
+                        max_rows, scopes=None, exclude_scopes=None):
     """Field-independent scope identities in a bounded interval.
 
     SELECT DISTINCT vehicle/source/decode_epoch only (no raw
@@ -1101,6 +1158,8 @@ def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
     filt = _vehicle_filter(vehicle)
     if scopes:
         filt += " AND (" + _scope_predicate(scopes) + ")"
+    if exclude_scopes:
+        filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
     stmt = ("SELECT DISTINCT vehicle, source, decode_epoch FROM "
             + SIGNAL_TABLE + " WHERE event_time >= '"
             + ns_to_sql_ts(start_ns) + "' AND event_time <= '"
@@ -1129,10 +1188,12 @@ def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
 
 
 def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                 scopes=None):
+                 scopes=None, exclude_scopes=None):
     filt = _vehicle_filter(vehicle)
     if scopes:
         filt += " AND (" + _scope_predicate(scopes) + ")"
+    if exclude_scopes:
+        filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
     stmt = ("SELECT " + ", ".join(EVENT_COLS) + " FROM " + EVENT_TABLE
             + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
             + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -1208,14 +1269,14 @@ def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
 
 
 def coverage_min(base_url, auth, db, table, vehicle, max_rows=5):
-    filt = _vehicle_filter(vehicle)
-    stmt = ("SELECT MIN(event_time) FROM " + table + " WHERE 1=1" + filt)
-    try:
-        cols, rows, schema = fetch_raw(base_url, auth, db, stmt, max_rows)
-    except BatteryError as exc:
-        if is_missing_table(exc):
-            return None
-        raise
+    """Conservative table-wide flushed retention floor, not vehicle coverage."""
+    if table not in (SIGNAL_TABLE, EVENT_TABLE):
+        raise BatteryError("unsupported coverage table")
+    stmt = ("SELECT MIN(min_ts) FROM information_schema.ssts_manifest"
+            " WHERE table_id = (SELECT table_id FROM information_schema.tables"
+            " WHERE table_schema = " + _sql_str(db)
+            + " AND table_name = " + _sql_str(table) + ") AND visible = true")
+    cols, rows, schema = fetch_raw(base_url, auth, db, stmt, max_rows)
     if not rows or not rows[0] or rows[0][0] is None:
         return None
     dtype = (schema[0].get("data_type") if schema else None)
@@ -1457,12 +1518,11 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
                 analysis_cfg=None):
     """Bounded disjoint fetches: no envelope over unrelated gaps.
 
-    Hourly windows share one bounded query (contiguous sealed pass);
-    each disjoint coordinated interval is fetched separately with its
-    own >=24h signal context. Cumulative rows fail closed at max_rows.
-    Exact scope predicates apply only in only-mode; union mode fetches
-    the pass scope and filters in memory so discovery cannot miss. The
-    source_field predicate narrows fetched ROWS (exact required set),
+    Requests partition merged inclusive intervals into at most one hour,
+    retaining each interval's full >=24h signal context. Cumulative raw
+    rows and unique discovered scope identities fail closed at max_rows.
+    Exact exclusions apply in SQL before LIMIT, including union mode.
+    The source_field predicate narrows fetched ROWS (exact required set),
     never scopes: a parallel field-independent DISTINCT tag query per
     interval preserves scopes whose every raw row was filtered out, so
     value-blind consumers (RUL history/scope binding) and
@@ -1481,12 +1541,11 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
     signal_q = []
     event_q = []
     if windows:
-        fetch_start_w = min(ws for ws, _ in windows)
-        fetch_end_w = max(we for _, we in windows)
-        signal_q.append((fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w,
-                         None))
-        event_q.append((fetch_start_w, fetch_end_w, None))
-        context_cover = [(fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w)]
+        context_cover = _merge_intervals(
+            [(start - SIGNAL_CONTEXT_NS, end) for start, end in windows])
+        signal_q.extend((start, end, None) for start, end in context_cover)
+        event_q.extend((start, end, None)
+                       for start, end in _merge_intervals(windows))
     else:
         context_cover = []
     for scope in sorted(scope_windows):
@@ -1504,6 +1563,18 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
                 event_q.append((start, end, [scope] if only else None))
             context_cover = _merge_intervals(
                 context_cover + [(start - SIGNAL_CONTEXT_NS, end)])
+
+    def _chunks(queries):
+        by_scope = {}
+        for start, end, scopes in queries:
+            key = tuple(scopes) if scopes else None
+            by_scope.setdefault(key, []).append((start, end))
+        for scopes, intervals in by_scope.items():
+            for start, end in _merge_intervals(intervals):
+                while start <= end:
+                    stop = min(end, start + HOUR_NS - 1)
+                    yield start, stop, scopes
+                    start = stop + 1
     signals = []
     events = []
     tag_scopes = set()
@@ -1517,16 +1588,16 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
         return rows
 
     def _take_tags(tags):
-        total[0] += len(tags)
+        total[0] += len(tags - tag_scopes)
         if total[0] > max_rows:
             raise BatteryCapError("row cap exceeded (%d > %d): refusing "
                                   "partial" % (total[0], max_rows))
         tag_scopes.update(tags)
 
-    for start, end, scopes in event_q:
+    for start, end, scopes in _chunks(event_q):
         events.extend(_take(fetch_events(
             base_url, auth, db, start, end, vehicle, max_rows,
-            scopes=scopes)))
+            scopes=scopes, exclude_scopes=exclude_scopes)))
     if analysis_cfg is not None:
         # Excluded scopes never analyze, so their events cannot require
         # context. Malformed config propagates (fail closed).
@@ -1534,14 +1605,14 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
                   if (e["vehicle"], e["source"], e.get("decode_epoch"))
                   not in exclude_scopes]
         fields = _required_signal_fields(analysis_cfg, events=proven)
-    for cstart, cend, scopes in signal_q:
+    for cstart, cend, scopes in _chunks(signal_q):
         signals.extend(_take(fetch_signals(
             base_url, auth, db, cstart, cend, vehicle, max_rows,
-            fields=fields, scopes=scopes)))
+            fields=fields, scopes=scopes, exclude_scopes=exclude_scopes)))
         if fields is not None:
             _take_tags(fetch_signal_scopes(
                 base_url, auth, db, cstart, cend, vehicle, max_rows,
-                scopes=scopes))
+                scopes=scopes, exclude_scopes=exclude_scopes))
     signals = [s for s in signals if (s["vehicle"], s["source"],
                                       s["decode_epoch"]) not in exclude_scopes]
     events = [e for e in events if (e["vehicle"], e["source"],
@@ -1737,7 +1808,6 @@ def _persist_all(base_url, auth, db, all_rows, scopes,
         raise BatteryConfigError(config_error)
     disambiguate_rows(all_rows)
     checked = validate_no_duplicate_pks(list(all_rows))
-    written, skipped = insert_analysis_rows(base_url, auth, db, checked)
     if fetch_start is not None:
         oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE, vehicle)
         oldest_event = coverage_min(base_url, auth, db, EVENT_TABLE, vehicle)
@@ -1747,10 +1817,12 @@ def _persist_all(base_url, auth, db, all_rows, scopes,
             need = "'%s' to '%s'" % (ns_to_sql_ts(oldest),
                                      ns_to_sql_ts(fetch_start - 1))
             sys.stdout.write(
-                "battery: older data before fetch_start exists (oldest %s); "
-                "supply BATTERY_BACKFILL_START/END covering %s to recompute; "
-                "normal lookback left it untouched\n"
+                "battery: conservative table retention boundary %s predates "
+                "fetch_start (not exact vehicle/scope coverage); consider "
+                "BATTERY_BACKFILL_START/END covering %s; "
+                "normal lookback left older intervals untouched\n"
                 % (ns_to_sql_ts(oldest), need))
+    written, skipped = insert_analysis_rows(base_url, auth, db, checked)
     if skipped:
         sys.stdout.write("battery: skipped %d rows missing NOT NULL "
                          "identity (no vehicle/metric/revision)\n" % skipped)

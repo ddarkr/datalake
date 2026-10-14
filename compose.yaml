@@ -101,7 +101,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '23'
+      datalake.aggregate-revision: '25'
     depends_on:
       greptimedb:
         condition: service_started
@@ -2582,6 +2582,58 @@ configs:
 
 
       def request_sql(base_url, auth, db, stmt, timeout=60):
+          started = time.monotonic()
+          failed = True
+          try:
+              result = _request_sql(base_url, auth, db, stmt, timeout)
+              failed = False
+              return result
+          finally:
+              elapsed = time.monotonic() - started
+              if failed or elapsed >= 1:
+                  shape = re.sub(r"'(?:''|[^'])*'", "?", stmt)
+                  shape = re.sub(r"\b\d+(?:\.\d+)?\b", "?", shape)
+                  shape = " ".join(shape.upper().split())
+                  verb = shape.split(" ", 1)[0]
+                  operation = verb if verb in ("SELECT", "INSERT", "DELETE", "UPDATE",
+                                               "CREATE", "ALTER", "DROP") else "OTHER"
+                  tables = {"vehicle_signal", "vehicle_agg", "vehicle_trip",
+                            "vehicle_charge", "vehicle_signal_dirty",
+                            "vehicle_aggregate_checkpoint", "vehicle_aggregate_sweep",
+                            "opentelemetry_traces", "ai_session_summary",
+                            "home_signal", "home_agg", "ssts_manifest"}
+                  names = re.findall(r"\b(?:FROM|INTO|UPDATE|TABLE)\s+"
+                                     r"(?:INFORMATION_SCHEMA\.)?([A-Z_][A-Z_0-9]*)", shape)
+                  table = next((n.lower() for n in names if n.lower() in tables), "other")
+                  bounds = []
+                  # Consume literals/comments as units so predicate-like text inside
+                  # an identity or config value cannot become a logged query bound.
+                  for literal in re.findall(
+                          r"--[^\n]*|/\*[\s\S]*?\*/|"
+                          r'(?<![\w])(?:"(?:event_time|window_start|timestamp|'
+                          r'session_start|start_time|end_time)"|'
+                          r"(?:event_time|window_start|timestamp|"
+                          r"session_start|start_time|end_time))\s*(?:>=|<=|>|<)\s*"
+                          r"'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+                          r"(?:\.\d{1,9})?Z?)'|"
+                          r"""'(?:''|[^'])*'|"(?:""|[^"])*"|\w+""",
+                          stmt, flags=re.IGNORECASE):
+                      try:
+                          dt.datetime.fromisoformat(literal.rstrip("Z"))
+                      except ValueError:
+                          continue
+                      bounds.append(literal.replace(" ", "T").rstrip("Z") + "Z")
+                      if len(bounds) == 2:
+                          break
+                  fingerprint = hashlib.sha256(shape.encode()).hexdigest()[:16]
+                  sys.stderr.write("sql: status=" + ("failed" if failed else "ok")
+                                   + " operation=" + operation + " table=" + table
+                                   + " fingerprint=" + fingerprint
+                                   + " range=" + ",".join(bounds)
+                                   + " elapsed_seconds=%.3f\n" % elapsed)
+
+
+      def _request_sql(base_url, auth, db, stmt, timeout):
           url = base_url.rstrip("/") + "/v1/sql?db=" + urllib.parse.quote(db, safe="")
           body = urllib.parse.urlencode({"sql": stmt}).encode("utf-8")
           req = urllib.request.Request(url, data=body, method="POST")
@@ -5367,7 +5419,9 @@ configs:
       def _vehicle_rollup(ctx, cfg, exclude=None):
           base_url, auth, db = ctx
           now = utcnow()
-          cov = coverage_min(base_url, auth, db, "vehicle_signal", "event_time")
+          floor_ns = _flushed_floor_ns(ctx)
+          cov = (_ns_to_dt(floor_ns) if floor_ns is not None else
+                 coverage_min(base_url, auth, db, "vehicle_signal", "event_time"))
           aligned = floor_hour(now - dt.timedelta(hours=cfg["lookback_h"]))
           if cov:
               aligned = max(aligned, floor_hour(cov))
@@ -5539,7 +5593,7 @@ configs:
       #
       # Scope discovery itself never scans raw rows for bounds: the registry is
       # the DISTINCT union of the small dirty/checkpoint/sweep tables, plus up
-      # to TWO time-pruned DISTINCT windows (DIRTY_LIST_HOURS each) per pass
+      # to TWO resumable windows (DIRTY_LIST_HOURS each, one-hour queries) per pass
       # over vehicle_signal. The history floor comes from the pinned
       # information_schema.ssts_manifest MIN(min_ts) metadata scalar (zero SST
       # reads: a raw MIN(event_time) over flushed SSTs scans them instead, so it
@@ -6012,8 +6066,16 @@ configs:
 
 
       def _bootstrap_window_scopes(ctx, cfg, start_ns, end_ns):
-          """CAN scopes holding raw rows in [start_ns, end_ns): one time-pruned
-          DISTINCT over a bounded window."""
+          """CAN scopes in [start_ns, end_ns), queried one hour at a time.
+          The caller commits its durable page cursor only after the whole page."""
+          if end_ns - start_ns > HOUR_NS:
+              found = set()
+              for hour in range(start_ns, end_ns, HOUR_NS):
+                  found.update(_bootstrap_window_scopes(
+                      ctx, cfg, hour, min(hour + HOUR_NS, end_ns)))
+                  if len(found) > cfg["max_rows"]:
+                      raise SqlError("scope discovery exceeds row cap")
+              return found
           base_url, auth, db = ctx
           filt = ""
           if cfg.get("vehicle"):
@@ -6068,7 +6130,7 @@ configs:
           sweep tables (registry), two cursor point lookups (bootstrap frontier
           + reconcile), and one pinned information_schema.ssts_manifest MIN(min_ts)
           metadata scalar (zero SST reads). With a pinned floor, at most two
-          time-pruned DISTINCT windows (DIRTY_LIST_HOURS each) walk from the
+          resumable DISTINCT pages (DIRTY_LIST_HOURS each, one-hour queries) walk from the
           flushed floor and cycle sealed history for late-inserted scopes. With no
           visible SSTs, a raw MIN(event_time) bounds the in-memory first window.
 
@@ -6188,8 +6250,8 @@ configs:
 
 
       def _list_scope_hours(ctx, cfg, scope, start_hour_ns, seal_ns):
-          """Bounded checklist for one scope in [start_hour_ns, seal_ns): one
-          GROUP BY query covering at most DIRTY_LIST_HOURS. Returns (rows,
+          """Bounded checklist for one scope in [start_hour_ns, seal_ns):
+          one-hour GROUP BY queries covering at most DIRTY_LIST_HOURS. Returns (rows,
           listed_through_ns): rows are (hour_ns, count, max_event_ns,
           max_ingest_ns) oldest-first; listed_through_ns is the exclusive upper
           bound covered (never past seal_ns). Fingerprint columns only."""
@@ -6198,6 +6260,15 @@ configs:
           window_end_ns = min(start_hour_ns + DIRTY_LIST_HOURS * HOUR_NS, seal_ns)
           if window_end_ns <= start_hour_ns:
               return [], start_hour_ns
+          if window_end_ns - start_hour_ns > HOUR_NS:
+              out = []
+              for hour in range(start_hour_ns, window_end_ns, HOUR_NS):
+                  rows, through = _list_scope_hours(
+                      ctx, cfg, scope, hour, min(hour + HOUR_NS, window_end_ns))
+                  if through <= hour:
+                      return sorted(out), hour
+                  out.extend(rows)
+              return sorted(out), window_end_ns
           try:
               cols, rows = guarded_fetch(
                   base_url, auth, db,
@@ -6267,12 +6338,9 @@ configs:
                   or (tail_gap is not None and tail_gap > 0
                       and not segments[0].get("open"))):
               return None
-          base_url, auth, db = ctx
-          _, rows = fetch_rows(
-              base_url, auth, db, "SELECT MIN(event_time) FROM vehicle_signal WHERE vehicle = "
-              + str_lit(key[0]) + " AND source = " + str_lit(key[1])
-              + " AND decode_epoch = " + str_lit(key[2]))
-          first = parse_ts_ns(rows[0][0]) if rows and rows[0] else None
+          first = _flushed_floor_ns(ctx)
+          if first is None:
+              first = _raw_coverage_ns(ctx, key)
           if first is None:
               return None
           first_dt = _ns_to_dt(first)
@@ -6371,14 +6439,20 @@ configs:
           wanted = [p for p in (paths.get(a) for a in _VEHICLE_ATTRS) if p]
           if not wanted:
               return 0, None
-          cols, rows, _schema = _fetch_vehicle_raw(
-              base_url, auth, db,
-              "SELECT event_time, vehicle, path, source, decode_epoch, value_num,"
-              " value_bool, unit FROM vehicle_signal"
-              " WHERE event_time >= '" + raw_from.strftime("%Y-%m-%d %H:%M:%S")
-              + "' AND event_time < '" + seals + "' AND path IN ("
-              + ", ".join(str_lit(p) for p in wanted) + ")"
-              + filt + " ORDER BY event_time", cfg["max_rows"])
+          cols, rows = [], []
+          chunk_from, raw_end = dt_to_ns(raw_from), dt_to_ns(seal)
+          while chunk_from < raw_end:
+              chunk_end = min(chunk_from + HOUR_NS, raw_end)
+              cols, chunk_rows, _schema = _fetch_vehicle_raw(
+                  base_url, auth, db,
+                  "SELECT event_time, vehicle, path, source, decode_epoch, value_num,"
+                  " value_bool, unit FROM vehicle_signal"
+                  " WHERE event_time >= " + ns_to_sql_lit(chunk_from)
+                  + " AND event_time < " + ns_to_sql_lit(chunk_end)
+                  + " AND path IN (" + ", ".join(str_lit(p) for p in wanted) + ")"
+                  + filt + " ORDER BY event_time", cfg["max_rows"] - len(rows))
+              rows.extend(chunk_rows)
+              chunk_from = chunk_end
           groups = group_vehicle_rows(cols, rows, paths)
           for key in [k for k in groups if _scope_tuple(k) in excluded]:
               del groups[key]
@@ -6709,46 +6783,28 @@ configs:
                          for h, c in cells.items()):
                       _commit_sweep(ctx, scope, listed_through, revision, now_ns)
               return 0
-          observed = dict(pending)
-          before = {}
-          for scope, entry in listed.items():
-              for hour_fp in entry[0]:
-                  hour_ns, cell = hour_fp
-                  before[(scope, hour_ns)] = cell
-          for key in sorted(observed):
-              if key not in before:
-                  before[key] = _hour_cells(ctx, cfg, key[0], key[1])
-          scopes_hours = sorted(pending)
-          _rollup_hour_windows(ctx, cfg, scopes_hours)
-          _trip_charge_scope_windows(ctx, cfg, pending)
-          _battery_scope_work(ctx, cfg, pending)
-          if _config_revision(cfg) != revision:
-              return 0
-          after = {}
-          for scope, entry in listed.items():
-              _hours, cursor, listed_through = entry
-              rows, _end = _list_scope_hours(ctx, cfg, scope, cursor,
-                                             listed_through)
-              for hour_ns, count, max_event, max_ingest in rows:
-                  after[(scope, hour_ns)] = _hour_fingerprint(
-                      count, max_event, max_ingest)
-          for key in sorted(observed):
-              if key not in after:
-                  after[key] = _hour_cells(ctx, cfg, key[0], key[1])
           committed = 0
           done = set()
-          for key in sorted(observed):
+          for key in sorted(pending):
               scope, hour_ns = key
+              observed = pending[key]
+              before = _hour_cells(ctx, cfg, scope, hour_ns)
               current = _read_dirty_generation(ctx, scope, hour_ns)
-              if observed[key]:
-                  if current is None or current != observed[key]:
-                      continue
-              elif current:
+              if (observed and current != observed) or (not observed and current):
                   continue
-              if after.get(key) != before.get(key):
+              unit = {key: observed}
+              _rollup_hour_windows(ctx, cfg, [key])
+              _trip_charge_scope_windows(ctx, cfg, unit)
+              _battery_scope_work(ctx, cfg, unit)
+              if _config_revision(cfg) != revision:
+                  return committed
+              after = _hour_cells(ctx, cfg, scope, hour_ns)
+              current = _read_dirty_generation(ctx, scope, hour_ns)
+              if (observed and current != observed) or (not observed and current):
                   continue
-              _commit_checkpoint(ctx, scope, hour_ns, observed[key], revision,
-                                 now_ns, after.get(key, ""))
+              if after != before:
+                  continue
+              _commit_checkpoint(ctx, scope, hour_ns, observed, revision, now_ns, after)
               done.add(key)
               committed += 1
           for scope, entry in listed.items():
@@ -6876,6 +6932,8 @@ configs:
           try:
               counts, failed, durations, freshness = run_all(ctx, cfg, progress)
               try:
+                  if "vehicle_discovery" in failed:
+                      raise SqlError("vehicle discovery unavailable")
                   status["vehicle_window_lag_seconds"] = vehicle_window_lag(ctx)
                   status["vehicle_window_observation_timestamp_seconds"] = time.time()
                   status["vehicle_window_observation_success"] = 1
@@ -6929,15 +6987,26 @@ configs:
                   sys.stderr.write("aggregate: error: " + name + ": " + str(e)[:200] + "\n")
                   failed.append(name)
 
-          coordinated = sorted(_distinct_scopes(ctx, cfg), key=repr)
-          legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
           run_section("ai", lambda: ai_section(ctx, cfg))
           run_section("logs", lambda: log_section(ctx, cfg))
+          run_section("home", lambda: home_section(ctx, cfg))
+          if progress is not None:
+              progress("vehicle_discovery")
+          started = time.monotonic()
+          try:
+              coordinated = sorted(_distinct_scopes(ctx, cfg), key=repr)
+          except Exception:
+              durations["vehicle_discovery"] = time.monotonic() - started
+              failed.extend(("vehicle_discovery", "vehicle", "trip_charge",
+                             "vehicle_history", "battery"))
+              sys.stderr.write("aggregate: vehicle discovery failed; dependent sections skipped\n")
+              return counts, failed, durations, {"observation_success": 0}
+          durations["vehicle_discovery"] = time.monotonic() - started
+          legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
           run_section("vehicle", lambda: vehicle_section(ctx, legacy))
           run_section("trip_charge", lambda: trip_section(ctx, legacy_trip))
           run_section("vehicle_history",
                       lambda: vehicle_history_section(ctx, cfg, _known=coordinated))
-          run_section("home", lambda: home_section(ctx, cfg))
           run_section("battery", lambda: battery_section(ctx, legacy_bat))
           try:
               freshness = vehicle_freshness(ctx)
@@ -17638,7 +17707,62 @@ configs:
           return "'" + ns_to_sql_ts(timestamp_ns) + "'"
 
 
+      def _sql_diagnostic(stmt, elapsed, failed):
+          # Strip every literal before identifying SQL structure; never log input SQL.
+          structure = re.sub(r"'(?:''|[^'])*'", "?", stmt)
+          shape = " ".join(re.sub(r"\b\d+(?:\.\d+)?\b", "?",
+                                  structure).upper().split())
+          verb = structure.lstrip().split(None, 1)[0].upper() if structure.strip() else ""
+          if verb not in {"SELECT", "INSERT", "DELETE", "CREATE", "ALTER", "DROP", "SHOW"}:
+              verb = "OTHER"
+          tables = sorted(set(re.findall(
+              r"\b(?:vehicle_signal|vehicle_event|vehicle_analysis|ssts_manifest)\b",
+              structure, re.IGNORECASE)))
+          # Mask literals/comments at their original offsets so identifier contents
+          # cannot impersonate predicates, including INSERT data and quoted strings.
+          masked = re.sub(r"'(?:''|[^'])*'|--[^\n]*|/\*.*?\*/",
+                          lambda m: ("?" if m.group().startswith("'") else " ")
+                          + " " * (len(m.group()) - 1), stmt, flags=re.DOTALL)
+          bounds = []
+          for predicate in re.finditer(
+                  r'\b(?:WHERE|AND|OR|ON|HAVING)\s+\(*\s*'
+                  r'(?:[A-Za-z_][A-Za-z_0-9]*\.)?'
+                  r'"?(?:event_time|window_start|window_end|computed_at)"?'
+                  r'\s*(?:>=|<=|>|<|=)\s*(\?)', masked, re.IGNORECASE):
+              literal = re.match(
+                  r"'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?Z?)'",
+                  stmt[predicate.start(1):])
+              if literal is None:
+                  continue
+              candidate = literal.group(1)
+              try:
+                  parse_time_bound(candidate, allow_empty=False)
+              except BatteryConfigError:
+                  continue
+              bounds.append(candidate.replace(" ", "T").rstrip("Z") + "Z")
+              if len(bounds) == 2:
+                  break
+          print("sql: status=%s operation=%s table=%s fingerprint=%s "
+                "range=%s elapsed_seconds=%.3f" % (
+                    "failed" if failed else "ok", verb, ",".join(tables) or "other",
+                    hashlib.sha256(shape.encode("utf-8")).hexdigest()[:16],
+                    ",".join(bounds) or "none", elapsed), file=sys.stderr)
+
+
       def request_sql(base_url, auth, db, stmt, timeout=60):
+          started = time.monotonic()
+          failed = True
+          try:
+              result = _request_sql(base_url, auth, db, stmt, timeout)
+              failed = False
+              return result
+          finally:
+              elapsed = time.monotonic() - started
+              if failed or elapsed >= 1:
+                  _sql_diagnostic(stmt, elapsed, failed)
+
+
+      def _request_sql(base_url, auth, db, stmt, timeout=60):
           url = base_url.rstrip("/") + "/v1/sql?db=" + urllib.parse.quote(db,
                                                                          safe="")
           body = urllib.parse.urlencode({"sql": stmt}).encode("utf-8")
@@ -18446,10 +18570,12 @@ configs:
 
 
       def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                        fields=None, scopes=None):
+                        fields=None, scopes=None, exclude_scopes=None):
           filt = _vehicle_filter(vehicle) + _field_predicate(fields)
           if scopes:
               filt += " AND (" + _scope_predicate(scopes) + ")"
+          if exclude_scopes:
+              filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
           stmt = ("SELECT " + ", ".join(SIGNAL_COLS) + " FROM " + SIGNAL_TABLE
                   + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
                   + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -18515,7 +18641,7 @@ configs:
 
 
       def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
-                              max_rows, scopes=None):
+                              max_rows, scopes=None, exclude_scopes=None):
           """Field-independent scope identities in a bounded interval.
 
           SELECT DISTINCT vehicle/source/decode_epoch only (no raw
@@ -18529,6 +18655,8 @@ configs:
           filt = _vehicle_filter(vehicle)
           if scopes:
               filt += " AND (" + _scope_predicate(scopes) + ")"
+          if exclude_scopes:
+              filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
           stmt = ("SELECT DISTINCT vehicle, source, decode_epoch FROM "
                   + SIGNAL_TABLE + " WHERE event_time >= '"
                   + ns_to_sql_ts(start_ns) + "' AND event_time <= '"
@@ -18557,10 +18685,12 @@ configs:
 
 
       def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                       scopes=None):
+                       scopes=None, exclude_scopes=None):
           filt = _vehicle_filter(vehicle)
           if scopes:
               filt += " AND (" + _scope_predicate(scopes) + ")"
+          if exclude_scopes:
+              filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
           stmt = ("SELECT " + ", ".join(EVENT_COLS) + " FROM " + EVENT_TABLE
                   + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
                   + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -18636,14 +18766,14 @@ configs:
 
 
       def coverage_min(base_url, auth, db, table, vehicle, max_rows=5):
-          filt = _vehicle_filter(vehicle)
-          stmt = ("SELECT MIN(event_time) FROM " + table + " WHERE 1=1" + filt)
-          try:
-              cols, rows, schema = fetch_raw(base_url, auth, db, stmt, max_rows)
-          except BatteryError as exc:
-              if is_missing_table(exc):
-                  return None
-              raise
+          """Conservative table-wide flushed retention floor, not vehicle coverage."""
+          if table not in (SIGNAL_TABLE, EVENT_TABLE):
+              raise BatteryError("unsupported coverage table")
+          stmt = ("SELECT MIN(min_ts) FROM information_schema.ssts_manifest"
+                  " WHERE table_id = (SELECT table_id FROM information_schema.tables"
+                  " WHERE table_schema = " + _sql_str(db)
+                  + " AND table_name = " + _sql_str(table) + ") AND visible = true")
+          cols, rows, schema = fetch_raw(base_url, auth, db, stmt, max_rows)
           if not rows or not rows[0] or rows[0][0] is None:
               return None
           dtype = (schema[0].get("data_type") if schema else None)
@@ -18885,12 +19015,11 @@ configs:
                       analysis_cfg=None):
           """Bounded disjoint fetches: no envelope over unrelated gaps.
 
-          Hourly windows share one bounded query (contiguous sealed pass);
-          each disjoint coordinated interval is fetched separately with its
-          own >=24h signal context. Cumulative rows fail closed at max_rows.
-          Exact scope predicates apply only in only-mode; union mode fetches
-          the pass scope and filters in memory so discovery cannot miss. The
-          source_field predicate narrows fetched ROWS (exact required set),
+          Requests partition merged inclusive intervals into at most one hour,
+          retaining each interval's full >=24h signal context. Cumulative raw
+          rows and unique discovered scope identities fail closed at max_rows.
+          Exact exclusions apply in SQL before LIMIT, including union mode.
+          The source_field predicate narrows fetched ROWS (exact required set),
           never scopes: a parallel field-independent DISTINCT tag query per
           interval preserves scopes whose every raw row was filtered out, so
           value-blind consumers (RUL history/scope binding) and
@@ -18909,12 +19038,11 @@ configs:
           signal_q = []
           event_q = []
           if windows:
-              fetch_start_w = min(ws for ws, _ in windows)
-              fetch_end_w = max(we for _, we in windows)
-              signal_q.append((fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w,
-                               None))
-              event_q.append((fetch_start_w, fetch_end_w, None))
-              context_cover = [(fetch_start_w - SIGNAL_CONTEXT_NS, fetch_end_w)]
+              context_cover = _merge_intervals(
+                  [(start - SIGNAL_CONTEXT_NS, end) for start, end in windows])
+              signal_q.extend((start, end, None) for start, end in context_cover)
+              event_q.extend((start, end, None)
+                             for start, end in _merge_intervals(windows))
           else:
               context_cover = []
           for scope in sorted(scope_windows):
@@ -18932,6 +19060,18 @@ configs:
                       event_q.append((start, end, [scope] if only else None))
                   context_cover = _merge_intervals(
                       context_cover + [(start - SIGNAL_CONTEXT_NS, end)])
+
+          def _chunks(queries):
+              by_scope = {}
+              for start, end, scopes in queries:
+                  key = tuple(scopes) if scopes else None
+                  by_scope.setdefault(key, []).append((start, end))
+              for scopes, intervals in by_scope.items():
+                  for start, end in _merge_intervals(intervals):
+                      while start <= end:
+                          stop = min(end, start + HOUR_NS - 1)
+                          yield start, stop, scopes
+                          start = stop + 1
           signals = []
           events = []
           tag_scopes = set()
@@ -18945,16 +19085,16 @@ configs:
               return rows
 
           def _take_tags(tags):
-              total[0] += len(tags)
+              total[0] += len(tags - tag_scopes)
               if total[0] > max_rows:
                   raise BatteryCapError("row cap exceeded (%d > %d): refusing "
                                         "partial" % (total[0], max_rows))
               tag_scopes.update(tags)
 
-          for start, end, scopes in event_q:
+          for start, end, scopes in _chunks(event_q):
               events.extend(_take(fetch_events(
                   base_url, auth, db, start, end, vehicle, max_rows,
-                  scopes=scopes)))
+                  scopes=scopes, exclude_scopes=exclude_scopes)))
           if analysis_cfg is not None:
               # Excluded scopes never analyze, so their events cannot require
               # context. Malformed config propagates (fail closed).
@@ -18962,14 +19102,14 @@ configs:
                         if (e["vehicle"], e["source"], e.get("decode_epoch"))
                         not in exclude_scopes]
               fields = _required_signal_fields(analysis_cfg, events=proven)
-          for cstart, cend, scopes in signal_q:
+          for cstart, cend, scopes in _chunks(signal_q):
               signals.extend(_take(fetch_signals(
                   base_url, auth, db, cstart, cend, vehicle, max_rows,
-                  fields=fields, scopes=scopes)))
+                  fields=fields, scopes=scopes, exclude_scopes=exclude_scopes)))
               if fields is not None:
                   _take_tags(fetch_signal_scopes(
                       base_url, auth, db, cstart, cend, vehicle, max_rows,
-                      scopes=scopes))
+                      scopes=scopes, exclude_scopes=exclude_scopes))
           signals = [s for s in signals if (s["vehicle"], s["source"],
                                             s["decode_epoch"]) not in exclude_scopes]
           events = [e for e in events if (e["vehicle"], e["source"],
@@ -19165,7 +19305,6 @@ configs:
               raise BatteryConfigError(config_error)
           disambiguate_rows(all_rows)
           checked = validate_no_duplicate_pks(list(all_rows))
-          written, skipped = insert_analysis_rows(base_url, auth, db, checked)
           if fetch_start is not None:
               oldest_signal = coverage_min(base_url, auth, db, SIGNAL_TABLE, vehicle)
               oldest_event = coverage_min(base_url, auth, db, EVENT_TABLE, vehicle)
@@ -19175,10 +19314,12 @@ configs:
                   need = "'%s' to '%s'" % (ns_to_sql_ts(oldest),
                                            ns_to_sql_ts(fetch_start - 1))
                   sys.stdout.write(
-                      "battery: older data before fetch_start exists (oldest %s); "
-                      "supply BATTERY_BACKFILL_START/END covering %s to recompute; "
-                      "normal lookback left it untouched\n"
+                      "battery: conservative table retention boundary %s predates "
+                      "fetch_start (not exact vehicle/scope coverage); consider "
+                      "BATTERY_BACKFILL_START/END covering %s; "
+                      "normal lookback left older intervals untouched\n"
                       % (ns_to_sql_ts(oldest), need))
+          written, skipped = insert_analysis_rows(base_url, auth, db, checked)
           if skipped:
               sys.stdout.write("battery: skipped %d rows missing NOT NULL "
                                "identity (no vehicle/metric/revision)\n" % skipped)

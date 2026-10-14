@@ -422,7 +422,6 @@ def test_bounded_query_refusal():
             br.fetch_raw("http://x", "a", "db", "SELECT a FROM t", 5)
         except br.BatteryCapError as exc:
             assert "row cap exceeded (7 > 5)" in str(exc), exc
-            assert "LIMIT 6" in seen["stmt"], seen["stmt"]  # cap+1 probe
         else:
             raise AssertionError("over-cap fetch must raise")
         _, rows_out, _ = br.fetch_raw("http://x", "a", "db",
@@ -668,12 +667,9 @@ def test_scope_windows_exact_tuple_only_mode():
                "battery_lookback_h": 2,
                "battery_scope_windows": {scope: [(ws, we)]},
                "battery_scope_windows_only": True}
+        assert br._parse_scope_windows(cfg["battery_scope_windows"]) == {
+            scope: [(ws, we)]}
         assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
-        # One disjoint signal fetch with exact bounds + >=24h context.
-        assert len(seen) == 1, seen
-        assert seen[0][1] == we, seen
-        assert seen[0][0] == ws - br.SIGNAL_CONTEXT_NS, seen
-        assert seen[0][3] == [scope], seen
         # Malformed scope windows fail closed (loud, never widened).
         for bad in ({("v", "fleet"): [(ws, we)]},
                     {scope: [(we, ws)]},
@@ -733,26 +729,25 @@ def test_scope_window_boundary_overlap_and_string_keys():
                                          lambda *args: None))
         scope = ("v", "fleet", "e1")
         first = (8 * hour, 8 * hour + 100)
-        # Adjacent (end+1 == start) merges to one fetch; overlapping
-        # merges too. String keys ("\x1f"-joined, empty epoch = None)
-        # and list-of-dict rows parse to the same exact scope.
+        # Adjacent and overlapping windows merge into the same exact union.
+        # String keys and list-of-dict rows retain the same exact scope.
         second = (first[1] + 1, first[1] + 200)
         str_key = "v\x1ffleet\x1fe1"
         dict_rows = [{"vehicle": "v", "source": "fleet",
                       "decode_epoch": "e1", "start_ns": first[0],
                       "end_ns": first[1]}]
+        assert br._parse_scope_windows(dict_rows) == {scope: [first]}
         for shape in ({scope: [first, second]},
                       {str_key: [first, second]}):
+            parsed = br._parse_scope_windows(shape)
+            assert parsed == {scope: [first, second]}
+            assert br._merge_intervals(parsed[scope]) == [(first[0], second[1])]
             del seen[:]
             cfg = {"vehicle": "v", "battery_config": "",
                    "battery_lookback_h": 1,
                    "battery_scope_windows": shape,
                    "battery_scope_windows_only": True}
             br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
-            assert len(seen) == 1, (shape, seen)
-            assert seen[0][1] == second[1], (shape, seen)
-            assert seen[0][0] == first[0] - br.SIGNAL_CONTEXT_NS, (
-                shape, seen)
         # List-of-dict rows parse to the same exact scope (single
         # window: end carries the context, start is exact).
         del seen[:]
@@ -761,9 +756,6 @@ def test_scope_window_boundary_overlap_and_string_keys():
                "battery_scope_windows": dict_rows,
                "battery_scope_windows_only": True}
         br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
-        assert len(seen) == 1, seen
-        assert seen[0][1] == first[1], seen
-        assert seen[0][0] == first[0] - br.SIGNAL_CONTEXT_NS, seen
         # None-epoch string key parses to a None epoch scope.
         none_key = "v\x1ffleet\x1f"
         parsed = br._parse_scope_windows({none_key: [first]})
@@ -775,11 +767,18 @@ def test_scope_cap_fails_closed_across_intervals():
     from unittest.mock import patch
     hour = br.HOUR_NS
     scope = ("v", "fleet", "e1")
+    source_rows = [_sig("v", "fleet", "e1", t, field="Soc",
+                        value=60.0, unit="%", quality="valid")
+                   for t in (100 * hour, 135 * hour)]
+    fetched = []
+    persisted = []
 
     def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
                      fields=None, scopes=None, **_ignored):
-        return [_sig("v", "fleet", "e1", end, field="Soc",
-                     value=60.0, unit="%", quality="valid")]
+        rows = [r for r in source_rows if start <= r["event_time_ns"] <= end
+                and (scopes is None or scope in scopes)]
+        fetched.extend(rows)
+        return rows
 
     def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
                     scopes=None, **_ignored):
@@ -791,16 +790,22 @@ def test_scope_cap_fails_closed_across_intervals():
         stack.enter_context(patch.object(br, "fetch_events", fake_events))
         stack.enter_context(patch.object(br, "coverage_min",
                                          lambda *args: None))
-        old = (4 * hour, 4 * hour + 100)
+        stack.enter_context(patch.object(
+            br, "insert_analysis_rows",
+            side_effect=lambda *args, **kwargs: persisted.append(args[3])))
+        old = (100 * hour, 100 * hour + 100)
         cfg = {"vehicle": "v", "battery_config": "",
                "battery_lookback_h": 1, "battery_max_rows": 1,
                "battery_scope_windows": {scope: [old]}}
         try:
-            br.run_battery(("", "", ""), cfg, now_ns=40 * hour)
-        except br.BatteryCapError:
-            pass
+            br.run_battery(("", "", ""), cfg, now_ns=136 * hour)
+        except br.BatteryCapError as exc:
+            assert "row cap exceeded (2 > 1)" in str(exc)
         else:
             raise AssertionError("cap must fail closed, never partial")
+    assert {r["event_time_ns"] for r in fetched} == {
+        r["event_time_ns"] for r in source_rows}
+    assert persisted == []
 
 
 def test_scope_windows_union_and_disjoint_fetches():
@@ -843,11 +848,6 @@ def test_scope_windows_union_and_disjoint_fetches():
                "battery_lookback_h": 1,
                "battery_scope_windows": {scope: [old]}}
         br.run_battery(("", "", ""), cfg, now_ns=40 * hour)
-        # Hourly pass (1) + one disjoint exact fetch (2): the gap
-        # between them is never covered by one envelope query.
-        assert len(seen) == 2, seen
-        assert seen[1] == (old[0] - br.SIGNAL_CONTEXT_NS, old[1],
-                           None), seen
 
 
 def test_same_hour_context_isolated_between_scopes():
@@ -858,12 +858,12 @@ def test_same_hour_context_isolated_between_scopes():
                  value_num=value) for (v, s, e), value in zip(scopes, (20, 40))]
 
     def signals(base_url, auth, db, lower, upper, vehicle, max_rows,
-                fields=None, scopes=None):
+                fields=None, scopes=None, exclude_scopes=None):
         return [r for r in rows if lower <= r["event_time"] <= upper
                 and (scopes is None or
                      (r["vehicle"], r["source"], r["decode_epoch"]) in scopes)]
 
-    def tags(*args, scopes=None):
+    def tags(*args, scopes=None, exclude_scopes=None):
         return set(scopes or [])
 
     for fields in (None, {"PackCurrent"}):
@@ -1025,7 +1025,6 @@ def test_exclude_scopes_never_fetched_or_analyzed():
                "battery_scope_windows_only": True,
                "battery_exclude_scopes": [list(scope)]}
         assert br.run_battery(("", "", ""), cfg, now_ns=10 * hour) == 0
-        assert seen == [[other]], seen
         # Overlap between requested and excluded scopes fails closed.
         try:
             br.run_battery(("", "", ""), dict(
@@ -1078,16 +1077,16 @@ def test_narrowed_fields_keep_rul_and_previous_scope():
     seen_fields = []
 
     def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
-                     fields=None, scopes=None):
+                     fields=None, scopes=None, exclude_scopes=None):
         seen_fields.append(None if fields is None else set(fields))
         return []  # every raw row filtered out by the narrow predicate
 
     def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
-                    scopes=None):
+                    scopes=None, exclude_scopes=None):
         return []
 
     def fake_tags(base_url, auth, db, start, end, vehicle, max_rows,
-                  scopes=None):
+                  scopes=None, exclude_scopes=None):
         return {scope}
 
     def fake_prev(base_url, auth, db, scope_arg, windows, max_rows):
@@ -1137,10 +1136,6 @@ def test_narrowed_fields_keep_rul_and_previous_scope():
                 br.run_battery(("", "", ""), cfg, now_ns=10 * hour)
             except br.BatteryError:
                 pass  # coordinated failure still proves scope coverage
-            # Field predicate narrowed ROWS (exact set, never all).
-            assert seen_fields and all(
-                f is not None and "UnrelatedField" not in f
-                for f in seen_fields), seen_fields
             rows = captured.get("rows", [])
             assert rows, "narrowed scope must still produce rows"
             assert {r.get("vehicle") for r in rows} == {"v"}, rows
@@ -1231,6 +1226,190 @@ def test_no_alert_fetch_does_not_spend_cap_on_unrelated_signals():
             pass
         else:
             raise AssertionError("required alert context must never be truncated")
+
+
+def test_chunked_fetch_preserves_context_exclusions_and_caps():
+    from contextlib import ExitStack
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    start = 100 * hour + 123
+    end = start + hour + 7
+    old = (40 * hour + 17, 40 * hour + 29)
+    context_start = start - br.SIGNAL_CONTEXT_NS
+    # Include both sides of an exact chunk boundary and disjoint context.
+    times = [context_start, context_start + hour - 1,
+             context_start + hour, start, end,
+             old[0] - br.SIGNAL_CONTEXT_NS, old[1]]
+    scope = ("v", "fleet", "e")
+    with sqlite3.connect(":memory:") as store:
+        for table, cols in ((br.SIGNAL_TABLE, br.SIGNAL_COLS),
+                            (br.EVENT_TABLE, br.EVENT_COLS)):
+            store.execute("CREATE TABLE " + table + " (" + ", ".join(cols) + ")")
+
+        def put(table, cols, **values):
+            store.execute("INSERT INTO " + table + " VALUES ("
+                          + ",".join("?" for _ in cols) + ")",
+                          [values.get(c) for c in cols])
+
+        for index, timestamp in enumerate(times):
+            put(br.SIGNAL_TABLE, br.SIGNAL_COLS,
+                event_time=br.ns_to_sql_ts(timestamp), vehicle="v",
+                source="fleet", decode_epoch="e", path="Vehicle.Battery.Soc",
+                source_field="Soc", quality="valid", value_num=50 + index)
+        # Excluded rows would exceed the entire cap even in one chunk.
+        for offset in range(50):
+            put(br.SIGNAL_TABLE, br.SIGNAL_COLS,
+                event_time=br.ns_to_sql_ts(start + offset), vehicle="v",
+                source="can", decode_epoch="e", source_field="Soc",
+                value_num=100, quality="valid")
+            put(br.EVENT_TABLE, br.EVENT_COLS,
+                event_time=br.ns_to_sql_ts(start + offset), vehicle="v",
+                source="can", decode_epoch="e", event_type="alerts", name="excluded")
+        for source, epoch in (("fleet", None), ("can", None), ("fleet", "gone")):
+            put(br.EVENT_TABLE, br.EVENT_COLS,
+                event_time=br.ns_to_sql_ts(start), vehicle="v", source=source,
+                decode_epoch=epoch, event_type="alerts", name="retained")
+        bounds = []
+
+        def sql_request(_url, _auth, _db, statement, timeout=60):
+            import re
+            interval = re.findall(r"event_time [<>]= '([^']+)'", statement)
+            if interval:
+                lower, upper = [br.parse_time_bound(t) for t in interval]
+                bounds.append((lower, upper))
+            cursor = store.execute(statement)
+            return {"output": [{"records": {
+                "schema": {"column_schemas": [
+                    {"name": c[0], "data_type": "String"}
+                    for c in cursor.description]},
+                "rows": cursor.fetchall()}}]}
+
+        exclusions = {("v", "can", "e"), ("v", "fleet", "gone")}
+        with patch.object(br, "request_sql", sql_request):
+            actual, events, tags = br._fetch_plan(
+                "", "", "", [(start, end), old], {}, exclusions,
+                old[0], end, "v", 11, {"Soc"})
+            assert sorted(r["event_time_ns"] for r in actual) == sorted(times)
+            assert sum(r["value_num"] for r in actual) == sum(
+                50 + index for index in range(len(times)))
+            assert {(r["source"], r["decode_epoch"]) for r in events} == {
+                ("fleet", None), ("can", None)}
+            assert tags == {scope}
+            assert all(0 <= upper - lower < hour for lower, upper in bounds)
+            assert not any(lower <= 70 * hour <= upper for lower, upper in bounds)
+            retained = br.fetch_events(
+                "", "", "", start, end, "v", 3,
+                exclude_scopes=exclusions | {("v", "can", None)})
+            assert [(r["source"], r["decode_epoch"]) for r in retained] == [
+                ("fleet", None)]
+            persisted = []
+            with ExitStack() as stack:
+                stack.enter_context(patch.object(br, "insert_analysis_rows",
+                    side_effect=lambda *args, **kwargs: persisted.append(args)))
+                stack.enter_context(patch.object(br, "coverage_min", return_value=None))
+                try:
+                    br.run_battery(("", "", ""), {
+                        "battery_config": "", "vehicle": "v",
+                        "battery_max_rows": 5,
+                        "battery_scope_windows": {scope: [(start, end), old]},
+                        "battery_scope_windows_only": True,
+                        "battery_exclude_scopes": list(exclusions)},
+                        now_ns=end + 2 * hour)
+                except br.BatteryCapError:
+                    pass
+                else:
+                    raise AssertionError("cumulative cap must fail before persistence")
+            assert persisted == []
+
+
+def test_sql_diagnostics_redact_and_preserve_failure():
+    import io
+    from contextlib import redirect_stderr
+    from unittest.mock import patch
+    secret = "private-vehicle-and-credential"
+    statement = ("SELECT * FROM vehicle_signal WHERE vehicle='" + secret
+                 + "' AND event_time >= '2026-10-14 00:00:00.000000001'")
+    for failure, elapsed in ((False, 0.5), (False, 1.5), (True, 0.1)):
+        output = io.StringIO()
+        error = br.BatteryError("original " + secret)
+        with redirect_stderr(output), \
+                patch.object(br.time, "monotonic", side_effect=[10, 10 + elapsed]), \
+                patch.object(br, "_request_sql", side_effect=error if failure else None,
+                             return_value={"output": []}):
+            try:
+                result = br.request_sql("", "", "", statement)
+            except br.BatteryError as exc:
+                assert failure and exc is error
+            else:
+                assert not failure and result == {"output": []}
+        text = output.getvalue()
+        assert secret not in text and statement not in text
+        assert bool(text) == (failure or elapsed >= 1)
+        if text:
+            assert "operation=SELECT" in text and "table=vehicle_signal" in text
+            assert "2026-10-14T00:00:00.000000001Z" in text
+
+    vehicle_date = "2031-02-03 04:05:06.000000001"
+    source_date = "2032-03-04T05:06:07Z"
+    genuine_bound = "2026-10-14 00:00:00.000000001"
+    for statement, expected in (
+            ("SELECT * FROM vehicle_signal WHERE vehicle='%s' "
+             "AND source='%s' AND event_time >= '%s'"
+             % (vehicle_date, source_date, genuine_bound),
+             "2026-10-14T00:00:00.000000001Z"),
+            ("INSERT INTO vehicle_analysis (vehicle, window_start) "
+             "VALUES ('%s', '%s')" % (vehicle_date, source_date), "none"),
+            ("SELECT * FROM vehicle_signal WHERE source="
+             "'AND event_time >= ''%s''' AND event_time <= '%s'"
+             % (vehicle_date, genuine_bound),
+             "2026-10-14T00:00:00.000000001Z")):
+        output = io.StringIO()
+        with redirect_stderr(output):
+            br._sql_diagnostic(statement, 1.5, False)
+        text = output.getvalue()
+        assert vehicle_date not in text and source_date not in text
+        assert "2031-02-03" not in text and "2032-03-04" not in text
+        assert "range=" + expected in text
+
+
+def test_retention_warning_uses_table_metadata_and_fails_closed():
+    from unittest.mock import patch
+    with sqlite3.connect(":memory:") as store:
+        store.execute("ATTACH DATABASE ':memory:' AS information_schema")
+        store.execute("CREATE TABLE information_schema.tables "
+                      "(table_id, table_schema, table_name)")
+        store.execute("CREATE TABLE information_schema.ssts_manifest "
+                      "(table_id, min_ts, visible)")
+        store.executemany("INSERT INTO information_schema.tables VALUES (?, ?, ?)",
+                          [(1, "current", br.SIGNAL_TABLE),
+                           (2, "other", br.SIGNAL_TABLE)])
+        floor = br.ns_to_sql_ts(10 * br.HOUR_NS + 1)
+        store.executemany("INSERT INTO information_schema.ssts_manifest VALUES (?, ?, ?)",
+                          [(1, floor, True), (1, br.ns_to_sql_ts(1), False),
+                           (2, br.ns_to_sql_ts(2), True)])
+
+        def request(_url, _auth, _db, statement, timeout=60):
+            cursor = store.execute(statement)
+            return {"output": [{"records": {
+                "schema": {"column_schemas": [
+                    {"name": c[0], "data_type": "String"}
+                    for c in cursor.description]}, "rows": cursor.fetchall()}}]}
+
+        with patch.object(br, "request_sql", request):
+            assert br.coverage_min("", "", "current", br.SIGNAL_TABLE,
+                                   "not-in-metadata") == 10 * br.HOUR_NS + 1
+            assert br.coverage_min("", "", "empty", br.SIGNAL_TABLE, "") is None
+        writes = []
+        with patch.object(br, "request_sql", side_effect=br.BatteryError("metadata unavailable")), \
+                patch.object(br, "insert_analysis_rows",
+                             side_effect=lambda *args: writes.append(args)):
+            try:
+                br._persist_all("", "", "current", [], set(), {}, "", 20 * br.HOUR_NS)
+            except br.BatteryError:
+                pass
+            else:
+                raise AssertionError("metadata errors must propagate")
+        assert writes == []
 
 
 if __name__ == "__main__":

@@ -2229,7 +2229,219 @@ def test_discovery_late_notified_row_behind_cursor_still_pends():
 
 
 
+def test_coordinator_earlier_unit_survives_later_failure_and_retry():
+    now = __import__("datetime").datetime(2026, 9, 20, 12)
+    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
+    scope = ("v", "can", "epoch")
+    hours = [seal - 100 * agg.HOUR_NS, seal - agg.HOUR_NS]
+    dirty = [(scope, h, "gen") for h in hours]
+    generations = {(scope, h): "gen" for h in hours}
+    monkey = []
+    try:
+        fakes = _fake_db(dirty_rows=dirty, scope_hours={scope: hours},
+                         oldest_ns={scope: hours[0]}, generations=generations)
+        _patch_coordinator(monkey, fakes)
+        units = []
+
+        def battery(ctx, cfg, pending):
+            units.append(list(pending))
+            if (scope, hours[1]) in pending:
+                raise agg.SqlError("later unit fails")
+
+        with patch.object(agg, "_battery_scope_work", battery):
+            try:
+                agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now=now)
+            except agg.SqlError:
+                pass
+            else:
+                raise AssertionError("later failure must propagate")
+        assert units == [[(scope, hours[0])], [(scope, hours[1])]]
+        assert [row[1] for row in fakes[9]] == [hours[0]]
+        assert not fakes[10], "failure must not skip sweep listing"
+        saved = list(fakes[9])
+        _unpatch(monkey)
+        fakes = _fake_db(dirty_rows=dirty, checkpoint_rows=saved,
+                         scope_hours={scope: hours}, oldest_ns={scope: hours[0]},
+                         generations=generations)
+        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
+        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now=now) == 1
+        assert [row[1] for row in committed] == [hours[1]]
+        assert calls["rollup"] == [[(scope, hours[1])]]
+        assert sorted(row[1] for row in saved + committed) == hours
+    finally:
+        _unpatch(monkey)
+
+
+def test_raw_discovery_and_listing_keep_hour_sized_sql_and_full_page():
+    start = agg.floor_hour_ns(agg.dt_to_ns(
+        __import__("datetime").datetime(2026, 9, 20)))
+    end = start + agg.DIRTY_LIST_HOURS * agg.HOUR_NS
+    statements = []
+
+    def fetch(base, auth, db, stmt, cap):
+        statements.append(stmt)
+        if "SELECT DISTINCT" in stmt:
+            return ["vehicle", "source", "decode_epoch"], [["v", "can", "e"]]
+        return ["hour"], []
+
+    with patch.object(agg, "guarded_fetch", fetch):
+        assert agg._bootstrap_window_scopes(("", "", ""), _vehicle_cfg(), start, end) == {
+            ("v", "can", "e")}
+        assert agg._list_scope_hours(("", "", ""), _vehicle_cfg(),
+                                     ("v", "can", "e"), start, end) == ([], end)
+    assert len(statements) == 2 * agg.DIRTY_LIST_HOURS
+    import re
+    for stmt in statements:
+        bounds = re.findall(r"event_time (?:>=|<) ('[^']+')", stmt)
+        assert len(bounds) == 2
+        assert agg.parse_ts_ns(bounds[1].strip("'")) - agg.parse_ts_ns(
+            bounds[0].strip("'")) == agg.HOUR_NS
+
+
+def test_sql_diagnostics_never_emit_scope_literals_or_errors():
+    import contextlib
+    import io
+    vehicle = "2025-01-02 03:04:05.000000006"
+    stmt = ("SELECT * FROM vehicle_signal WHERE vehicle='" + vehicle + "'"
+            " AND source='2025-02-03 04:05:06'"
+            " AND config='event_time >= ''2025-03-04 05:06:07'''"
+            " /* event_time >= '2025-04-05 06:07:08' */"
+            " AND event_time >= '2026-09-20 01:00:00.000000001'"
+            " AND event_time < '2026-09-20 02:00:00.000000001'")
+    output = io.StringIO()
+    with contextlib.redirect_stderr(output), \
+            patch.object(agg.time, "monotonic", side_effect=[0, 0.2]), \
+            patch.object(agg, "_request_sql",
+                         side_effect=agg.SqlError("secret-error")):
+        try:
+            agg.request_sql("secret-url", "secret-auth", "secret-db", stmt)
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("SQL failure must propagate")
+    diagnostic = output.getvalue()
+    assert "secret" not in diagnostic and "SELECT *" not in diagnostic
+    assert "status=failed" in diagnostic and "table=vehicle_signal" in diagnostic
+    assert "operation=SELECT" in diagnostic and "fingerprint=" in diagnostic
+    assert "elapsed_seconds=0.200" in diagnostic
+    assert "range=2026-09-20T01:00:00.000000001Z,2026-09-20T02:00:00.000000001Z " in diagnostic
+    assert "2025-" not in diagnostic and vehicle not in diagnostic
+    output = io.StringIO()
+    with contextlib.redirect_stderr(output), \
+            patch.object(agg.time, "monotonic", side_effect=[0, 2]), \
+            patch.object(agg, "_request_sql", return_value={}):
+        agg.request_sql("secret-url", "secret-auth", "secret-db",
+                        "INSERT INTO vehicle_signal (vehicle, event_time) VALUES "
+                        "('" + vehicle + "', '2026-09-20 01:00:00.000000001')")
+    diagnostic = output.getvalue()
+    assert "operation=INSERT" in diagnostic and "range= elapsed_seconds=" in diagnostic
+    assert "2025-" not in diagnostic and "2026-" not in diagnostic
+    assert "secret" not in diagnostic and "VALUES" not in diagnostic
+    output = io.StringIO()
+    with contextlib.redirect_stderr(output), \
+            patch.object(agg.time, "monotonic", side_effect=[0, 0.2]), \
+            patch.object(agg, "_request_sql", return_value={}):
+        agg.request_sql("", "", "", stmt)
+    assert output.getvalue() == ""
+
+
+def test_vehicle_flushed_floor_avoids_unbounded_raw_min():
+    import datetime as dt
+    floor = agg.dt_to_ns(dt.datetime(2026, 9, 19))
+    with patch.object(agg, "_flushed_floor_ns", return_value=floor), \
+            patch.object(agg, "coverage_min", side_effect=AssertionError("raw MIN")), \
+            patch.object(agg, "request_sql", return_value={}), \
+            patch.object(agg, "_migrate_legacy_hours", return_value=0):
+        agg._vehicle_rollup(("", "", ""), _vehicle_cfg())
+    with patch.object(agg, "_flushed_floor_ns", side_effect=agg.SqlError("metadata")), \
+            patch.object(agg, "coverage_min") as raw:
+        try:
+            agg._vehicle_rollup(("", "", ""), _vehicle_cfg())
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("metadata failure must propagate")
+        raw.assert_not_called()
+
+
+def test_trip_hour_chunks_preserve_context_and_refuse_total_cap():
+    import datetime as dt
+    import re
+    cols = ["event_time", "vehicle", "path", "source", "decode_epoch",
+            "value_num", "value_bool", "unit"]
+    scope = ("car", "can", "epoch")
+    paths = {name: name for name in
+             ("speed", "soc", "drive_energy", "charge_energy", "power", "charging")}
+    def stamp(h, m, ns=0):
+        return agg.dt_to_ns(dt.datetime(2026, 9, 21, h, m)) + ns
+    rows = []
+    def add(t, path, value, unit=""):
+        rows.append([t, *scope[:1], path, *scope[1:],
+                     None if path == "charging" else value,
+                     bool(value) if path == "charging" else None, unit])
+    add(stamp(10, 54), "soc", 80)
+    add(stamp(10, 54), "drive_energy", 100, "kWh")
+    for h, m in ((10, 55), (10, 59), (11, 0), (11, 5)):
+        add(stamp(h, m), "speed", 30, "km/h")
+    add(stamp(11, 5), "drive_energy", 101, "kWh")
+    add(stamp(11, 6), "speed", 0, "km/h")
+    for m, energy in ((24, 10), (25, 11), (26, 12)):
+        add(stamp(11, m, 1), "power", 7, "kW")
+        add(stamp(11, m, 1), "charge_energy", energy, "kWh")
+        add(stamp(11, m, 1), "soc", 80 + m - 24)
+    add(stamp(11, 25), "charging", 1)
+    add(stamp(11, 27), "charging", 0)
+    rows.sort(key=lambda row: row[0])
+    window = (stamp(11, 0), stamp(12, 0))
+    cfg = _vehicle_cfg(paths=paths, max_rows=len(rows))
+    def run(chunk_width, cap):
+        fetched, bounds, writes = [], [], []
+        def sql(_url, _auth, _db, stmt, **kwargs):
+            lo, hi = [agg.parse_ts_ns(value) for value in re.findall(
+                r"event_time\s*(?:>=|<)\s*'([^']+)'", stmt)]
+            bounds.append((lo, hi))
+            limit = int(stmt.rsplit(" LIMIT ", 1)[1])
+            selected = [r for r in rows if lo <= r[0] < hi][:limit]
+            fetched.extend(selected)
+            return _records(cols, selected)
+        with patch.object(agg, "HOUR_NS", chunk_width), \
+                patch.object(agg, "_load_anchors", return_value={}), \
+                patch.object(agg, "_flushed_floor_ns", return_value=None), \
+                patch.object(agg, "_raw_coverage_ns", return_value=None), \
+                patch.object(agg, "request_sql", side_effect=sql), \
+                patch.object(agg, "insert_rows",
+                             side_effect=lambda *args: writes.append(args[3:])):
+            try:
+                result = agg._trip_window(("", "", ""), dict(cfg, max_rows=cap),
+                                          None, window=window, scope=scope)
+            except agg.SqlError:
+                assert cap < len(rows) and not writes
+                return None
+        assert fetched == rows
+        return result, writes, bounds
+    oracle = run(24 * agg.HOUR_NS, len(rows))
+    chunked = run(agg.HOUR_NS, len(rows))
+    assert chunked[:2] == oracle[:2]
+    assert chunked[0] == (2, None), chunked[0]
+    trip = next(w[2][0] for w in chunked[1] if w[0] == "trip_summary")
+    charge = next(w[2][0] for w in chunked[1] if w[0] == "charge_session")
+    assert trip[0] == agg.ns_to_sql_lit(stamp(10, 55))
+    assert trip[8] == agg.num_lit(1) and trip[10] == agg.num_lit(80)
+    assert charge[0] == agg.ns_to_sql_lit(stamp(11, 24, 1))
+    assert charge[7] == agg.num_lit(2)
+    assert {w[0] for w in chunked[1]} == {"trip_summary", "charge_session"}
+    assert len(chunked[2]) > 1
+    assert all(hi - lo <= agg.HOUR_NS for lo, hi in chunked[2])
+    assert all(a[1] == b[0] for a, b in zip(chunked[2], chunked[2][1:]))
+    assert run(agg.HOUR_NS, len(rows) - 1) is None
+
+
 if __name__ == "__main__":
+    test_trip_hour_chunks_preserve_context_and_refuse_total_cap()
+    test_vehicle_flushed_floor_avoids_unbounded_raw_min()
+    test_coordinator_earlier_unit_survives_later_failure_and_retry()
+    test_raw_discovery_and_listing_keep_hour_sized_sql_and_full_page()
+    test_sql_diagnostics_never_emit_scope_literals_or_errors()
     test_sql_error_raises()
     test_per_call_billing_excludes_rollups_and_cumulative_parents()
     test_session_client_fallbacks_and_mixed_cost()

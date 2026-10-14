@@ -455,6 +455,58 @@ class SqlError(Exception):
 
 
 def request_sql(base_url, auth, db, stmt, timeout=60):
+    started = time.monotonic()
+    failed = True
+    try:
+        result = _request_sql(base_url, auth, db, stmt, timeout)
+        failed = False
+        return result
+    finally:
+        elapsed = time.monotonic() - started
+        if failed or elapsed >= 1:
+            shape = re.sub(r"'(?:''|[^'])*'", "?", stmt)
+            shape = re.sub(r"\b\d+(?:\.\d+)?\b", "?", shape)
+            shape = " ".join(shape.upper().split())
+            verb = shape.split(" ", 1)[0]
+            operation = verb if verb in ("SELECT", "INSERT", "DELETE", "UPDATE",
+                                         "CREATE", "ALTER", "DROP") else "OTHER"
+            tables = {"vehicle_signal", "vehicle_agg", "vehicle_trip",
+                      "vehicle_charge", "vehicle_signal_dirty",
+                      "vehicle_aggregate_checkpoint", "vehicle_aggregate_sweep",
+                      "opentelemetry_traces", "ai_session_summary",
+                      "home_signal", "home_agg", "ssts_manifest"}
+            names = re.findall(r"\b(?:FROM|INTO|UPDATE|TABLE)\s+"
+                               r"(?:INFORMATION_SCHEMA\.)?([A-Z_][A-Z_0-9]*)", shape)
+            table = next((n.lower() for n in names if n.lower() in tables), "other")
+            bounds = []
+            # Consume literals/comments as units so predicate-like text inside
+            # an identity or config value cannot become a logged query bound.
+            for literal in re.findall(
+                    r"--[^\n]*|/\*[\s\S]*?\*/|"
+                    r'(?<![\w])(?:"(?:event_time|window_start|timestamp|'
+                    r'session_start|start_time|end_time)"|'
+                    r"(?:event_time|window_start|timestamp|"
+                    r"session_start|start_time|end_time))\s*(?:>=|<=|>|<)\s*"
+                    r"'(\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}"
+                    r"(?:\.\d{1,9})?Z?)'|"
+                    r"""'(?:''|[^'])*'|"(?:""|[^"])*"|\w+""",
+                    stmt, flags=re.IGNORECASE):
+                try:
+                    dt.datetime.fromisoformat(literal.rstrip("Z"))
+                except ValueError:
+                    continue
+                bounds.append(literal.replace(" ", "T").rstrip("Z") + "Z")
+                if len(bounds) == 2:
+                    break
+            fingerprint = hashlib.sha256(shape.encode()).hexdigest()[:16]
+            sys.stderr.write("sql: status=" + ("failed" if failed else "ok")
+                             + " operation=" + operation + " table=" + table
+                             + " fingerprint=" + fingerprint
+                             + " range=" + ",".join(bounds)
+                             + " elapsed_seconds=%.3f\n" % elapsed)
+
+
+def _request_sql(base_url, auth, db, stmt, timeout):
     url = base_url.rstrip("/") + "/v1/sql?db=" + urllib.parse.quote(db, safe="")
     body = urllib.parse.urlencode({"sql": stmt}).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
@@ -3240,7 +3292,9 @@ def vehicle_section(ctx, cfg):
 def _vehicle_rollup(ctx, cfg, exclude=None):
     base_url, auth, db = ctx
     now = utcnow()
-    cov = coverage_min(base_url, auth, db, "vehicle_signal", "event_time")
+    floor_ns = _flushed_floor_ns(ctx)
+    cov = (_ns_to_dt(floor_ns) if floor_ns is not None else
+           coverage_min(base_url, auth, db, "vehicle_signal", "event_time"))
     aligned = floor_hour(now - dt.timedelta(hours=cfg["lookback_h"]))
     if cov:
         aligned = max(aligned, floor_hour(cov))
@@ -3412,7 +3466,7 @@ def _mark_legacy_expired(ctx, scope, hour_ns):
 #
 # Scope discovery itself never scans raw rows for bounds: the registry is
 # the DISTINCT union of the small dirty/checkpoint/sweep tables, plus up
-# to TWO time-pruned DISTINCT windows (DIRTY_LIST_HOURS each) per pass
+# to TWO resumable windows (DIRTY_LIST_HOURS each, one-hour queries) per pass
 # over vehicle_signal. The history floor comes from the pinned
 # information_schema.ssts_manifest MIN(min_ts) metadata scalar (zero SST
 # reads: a raw MIN(event_time) over flushed SSTs scans them instead, so it
@@ -3885,8 +3939,16 @@ def _flushed_floor_ns(ctx):
 
 
 def _bootstrap_window_scopes(ctx, cfg, start_ns, end_ns):
-    """CAN scopes holding raw rows in [start_ns, end_ns): one time-pruned
-    DISTINCT over a bounded window."""
+    """CAN scopes in [start_ns, end_ns), queried one hour at a time.
+    The caller commits its durable page cursor only after the whole page."""
+    if end_ns - start_ns > HOUR_NS:
+        found = set()
+        for hour in range(start_ns, end_ns, HOUR_NS):
+            found.update(_bootstrap_window_scopes(
+                ctx, cfg, hour, min(hour + HOUR_NS, end_ns)))
+            if len(found) > cfg["max_rows"]:
+                raise SqlError("scope discovery exceeds row cap")
+        return found
     base_url, auth, db = ctx
     filt = ""
     if cfg.get("vehicle"):
@@ -3941,7 +4003,7 @@ def _distinct_scopes(ctx, cfg):
     sweep tables (registry), two cursor point lookups (bootstrap frontier
     + reconcile), and one pinned information_schema.ssts_manifest MIN(min_ts)
     metadata scalar (zero SST reads). With a pinned floor, at most two
-    time-pruned DISTINCT windows (DIRTY_LIST_HOURS each) walk from the
+    resumable DISTINCT pages (DIRTY_LIST_HOURS each, one-hour queries) walk from the
     flushed floor and cycle sealed history for late-inserted scopes. With no
     visible SSTs, a raw MIN(event_time) bounds the in-memory first window.
 
@@ -4061,8 +4123,8 @@ def _sweep_reset_ns(ctx, scope):
 
 
 def _list_scope_hours(ctx, cfg, scope, start_hour_ns, seal_ns):
-    """Bounded checklist for one scope in [start_hour_ns, seal_ns): one
-    GROUP BY query covering at most DIRTY_LIST_HOURS. Returns (rows,
+    """Bounded checklist for one scope in [start_hour_ns, seal_ns):
+    one-hour GROUP BY queries covering at most DIRTY_LIST_HOURS. Returns (rows,
     listed_through_ns): rows are (hour_ns, count, max_event_ns,
     max_ingest_ns) oldest-first; listed_through_ns is the exclusive upper
     bound covered (never past seal_ns). Fingerprint columns only."""
@@ -4071,6 +4133,15 @@ def _list_scope_hours(ctx, cfg, scope, start_hour_ns, seal_ns):
     window_end_ns = min(start_hour_ns + DIRTY_LIST_HOURS * HOUR_NS, seal_ns)
     if window_end_ns <= start_hour_ns:
         return [], start_hour_ns
+    if window_end_ns - start_hour_ns > HOUR_NS:
+        out = []
+        for hour in range(start_hour_ns, window_end_ns, HOUR_NS):
+            rows, through = _list_scope_hours(
+                ctx, cfg, scope, hour, min(hour + HOUR_NS, window_end_ns))
+            if through <= hour:
+                return sorted(out), hour
+            out.extend(rows)
+        return sorted(out), window_end_ns
     try:
         cols, rows = guarded_fetch(
             base_url, auth, db,
@@ -4140,12 +4211,9 @@ def _extend_vehicle_head(ctx, key, segments, raw_from, cutoff, gap_s, lookback_h
             or (tail_gap is not None and tail_gap > 0
                 and not segments[0].get("open"))):
         return None
-    base_url, auth, db = ctx
-    _, rows = fetch_rows(
-        base_url, auth, db, "SELECT MIN(event_time) FROM vehicle_signal WHERE vehicle = "
-        + str_lit(key[0]) + " AND source = " + str_lit(key[1])
-        + " AND decode_epoch = " + str_lit(key[2]))
-    first = parse_ts_ns(rows[0][0]) if rows and rows[0] else None
+    first = _flushed_floor_ns(ctx)
+    if first is None:
+        first = _raw_coverage_ns(ctx, key)
     if first is None:
         return None
     first_dt = _ns_to_dt(first)
@@ -4244,14 +4312,20 @@ def _trip_window(ctx, cfg, raw_floor, *, window=None, scope=None):
     wanted = [p for p in (paths.get(a) for a in _VEHICLE_ATTRS) if p]
     if not wanted:
         return 0, None
-    cols, rows, _schema = _fetch_vehicle_raw(
-        base_url, auth, db,
-        "SELECT event_time, vehicle, path, source, decode_epoch, value_num,"
-        " value_bool, unit FROM vehicle_signal"
-        " WHERE event_time >= '" + raw_from.strftime("%Y-%m-%d %H:%M:%S")
-        + "' AND event_time < '" + seals + "' AND path IN ("
-        + ", ".join(str_lit(p) for p in wanted) + ")"
-        + filt + " ORDER BY event_time", cfg["max_rows"])
+    cols, rows = [], []
+    chunk_from, raw_end = dt_to_ns(raw_from), dt_to_ns(seal)
+    while chunk_from < raw_end:
+        chunk_end = min(chunk_from + HOUR_NS, raw_end)
+        cols, chunk_rows, _schema = _fetch_vehicle_raw(
+            base_url, auth, db,
+            "SELECT event_time, vehicle, path, source, decode_epoch, value_num,"
+            " value_bool, unit FROM vehicle_signal"
+            " WHERE event_time >= " + ns_to_sql_lit(chunk_from)
+            + " AND event_time < " + ns_to_sql_lit(chunk_end)
+            + " AND path IN (" + ", ".join(str_lit(p) for p in wanted) + ")"
+            + filt + " ORDER BY event_time", cfg["max_rows"] - len(rows))
+        rows.extend(chunk_rows)
+        chunk_from = chunk_end
     groups = group_vehicle_rows(cols, rows, paths)
     for key in [k for k in groups if _scope_tuple(k) in excluded]:
         del groups[key]
@@ -4582,46 +4656,28 @@ def vehicle_history_section(ctx, cfg, now=None, _known=None):
                    for h, c in cells.items()):
                 _commit_sweep(ctx, scope, listed_through, revision, now_ns)
         return 0
-    observed = dict(pending)
-    before = {}
-    for scope, entry in listed.items():
-        for hour_fp in entry[0]:
-            hour_ns, cell = hour_fp
-            before[(scope, hour_ns)] = cell
-    for key in sorted(observed):
-        if key not in before:
-            before[key] = _hour_cells(ctx, cfg, key[0], key[1])
-    scopes_hours = sorted(pending)
-    _rollup_hour_windows(ctx, cfg, scopes_hours)
-    _trip_charge_scope_windows(ctx, cfg, pending)
-    _battery_scope_work(ctx, cfg, pending)
-    if _config_revision(cfg) != revision:
-        return 0
-    after = {}
-    for scope, entry in listed.items():
-        _hours, cursor, listed_through = entry
-        rows, _end = _list_scope_hours(ctx, cfg, scope, cursor,
-                                       listed_through)
-        for hour_ns, count, max_event, max_ingest in rows:
-            after[(scope, hour_ns)] = _hour_fingerprint(
-                count, max_event, max_ingest)
-    for key in sorted(observed):
-        if key not in after:
-            after[key] = _hour_cells(ctx, cfg, key[0], key[1])
     committed = 0
     done = set()
-    for key in sorted(observed):
+    for key in sorted(pending):
         scope, hour_ns = key
+        observed = pending[key]
+        before = _hour_cells(ctx, cfg, scope, hour_ns)
         current = _read_dirty_generation(ctx, scope, hour_ns)
-        if observed[key]:
-            if current is None or current != observed[key]:
-                continue
-        elif current:
+        if (observed and current != observed) or (not observed and current):
             continue
-        if after.get(key) != before.get(key):
+        unit = {key: observed}
+        _rollup_hour_windows(ctx, cfg, [key])
+        _trip_charge_scope_windows(ctx, cfg, unit)
+        _battery_scope_work(ctx, cfg, unit)
+        if _config_revision(cfg) != revision:
+            return committed
+        after = _hour_cells(ctx, cfg, scope, hour_ns)
+        current = _read_dirty_generation(ctx, scope, hour_ns)
+        if (observed and current != observed) or (not observed and current):
             continue
-        _commit_checkpoint(ctx, scope, hour_ns, observed[key], revision,
-                           now_ns, after.get(key, ""))
+        if after != before:
+            continue
+        _commit_checkpoint(ctx, scope, hour_ns, observed, revision, now_ns, after)
         done.add(key)
         committed += 1
     for scope, entry in listed.items():
@@ -4749,6 +4805,8 @@ def run_pass(ctx, cfg, path=STATUS_PATH):
     try:
         counts, failed, durations, freshness = run_all(ctx, cfg, progress)
         try:
+            if "vehicle_discovery" in failed:
+                raise SqlError("vehicle discovery unavailable")
             status["vehicle_window_lag_seconds"] = vehicle_window_lag(ctx)
             status["vehicle_window_observation_timestamp_seconds"] = time.time()
             status["vehicle_window_observation_success"] = 1
@@ -4802,15 +4860,26 @@ def run_all(ctx, cfg, progress=None):
             sys.stderr.write("aggregate: error: " + name + ": " + str(e)[:200] + "\n")
             failed.append(name)
 
-    coordinated = sorted(_distinct_scopes(ctx, cfg), key=repr)
-    legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
     run_section("ai", lambda: ai_section(ctx, cfg))
     run_section("logs", lambda: log_section(ctx, cfg))
+    run_section("home", lambda: home_section(ctx, cfg))
+    if progress is not None:
+        progress("vehicle_discovery")
+    started = time.monotonic()
+    try:
+        coordinated = sorted(_distinct_scopes(ctx, cfg), key=repr)
+    except Exception:
+        durations["vehicle_discovery"] = time.monotonic() - started
+        failed.extend(("vehicle_discovery", "vehicle", "trip_charge",
+                       "vehicle_history", "battery"))
+        sys.stderr.write("aggregate: vehicle discovery failed; dependent sections skipped\n")
+        return counts, failed, durations, {"observation_success": 0}
+    durations["vehicle_discovery"] = time.monotonic() - started
+    legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
     run_section("vehicle", lambda: vehicle_section(ctx, legacy))
     run_section("trip_charge", lambda: trip_section(ctx, legacy_trip))
     run_section("vehicle_history",
                 lambda: vehicle_history_section(ctx, cfg, _known=coordinated))
-    run_section("home", lambda: home_section(ctx, cfg))
     run_section("battery", lambda: battery_section(ctx, legacy_bat))
     try:
         freshness = vehicle_freshness(ctx)

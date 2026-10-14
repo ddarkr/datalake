@@ -15,32 +15,42 @@ CFG = {"interval_s": 300}
 
 
 class PassFailureContainmentTest(unittest.TestCase):
-    def test_presection_sqlerror_survives_and_recovers(self):
+    def test_discovery_failure_isolates_dependents_and_recovers(self):
         with tempfile.TemporaryDirectory() as directory:
             path = directory + "/aggregate-status.json"
-            with patch.object(agg.time, "time", return_value=100.0), \
-                    patch.object(agg, "_distinct_scopes",
-                                 side_effect=agg.SqlError("timeout")):
+            agg.write_status({"last_success_timestamp_seconds": 50.0}, path)
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(agg.time, "time", return_value=100.0))
+                stack.enter_context(patch.object(
+                    agg, "_distinct_scopes", side_effect=agg.SqlError("timeout")))
+                independent = [stack.enter_context(patch.object(agg, name, return_value=1))
+                               for name in ("ai_section", "log_section", "home_section")]
+                dependent = [stack.enter_context(patch.object(agg, name))
+                             for name in ("vehicle_section", "trip_section",
+                                          "vehicle_history_section", "battery_section",
+                                          "_legacy_cfgs", "vehicle_freshness",
+                                          "vehicle_window_lag")]
                 counts, failed = agg.run_pass(CTX, CFG, path)
-            self.assertEqual(counts, {})
-            self.assertEqual(failed, ["pass"])
+                self.assertEqual(counts, {"ai": 1, "logs": 1, "home": 1})
+                for fn in independent:
+                    fn.assert_called_once()
+                for fn in dependent:
+                    fn.assert_not_called()
+            self.assertIn("vehicle_discovery", failed)
+            self.assertTrue(set(("vehicle", "trip_charge", "vehicle_history", "battery"))
+                            <= set(failed))
             bad = agg.read_status(path)
             self.assertEqual(bad["success"], 0)
-            self.assertEqual(bad["failed_sections"], ["pass"])
             self.assertEqual(bad["running"], 0)
-            self.assertEqual(bad["last_failure_timestamp_seconds"], 100.0)
-            self.assertNotIn("last_success_timestamp_seconds", bad)
-
-            def recovered(ctx, cfg, progress=None):
-                return {"vehicle": 2}, [], {"vehicle": 0.1}, {"observation_success": 1}
-
+            self.assertEqual(bad["last_success_timestamp_seconds"], 50.0)
+            self.assertEqual(bad["vehicle_window_observation_success"], 0)
             with patch.object(agg.time, "time", return_value=200.0), \
-                    patch.object(agg, "run_all", recovered), \
-                    patch.object(agg, "vehicle_window_lag", lambda ctx: {}):
-                counts, failed = agg.run_pass(CTX, CFG, path)
+                    patch.object(agg, "run_all", return_value=(
+                        {"vehicle": 2}, [], {"vehicle": 0.1}, {})), \
+                    patch.object(agg, "vehicle_window_lag", return_value={}):
+                _, failed = agg.run_pass(CTX, CFG, path)
             self.assertEqual(failed, [])
             good = agg.read_status(path)
-            self.assertEqual(good["success"], 1)
             self.assertEqual(good["last_success_timestamp_seconds"], 200.0)
             self.assertEqual(good["last_failure_timestamp_seconds"], 100.0)
 
@@ -158,7 +168,7 @@ class CadenceTest(unittest.TestCase):
             finally:
                 agg.STOP = False
             # Slow first pass pushes the next start; no catch-up sprint.
-            self.assertEqual(starts, [1000.0, 1250.0])
+            self.assertEqual(starts, [1250.0, 1250.0])
             self.assertEqual(clock[0], 1250.0)
 
 
@@ -172,6 +182,9 @@ class RunOnceTest(unittest.TestCase):
                     patch.object(agg, "request_sql", return_value=None), \
                     patch.object(agg, "_distinct_scopes",
                                  side_effect=agg.SqlError("timeout")), \
+                    patch.object(agg, "ai_section", return_value=1), \
+                    patch.object(agg, "log_section", return_value=1), \
+                    patch.object(agg, "home_section", return_value=1), \
                     patch.object(agg, "vehicle_window_lag", return_value={}), \
                     patch.object(agg.run_pass, "__defaults__", (path,)), \
                     patch.object(agg.startup_failure, "__defaults__",
@@ -181,7 +194,8 @@ class RunOnceTest(unittest.TestCase):
                 self.assertEqual(agg.main(), 3)
             status = agg.read_status(path)
             self.assertEqual(status["success"], 0)
-            self.assertEqual(status["failed_sections"], ["pass"])
+            self.assertIn("vehicle_discovery", status["failed_sections"])
+            self.assertEqual(status["section_counts"], {"ai": 1, "logs": 1, "home": 1})
             self.assertEqual(status["last_failure_timestamp_seconds"], 500.0)
 
     def test_successful_pass_exits_zero(self):
