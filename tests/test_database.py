@@ -1290,676 +1290,114 @@ def _vehicle_cfg(**over):
     return cfg
 
 
-def _cell(scope, hour_ns, fake_rows):
-    """Expected per-hour raw cell from the fake row table."""
-    row = (fake_rows or {}).get((scope, hour_ns))
-    if row is None:
-        return agg._hour_fingerprint(1, hour_ns, None)
-    _h, count, max_event, max_ingest = row
-    return agg._hour_fingerprint(count, max_event, max_ingest)
+def _fake_db(dirty_rows=(), checkpoint_rows=(), generations=None):
+    committed = []
+    def dirty(ctx, cfg, cutoff, seal):
+        return {(s, h): g for s, h, g in dirty_rows if cutoff <= h < seal}
+    def checkpoints(ctx, cfg, cutoff, seal):
+        return {(r[0], r[1]): tuple(r[2:]) for r in checkpoint_rows
+                if cutoff <= r[1] < seal}
+    def read(ctx, scope, hour):
+        return (generations or {}).get((scope, hour))
+    def commit(ctx, scope, hour, gen, rev, now):
+        committed.append((scope, hour, gen, rev, ""))
+    return dirty, checkpoints, read, commit, committed
 
 
-def _fake_db(dirty_rows=(), checkpoint_rows=(), scope_hours=(),
-             oldest_ns=None, generations=None, committed=None,
-             sweep_state=None, scope_list=None, fake_rows=None):
-    """Behavioral fake backend over patched helpers (no SQL strings here).
-    dirty_rows: [((v,s,e), hour_ns, gen)]; checkpoint_rows: [((v,s,e),
-    hour_ns, gen, rev)] or [((v,s,e), hour_ns, gen, rev, fp)]; scope_hours:
-    {scope: [hour_ns with raw rows]}; oldest_ns: {scope: oldest raw ns};
-    generations: {(scope, hour): gen} for the re-read;
-    committed/sweep_state record writes. sweep_state: {scope: (cursor_ns,
-    rev)}. fake_rows: {(scope, hour): (hour, count, max_event, max_ingest)}
-    overriding the default (hour, 1, hour, None) raw cells."""
-    generations = generations if generations is not None else {}
-    committed = committed if committed is not None else []
-    fake_rows = fake_rows if fake_rows is not None else {}
-    sweeps = {}
-    for scope, entry in (sweep_state or {}).items():
-        if isinstance(entry, tuple):
-            sweeps[scope] = (entry[0], entry[1] if len(entry) > 1 else "")
-        else:
-            sweeps[scope] = (entry, "")
-    sweep_writes = []
-
-    def fake_distinct(ctx, cfg):
-        return set(scope_list) if scope_list is not None else set(
-            scope_hours)
-
-    def fake_oldest(ctx, scope):
-        return (oldest_ns or {}).get(scope)
-
-    def fake_list(ctx, cfg, scope, start_ns, seal_ns):
-        rows = [fake_rows.get((scope, h), (h, 1, h, None))
-                for h in (scope_hours.get(scope, ()))
-                if start_ns <= h < seal_ns
-                and h < start_ns + agg.DIRTY_LIST_HOURS * agg.HOUR_NS]
-        end = min(start_ns + agg.DIRTY_LIST_HOURS * agg.HOUR_NS, seal_ns)
-        return sorted(rows), end
-
-    def fake_load_dirty(ctx, cfg, cutoff_ns, seal_ns):
-        return {(s, h): g for (s, h, g) in dirty_rows
-                if cutoff_ns <= h < seal_ns
-                and (not cfg.get("vehicle") or s[0] == cfg["vehicle"])}
-
-    def fake_load_checkpoints(ctx, cfg, cutoff_ns, seal_ns):
-        out = {}
-        for row in checkpoint_rows:
-            s, h, g, r = row[0], row[1], row[2], row[3]
-            fp = row[4] if len(row) > 4 else _cell(s, h, fake_rows)
-            if cutoff_ns <= h < seal_ns \
-                    and (not cfg.get("vehicle") or s[0] == cfg["vehicle"]):
-                out[(s, h)] = (g, r, fp)
-        return out
-
-    def fake_sweeps(ctx, cfg):
-        return dict(sweeps)
-
-    def fake_read(ctx, scope, hour_ns):
-        return generations.get((scope, hour_ns))
-
-    def fake_commit(ctx, scope, hour_ns, gen, rev, now_ns, fp=""):
-        committed.append((scope, hour_ns, gen, rev, fp))
-
-    def fake_sweep(ctx, scope, next_ns, rev, now_ns):
-        sweeps[scope] = (next_ns, rev)
-        sweep_writes.append((scope, next_ns, rev))
-    return (fake_distinct, fake_oldest, fake_list, fake_load_dirty,
-            fake_load_checkpoints, fake_sweeps, fake_read, fake_commit,
-            fake_sweep, committed, sweep_writes)
-
-
-def _patch_coordinator(monkey, fakes, work=None, fail_at=None):
-    (fake_distinct, fake_oldest, fake_list, fake_load_dirty,
-     fake_load_checkpoints, fake_sweeps, fake_read, fake_commit,
-     fake_sweep, committed, sweeps) = fakes
+def _patch_coordinator(monkey, fakes, fail_at=None):
+    dirty, checkpoints, read, commit, committed = fakes
     calls = {"rollup": [], "trip": [], "battery": []}
-    scope_windows_seen = {}
-
-    def fake_rollup(ctx, cfg, scopes_hours):
-        calls["rollup"].append(list(scopes_hours))
-        return {h for (_, h) in scopes_hours}
-
-    def fake_trip(ctx, cfg, pending):
-        calls["trip"].append(dict(pending))
-        if fail_at == "trip":
-            raise agg.SqlError("boom")
-        return dict.fromkeys(pending, True)
-
-    def fake_battery(ctx, cfg, pending):
-        calls["battery"].append(dict(pending))
-        for (scope, hour_ns) in pending:
-            assert scope[1] == "can", scope
-            scope_windows_seen.setdefault(scope, []).append(
-                (hour_ns, hour_ns + agg.HOUR_NS - 1))
-        if fail_at == "battery":
-            raise agg.SqlError("battery boom")
-        return dict.fromkeys(pending, True)
-
-    if work is not None:
-        fake_rollup, fake_trip, fake_battery = work
-    patches = [patch.object(agg, "_distinct_scopes", fake_distinct),
-               patch.object(agg, "_flushed_floor_ns", lambda ctx: None),
-               patch.object(agg, "_raw_coverage_ns", fake_oldest),
-               patch.object(agg, "_list_scope_hours", fake_list),
-               patch.object(agg, "_load_dirty", fake_load_dirty),
-               patch.object(agg, "_load_checkpoints", fake_load_checkpoints),
-               patch.object(agg, "_load_sweeps", fake_sweeps),
-               patch.object(agg, "_read_dirty_generation", fake_read),
-               patch.object(agg, "_commit_checkpoint", fake_commit),
-               patch.object(agg, "_commit_sweep", fake_sweep),
-               patch.object(agg, "_rollup_hour_windows", fake_rollup),
-               patch.object(agg, "_trip_charge_scope_windows", fake_trip),
-               patch.object(agg, "_battery_scope_work", fake_battery)]
-    for p in patches:
+    def work(name):
+        def apply(ctx, cfg, pending):
+            calls[name].append(pending)
+            if fail_at == name:
+                raise agg.SqlError("work failed")
+        return apply
+    for name, fn in (("_load_dirty", dirty), ("_load_checkpoints", checkpoints),
+                     ("_read_dirty_generation", read), ("_commit_checkpoint", commit),
+                     ("_rollup_hour_windows", work("rollup")),
+                     ("_trip_charge_scope_windows", work("trip")),
+                     ("_battery_scope_work", work("battery"))):
+        p = patch.object(agg, name, fn)
         monkey.append(p)
         p.start()
-    return calls, scope_windows_seen, committed, sweeps
+    return calls, committed
 
 
 def _unpatch(monkey):
     for p in reversed(monkey):
-        try:
-            p.stop()
-        except RuntimeError:
-            pass
+        p.stop()
     del monkey[:]
 
 
-def test_coordinator_bootstrap_visits_prenotification_history():
-    # 4-day-old raw hours with NO dirty notification are listed from raw
-    # coverage and checkpointed "" after work commits; the sweep cursor
-    # advances only past committed hours.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 90 * agg.HOUR_NS  # beyond the old 96h cutoff: no age discard
-    scope = ("v", "can", "e1")
-    monkey = []
-    try:
-        fakes = _fake_db(scope_hours={scope: [old]},
-                         oldest_ns={scope: old + 7},
-                         scope_list=[scope])
-        calls, seen, committed, sweeps = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert [(c[0], c[1], c[2], c[3]) for c in committed] == [
-            (scope, old, "", agg._config_revision(_vehicle_cfg()))], committed
-        assert sweeps and sweeps[0][0] == scope and sweeps[0][1] > old
-        assert calls["rollup"] and calls["trip"] and calls["battery"]
-        # Restart: same revision checkpoint + empty re-list -> no recompute.
-        rev = agg._config_revision(_vehicle_cfg())
-        _unpatch(monkey)
-        fakes = _fake_db(checkpoint_rows=[(scope, old, "", rev)],
-                         scope_hours={scope: [old]},
-                         oldest_ns={scope: old + 7},
-                         scope_list=[scope],
-                         sweep_state={scope: (old + agg.HOUR_NS, "")})
-        calls2, _, committed2, _ = _patch_coordinator(monkey, fakes)
-        before = (list(calls2["rollup"]), list(calls2["trip"]),
-                  list(calls2["battery"]))
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 0
-        assert committed2 == []
-        assert (list(calls2["rollup"]), list(calls2["trip"]),
-                list(calls2["battery"])) == before
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_older_notified_windows_have_no_age_cutoff():
-    # Dirty rows older than any fixed cutoff still pend and commit; the
-    # re-read guards a mid-pass generation race; failures never checkpoint.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 150 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    key = (scope, old)
-    monkey = []
-    try:
-        fakes = _fake_db(dirty_rows=[(scope, old, "gen-old")],
-                         scope_hours={scope: [old]},
-                         oldest_ns={scope: old},
-                         generations={key: "gen-old"},
-                         scope_list=[scope],
-                         sweep_state={scope: (old, "")})
-        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert committed[0][:3] == (scope, old, "gen-old"), committed
-        # Mid-pass race: dirty row moved to gen2 -> re-read mismatch, stays.
-        _unpatch(monkey)
-        fakes = _fake_db(dirty_rows=[(scope, old, "gen-old")],
-                         scope_hours={scope: [old]},
-                         oldest_ns={scope: old},
-                         generations={key: "gen2"},
-                         scope_list=[scope],
-                         sweep_state={scope: (old, "")})
-        _, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 0
-        assert committed == []
-        # Section failure propagates and checkpoints nothing.
-        _unpatch(monkey)
-        fakes = _fake_db(dirty_rows=[(scope, old, "gen-old")],
-                         scope_hours={scope: [old]},
-                         oldest_ns={scope: old},
-                         generations={key: "gen-old"},
-                         scope_list=[scope],
-                         sweep_state={scope: (old, "")})
-        _patch_coordinator(monkey, fakes, fail_at="trip")
+def test_coordinator_notified_generation_only():
+    now = __import__("datetime").datetime(2026, 9, 20, 12)
+    hour = agg.dt_to_ns(now) - 150 * agg.HOUR_NS
+    scope = ("v", "can", "e")
+    key = (scope, hour)
+    for stored, generation, expected in (
+            ([], "new", 1),
+            ([(scope, hour, "new", "old-code-sha", "old-fingerprint")], "new", 0),
+            ([(scope, hour, "old", "old-code-sha", "")], "new", 1)):
+        monkey = []
         try:
-            agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now=now)
+            calls, committed = _patch_coordinator(monkey, _fake_db(
+                [(scope, hour, generation)], stored, {key: generation}))
+            assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == expected
+            assert len(committed) == expected
+            assert all(len(v) == expected for v in calls.values())
+            if expected:
+                assert committed[0][:3] == (scope, hour, generation)
+        finally:
+            _unpatch(monkey)
+
+
+def test_coordinator_unnotified_raw_is_not_discovered():
+    now = __import__("datetime").datetime(2026, 9, 20, 12)
+    scope = ("v", "can", "e")
+    raw_reads = []
+    def sql(base, auth, db, stmt, **kwargs):
+        if "FROM vehicle_signal " in stmt:
+            raw_reads.append(stmt)
+            return _records(["vehicle", "source", "decode_epoch"], [list(scope)])
+        return _records(["vehicle", "source", "decode_epoch"], [])
+    with patch.object(agg, "request_sql", side_effect=sql), \
+            patch.object(agg, "_rollup_hour_windows") as rollup, \
+            patch.object(agg, "_trip_charge_scope_windows") as trip, \
+            patch.object(agg, "_battery_scope_work") as battery:
+        assert agg._distinct_scopes(("", "", ""), _vehicle_cfg()) == set()
+        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == 0
+        assert not raw_reads
+        rollup.assert_not_called()
+        trip.assert_not_called()
+        battery.assert_not_called()
+
+
+def test_coordinator_midpass_generation_change_and_failure_do_not_checkpoint():
+    now = __import__("datetime").datetime(2026, 9, 20, 12)
+    hour = agg.dt_to_ns(now) - agg.HOUR_NS
+    scope = ("v", "can", "e")
+    key = (scope, hour)
+    generations = {key: "gen1"}
+    monkey = []
+    try:
+        _, committed = _patch_coordinator(monkey, _fake_db(
+            [(scope, hour, "gen1")], generations=generations))
+        def arriving(ctx, cfg, pending):
+            generations[key] = "gen2"
+        with patch.object(agg, "_battery_scope_work", arriving):
+            assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == 0
+        assert committed == []
+        _unpatch(monkey)
+        generations[key] = "gen1"
+        _, committed = _patch_coordinator(monkey, _fake_db(
+            [(scope, hour, "gen1")], generations=generations), fail_at="trip")
+        try:
+            agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now)
         except agg.SqlError:
             pass
         else:
-            raise AssertionError("expected SqlError")
-        assert fakes[9] == []
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_cursor_progress_and_config_invalidation():
-    # Two listed hours, one already checkpointed under this revision: only
-    # the missing hour is recomputed; a stale revision reworks both.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    hours = [seal - 3 * agg.HOUR_NS, seal - 2 * agg.HOUR_NS]
-    scope = ("v", "can", "e1")
-    rev = agg._config_revision(_vehicle_cfg())
-    monkey = []
-    try:
-        fakes = _fake_db(
-            scope_hours={scope: hours}, oldest_ns={scope: hours[0]},
-            checkpoint_rows=[(scope, hours[0], "", rev)],
-            scope_list=[scope])
-        calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert [c[1] for c in committed] == [hours[1]], committed
-        assert sweeps and sweeps[0][1] == seal, sweeps
-        # Stale revision checkpoints: both hours rework under the new rev.
-        _unpatch(monkey)
-        fakes = _fake_db(
-            scope_hours={scope: hours}, oldest_ns={scope: hours[0]},
-            checkpoint_rows=[(scope, hours[0], "", "stale"),
-                             (scope, hours[1], "", "stale")],
-            scope_list=[scope])
-        _, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 2
-        assert sorted(c[1] for c in committed) == sorted(hours), committed
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_rotates_past_fifty_scopes():
-    # 60 scopes: the first pass lists the first 50 by rotation, the next
-    # pass lists the remaining 10; every scope commits exactly once and
-    # legacy sections exclude ALL coordinated CAN scopes each pass.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    hour = seal - agg.HOUR_NS
-    scopes = [("v%02d" % i, "can", "e1") for i in range(60)]
-    monkey = []
-    try:
-        fakes = _fake_db(
-            scope_hours={s: [hour] for s in scopes},
-            oldest_ns={s: hour for s in scopes},
-            scope_list=scopes)
-        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == agg.DIRTY_SWEEP_SCOPES
-        assert len(committed) == agg.DIRTY_SWEEP_SCOPES, len(committed)
-        listed_first = {c[0] for c in committed}
-        assert len(listed_first) == agg.DIRTY_SWEEP_SCOPES
-        rev = agg._config_revision(_vehicle_cfg())
-        carried = {s: (hour + agg.HOUR_NS, rev) for s in listed_first}
-        _unpatch(monkey)
-        fakes = _fake_db(
-            scope_hours={s: [hour] for s in scopes},
-            oldest_ns={s: hour for s in scopes},
-            checkpoint_rows=[(s, hour, "", rev) for s in listed_first],
-            scope_list=scopes,
-            sweep_state=carried)
-        _, _, committed2, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == len(scopes) - len(
-                                               listed_first)
-        assert {c[0] for c in committed2} == set(scopes) - listed_first
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_empty_gap_advances_without_recompute():
-    # A >48h empty gap followed by new raw: the empty checklist still
-    # advances the cursor (no recompute, returns 0), so the later hour is
-    # reached on the next pass instead of stalling forever.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    scope = ("v", "can", "e1")
-    cursor = seal - 100 * agg.HOUR_NS
-    new = seal - agg.HOUR_NS
-    monkey = []
-    try:
-        state = {scope: (cursor, "")}
-        advanced = None
-        for _ in range(5):
-            fakes = _fake_db(
-                scope_hours={scope: [new]}, oldest_ns={scope: cursor},
-                scope_list=[scope], sweep_state=dict(state))
-            calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-            result = agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                                 now=now)
-            _unpatch(monkey)
-            if result == 1:
-                assert [c[1] for c in committed] == [new], committed
-                break
-            assert committed == []
-            assert not calls["rollup"] and not calls["trip"] \
-                and not calls["battery"]
-            assert sweeps and sweeps[0][1] > state[scope][0], sweeps
-            state = {scope: (sweeps[-1][1], "")}
-            advanced = sweeps[-1][1]
-        else:
-            raise AssertionError("gap never crossed: %r" % (state,))
-        assert advanced is not None and advanced > cursor
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_late_dirty_behind_cursor_still_pends():
-    # A late notification for an hour BEHIND the advanced cursor pends via
-    # the dirty table even though the raw listing has moved past it.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 100 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    key = (scope, old)
-    monkey = []
-    try:
-        fakes = _fake_db(dirty_rows=[(scope, old, "gen-late")],
-                         scope_hours={scope: []},
-                         oldest_ns={scope: seal - agg.HOUR_NS},
-                         generations={key: "gen-late"},
-                         scope_list=[scope],
-                         sweep_state={scope: (seal, "")})
-        _, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert committed[0][:3] == (scope, old, "gen-late"), committed
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_revision_revisits_completed_history():
-    # Completed history under rev A re-pends after the revision changes:
-    # both the dirty re-notification and the sweep re-list it.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 200 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    monkey = []
-    try:
-        fakes = _fake_db(
-            dirty_rows=[(scope, old, "gen1")],
-            scope_hours={scope: [old]}, oldest_ns={scope: old},
-            generations={(scope, old): "gen1"},
-            checkpoint_rows=[(scope, old, "gen1", "rev-A")],
-            scope_list=[scope],
-            sweep_state={scope: (old, "rev-A")})
-        _, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert committed and committed[0][1] == old, committed
-        assert committed[0][3] != "rev-A", committed
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_sweep_single_row_per_scope():
-    # Repeated progress overwrites one row per scope: two advances leave
-    # exactly one sweep entry holding the latest cursor.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    hours = [seal - 60 * agg.HOUR_NS, seal - 55 * agg.HOUR_NS]
-    scope = ("v", "can", "e1")
-    monkey = []
-    try:
-        fakes = _fake_db(
-            scope_hours={scope: hours}, oldest_ns={scope: hours[0]},
-            scope_list=[scope])
-        _, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 2
-        assert len({s for (s, _h, _r) in sweeps}) == 1, sweeps
-        _unpatch(monkey)
-        rev = agg._config_revision(_vehicle_cfg())
-        fakes = _fake_db(
-            scope_hours={scope: hours}, oldest_ns={scope: hours[0]},
-            checkpoint_rows=[(scope, h, "", rev) for h in hours],
-            scope_list=[scope],
-            sweep_state={scope: (sweeps[0][1], rev)})
-        _, _, committed2, sweeps2 = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 0
-        assert committed2 == []
-        assert sweeps2 and sweeps2[0][1] >= sweeps[0][1], (sweeps, sweeps2)
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_multiwindow_scopes_all_complete():
-    # 55 scopes x 2 checklist windows each: least-advanced-cursor order
-    # completes every scope across passes (no 51st-scope starvation).
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    scopes = [("v%02d" % i, "can", "e1") for i in range(55)]
-    hours = {s: [seal - 100 * agg.HOUR_NS, seal - agg.HOUR_NS] for s in scopes}
-    monkey = []
-    try:
-        state, done, passes = {}, set(), 0
-        while len(done) < len(scopes) and passes < 8:
-            fakes = _fake_db(
-                scope_hours=hours,
-                oldest_ns={s: hours[s][0] for s in scopes},
-                checkpoint_rows=[(s, h, "", agg._config_revision(
-                    _vehicle_cfg())) for s in done for h in hours[s]],
-                scope_list=scopes, sweep_state=dict(state))
-            calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-            result = agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                                 now=now)
-            _unpatch(monkey)
-            passes += 1
-            for c in committed:
-                if c[1] == hours[c[0]][-1]:
-                    done.add(c[0])
-            for (s, nxt, _r) in sweeps:
-                state[s] = (nxt, "")
-            if result == 0 and not sweeps:
-                break
-        assert done == set(scopes), (len(done), passes)
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_sealed_cursor_revisits_history():
-    # Cursor at seal (steady state) performs a bounded periodic revisit of
-    # oldest history instead of skipping: unchanged hours stay skipped via
-    # checkpoints, so the pass returns 0 but the cursor fingerprint refreshes.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 90 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    rev = agg._config_revision(_vehicle_cfg())
-    monkey = []
-    try:
-        fakes = _fake_db(
-            scope_hours={scope: [old]}, oldest_ns={scope: old},
-            checkpoint_rows=[(scope, old, "", rev)],
-            scope_list=[scope],
-            sweep_state={scope: (seal, rev)})
-        calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 0
-        assert committed == []
-        assert not calls["rollup"] and not calls["trip"] \
-            and not calls["battery"]
-        assert sweeps, sweeps
-    finally:
-        _unpatch(monkey)
-
-
-
-
-def test_coordinator_late_nonotice_fingerprint_recomputes():
-    # Same revision, new raw rows behind the cursor, no dirty notification:
-    # the fingerprint changes, the hour re-pends as "" and recomputes.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 90 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    rev = agg._config_revision(_vehicle_cfg())
-    monkey = []
-    try:
-        rows_v1 = {(scope, old): (old, 5, old + 100, None)}
-        fakes = _fake_db(
-            scope_hours={scope: [old]}, oldest_ns={scope: old},
-            checkpoint_rows=[(scope, old, "", rev)],
-            scope_list=[scope],
-            sweep_state={scope: (old, rev)},
-            fake_rows=rows_v1)
-        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 0
-        assert committed == [] and not calls["rollup"]
-        _unpatch(monkey)
-        rows_v2 = {(scope, old): (old, 9, old + 999, None)}
-        v1_fp = agg._hour_fingerprint(5, old + 100, None)
-        fakes = _fake_db(
-            scope_hours={scope: [old]}, oldest_ns={scope: old},
-            checkpoint_rows=[(scope, old, "", rev, v1_fp)],
-            scope_list=[scope],
-            sweep_state={scope: (old, rev)},
-            fake_rows=rows_v2)
-        _, _, committed2, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert [c[1] for c in committed2] == [old], committed2
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_twopage_complete_then_zero():
-    # Two-page (>48h) history: complete both pages, then reconcile again
-    # with zero work — page A is NOT re-pended once its checkpoint holds
-    # the same per-hour cells (no repeat-forever).
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    scope = ("v", "can", "e1")
-    page_a = [seal - 100 * agg.HOUR_NS + i * agg.HOUR_NS for i in range(10)]
-    page_b = [seal - 30 * agg.HOUR_NS + i * agg.HOUR_NS for i in range(10)]
-    hours = sorted(page_a + page_b)
-    rev = agg._config_revision(_vehicle_cfg())
-    monkey = []
-    try:
-        state, done_fp = {}, {}
-        for _ in range(6):
-            fakes = _fake_db(
-                scope_hours={scope: hours},
-                oldest_ns={scope: hours[0]},
-                checkpoint_rows=[(s, h, g, r, fp)
-                                 for (s, h), (g, r, fp) in done_fp.items()],
-                scope_list=[scope], sweep_state=dict(state))
-            calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-            result = agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                                 now=now)
-            _unpatch(monkey)
-            for c in committed:
-                done_fp[(c[0], c[1])] = (c[2], c[3], c[4])
-            for (s, nxt, _r) in sweeps:
-                state[s] = (nxt, rev)
-            if result == 0:
-                break
-        assert len(done_fp) == len(hours), (len(done_fp), state)
-        _unpatch(monkey)
-        fakes = _fake_db(
-            scope_hours={scope: hours},
-            oldest_ns={scope: hours[0]},
-            checkpoint_rows=[(s, h, g, r, fp)
-                             for (s, h), (g, r, fp) in done_fp.items()],
-            scope_list=[scope], sweep_state=dict(state))
-        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
-        try:
-            assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                               now=now) == 0
-            assert committed == []
-            assert not calls["rollup"] and not calls["trip"] \
-                and not calls["battery"]
-        finally:
-            _unpatch(monkey)
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_late_nonotice_old_page_after_new():
-    # Page B completes; then late no-notify rows land on old page A:
-    # only page-A hours recompute, page B stays skipped.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    scope = ("v", "can", "e1")
-    page_a = [seal - 100 * agg.HOUR_NS + i * agg.HOUR_NS for i in range(5)]
-    page_b = [seal - 30 * agg.HOUR_NS + i * agg.HOUR_NS for i in range(5)]
-    rev = agg._config_revision(_vehicle_cfg())
-    monkey = []
-    try:
-        done_fp = {(scope, h): ("", rev, agg._hour_fingerprint(1, h, None))
-                   for h in page_a + page_b}
-        target = page_a[2]
-        v2_rows = {(scope, h): (h, 1, h, None) for h in page_a + page_b}
-        v2_rows[(scope, target)] = (target, 7, target + 5, None)
-        fakes = _fake_db(
-            scope_hours={scope: page_a + page_b},
-            oldest_ns={scope: page_a[0]},
-            checkpoint_rows=[(s, h, g, r, fp)
-                             for (s, h), (g, r, fp) in done_fp.items()],
-            scope_list=[scope],
-            sweep_state={scope: (page_a[0], rev)},
-            fake_rows=v2_rows)
-        _, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert [c[1] for c in committed] == [target], committed
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_legacy_blank_fingerprint_repends_once():
-    # Same-rev checkpoint WITHOUT a fingerprint never blind-skips: it
-    # re-pends once, commits WITH the current cells, and the next pass is
-    # zero-work (no repeat-forever).
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 90 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    rev = agg._config_revision(_vehicle_cfg())
-    monkey = []
-    try:
-        import unittest.mock as _mock
-        with _mock.patch.object(agg, "_load_checkpoints",
-                                lambda ctx, cfg, co, se: {
-                                    (scope, old): ("", rev, "")}):
-            fakes = _fake_db(
-                scope_hours={scope: [old]}, oldest_ns={scope: old},
-                scope_list=[scope])
-            calls, _, committed, _ = _patch_coordinator(monkey, fakes)
-            assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                               now=now) == 1
-            assert len(committed) == 1 and committed[0][4] != "", committed
-            stored_fp = committed[0][4]
-        _unpatch(monkey)
-        fakes = _fake_db(
-            scope_hours={scope: [old]}, oldest_ns={scope: old},
-            checkpoint_rows=[(scope, old, "", rev, stored_fp)],
-            scope_list=[scope],
-            sweep_state={scope: (old, rev)})
-        calls, _, committed2, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 0
-        assert committed2 == [] and not calls["rollup"]
-    finally:
-        _unpatch(monkey)
-
-
-def test_coordinator_midpass_notify_on_swept_hour_blocks():
-    # An unnotified hour gains a notification DURING work: the post-work
-    # recheck sees it and blocks the "" checkpoint (stays dirty).
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old = seal - 90 * agg.HOUR_NS
-    scope = ("v", "can", "e1")
-    phase = {"stage": "observe"}
-    monkey = []
-    try:
-        fakes = _fake_db(
-            scope_hours={scope: [old]}, oldest_ns={scope: old},
-            scope_list=[scope])
-        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
-
-        def arriving_read(ctx, sc, hour_ns):
-            if phase["stage"] == "observe":
-                return None
-            return "gen-arrived"
-
-        def phased_roll(ctx, cfg, scopes_hours):
-            phase["stage"] = "work"
-            return {h for (_, h) in scopes_hours}
-
-        import unittest.mock as _mock
-        with _mock.patch.object(agg, "_read_dirty_generation",
-                                arriving_read), \
-                _mock.patch.object(agg, "_rollup_hour_windows",
-                                    phased_roll):
-            assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                               now=now) == 0
+            raise AssertionError("work failure must propagate")
         assert committed == []
     finally:
         _unpatch(monkey)
@@ -1999,236 +1437,6 @@ def test_battery_worker_uses_only_scoped_call():
 
 
 
-def test_discovery_registers_frontier_window_durably():
-    # Frontier window lists a new unnotified scope: it registers a sweep
-    # row at the flushed floor hour before the cursor advances, so a
-    # restart retries from the committed cursor instead of rescanning.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old_scope = ("v", "can", "e1")
-    new_scope = ("w", "can", "e2")
-    floor_hr = seal - 300 * agg.HOUR_NS
-    frontier = floor_hr + 10 * agg.HOUR_NS
-    import unittest.mock as _mock
-    writes, cursors = [], []
-    with _mock.patch.object(agg, "_registered_scopes",
-                            lambda ctx, cfg: {old_scope}), \
-            _mock.patch.object(agg, "_flushed_floor_ns",
-                               lambda ctx: floor_hr), \
-            _mock.patch.object(agg, "_load_bootstrap_cursor",
-                               lambda ctx, cfg: frontier), \
-            _mock.patch.object(agg, "_bootstrap_window_scopes",
-                               lambda ctx, cfg, s, e: (
-                                   {new_scope} if s == frontier else set())), \
-            _mock.patch.object(agg, "_commit_sweep",
-                               lambda ctx, scope, start, rev, now_ns: writes.append(
-                                   (scope, start))), \
-            _mock.patch.object(agg, "_commit_bootstrap_cursor",
-                               lambda ctx, cfg, nxt, rev, now_ns: cursors.append(
-                                   ("bootstrap", nxt))), \
-            _mock.patch.object(agg, "_load_reconcile_cursor",
-                               lambda ctx, cfg: seal), \
-            _mock.patch.object(agg, "_commit_reconcile_cursor",
-                               lambda *a: cursors.append(("reconcile", a[2]))):
-        first = agg._distinct_scopes(("", "", ""), _vehicle_cfg())
-    assert first == {old_scope, new_scope}, first
-    assert writes == [(new_scope, floor_hr)], writes
-    assert ("bootstrap", frontier + agg.DIRTY_LIST_HOURS * agg.HOUR_NS) \
-        in cursors, cursors
-    # Failure BEFORE the cursor commit retries the window, not skips it.
-    seen = []
-    with _mock.patch.object(agg, "_registered_scopes",
-                            lambda ctx, cfg: {old_scope}), \
-            _mock.patch.object(agg, "_flushed_floor_ns",
-                               lambda ctx: floor_hr), \
-            _mock.patch.object(agg, "_load_bootstrap_cursor",
-                               lambda ctx, cfg: frontier), \
-            _mock.patch.object(agg, "_bootstrap_window_scopes",
-                               lambda ctx, cfg, s, e: {new_scope}), \
-            _mock.patch.object(agg, "_sweep_start_ns",
-                               lambda ctx, fhr, scope: floor_hr), \
-            _mock.patch.object(agg, "_commit_sweep",
-                               lambda *a: seen.append("sweep")), \
-            _mock.patch.object(agg, "_commit_bootstrap_cursor",
-                               lambda *a: (_ for _ in ()).throw(
-                                   agg.SqlError("cursor down"))):
-        try:
-            agg._distinct_scopes(("", "", ""), _vehicle_cfg())
-        except agg.SqlError:
-            pass
-        else:
-            raise AssertionError("cursor failure must propagate")
-    assert seen == ["sweep"], seen
-
-
-def test_discovery_reconcile_finds_late_scope_behind_cursor():
-    # Frontier already walked past an old hour; a newly inserted UNNOTIFIED
-    # scope lives behind it. The durable reconcile window eventually lists
-    # that sealed hour and registers the scope at the flushed floor.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old_scope = ("v", "can", "e1")
-    late_scope = ("w", "can", "e2")
-    floor_hr = seal - 300 * agg.HOUR_NS
-    late_hour = floor_hr + 5 * agg.HOUR_NS
-    frontier = seal - 10 * agg.HOUR_NS
-    import unittest.mock as _mock
-    writes = []
-    with _mock.patch.object(agg, "_registered_scopes",
-                            lambda ctx, cfg: {old_scope}), \
-            _mock.patch.object(agg, "_flushed_floor_ns",
-                               lambda ctx: floor_hr), \
-            _mock.patch.object(agg, "_load_bootstrap_cursor",
-                               lambda ctx, cfg: frontier), \
-            _mock.patch.object(agg, "_load_reconcile_cursor",
-                               lambda ctx, cfg: None), \
-            _mock.patch.object(agg, "_bootstrap_window_scopes",
-                               lambda ctx, cfg, s, e: (
-                                   {late_scope} if s == floor_hr else set())), \
-            _mock.patch.object(agg, "_sweep_start_ns",
-                               lambda ctx, fhr, scope: floor_hr), \
-            _mock.patch.object(agg, "_commit_sweep",
-                               lambda ctx, scope, start, rev, now_ns: writes.append(
-                                   (scope, start))), \
-            _mock.patch.object(agg, "_commit_bootstrap_cursor",
-                               lambda *a: None), \
-            _mock.patch.object(agg, "_commit_reconcile_cursor",
-                               lambda *a: None):
-        found = agg._distinct_scopes(("", "", ""), _vehicle_cfg())
-    assert late_scope in found, found
-    assert (late_scope, floor_hr) in writes, writes
-    # source='can' at the exact epoch is discovered; exact separation holds.
-    assert late_scope[1] == "can" and late_scope[2] == "e2", writes
-
-
-def test_discovery_memtable_only_stays_in_memory():
-    # No visible SSTs yet: one bounded window is listed, finds stay in
-    # memory, and no cursor or sweep row is committed. The first post-flush
-    # walk still registers their full history durably.
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    oldest = seal - 72 * agg.HOUR_NS
-    old_scope = ("v", "can", "e1")
-    import unittest.mock as _mock
-
-    def fake_fetch_rows(base_url, auth, db, sql):
-        assert "SELECT MIN(event_time) FROM vehicle_signal" in sql, sql
-        return ["MIN(event_time)"], [[oldest + 7]]
-
-    def fake_window(ctx, cfg, start, end):
-        return {old_scope} if start <= oldest < end else set()
-
-    with _mock.patch.object(agg, "utcnow", lambda: now), \
-            _mock.patch.object(agg, "fetch_rows", fake_fetch_rows), \
-            _mock.patch.object(agg, "_registered_scopes",
-                               lambda ctx, cfg: set()), \
-            _mock.patch.object(agg, "_flushed_floor_ns",
-                               lambda ctx: None), \
-            _mock.patch.object(agg, "_load_bootstrap_cursor",
-                               lambda ctx, cfg: None), \
-            _mock.patch.object(agg, "_bootstrap_window_scopes",
-                               fake_window), \
-            _mock.patch.object(agg, "_commit_sweep",
-                               side_effect=AssertionError(
-                                   "memtable-only commits nothing")), \
-            _mock.patch.object(agg, "_commit_bootstrap_cursor",
-                               side_effect=AssertionError(
-                                   "memtable-only commits nothing")):
-        found = agg._distinct_scopes(("", "", ""), _vehicle_cfg())
-    assert found == {old_scope}, found
-
-
-def test_discovery_metadata_failure_never_scans_raw():
-    import unittest.mock as _mock
-
-    unsafe = AssertionError("unsafe fallback/progress")
-    with _mock.patch.object(agg, "_registered_scopes",
-                           lambda ctx, cfg: set()), \
-            _mock.patch.object(
-                agg, "fetch_rows",
-                side_effect=agg.SqlError("ssts_manifest not found")), \
-            _mock.patch.object(agg, "_raw_coverage_ns",
-                               side_effect=unsafe), \
-            _mock.patch.object(agg, "_bootstrap_window_scopes",
-                               side_effect=unsafe), \
-            _mock.patch.object(agg, "_commit_bootstrap_cursor",
-                               side_effect=unsafe), \
-            _mock.patch.object(agg, "_commit_reconcile_cursor",
-                               side_effect=unsafe):
-        try:
-            agg._distinct_scopes(("", "", ""), _vehicle_cfg())
-        except agg.SqlError as exc:
-            assert "ssts_manifest not found" in str(exc), exc
-        else:
-            raise AssertionError("metadata query failure must propagate")
-
-def test_coordinator_sweep_metadata_failure_never_scans_or_commits():
-    flushed_floor = agg._flushed_floor_ns
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    scope = ("v", "can", "e1")
-    # Both initial bootstrap and a completed cursor must fail closed.
-    for cursor in (None, seal):
-        monkey = []
-        try:
-            fakes = _fake_db(scope_list=[scope], sweep_state=(
-                {} if cursor is None else {scope: (cursor, "")}))
-            calls, _, committed, sweeps = _patch_coordinator(monkey, fakes)
-            error = agg.SqlError("ssts_manifest not found")
-            unsafe = AssertionError("metadata failure must not scan raw")
-            with patch.object(agg, "fetch_rows", side_effect=error) as fetch, \
-                    patch.object(agg, "_flushed_floor_ns", flushed_floor), \
-                    patch.object(agg, "_raw_coverage_ns", side_effect=unsafe), \
-                    patch.object(agg, "_list_scope_hours", side_effect=unsafe):
-                try:
-                    agg.vehicle_history_section(
-                        ("", "", ""), _vehicle_cfg(), now=now, _known=[scope])
-                except agg.SqlError as exc:
-                    assert exc is error, exc
-                else:
-                    raise AssertionError("sweep metadata failure must propagate")
-            assert fetch.call_count == 1, fetch.call_args_list
-            assert "information_schema.ssts_manifest" in fetch.call_args[0][3]
-            assert committed == [] and sweeps == [], (committed, sweeps)
-            assert calls == {"rollup": [], "trip": [], "battery": []}, calls
-        finally:
-            _unpatch(monkey)
-
-
-def test_discovery_filtered_and_unfiltered_cursors_independent():
-    # The vehicle filter rides in each sentinel decode_epoch, so filtered
-    # and unfiltered frontier/reconcile cursors advance independently.
-    assert agg._bootstrap_sentinel({"vehicle": "v"}) != \
-        agg._bootstrap_sentinel({"vehicle": ""})
-    assert agg._reconcile_sentinel({"vehicle": "v"}) != \
-        agg._reconcile_sentinel({"vehicle": ""})
-
-
-def test_discovery_late_notified_row_behind_cursor_still_pends():
-    # Late notified rows on history the cursor passed still pend via
-    # the dirty table (no lower bound on notifications).
-    now = __import__("datetime").datetime(2026, 9, 20, 12, 0, 0)
-    seal = agg.floor_hour_ns(agg.dt_to_ns(now))
-    old_scope = ("v", "can", "e1")
-    new_scope = ("w", "can", "e2")
-    new_hour = seal - 200 * agg.HOUR_NS
-    monkey = []
-    try:
-        fakes = _fake_db(dirty_rows=[(new_scope, new_hour, "gen-late")],
-                         scope_hours={new_scope: []},
-                         oldest_ns={new_scope: seal - agg.HOUR_NS},
-                         generations={(new_scope, new_hour): "gen-late"},
-                         scope_list=[old_scope, new_scope],
-                         sweep_state={new_scope: (seal, "")})
-        _, _, committed, _ = _patch_coordinator(monkey, fakes)
-        assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(),
-                                           now=now) == 1
-        assert committed[0][:3] == (new_scope, new_hour, "gen-late"), committed
-    finally:
-        _unpatch(monkey)
-
-
-
 def test_coordinator_earlier_unit_survives_later_failure_and_retry():
     now = __import__("datetime").datetime(2026, 9, 20, 12)
     seal = agg.floor_hour_ns(agg.dt_to_ns(now))
@@ -2238,8 +1446,7 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
     generations = {(scope, h): "gen" for h in hours}
     monkey = []
     try:
-        fakes = _fake_db(dirty_rows=dirty, scope_hours={scope: hours},
-                         oldest_ns={scope: hours[0]}, generations=generations)
+        fakes = _fake_db(dirty_rows=dirty, generations=generations)
         _patch_coordinator(monkey, fakes)
         units = []
 
@@ -2256,14 +1463,12 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
             else:
                 raise AssertionError("later failure must propagate")
         assert units == [[(scope, hours[0])], [(scope, hours[1])]]
-        assert [row[1] for row in fakes[9]] == [hours[0]]
-        assert not fakes[10], "failure must not skip sweep listing"
-        saved = list(fakes[9])
+        assert [row[1] for row in fakes[4]] == [hours[0]]
+        saved = list(fakes[4])
         _unpatch(monkey)
         fakes = _fake_db(dirty_rows=dirty, checkpoint_rows=saved,
-                         scope_hours={scope: hours}, oldest_ns={scope: hours[0]},
                          generations=generations)
-        calls, _, committed, _ = _patch_coordinator(monkey, fakes)
+        calls, committed = _patch_coordinator(monkey, fakes)
         assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now=now) == 1
         assert [row[1] for row in committed] == [hours[1]]
         assert calls["rollup"] == [[(scope, hours[1])]]
@@ -2271,31 +1476,6 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
     finally:
         _unpatch(monkey)
 
-
-def test_raw_discovery_and_listing_keep_hour_sized_sql_and_full_page():
-    start = agg.floor_hour_ns(agg.dt_to_ns(
-        __import__("datetime").datetime(2026, 9, 20)))
-    end = start + agg.DIRTY_LIST_HOURS * agg.HOUR_NS
-    statements = []
-
-    def fetch(base, auth, db, stmt, cap):
-        statements.append(stmt)
-        if "SELECT DISTINCT" in stmt:
-            return ["vehicle", "source", "decode_epoch"], [["v", "can", "e"]]
-        return ["hour"], []
-
-    with patch.object(agg, "guarded_fetch", fetch):
-        assert agg._bootstrap_window_scopes(("", "", ""), _vehicle_cfg(), start, end) == {
-            ("v", "can", "e")}
-        assert agg._list_scope_hours(("", "", ""), _vehicle_cfg(),
-                                     ("v", "can", "e"), start, end) == ([], end)
-    assert len(statements) == 2 * agg.DIRTY_LIST_HOURS
-    import re
-    for stmt in statements:
-        bounds = re.findall(r"event_time (?:>=|<) ('[^']+')", stmt)
-        assert len(bounds) == 2
-        assert agg.parse_ts_ns(bounds[1].strip("'")) - agg.parse_ts_ns(
-            bounds[0].strip("'")) == agg.HOUR_NS
 
 
 def test_sql_diagnostics_never_emit_scope_literals_or_errors():
@@ -2440,7 +1620,6 @@ if __name__ == "__main__":
     test_trip_hour_chunks_preserve_context_and_refuse_total_cap()
     test_vehicle_flushed_floor_avoids_unbounded_raw_min()
     test_coordinator_earlier_unit_survives_later_failure_and_retry()
-    test_raw_discovery_and_listing_keep_hour_sized_sql_and_full_page()
     test_sql_diagnostics_never_emit_scope_literals_or_errors()
     test_sql_error_raises()
     test_per_call_billing_excludes_rollups_and_cumulative_parents()
@@ -2478,27 +1657,8 @@ if __name__ == "__main__":
     test_session_batch_replacement_isolation_and_failure_keeps_anchor()
     test_operational_status_failure_recovery_and_atomic_replace()
     test_vehicle_window_lag_is_observed_data_gap_not_wall_clock_age()
-    test_coordinator_bootstrap_visits_prenotification_history()
-    test_coordinator_older_notified_windows_have_no_age_cutoff()
-    test_coordinator_cursor_progress_and_config_invalidation()
-    test_coordinator_rotates_past_fifty_scopes()
-    test_coordinator_multiwindow_scopes_all_complete()
-    test_coordinator_sealed_cursor_revisits_history()
-    test_coordinator_late_nonotice_fingerprint_recomputes()
-    test_coordinator_twopage_complete_then_zero()
-    test_coordinator_legacy_blank_fingerprint_repends_once()
-    test_coordinator_late_nonotice_old_page_after_new()
-    test_coordinator_midpass_notify_on_swept_hour_blocks()
-    test_coordinator_empty_gap_advances_without_recompute()
-    test_coordinator_late_dirty_behind_cursor_still_pends()
-    test_coordinator_revision_revisits_completed_history()
-    test_coordinator_sweep_single_row_per_scope()
+    test_coordinator_notified_generation_only()
+    test_coordinator_unnotified_raw_is_not_discovered()
+    test_coordinator_midpass_generation_change_and_failure_do_not_checkpoint()
     test_battery_worker_uses_only_scoped_call()
     test_coordinator_late_ingest_uses_event_time_window()
-    test_discovery_registers_frontier_window_durably()
-    test_discovery_reconcile_finds_late_scope_behind_cursor()
-    test_discovery_memtable_only_stays_in_memory()
-    test_discovery_metadata_failure_never_scans_raw()
-    test_coordinator_sweep_metadata_failure_never_scans_or_commits()
-    test_discovery_filtered_and_unfiltered_cursors_independent()
-    test_discovery_late_notified_row_behind_cursor_still_pends()

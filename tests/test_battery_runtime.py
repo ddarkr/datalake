@@ -1297,6 +1297,17 @@ def test_chunked_fetch_preserves_context_exclusions_and_caps():
             assert tags == {scope}
             assert all(0 <= upper - lower < hour for lower, upper in bounds)
             assert not any(lower <= 70 * hour <= upper for lower, upper in bounds)
+            # Source exclusion also covers unregistered/NULL-epoch CAN.
+            legacy_signals, legacy_events, legacy_tags = br._fetch_plan(
+                "", "", "", [(start, end), old], {}, {("v", "fleet", "gone")},
+                old[0], end, "v", 10, {"Soc"}, exclude_sources=["can"])
+            assert sorted(r["event_time_ns"] for r in legacy_signals) == sorted(times)
+            assert {(r["source"], r["decode_epoch"]) for r in legacy_events} == {
+                ("fleet", None)}
+            assert legacy_tags == {scope}
+            notified = br.fetch_events("", "", "", start, end, "v", 100,
+                                       scopes=[("v", "can", "e")])
+            assert len(notified) == 50
             retained = br.fetch_events(
                 "", "", "", start, end, "v", 3,
                 exclude_scopes=exclusions | {("v", "can", None)})

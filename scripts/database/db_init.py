@@ -516,11 +516,10 @@ def ddl_statements(otel_ttl):
   "received_at" TIMESTAMP(9) NOT NULL,
   PRIMARY KEY ("vehicle", "source", "decode_epoch")
 )"""))
-    # Analytics checkpoint: the dirty generation (plus config revision)
-    # fully rolled up into vehicle_agg/trip_summary/charge_session and
-    # vehicle_analysis. Committed only AFTER every applicable section
-    # succeeds under an unchanged config; a newer generation arriving
-    # mid-pass stays dirty. Same merge semantics as the dirty table.
+    # Analytics checkpoint: a successfully processed dirty generation.
+    # Same generation skips work even after code/config revision changes.
+    # A newer mid-pass generation remains dirty. raw_fingerprint is kept
+    # for the existing NOT NULL schema and new commits store an empty value.
     ddls.append(("vehicle_aggregate_checkpoint", """CREATE TABLE IF NOT EXISTS "vehicle_aggregate_checkpoint" (
   "window_start" TIMESTAMP(9) NOT NULL TIME INDEX,
   "vehicle" STRING NOT NULL,
@@ -529,30 +528,6 @@ def ddl_statements(otel_ttl):
   "applied_generation" STRING NOT NULL,
   "config_revision" STRING NOT NULL,
   "raw_fingerprint" STRING NOT NULL,
-  "committed_at" TIMESTAMP(9) NOT NULL,
-  PRIMARY KEY ("vehicle", "source", "decode_epoch")
-)"""))
-    # Analytics sweep cursor: one mutable row per (vehicle, source,
-    # decode_epoch) holding the next unlisted hour as cursor_ns. The TIME
-    # INDEX is a constant sentinel (never the cursor): the cursor advances
-    # by overwriting the same scope-keyed row (default last_row merge), so
-    # repeated progress leaves exactly one persisted row per scope.
-    # Per-hour raw fingerprints live on the checkpoint rows (same
-    # scope/hour key), never as an accumulating per-scope string. Listing
-    # is config-independent (it only finds hours holding raw rows); the
-    # checkpoint table stays the only proof of completed work. Reserved
-    # scopes ("__scope_bootstrap__" / "__scope_reconcile__", each with a
-    # matching source and "<name>:<vehicle filter>" decode_epoch) hold the
-    # discovery frontier cursor and the sealed-history reconcile cursor in
-    # the same row shape: analytics skips both as non-CAN scopes, so no
-    # schema change is needed.
-    ddls.append(("vehicle_aggregate_sweep", """CREATE TABLE IF NOT EXISTS "vehicle_aggregate_sweep" (
-  "sweep_mark" TIMESTAMP(9) NOT NULL TIME INDEX,
-  "vehicle" STRING NOT NULL,
-  "source" STRING NOT NULL,
-  "decode_epoch" STRING NOT NULL,
-  "cursor_ns" BIGINT NOT NULL,
-  "config_revision" STRING NOT NULL,
   "committed_at" TIMESTAMP(9) NOT NULL,
   PRIMARY KEY ("vehicle", "source", "decode_epoch")
 )"""))

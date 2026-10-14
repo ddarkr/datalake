@@ -1073,8 +1073,11 @@ def _subtract_context(intervals, context):
 
 
 def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                  fields=None, scopes=None, exclude_scopes=None):
+                  fields=None, scopes=None, exclude_scopes=None, exclude_sources=()):
     filt = _vehicle_filter(vehicle) + _field_predicate(fields)
+    if exclude_sources:
+        filt += " AND NOT COALESCE(source IN (" + ", ".join(
+            _sql_str(s) for s in exclude_sources) + "), false)"
     if scopes:
         filt += " AND (" + _scope_predicate(scopes) + ")"
     if exclude_scopes:
@@ -1144,7 +1147,7 @@ def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
 
 
 def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
-                        max_rows, scopes=None, exclude_scopes=None):
+                        max_rows, scopes=None, exclude_scopes=None, exclude_sources=()):
     """Field-independent scope identities in a bounded interval.
 
     SELECT DISTINCT vehicle/source/decode_epoch only (no raw
@@ -1160,6 +1163,9 @@ def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
         filt += " AND (" + _scope_predicate(scopes) + ")"
     if exclude_scopes:
         filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
+    if exclude_sources:
+        filt += " AND NOT COALESCE(source IN (" + ", ".join(
+            _sql_str(s) for s in exclude_sources) + "), false)"
     stmt = ("SELECT DISTINCT vehicle, source, decode_epoch FROM "
             + SIGNAL_TABLE + " WHERE event_time >= '"
             + ns_to_sql_ts(start_ns) + "' AND event_time <= '"
@@ -1188,12 +1194,15 @@ def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
 
 
 def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                 scopes=None, exclude_scopes=None):
+                 scopes=None, exclude_scopes=None, exclude_sources=()):
     filt = _vehicle_filter(vehicle)
     if scopes:
         filt += " AND (" + _scope_predicate(scopes) + ")"
     if exclude_scopes:
         filt += " AND NOT COALESCE((" + _scope_predicate(exclude_scopes) + "), false)"
+    if exclude_sources:
+        filt += " AND NOT COALESCE(source IN (" + ", ".join(
+            _sql_str(s) for s in exclude_sources) + "), false)"
     stmt = ("SELECT " + ", ".join(EVENT_COLS) + " FROM " + EVENT_TABLE
             + " WHERE event_time >= '" + ns_to_sql_ts(start_ns) + "'"
             + " AND event_time <= '" + ns_to_sql_ts(end_ns) + "'" + filt
@@ -1408,6 +1417,7 @@ def run_battery(ctx, cfg, now_ns=None):
             raise BatteryConfigError("battery required fields: "
                                      + type(exc).__name__)
     exclude_scopes = _parse_exclude_scopes(cfg.get("battery_exclude_scopes"))
+    exclude_sources = () if only_scoped else cfg.get("battery_exclude_sources", ())
     for scope in scope_windows:
         if scope in exclude_scopes:
             raise BatteryConfigError("battery_scope_windows overlaps "
@@ -1463,7 +1473,8 @@ def run_battery(ctx, cfg, now_ns=None):
         signals, events, tag_scopes = _fetch_plan(
             base_url, auth, db, windows, scope_windows, exclude_scopes,
             fetch_start, fetch_end, vehicle, max_rows, fields,
-            analysis_cfg=analysis_cfg if config_error is None else None)
+            analysis_cfg=analysis_cfg if config_error is None else None,
+            exclude_sources=exclude_sources)
         scopes = set(tag_scopes)
         for raw in signals:
             scope = (raw["vehicle"], raw["source"], raw["decode_epoch"])
@@ -1515,7 +1526,7 @@ def run_battery(ctx, cfg, now_ns=None):
 
 def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
                 fetch_start, fetch_end, vehicle, max_rows, fields,
-                analysis_cfg=None):
+                analysis_cfg=None, exclude_sources=()):
     """Bounded disjoint fetches: no envelope over unrelated gaps.
 
     Requests partition merged inclusive intervals into at most one hour,
@@ -1594,10 +1605,11 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
                                   "partial" % (total[0], max_rows))
         tag_scopes.update(tags)
 
+    source_filter = {"exclude_sources": exclude_sources} if exclude_sources else {}
     for start, end, scopes in _chunks(event_q):
         events.extend(_take(fetch_events(
             base_url, auth, db, start, end, vehicle, max_rows,
-            scopes=scopes, exclude_scopes=exclude_scopes)))
+            scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
     if analysis_cfg is not None:
         # Excluded scopes never analyze, so their events cannot require
         # context. Malformed config propagates (fail closed).
@@ -1608,16 +1620,19 @@ def _fetch_plan(base_url, auth, db, windows, scope_windows, exclude_scopes,
     for cstart, cend, scopes in _chunks(signal_q):
         signals.extend(_take(fetch_signals(
             base_url, auth, db, cstart, cend, vehicle, max_rows,
-            fields=fields, scopes=scopes, exclude_scopes=exclude_scopes)))
+            fields=fields, scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
         if fields is not None:
             _take_tags(fetch_signal_scopes(
                 base_url, auth, db, cstart, cend, vehicle, max_rows,
-                scopes=scopes, exclude_scopes=exclude_scopes))
+                scopes=scopes, exclude_scopes=exclude_scopes, **source_filter))
     signals = [s for s in signals if (s["vehicle"], s["source"],
-                                      s["decode_epoch"]) not in exclude_scopes]
+                                      s["decode_epoch"]) not in exclude_scopes
+               and s["source"] not in exclude_sources]
     events = [e for e in events if (e["vehicle"], e["source"],
-                                    e.get("decode_epoch")) not in exclude_scopes]
+                                    e.get("decode_epoch")) not in exclude_scopes
+              and e["source"] not in exclude_sources]
     tag_scopes -= exclude_scopes
+    tag_scopes = {s for s in tag_scopes if s[1] not in exclude_sources}
     return signals, events, tag_scopes
 
 

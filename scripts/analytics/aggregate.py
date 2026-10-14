@@ -3294,22 +3294,23 @@ def _vehicle_rollup(ctx, cfg, exclude=None):
     now = utcnow()
     floor_ns = _flushed_floor_ns(ctx)
     cov = (_ns_to_dt(floor_ns) if floor_ns is not None else
-           coverage_min(base_url, auth, db, "vehicle_signal", "event_time"))
+           coverage_min(base_url, auth, db, "vehicle_signal", "event_time",
+                        " WHERE NOT COALESCE(source = 'can', false)"))
     aligned = floor_hour(now - dt.timedelta(hours=cfg["lookback_h"]))
     if cov:
         aligned = max(aligned, floor_hour(cov))
     cut = aligned.strftime("%Y-%m-%d %H:%M:%S")
     seal_m = floor_minute(now).strftime("%Y-%m-%d %H:%M:%S")
     seal_h = floor_hour(now).strftime("%Y-%m-%d %H:%M:%S")
-    filt = ""
+    filt = " AND NOT COALESCE(source = 'can', false)"
     excluded = {_scope_tuple(s) for s in (exclude or [])}
     excluded = {s for s in excluded if s is not None}
     if excluded:
-        filt = " AND NOT (" + _dirty_scope_predicate(excluded) + ")"
+        filt += " AND NOT (" + _dirty_scope_predicate(excluded) + ")"
     # Same scope columns exist on vehicle_agg, so the filter applies to both
     # the deletes and the rebuilds: corrected quality/unit/source_field
-    # groups leave no stale rows, and coordinated CAN scopes are never
-    # touched here. Per-resolution deletes match each sealed range, so no
+    # groups leave no stale rows, and all CAN sources are never touched
+    # here. Per-resolution deletes match each sealed range, so no
     # transient gap past the 1h seal. NULL-version legacy rows are the
     # durable rediscovery marker for the migration below: v2 rows are
     # deleted first, then rebuilt, and legacy rows only finally — a
@@ -3449,44 +3450,16 @@ def _mark_legacy_expired(ctx, scope, hour_ns):
 # commits vehicle_aggregate_checkpoint only AFTER the matching rollup +
 # trip/charge + battery work for that generation succeeds (or is explicitly
 # unavailable under an unchanged config). Observe generation BEFORE work,
-# commit AFTER. Any failure, restart, config change, or mid-pass generation
-# change leaves the checkpoint behind -> the window stays dirty.
+# commit AFTER. Failure or a mid-pass generation change leaves the hour dirty.
 #
 # CAN scopes (source 'can') never run the legacy global sections: their
 # revisions come only from this coordinator. Non-CAN producers keep the
 # legacy lookback reconciliation via explicit *_legacy_cfgs below.
 #
-# Pre-notification history gets a durable bounded bootstrap plus periodic
-# bounded reconciliation through vehicle_aggregate_sweep, which stores the
-# next unlisted hour per (vehicle, source, decode_epoch). Both list raw
-# signal hours via bounded GROUP BY checklist queries (DIRTY_LIST_HOURS
-# per query), never MIN(event_time)-to-now in one fetch, and never discard
-# old hours by age: every listed hour is processed or checkpointed before
-# the cursor advances past it.
-#
-# Scope discovery itself never scans raw rows for bounds: the registry is
-# the DISTINCT union of the small dirty/checkpoint/sweep tables, plus up
-# to TWO resumable windows (DIRTY_LIST_HOURS each, one-hour queries) per pass
-# over vehicle_signal. The history floor comes from the pinned
-# information_schema.ssts_manifest MIN(min_ts) metadata scalar (zero SST
-# reads: a raw MIN(event_time) over flushed SSTs scans them instead, so it
-# is never used). A durable bootstrap cursor (a reserved sweep-table row,
-# never a real scope) walks forward from the flushed floor; a second
-# durable reconcile cursor cycles the sealed history behind it forever, so
-# a late-inserted unnotified scope with event_time behind the bootstrap
-# frontier is eventually listed without any global DISTINCT or age cutoff.
-# Every newly found scope gets its sweep row (starting at the flushed
-# floor hour, so the coordinator lists its full history) BEFORE either
-# cursor advances, so errors/restarts retry the window instead of skipping
-# it. Memtable-only installs (no SSTs yet) list one bounded recent window
-# per pass without committing a cursor until a flush pins the floor.
 
 DIRTY_TABLE = "vehicle_signal_dirty"
 CHECKPOINT_TABLE = "vehicle_aggregate_checkpoint"
-SWEEP_TABLE = "vehicle_aggregate_sweep"
-DIRTY_LIST_HOURS = 48
 DIRTY_MAX_WINDOWS = 500
-DIRTY_SWEEP_SCOPES = 50
 CAN_SOURCES = ("can",)
 
 
@@ -3600,9 +3573,7 @@ def _load_dirty(ctx, cfg, cutoff_ns, seal_ns):
 
 
 def _load_checkpoints(ctx, cfg, cutoff_ns, seal_ns):
-    """{(scope, hour_ns): (generation, config_revision, fingerprint)}
-    already applied. Fingerprint is the per-hour raw cell committed with
-    the work; "" means committed before fingerprints existed."""
+    """Applied generation and historical revision; fingerprint is legacy metadata."""
     base_url, auth, db = ctx
     filt = ""
     if cfg.get("vehicle"):
@@ -3640,19 +3611,10 @@ def _load_checkpoints(ctx, cfg, cutoff_ns, seal_ns):
     return out
 
 
-def _pending_dirty(dirty, checkpoints, revision):
-    """Dirty entries whose checkpoint does not cover the observed generation
-    under the CURRENT config revision. Config/analyzer changes invalidate
-    every skip; a newer mid-pass generation stays dirty via re-read below.
-    Checkpoints carry a third fingerprint field; the dirty path matches on
-    (generation, revision) only."""
-    pending = {}
-    for key, gen in dirty.items():
-        applied = checkpoints.get(key)
-        if applied is not None and (applied[0], applied[1]) == (gen, revision):
-            continue
-        pending[key] = gen
-    return pending
+def _pending_dirty(dirty, checkpoints):
+    """Only new generations need work; code changes do not replay history."""
+    return {key: gen for key, gen in dirty.items()
+            if key not in checkpoints or checkpoints[key][0] != gen}
 
 
 def _dirty_scope_predicate(scopes):
@@ -3687,10 +3649,8 @@ def _read_dirty_generation(ctx, scope, hour_ns):
     return gen if isinstance(gen, str) and gen else None
 
 
-def _commit_checkpoint(ctx, scope, hour_ns, generation, revision, now_ns,
-                         fingerprint=""):
-    """Same key + window_start overwrites (mutable row, last_row merge),
-    carrying the per-hour raw fingerprint committed with the work."""
+def _commit_checkpoint(ctx, scope, hour_ns, generation, revision, now_ns):
+    """Commit a successful generation; retain the existing NOT NULL schema."""
     base_url, auth, db = ctx
     v, src, epoch = scope
     insert_rows(base_url, auth, db, CHECKPOINT_TABLE,
@@ -3699,121 +3659,17 @@ def _commit_checkpoint(ctx, scope, hour_ns, generation, revision, now_ns,
                  "committed_at"],
                 [[ns_to_sql_lit(hour_ns), str_lit(v), str_lit(src),
                   str_lit(epoch), str_lit(generation), str_lit(revision),
-                  str_lit(fingerprint), ns_to_sql_lit(now_ns)]])
-
-
-SWEEP_SENTINEL_NS = 0
-
-
-def _hour_fingerprint(count, max_event_ns, max_ingest_ns):
-    """Stable per-hour raw cell: count/max-event/max-ingest. Late
-    no-notify arrivals change it; identical raw state reproduces it
-    byte-identically (never random). Stored per (scope, hour) in the
-    checkpoint row, so every page carries its own baseline."""
-    return "%s:%s:%s" % (
-        count,
-        max_event_ns if max_event_ns is not None else "-",
-        max_ingest_ns if max_ingest_ns is not None else "-")
-
-
-def _parse_hour_fingerprint(text):
-    """fingerprint -> (count, max_event_ns, max_ingest_ns); None when blank
-    (no baseline: first listing) or malformed (never crash on stored data)."""
-    if not isinstance(text, str) or not text:
-        return None
-    fields = text.split(":")
-    if len(fields) != 3:
-        return None
-    try:
-        count = int(fields[0])
-    except ValueError:
-        return None
-    def _ns(part):
-        if part == "-":
-            return None
-        try:
-            return int(part)
-        except ValueError:
-            return None
-    event = _ns(fields[1])
-    ingest = _ns(fields[2])
-    if fields[1] != "-" and event is None:
-        return None
-    if fields[2] != "-" and ingest is None:
-        return None
-    return (count, event, ingest)
-
-
-def _load_sweeps(ctx, cfg):
-    """{scope: (cursor_hour_ns, revision)} listing cursor. One persisted
-    row per scope: sweep_mark is a constant TIME INDEX sentinel,
-    cursor_ns carries the next unlisted hour. Missing table or no row
-    means the scope was never listed: start at raw coverage."""
-    base_url, auth, db = ctx
-    filt = ""
-    if cfg.get("vehicle"):
-        filt = " WHERE vehicle = " + str_lit(cfg["vehicle"])
-    try:
-        cols, rows = guarded_fetch(
-            base_url, auth, db,
-            "SELECT sweep_mark, vehicle, source, decode_epoch, cursor_ns,"
-            " config_revision FROM " + SWEEP_TABLE + filt
-            + " ORDER BY vehicle", cfg["max_rows"])
-    except SqlError as e:
-        if is_missing_table(e):
-            return {}
-        raise
-    idx = {c: i for i, c in enumerate(cols)}
-    out = {}
-    for r in rows:
-        def col(name):
-            return r[idx[name]] if name in idx else None
-        scope = _scope_tuple((col("vehicle"), col("source"), col("decode_epoch")))
-        if scope is None or not _is_can_scope(scope):
-            continue
-        cursor = col("cursor_ns")
-        if isinstance(cursor, bool) or not isinstance(cursor, int):
-            continue
-        rev = col("config_revision")
-        if not isinstance(rev, str):
-            rev = ""
-        if scope not in out:
-            out[scope] = (floor_hour_ns(max(cursor, 0)), rev)
-    return out
-
-
-def _commit_sweep(ctx, scope, next_hour_ns, revision, now_ns):
-    """Advance one scope's cursor by overwriting its single row: constant
-    sweep_mark TIME INDEX plus scope PK, cursor_ns carries the hour."""
-    base_url, auth, db = ctx
-    v, src, epoch = scope
-    insert_rows(base_url, auth, db, SWEEP_TABLE,
-                ["sweep_mark", "vehicle", "source", "decode_epoch",
-                 "cursor_ns", "config_revision", "committed_at"],
-                [[ns_to_sql_lit(SWEEP_SENTINEL_NS), str_lit(v), str_lit(src),
-                  str_lit(epoch), str(next_hour_ns), str_lit(revision),
-                  ns_to_sql_lit(now_ns)]])
-
-
-def _bootstrap_sentinel(cfg):
-    """Sweep-table PK holding the global bootstrap cursor. Never a real
-    scope: its source fails _is_can_scope, so registry/sweep loaders skip
-    it; decode_epoch carries the vehicle filter so filtered and unfiltered
-    runs advance independent cursors."""
-    return ("__scope_bootstrap__", "__scope_bootstrap__",
-            "__scope_bootstrap__:" + (cfg.get("vehicle") or ""))
+                  str_lit(""), ns_to_sql_lit(now_ns)]])
 
 
 def _registered_scopes(ctx, cfg):
-    """CAN scopes known WITHOUT touching raw: DISTINCT over the small
-    dirty/checkpoint/sweep metadata tables. Bounded output (scopes, never
-    hours); missing tables are fresh installs, never failures."""
+    """CAN scopes from dirty/checkpoint metadata only; never discover raw."""
     base_url, auth, db = ctx
     filt = ""
     if cfg.get("vehicle"):
         filt = " WHERE vehicle = " + str_lit(cfg["vehicle"])
     out = set()
-    for table in (DIRTY_TABLE, CHECKPOINT_TABLE, SWEEP_TABLE):
+    for table in (DIRTY_TABLE, CHECKPOINT_TABLE):
         try:
             cols, rows = guarded_fetch(
                 base_url, auth, db,
@@ -3832,89 +3688,6 @@ def _registered_scopes(ctx, cfg):
             if scope is not None and _is_can_scope(scope):
                 out.add(scope)
     return out
-
-
-def _load_bootstrap_cursor(ctx, cfg):
-    """Next unlisted raw window start, or None when never bootstrapped."""
-    base_url, auth, db = ctx
-    v, src, epoch = _bootstrap_sentinel(cfg)
-    try:
-        cols, rows = fetch_rows(
-            base_url, auth, db,
-            "SELECT cursor_ns FROM " + SWEEP_TABLE
-            + " WHERE vehicle = " + str_lit(v) + " AND source = "
-            + str_lit(src) + " AND decode_epoch = " + str_lit(epoch)
-            + " LIMIT 2")
-    except SqlError as e:
-        if is_missing_table(e):
-            return None
-        raise
-    if not rows or not rows[0]:
-        return None
-    cursor = rows[0][0]
-    if isinstance(cursor, bool) or not isinstance(cursor, int):
-        return None
-    return floor_hour_ns(max(cursor, 0))
-
-
-def _commit_bootstrap_cursor(ctx, cfg, next_ns, revision, now_ns):
-    """Advance the global bootstrap cursor (same overwrite-row semantics as
-    _commit_sweep). Only called AFTER every new scope in the window is
-    registered, so a crash retries the window instead of skipping it."""
-    base_url, auth, db = ctx
-    v, src, epoch = _bootstrap_sentinel(cfg)
-    insert_rows(base_url, auth, db, SWEEP_TABLE,
-                ["sweep_mark", "vehicle", "source", "decode_epoch",
-                 "cursor_ns", "config_revision", "committed_at"],
-                [[ns_to_sql_lit(SWEEP_SENTINEL_NS), str_lit(v), str_lit(src),
-                  str_lit(epoch), str(next_ns), str_lit(revision),
-                  ns_to_sql_lit(now_ns)]])
-
-
-def _reconcile_sentinel(cfg):
-    """Sweep-table PK holding the durable reconcile cursor. Never a real
-    scope: its source fails _is_can_scope, so registry/sweep loaders skip
-    it; decode_epoch carries the vehicle filter so filtered and unfiltered
-    runs cycle independent history."""
-    return ("__scope_reconcile__", "__scope_reconcile__",
-            "__scope_reconcile__:" + (cfg.get("vehicle") or ""))
-
-
-def _load_reconcile_cursor(ctx, cfg):
-    """Sealed-history reconcile window start, or None when never reconciled."""
-    base_url, auth, db = ctx
-    v, src, epoch = _reconcile_sentinel(cfg)
-    try:
-        cols, rows = fetch_rows(
-            base_url, auth, db,
-            "SELECT cursor_ns FROM " + SWEEP_TABLE
-            + " WHERE vehicle = " + str_lit(v) + " AND source = "
-            + str_lit(src) + " AND decode_epoch = " + str_lit(epoch)
-            + " LIMIT 2")
-    except SqlError as e:
-        if is_missing_table(e):
-            return None
-        raise
-    if not rows or not rows[0]:
-        return None
-    cursor = rows[0][0]
-    if isinstance(cursor, bool) or not isinstance(cursor, int):
-        return None
-    return floor_hour_ns(max(cursor, 0))
-
-
-def _commit_reconcile_cursor(ctx, cfg, next_ns, revision, now_ns):
-    """Advance the durable reconcile cursor (same overwrite-row semantics as
-    _commit_sweep). Only called AFTER every new scope in the window is
-    registered, so a crash retries the window instead of skipping it."""
-    base_url, auth, db = ctx
-    v, src, epoch = _reconcile_sentinel(cfg)
-    insert_rows(base_url, auth, db, SWEEP_TABLE,
-                ["sweep_mark", "vehicle", "source", "decode_epoch",
-                 "cursor_ns", "config_revision", "committed_at"],
-                [[ns_to_sql_lit(SWEEP_SENTINEL_NS), str_lit(v), str_lit(src),
-                  str_lit(epoch), str(next_ns), str_lit(revision),
-                  ns_to_sql_lit(now_ns)]])
 
 
 def _flushed_floor_ns(ctx):
@@ -3938,140 +3711,9 @@ def _flushed_floor_ns(ctx):
     return parse_ts_ns(rows[0][0])
 
 
-def _bootstrap_window_scopes(ctx, cfg, start_ns, end_ns):
-    """CAN scopes in [start_ns, end_ns), queried one hour at a time.
-    The caller commits its durable page cursor only after the whole page."""
-    if end_ns - start_ns > HOUR_NS:
-        found = set()
-        for hour in range(start_ns, end_ns, HOUR_NS):
-            found.update(_bootstrap_window_scopes(
-                ctx, cfg, hour, min(hour + HOUR_NS, end_ns)))
-            if len(found) > cfg["max_rows"]:
-                raise SqlError("scope discovery exceeds row cap")
-        return found
-    base_url, auth, db = ctx
-    filt = ""
-    if cfg.get("vehicle"):
-        filt = " AND vehicle = " + str_lit(cfg["vehicle"])
-    try:
-        cols, rows = guarded_fetch(
-            base_url, auth, db,
-            "SELECT DISTINCT vehicle, source, decode_epoch FROM vehicle_signal"
-            " WHERE event_time >= " + ns_to_sql_lit(start_ns)
-            + " AND event_time < " + ns_to_sql_lit(end_ns)
-            + " AND source IN ("
-            + ",".join(str_lit(s) for s in CAN_SOURCES) + ")" + filt,
-            cfg["max_rows"])
-    except SqlError as e:
-        if is_missing_table(e):
-            return set()
-        raise
-    idx = {c: i for i, c in enumerate(cols)}
-    out = set()
-    for r in rows:
-        def col(name):
-            return r[idx[name]] if name in idx else None
-        scope = _scope_tuple((col("vehicle"), col("source"),
-                              col("decode_epoch")))
-        if scope is not None and _is_can_scope(scope):
-            out.add(scope)
-    return out
-
-
-def _register_new_scopes(ctx, floor_hr, known, found, revision, now_ns):
-    """Commit a sweep row for each newly found scope, then add it to known.
-    Start hour is the flushed-floor hour when pinned (a scope cannot predate
-    retained flushed history; over-listing empty hours beats lost history),
-    else the memtable-only scoped raw MIN fallback per scope. No sweep row
-    when neither bounds the scope yet. Callers advance their cursor only
-    after this returns, so a commit failure retries the window instead of
-    skipping it."""
-    new = sorted(s for s in found if s not in known)
-    for scope in new:
-        start = _sweep_start_ns(ctx, floor_hr, scope)
-        if start is None:
-            continue
-        _commit_sweep(ctx, scope, start, revision, now_ns)
-        known.add(scope)
-    return new
-
-
 def _distinct_scopes(ctx, cfg):
-    """CAN scope discovery over durable state plus bounded raw windows.
-
-    Queries per pass: three small DISTINCTs over the dirty/checkpoint/
-    sweep tables (registry), two cursor point lookups (bootstrap frontier
-    + reconcile), and one pinned information_schema.ssts_manifest MIN(min_ts)
-    metadata scalar (zero SST reads). With a pinned floor, at most two
-    resumable DISTINCT pages (DIRTY_LIST_HOURS each, one-hour queries) walk from the
-    flushed floor and cycle sealed history for late-inserted scopes. With no
-    visible SSTs, a raw MIN(event_time) bounds the in-memory first window.
-
-    New scopes register at the flushed-floor hour before either cursor
-    advances, so an error or restart retries the window instead of
-    skipping it. Memtable-only installs discover scopes in a bounded window
-    at memtable coverage and keep finds in memory only -- no cursor or sweep
-    commits until a flush pins the floor, so the first post-flush walk still
-    registers their full history durably. Sentinel decode_epochs carry the
-    vehicle filter; other SqlErrors propagate (fail closed, retry next pass).
-
-    Migration: existing deployments already hold sweep/checkpoint/dirty
-    rows, so the registry is populated with zero rescan; the frontier and
-    reconcile cursors start at the flushed floor on their first pass."""
-    known = _registered_scopes(ctx, cfg)
-    now_ns = dt_to_ns(utcnow())
-    revision = _config_revision(cfg)
-    seal_ns = floor_hour_ns(now_ns)
-    floor_hr = _sweep_floor_hr(ctx)
-    cursor = _load_bootstrap_cursor(ctx, cfg)
-    if cursor is None and floor_hr is not None:
-        cursor = floor_hr
-        # Persist the start BEFORE raw window work: a crash below retries
-        # this same window instead of re-deriving the start from scratch.
-        _commit_bootstrap_cursor(ctx, cfg, cursor, revision, now_ns)
-    if cursor is None:
-        # Memtable-only: scan a bounded window from raw memtable coverage,
-        # in-memory only; never advance a durable cursor before a flush.
-        base_url, auth, db = ctx
-        filt = ""
-        if cfg.get("vehicle"):
-            filt = " WHERE vehicle = " + str_lit(cfg["vehicle"])
-        try:
-            cols, rows = fetch_rows(
-                base_url, auth, db,
-                "SELECT MIN(event_time) FROM vehicle_signal" + filt
-                + " LIMIT 2")
-        except SqlError as e:
-            if is_missing_table(e):
-                return known
-            raise
-        raw_floor_ns = parse_ts_ns(rows[0][0]) if rows and rows[0] else None
-        if raw_floor_ns is None:
-            return known
-        start_ns = floor_hour_ns(raw_floor_ns)
-        end_ns = min(start_ns + DIRTY_LIST_HOURS * HOUR_NS, seal_ns)
-        if start_ns < end_ns:
-            found = _bootstrap_window_scopes(ctx, cfg, start_ns, end_ns)
-            for scope in sorted(s for s in found if s not in known):
-                known.add(scope)
-        return known
-    if floor_hr is not None and cursor < floor_hr:
-        cursor = floor_hr  # Retention dropped SSTs behind the cursor.
-    if cursor < seal_ns:
-        window_end = min(cursor + DIRTY_LIST_HOURS * HOUR_NS, seal_ns)
-        found = _bootstrap_window_scopes(ctx, cfg, cursor, window_end)
-        _register_new_scopes(ctx, floor_hr, known, found, revision, now_ns)
-        _commit_bootstrap_cursor(ctx, cfg, window_end, revision, now_ns)
-    if floor_hr is None or floor_hr >= seal_ns:
-        return known
-    rc = _load_reconcile_cursor(ctx, cfg)
-    if rc is None or rc >= seal_ns or rc < floor_hr:
-        rc = floor_hr
-    rc_end = min(rc + DIRTY_LIST_HOURS * HOUR_NS, seal_ns)
-    found = _bootstrap_window_scopes(ctx, cfg, rc, rc_end)
-    _register_new_scopes(ctx, floor_hr, known, found, revision, now_ns)
-    _commit_reconcile_cursor(ctx, cfg, rc_end, revision, now_ns)
-    return known
+    """Known CAN scopes only; unnotified history is not discovered."""
+    return _registered_scopes(ctx, cfg)
 
 
 def _raw_coverage_ns(ctx, scope):
@@ -4095,111 +3737,6 @@ def _raw_coverage_ns(ctx, scope):
     if not rows or not rows[0]:
         return None
     return parse_ts_ns(rows[0][0])
-
-def _sweep_start_ns(ctx, floor_hr, scope):
-    """Conservative sweep start hour for a scope: the flushed SST floor when
-    pinned (a scope cannot predate retained flushed history; over-listing
-    empty hours beats lost history), else the scoped raw MIN fallback for
-    memtable-only installs, else None when the scope has no raw yet."""
-    if floor_hr is not None:
-        return floor_hr
-    oldest = _raw_coverage_ns(ctx, scope)
-    if oldest is None:
-        return None
-    return floor_hour_ns(oldest)
-
-def _sweep_floor_hr(ctx):
-    """Flushed-floor hour for sweep starts, or None when unpinned
-    (memtable-only/fresh installs: the raw MIN fallback applies)."""
-    floor = _flushed_floor_ns(ctx)
-    return floor_hour_ns(floor) if floor is not None else None
-
-
-def _sweep_reset_ns(ctx, scope):
-    """Re-check start when a persisted cursor already reached the seal:
-    retained history may have shifted, so re-derive the conservative start
-    (flushed floor preferred, raw MIN fallback) instead of skipping."""
-    return _sweep_start_ns(ctx, _sweep_floor_hr(ctx), scope)
-
-
-def _list_scope_hours(ctx, cfg, scope, start_hour_ns, seal_ns):
-    """Bounded checklist for one scope in [start_hour_ns, seal_ns):
-    one-hour GROUP BY queries covering at most DIRTY_LIST_HOURS. Returns (rows,
-    listed_through_ns): rows are (hour_ns, count, max_event_ns,
-    max_ingest_ns) oldest-first; listed_through_ns is the exclusive upper
-    bound covered (never past seal_ns). Fingerprint columns only."""
-    base_url, auth, db = ctx
-    v, src, epoch = scope
-    window_end_ns = min(start_hour_ns + DIRTY_LIST_HOURS * HOUR_NS, seal_ns)
-    if window_end_ns <= start_hour_ns:
-        return [], start_hour_ns
-    if window_end_ns - start_hour_ns > HOUR_NS:
-        out = []
-        for hour in range(start_hour_ns, window_end_ns, HOUR_NS):
-            rows, through = _list_scope_hours(
-                ctx, cfg, scope, hour, min(hour + HOUR_NS, window_end_ns))
-            if through <= hour:
-                return sorted(out), hour
-            out.extend(rows)
-        return sorted(out), window_end_ns
-    try:
-        cols, rows = guarded_fetch(
-            base_url, auth, db,
-            "SELECT date_bin('1h'::INTERVAL, event_time) AS hour,"
-            " COUNT(*), MAX(event_time), MAX(ingest_time) FROM vehicle_signal"
-            " WHERE event_time >= " + ns_to_sql_lit(start_hour_ns)
-            + " AND event_time < " + ns_to_sql_lit(window_end_ns)
-            + " AND vehicle = " + str_lit(v) + " AND source = "
-            + str_lit(src) + " AND decode_epoch = " + str_lit(epoch)
-            + " GROUP BY date_bin('1h'::INTERVAL, event_time)"
-            + " ORDER BY hour", cfg["max_rows"])
-    except SqlError as e:
-        if is_missing_table(e):
-            return [], start_hour_ns
-        raise
-    idx = {c: i for i, c in enumerate(cols)}
-    out = []
-    for r in rows:
-        def col(name):
-            return r[idx[name]] if name in idx else None
-        hour = parse_ts_ns(col("hour") if "hour" in idx else col("event_time"))
-        if hour is None:
-            continue
-        floored = floor_hour_ns(hour)
-        if not (start_hour_ns <= floored < window_end_ns):
-            continue
-        vals = list(r)
-        count = vals[1] if len(vals) > 1 else None
-        max_event = parse_ts_ns(vals[2]) if len(vals) > 2 else None
-        max_ingest = parse_ts_ns(vals[3]) if len(vals) > 3 else None
-        out.append((floored,
-                    count if isinstance(count, int) else 0,
-                    max_event, max_ingest))
-    return sorted(out), window_end_ns
-
-
-def _checkpoint_cells_match(checkpoints, scope, hour_ns, cell, revision):
-    """True only when the checkpoint holds this revision AND the same
-    per-hour raw cells. Blank/legacy fingerprints never match (re-pend
-    once, then commit WITH the fingerprint)."""
-    applied = checkpoints.get((scope, hour_ns))
-    if applied is None or applied[1] != revision:
-        return False
-    cells = _parse_hour_fingerprint(applied[2] if len(applied) > 2 else "")
-    return cells is not None and cells == _parse_hour_fingerprint(cell)
-
-
-def _hour_cells(ctx, cfg, scope, hour_ns):
-    """Bounded per-hour raw cell for one (scope, hour): fingerprint string.
-    Used for dirty-only pending outside the current listing page and for
-    the post-work re-read; one GROUP BY query over a single hour."""
-    rows, _end = _list_scope_hours(ctx, cfg, scope, hour_ns,
-                                   hour_ns + HOUR_NS)
-    for hour, count, max_event, max_ingest in rows:
-        if hour == hour_ns:
-            return _hour_fingerprint(count, max_event, max_ingest)
-    return _hour_fingerprint(0, None, None)
-
 
 def _extend_vehicle_head(ctx, key, segments, raw_from, cutoff, gap_s, lookback_h):
     """Recover a cut head in bounded steps; never relabel a tail as a new trip."""
@@ -4233,26 +3770,17 @@ def trip_section(ctx, cfg, *, window=None, scope=None):
             return total
 
 
-def _coordinated_scopes(pending):
-    """Exact CAN scopes with work outstanding this pass (dirty or swept)."""
-    return sorted({scope for (scope, _h) in pending}, key=repr)
-
 
 def _legacy_cfgs(cfg, coordinated):
-    """cfg copies whose global sections skip coordinated CAN scopes.
-
-    CAN work runs only in vehicle_history_section. Legacy sections keep
-    their lookback reconciliation for every non-CAN producer; coordinated
-    CAN scopes are excluded explicitly so no hidden recompute survives."""
+    """Legacy sections never process CAN, including unregistered scopes."""
     coordinated = [s for s in coordinated if _is_can_scope(s)]
-    if not coordinated:
-        return dict(cfg), dict(cfg), dict(cfg)
     sub = dict(cfg)
     sub.pop("battery_exclude_scopes", None)
     sub["exclude_scopes"] = list(
         {tuple(s) for s in coordinated}
         | {tuple(s) for s in (cfg.get("exclude_scopes") or [])})
     bat = dict(sub)
+    bat["battery_exclude_sources"] = ["can"]
     bat["battery_exclude_scopes"] = list(
         {tuple(s) for s in coordinated}
         | {tuple(s) for s in (cfg.get("battery_exclude_scopes") or [])})
@@ -4290,6 +3818,9 @@ def _trip_window(ctx, cfg, raw_floor, *, window=None, scope=None):
         ", duration_s, energy_added_kwh, start_soc, end_soc,"
         " avg_power_kw, max_power_kw",
         cut, seals, filt_vehicle, cfg["max_rows"], scope=scope)
+    if scope is None:
+        trips_ex = {k: v for k, v in trips_ex.items() if k[1] != "can"}
+        charges_ex = {k: v for k, v in charges_ex.items() if k[1] != "can"}
     if excluded:
         trips_ex = {k: v for k, v in trips_ex.items() if k not in excluded}
         charges_ex = {k: v for k, v in charges_ex.items() if k not in excluded}
@@ -4305,6 +3836,8 @@ def _trip_window(ctx, cfg, raw_floor, *, window=None, scope=None):
                     if cand_ns < dt_to_ns(raw_from):
                         raw_from = _ns_to_dt(cand_ns)
     filt = (" AND vehicle = " + str_lit(filt_vehicle)) if filt_vehicle else ""
+    if scope is None:
+        filt += " AND NOT COALESCE(source = 'can', false)"
     if scope is not None:
         filt += " AND " + _dirty_scope_predicate([scope])
     if excluded:
@@ -4564,106 +4097,19 @@ def _battery_scope_work(ctx, cfg, pending):
     battery_section(ctx, sub)
     return dict.fromkeys(pending, True)
 
-def _sweep_pending(ctx, cfg, seal_ns, checkpoints, revision, now_ns,
-                   _sweeps=None, _known=None):
-    """One bounded bootstrap/reconciliation step with least-advanced-first
-    rotation: scopes order by persisted cursor (oldest first), so every
-    scope completes ALL its checklists across passes. Each listed hour
-    carries a cheap raw cell (COUNT/MAX(event_time)/MAX(ingest_time));
-    hours checkpointed under this revision with matching per-hour cells
-    are skipped WITHOUT consuming dirty generations; changed cells (late
-    no-notify arrivals) re-pend even at the same revision. No age
-    discard: unknown scopes start at the flushed SST floor when pinned
-    (conservative earlier bound; empty hours over-list), else the
-    memtable-only scoped raw MIN fallback, and move strictly forward."""
-    all_scopes = list(_known) if _known is not None else sorted(
-        _registered_scopes(ctx, cfg), key=repr)
-    sweeps = _sweeps if _sweeps is not None else _load_sweeps(ctx, cfg)
-    order = []
-    for scope in all_scopes:
-        entry = sweeps.get(scope)
-        cursor = entry[0] if entry is not None else None
-        if cursor is None:
-            order.append((0, repr(scope), scope))
-        else:
-            order.append((1, cursor, repr(scope), scope))
-    order.sort(key=lambda t: (t[0], t[1]) if len(t) == 3 else (t[0], t[1], t[2]))
-    scopes = [t[-1] for t in order[:DIRTY_SWEEP_SCOPES]]
-    pending = {}
-    listed = {}
-    for scope in scopes:
-        entry = sweeps.get(scope)
-        cursor = entry[0] if entry is not None else None
-        if cursor is None:
-            floor_hr = _sweep_floor_hr(ctx)
-            cursor = _sweep_start_ns(ctx, floor_hr, scope)
-            if cursor is None:
-                continue
-        cursor = max(cursor, 0)
-        if cursor >= seal_ns:
-            cursor = _sweep_reset_ns(ctx, scope)
-            if cursor is None or cursor >= seal_ns:
-                continue
-        rows, listed_through = _list_scope_hours(ctx, cfg, scope, cursor, seal_ns)
-        listed[scope] = ([(h, _hour_fingerprint(c, e, i))
-                          for (h, c, e, i) in rows],
-                         cursor, listed_through)
-        for (hour, count, max_event, max_ingest) in rows:
-            if len(pending) >= DIRTY_MAX_WINDOWS:
-                break
-            key = (scope, hour)
-            applied = checkpoints.get(key)
-            if applied is not None and applied[1] == revision:
-                cells = _parse_hour_fingerprint(
-                    applied[2] if len(applied) > 2 else "")
-                if cells is not None and cells == (count, max_event,
-                                                   max_ingest):
-                    continue
-            gen = _read_dirty_generation(ctx, scope, hour)
-            pending[key] = gen if gen is not None else ""
-        if len(pending) >= DIRTY_MAX_WINDOWS:
-            break
-    return pending, listed
-
-
-def vehicle_history_section(ctx, cfg, now=None, _known=None):
-    """Durable incremental dirty-hour coordinator. Returns windows committed.
-
-    _known reuses run_all's discovery so one pass queries raw once."""
-    now_dt = now or utcnow()
-    now_ns = dt_to_ns(now_dt)
+def vehicle_history_section(ctx, cfg, now=None):
+    """Process notified sealed hours, checkpointing each successful generation."""
+    now_ns = dt_to_ns(now or utcnow())
     seal_ns = floor_hour_ns(now_ns)
     revision = _config_revision(cfg)
-    sweeps = _load_sweeps(ctx, cfg)
-    known = list(_known) if _known is not None else sorted(
-        _distinct_scopes(ctx, cfg), key=repr)
     dirty = _load_dirty(ctx, cfg, 0, seal_ns)
     checkpoints = _load_checkpoints(ctx, cfg, 0, seal_ns)
-    pending = _pending_dirty(dirty, checkpoints, revision)
-    swept, listed = _sweep_pending(ctx, cfg, seal_ns, checkpoints, revision,
-                                   now_ns, _sweeps=sweeps, _known=known)
-    for key, gen in swept.items():
-        pending.setdefault(key, gen)
-    if len(pending) > DIRTY_MAX_WINDOWS:
-        ordered = sorted(pending)
-        pending = {k: pending[k] for k in ordered[:DIRTY_MAX_WINDOWS]}
-    if not pending:
-        for scope, entry in listed.items():
-            hours, _cursor, listed_through = entry
-            cells = {h: c for (h, c) in hours}
-            if all(_checkpoint_cells_match(checkpoints, scope, h, c,
-                                           revision)
-                   for h, c in cells.items()):
-                _commit_sweep(ctx, scope, listed_through, revision, now_ns)
-        return 0
+    pending = _pending_dirty(dirty, checkpoints)
     committed = 0
-    done = set()
-    for key in sorted(pending):
+    for key in sorted(pending)[:DIRTY_MAX_WINDOWS]:
         scope, hour_ns = key
         observed = pending[key]
-        before = _hour_cells(ctx, cfg, scope, hour_ns)
-        current = _read_dirty_generation(ctx, scope, hour_ns)
-        if (observed and current != observed) or (not observed and current):
+        if _read_dirty_generation(ctx, scope, hour_ns) != observed:
             continue
         unit = {key: observed}
         _rollup_hour_windows(ctx, cfg, [key])
@@ -4671,23 +4117,10 @@ def vehicle_history_section(ctx, cfg, now=None, _known=None):
         _battery_scope_work(ctx, cfg, unit)
         if _config_revision(cfg) != revision:
             return committed
-        after = _hour_cells(ctx, cfg, scope, hour_ns)
-        current = _read_dirty_generation(ctx, scope, hour_ns)
-        if (observed and current != observed) or (not observed and current):
+        if _read_dirty_generation(ctx, scope, hour_ns) != observed:
             continue
-        if after != before:
-            continue
-        _commit_checkpoint(ctx, scope, hour_ns, observed, revision, now_ns, after)
-        done.add(key)
+        _commit_checkpoint(ctx, scope, hour_ns, observed, revision, now_ns)
         committed += 1
-    for scope, entry in listed.items():
-        hours, _cursor, listed_through = entry
-        cells = {h: c for (h, c) in hours}
-        if all(((scope, h) in done
-                or _checkpoint_cells_match(checkpoints, scope, h, c,
-                                           revision))
-               for h, c in cells.items()):
-            _commit_sweep(ctx, scope, listed_through, revision, now_ns)
     return committed
 
 
@@ -4879,7 +4312,7 @@ def run_all(ctx, cfg, progress=None):
     run_section("vehicle", lambda: vehicle_section(ctx, legacy))
     run_section("trip_charge", lambda: trip_section(ctx, legacy_trip))
     run_section("vehicle_history",
-                lambda: vehicle_history_section(ctx, cfg, _known=coordinated))
+                lambda: vehicle_history_section(ctx, cfg))
     run_section("battery", lambda: battery_section(ctx, legacy_bat))
     try:
         freshness = vehicle_freshness(ctx)
