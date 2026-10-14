@@ -9,3 +9,5 @@ __pycache__/
 compose.private.yaml
 config/battery-analysis.json
 /AGENTS.md
+.omp/
+/local/

@@ -6,7 +6,7 @@ Commands (operator runs only these; `.env` holds all settings):
   restore   fetch archive (local or S3) -> verify -> populate FRESH restore volumes
   list      local archives (+ remote COMPLETE backup ids when S3 configured)
 
-Procedure (backup profile; both nondisruptive to the live receiver):
+Procedure (backup profile; both nondisruptive to the live receiver and worker):
   docker compose --profile backup run --rm can-backup backup
   BACKUP_OFFLINE_CONFIRMED=1 docker compose --profile backup run --rm can-backup restore
 
@@ -23,12 +23,15 @@ tar bytes are exactly the hashed bytes. The tar holds the snapshot
 raw.sqlite3 + definitions/ + manifest.json; tar member modes are normalized
 (0600/0700) and the manifest carries the authoritative mode/uid/gid.
 
-Off-host (S3 mode): tar + sidecar + manifest are uploaded and GET-and-hash
-verified (streaming SHA256, never ETag: multipart ETags legitimately differ),
+Off-host (S3 mode): tar + sidecar + manifest uploads PUT ChecksumSHA256 and
+require the echoed response plus HEAD ChecksumSHA256 to match (no
+verification-only body GET; metadata sha256 is a legacy hint, never proof),
 then a COMPLETE marker binds tar/sidecar/manifest/archive/definitions
 digests. Restore refuses anything the COMPLETE record does not bind,
-including local tars from failed uploads. boto checksum settings and all S3
-helpers are reused from scripts.storage.backup (same pinned boto3 venv).
+including local tars from failed uploads. A missing/unsupported server
+checksum fails the run (no GET fallback). boto checksum settings and all S3
+helpers are reused from scripts.storage.backup (same pinned boto3 venv),
+and one-shot S3 counters persist via scripts.storage.s3_cost.
 
 Restore: separate fresh volumes only (CAN_RESTORE_RAW_DIR /
 CAN_RESTORE_DEFS_DIR, never the live source paths: self-overwrite refuses).
@@ -41,14 +44,14 @@ and runs integrity_check. Manifest uids/modes are untrusted input:
 world-writable and setuid/setgid/sticky modes refuse,
 and staging extraction is traversal/symlink/special-file free.
 
-Restore gate: BACKUP_OFFLINE_CONFIRMED=1 AND the *restore-target* receiver
-lock (CAN_RESTORE_RAW_DIR/raw.sqlite3.lock) is free. The live source needs
+Restore gate: BACKUP_OFFLINE_CONFIRMED=1 AND the *restore-target* archive
+lock (CAN_RESTORE_RAW_DIR/raw.sqlite3.lock) is free of both receiver and worker. The live source needs
 no gate: restore populates only the separate fresh volumes (self-overwrite
 refuses), reads the source read-only, and never disturbs the running
-receiver or its WAL writer. Gates only inspect (read-only flock); they never
+receiver, worker, or their WAL writes. Gates only inspect (read-only flock); they never
 write the source mounts, which stay read-only in Compose. Cutover/restart
-replacement is a separate step: stop the original, keep a single archive
-owner for one path, and start the receiver on the verified restore.
+replacement is a separate step: stop both original roles, keep one receiver
+and one worker per archive, and start both on the verified restore.
 
 Capacity: backup preflights 2x source estimate + reserve on the backup
 volume; restore preflights tar + uncompressed members + reserve on the backup
@@ -82,7 +85,7 @@ from pathlib import Path
 
 from scripts.storage import backup as bk
 
-TOOL = "can_backup.py v1"
+TOOL = "can_backup.py v2"
 CURRENT_DIR_VERSION = 1
 CAN_PREFIX = "can-archive-backup-"
 CAN_SUFFIX = ".tar.gz"
@@ -91,6 +94,10 @@ CAN_MANIFEST = "manifest.json"
 CAN_COMPLETE = "COMPLETE"
 CAN_ARCHIVE = "raw.sqlite3"
 CAN_DEFS = "definitions"
+
+
+def make_client():
+    return bk.open_s3_client(component="can-backup")
 
 
 def archive_path():
@@ -102,7 +109,6 @@ def defs_dir():
 
 
 def ensure_backup_dir():
-    """Create CAN_BACKUP_DIR itself (e.g. /backup/can on first run)."""
     raw = bk.env("CAN_BACKUP_DIR", "/backup")
     try:
         os.makedirs(raw, mode=0o700, exist_ok=True)
@@ -625,7 +631,7 @@ def cmd_backup():
         bucket = bk.env("S3_BUCKET")
         bp = bk.norm_prefix(ident["backup_prefix"])
         try:
-            s3 = bk.make_s3_client()
+            s3 = make_client()
         except Exception as e:
             return bk.fail("S3 client failed: " + str(e)[:200], code=3)
     try:
@@ -761,7 +767,7 @@ def cmd_list():
         sys.stdout.write(os.path.basename(f) + "\n")
     if current_identity()["storage_type"] == "S3" and not bk.s3_missing():
         try:
-            client = bk.make_s3_client()
+            client = make_client()
             bp = bk.norm_prefix(bk.env("CAN_S3_BACKUP_PREFIX",
                                        "can-archive-backups"))
             objs = bk.s3_list_all(client, bk.env("S3_BUCKET"), bp)
@@ -1057,7 +1063,7 @@ def cmd_restore():
             return bk.fail("no local archive and S3 download needs: "
                            + ", ".join(miss), code=2)
         try:
-            s3 = bk.make_s3_client()
+            s3 = make_client()
             path, complete, derr = download_remote_backup(
                 d, s3, bk.env("S3_BUCKET"),
                 bk.norm_prefix(ident["backup_prefix"]), want)
@@ -1090,7 +1096,7 @@ def cmd_restore():
         bucket = bk.env("S3_BUCKET")
         try:
             if s3 is None:
-                s3 = bk.make_s3_client()
+                s3 = make_client()
             if complete is None:
                 complete, cerr = fetch_complete(
                     s3, bucket, bk.norm_prefix(ident["backup_prefix"]),
@@ -1186,6 +1192,11 @@ def cmd_restore():
                      + "can-backup: note: restored files carry their recorded"
                      " uid/gid/modes for the receiver user\n")
     return 0
+
+
+cmd_backup = bk.costed_command(cmd_backup, "can-backup", "CAN_BACKUP_DIR")
+cmd_restore = bk.costed_command(cmd_restore, "can-backup", "CAN_BACKUP_DIR")
+cmd_list = bk.costed_command(cmd_list, "can-backup", "CAN_BACKUP_DIR")
 
 
 def main(argv):

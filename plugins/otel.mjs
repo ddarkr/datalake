@@ -5,8 +5,7 @@ import { join, resolve } from 'node:path';
 import { execFile } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
-import { acquireProcessLock, openOutbox } from './outbox.mjs';
-import { readSenderStatus, startSender } from './sender.mjs';
+import { acquireProcessLock } from './process-lock.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -236,74 +235,31 @@ export async function sendPayload(config, body) {
   }
 }
 
-export function createTelemetry(client, options = {}) {
+
+export function createDirectTelemetry(client, options = {}) {
   if (typeof client !== 'string' || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(client)) throw new Error('Invalid telemetry client');
-  let selected, root, route;
-  const limits = { maxEntries: options.maxEntries, maxBytes: options.maxBytes };
-  const nodeBinary = options.nodeBinary;
-  try {
-    selected = configSource(options);
-    const profile = options.profile ?? 'default';
-    if (typeof profile !== 'string' || profile.length > 4096 || /[\x00-\x1f\x7f]/.test(profile)) throw new Error('invalid-profile');
-    const base = resolve(options.stateRoot ?? join(process.env.XDG_STATE_HOME || join(homedir(), '.local', 'state'), 'doda-datalake', 'otel'));
-    if (selected.config) {
-      const endpointHash = hash(selected.config.endpoint, 64);
-      const key = hash(JSON.stringify([client, selected.source, profile, endpointHash]), 64);
-      route = { key, endpointHash, ...(selected.configPath ? { configPath: selected.configPath } : {}) };
-      root = join(base, key);
-    }
-  } catch { selected = undefined; }
+  let selected;
+  try { selected = configSource(options); }
+  catch { selected = undefined; }
   if (!selected?.config) diagnostic('Export disabled: private configuration unavailable');
-  const pending = new Set();
-  let outbox, warnedPending = false;
-  const warnPending = () => {
-    if (!warnedPending) {
-      warnedPending = true;
-      diagnostic('Accepted telemetry remains pending; check private configuration and collector availability');
-    }
-  };
-  async function accept(serialized) {
-    let accepted = false;
-    try {
-      outbox ??= openOutbox({ root, route, ...limits }).catch(error => { outbox = undefined; throw error; });
-      const queue = await outbox;
-      const status = await readSenderStatus(root);
-      if (status?.state.startsWith('pending-')) warnPending();
-      accepted = await queue.put(serialized);
-      if (!accepted) {
-        diagnostic('Local telemetry queue unavailable or full; event not accepted');
-        return false;
-      }
-      // OMP waits for pipe transfer only; other hosts may also wait for worker readiness.
-      await startSender({ root, route, config: selected.config, nodeBinary, waitForReady: options.waitForSenderReady });
-    } catch {
-      if (accepted) warnPending();
-      else diagnostic('Local telemetry queue unavailable; event not accepted');
-    }
-    return accepted;
-  }
+  const active = new Set();
   return {
     get enabled() { return Boolean(selected?.config); },
-    enqueue(event) {
+    send(event) {
       if (!selected?.config) return Promise.resolve(false);
       let serialized;
       try { serialized = serializeEvent(client, event); }
       catch {
-        diagnostic('Invalid telemetry event; event not accepted');
+        diagnostic('Invalid telemetry event; event not delivered');
         return Promise.resolve(false);
       }
-      // Only local work is bounded here; a refused event must not advance caller checkpoints.
-      if (pending.size >= 128) {
-        diagnostic('Local telemetry queue busy; event not accepted');
-        return Promise.resolve(false);
-      }
-      const operation = accept(serialized);
-      pending.add(operation);
-      operation.then(() => pending.delete(operation), () => pending.delete(operation));
+      const operation = sendPayload(selected.config, serialized.body);
+      active.add(operation);
+      operation.then(() => active.delete(operation), () => active.delete(operation));
       return operation;
     },
-    async flushLocal() {
-      while (pending.size) await Promise.all([...pending]);
+    async flush() {
+      while (active.size) await Promise.all([...active]);
     },
   };
 }

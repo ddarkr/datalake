@@ -3,7 +3,7 @@ import { mkdir, open, readFile, rename, stat, unlink, writeFile } from 'node:fs/
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
+import { createDirectTelemetry, repositoryContext, isMain, withStateLock } from '../otel.mjs';
 
 const hash = value => createHash('sha256').update(value).digest('hex');
 const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$/.test(value) ? value : undefined;
@@ -138,14 +138,17 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
     await save(eventPath, { kind: isTool ? 'tool.call' : 'subagent', sessionId, eventId, parentEventId: isTool && agentId ? `subagent:${agentId}` : session?.eventId, startTimeMs: now, attributes }, true);
     return;
   }
-  async function enqueueOnce(event) {
-    // Existing sent receipts prove collector ACK; queued-v2 proves only durable local acceptance.
+  async function attemptOnce(event) {
+    // Existing sent receipts prove collector ACK; legacy queued-v2 proves only durable
+    // local acceptance. Both are treated as attempted: no automatic replay on failure.
     const legacy = join(stateDir, `sent-${hash(event.eventId)}.json`);
     const queued = join(stateDir, `queued-v2-${hash(event.eventId)}.json`);
-    if (await json(legacy) !== undefined || await json(queued) !== undefined) return true;
-    if (!await telemetry.enqueue(event)) return false;
-    await save(queued, {});
-    return true;
+    const attempted = join(stateDir, `attempted-${hash(event.eventId)}.json`);
+    if ((await json(legacy)) !== undefined || (await json(queued)) !== undefined || (await json(attempted)) !== undefined) return true;
+    let ok = false;
+    try { ok = await telemetry.send(event); } catch {}
+    await save(attempted, {});
+    return ok === true;
   }
   const completed = [];
   let checkpoint;
@@ -186,12 +189,12 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
     }
     completed.unshift(session);
   }
-  // Every local put settles before releasing serialization, even a mixed false/throw batch.
-  const accepted = await Promise.allSettled(completed.map(enqueueOnce));
-  if (checkpoint && accepted.every(result => result.status === 'fulfilled' && result.value)) {
+  // Every direct send settles before releasing serialization, even a mixed false/throw batch.
+  const outcome = await Promise.allSettled(completed.map(attemptOnce));
+  if (checkpoint && outcome.every(result => result.status === 'fulfilled')) {
     await save(checkpoint.path, checkpoint.value);
   }
-  const failure = accepted.find(result => result.status === 'rejected');
+  const failure = outcome.find(result => result.status === 'rejected');
   if (failure) throw failure.reason;
 }
 
@@ -199,9 +202,8 @@ async function main() {
   // OTEL_* is scrubbed from Claude hook children; installation stores only a private config path.
   const pointer = await json(fileURLToPath(new URL('./config-path.json', import.meta.url)));
   const dataRoot = process.env.CLAUDE_PLUGIN_DATA || join(process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude'), 'plugins', 'data', 'doda-datalake-otel');
-  const telemetry = createTelemetry('claude-code', {
+  const telemetry = createDirectTelemetry('claude-code', {
     configPath: process.env.DATALAKE_OTEL_CONFIG || pointer?.configPath,
-    profile: dataRoot, stateRoot: join(dataRoot, 'outbox'),
   });
   const stateRoot = join(dataRoot, 'sessions');
   let input = '', size = 0;
@@ -215,7 +217,7 @@ async function main() {
     // Native usage received by the datalake takes precedence; the native exporter may target
     // a different backend or emit only metrics, so its enable flag must not suppress this path.
     await handleHook(JSON.parse(input), { telemetry, stateRoot });
-  } finally { await telemetry.flushLocal(); }
+  } finally { await telemetry.flush().catch(() => {}); }
 }
 
 if (isMain(import.meta.url)) {

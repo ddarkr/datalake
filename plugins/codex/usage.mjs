@@ -100,14 +100,11 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
                       eventId: `usage:${cursor.threadId}:${cursor.turn}:${total.join(':')}`,
                       startTimeMs: timestamp, endTimeMs: timestamp, attributes,
                     };
-                    let accepted = false;
-                    try { accepted = await telemetry.enqueue(event); } catch {}
-                    if (accepted !== true) {
-                      // Do not advance the numeric baseline or byte offset before durable local acceptance.
-                      await save(cursorPath, cursor);
-                      return events;
-                    }
-                    events.push(event);
+                    let delivered = false;
+                    try { delivered = await telemetry.send(event); } catch {}
+                    // Attempted once: the numeric baseline below still advances, so a
+                    // failed HTTP send is never replayed by a later hook.
+                    if (delivered === true) events.push(event);
                   }
                   cursor.total = total;
                 }

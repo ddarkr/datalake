@@ -103,7 +103,7 @@ services:
     restart: unless-stopped
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.recorder-revision: "2"
+      datalake.recorder-revision: "3"
     # Allow the in-flight HTTP timeout and bounded final drain to finish.
     stop_grace_period: 90s
     depends_on:

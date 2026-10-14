@@ -701,6 +701,38 @@ def test_step_sequence_barriers_skew_clip_and_duplicates():
     assert seq == [(T0, 400.0, 20.0, T0)]
 
 
+def test_explicit_current_voltage_mapping_skips_uncalibrated_first_field():
+    # PackCurrent/PackVoltage rows exist but are uncalibrated barriers;
+    # an explicitly mapped native-A/V alternative must still drive
+    # Coulomb + DCR (pre-fix: first field with any rows won and masked it).
+    rows = []
+    for idx, amps in enumerate((0.0, 10.0)):
+        stamp = T0 + idx * 60000000000
+        rows.extend([pack_sig(stamp, amps),
+                     pack_v(stamp, 400.0 + 0.05 * amps),
+                     sig(stamp, field="BatteryCurrent", num=amps, unit="A",
+                         quality=None),
+                     sig(stamp, field="BatteryVoltage", num=400.0 + 0.05 * amps,
+                         unit="V", quality=None),
+                     sig(stamp, field="Soc", num=50.0, unit="%",
+                         quality=None),
+                     sig(stamp, field="ModuleTempMin", num=24.0,
+                         unit="celsius", quality=None),
+                     sig(stamp, field="ModuleTempMax", num=26.0,
+                         unit="celsius", quality=None)])
+    cfg = cal(initial_soc_time_ns=T0, field_units={},
+              current_fields=["PackCurrent", "BatteryCurrent"],
+              voltage_fields=["PackVoltage", "BatteryVoltage"])
+    out = {r["metric"]: r for r in be.analyze(rows, [], cfg)}
+    assert out["battery.electrical.soc_coulomb_pct"]["status"] == "estimated"
+    dcr = out["battery.electrical.resistance_apparent_ohm"]
+    assert dcr["status"] == "derived" and abs(dcr["value"] - 0.05) < 1e-12
+    # Unlisted alternatives stay excluded from the physical calculation.
+    cfg2 = cal(initial_soc_time_ns=T0, field_units={}, current_fields=["PackCurrent"],
+               voltage_fields=["PackVoltage"])
+    out2 = {r["metric"]: r for r in be.analyze(rows, [], cfg2)}
+    assert out2["battery.electrical.soc_coulomb_pct"]["value"] is None
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:

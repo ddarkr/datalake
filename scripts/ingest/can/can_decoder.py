@@ -1,6 +1,6 @@
 """Server-only CAN decoding; the receiver owns the unmodified raw archive."""
 
-import collections
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -28,6 +28,7 @@ COUNT_KEYS = (
     'unsupported_mux', 'decode_errors', 'control_records', 'oversize_records',
     'discarded_bytes', 'tail_bytes', 'unknown_enum_signals',
 )
+_COUNT_DEFAULTS = dict.fromkeys(COUNT_KEYS, 0)
 
 
 def _hash(value):
@@ -43,6 +44,11 @@ def _json_atom(value):
         return str(value).encode('ascii')
     return json.dumps(value, sort_keys=True, separators=(',', ':'),
                       ensure_ascii=True, allow_nan=False).encode()
+
+
+@lru_cache(maxsize=128, typed=True)
+def _identity_prefix(vehicle, collector_id, session_id):
+    return b'[' + b','.join(_json_atom(value) for value in (vehicle, collector_id, session_id))
 
 
 def _choice_quality(label):
@@ -171,7 +177,7 @@ class Decoder:
         if first:
             start = 0
             ingest_time = time.time_ns()
-            envelope_id = _hash([meta['vehicle'], meta['collector_id'], meta['session_id'], chunk['seq']])
+            envelope_id = None
         else:
             # Resume emits only the remainder: same chunk bytes, frozen row times/identities.
             if type(resume_part) is not int:
@@ -183,17 +189,15 @@ class Decoder:
                 raise ValueError('Decoder resume identity is invalid.')
             tail = b''
             start = resume_part
-        counts = collections.Counter({key: 0 for key in COUNT_KEYS})
+        counts = _COUNT_DEFAULTS.copy()
         if first:
             counts.update(bytes=len(data), chunks=1)
         rows = []
         event_time = meta['started_ns'] + chunk['offset_ns']
-        # Event-ID prefix: canonical bytes of [vehicle,collector_id,session_id]
-        # computed once per call; the ordinal is appended per frame from its
-        # exact _json_atom encoding. hashlib context per frame + copies per row.
-        identity_prefix = (b'[' + b','.join(_json_atom(meta[key])
-                                           for key in ('vehicle', 'collector_id', 'session_id')))
-        event_time_atom = _json_atom(event_time)
+        # Canonical identity bytes are shared across chunks, not rebuilt from
+        # three JSON strings for every unknown/control-only chunk.
+        identity_prefix = _identity_prefix(meta['vehicle'], meta['collector_id'], meta['session_id'])
+        event_time_atom = None
         parts = data.split(b'\r')
         if not first and not 0 < start < len(parts):
             raise ValueError('Decoder resume cursor is out of range.')
@@ -266,7 +270,7 @@ class Decoder:
             counts['decoded_frames'] += 1
             for name, raw in decoded.items():
                 cached = self._row_cache[(identifier, extended, name)]
-                definition, unit, has_reported_choice, path_atom = cached
+                definition, unit, has_reported_choice, path_cache = cached
                 if definition['kind'] != 'data':
                     continue
                 value_num = value_text = None
@@ -283,14 +287,18 @@ class Decoder:
                     if not math.isfinite(value_num):
                         counts['decode_errors'] += 1
                         continue
-                if path_atom is None:
-                    # Cached ",<path>,<epoch>" bytes: constant per signal identity.
+                if path_cache is None:
                     path = f'Vehicle.CAN.x{identifier:03X}.{name}'
                     path_atom = b',' + _json_atom(path) + b',' + _json_atom(self.epoch)
                     self._row_cache[(identifier, extended, name)] = (
-                        definition, unit, has_reported_choice, path_atom)
+                        definition, unit, has_reported_choice, (path, path_atom))
                 else:
-                    path = f'Vehicle.CAN.x{identifier:03X}.{name}'
+                    path, path_atom = path_cache
+                if event_time_atom is None:
+                    event_time_atom = _json_atom(event_time)
+                if envelope_id is None:
+                    envelope_id = hashlib.sha256(
+                        identity_prefix + b',' + _json_atom(chunk['seq']) + b']').hexdigest()
                 row_ctx = frame_ctx.copy()
                 row_ctx.update(path_atom + b',' + event_time_atom + b']')
                 rows.append({
@@ -314,10 +322,10 @@ class Decoder:
                              resume_envelope=envelope_id)
                 counts['tail_bytes'] = 0
                 counts['rows'] = len(rows)
-                return rows, state, dict(counts), False
+                return rows, state, counts, False
         for key in ('resume_part', 'resume_ingest_ns', 'resume_envelope'):
             state.pop(key, None)
         state.update(next_seq=chunk['seq'] + 1, last_offset_ns=chunk['offset_ns'], tail_hex=tail.hex())
         counts['tail_bytes'] = len(tail)
         counts['rows'] = len(rows)
-        return rows, state, dict(counts), True
+        return rows, state, counts, True

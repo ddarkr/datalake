@@ -88,7 +88,7 @@ row; runtime should also include it in persisted logical identity.
 
 from scripts.analytics.battery import battery_common as bc
 
-ALGORITHM_VERSION = "1.2.1"
+ALGORITHM_VERSION = "1.2.2"
 ANALYSIS_ID = "battery_alerts"
 DEFAULT_CONTEXT_SKEW_NS = 600_000_000_000
 
@@ -617,6 +617,14 @@ def analyze(signals, events, config):
         sig_by_scope.setdefault(
             (s["vehicle"], s["source"], s["decode_epoch"]), []).append(s)
     scope_hints = set(by_scope) | set(sig_by_scope) | set(exc_ev) | set(exc_sig)
+    hint = config.get("scope_hint")
+    if hint is not None:
+        if (not isinstance(hint, (list, tuple)) or len(hint) != 3
+                or not all(isinstance(v, str) and v for v in hint[:2])
+                or (hint[2] is not None and
+                    (not isinstance(hint[2], str) or not hint[2]))):
+            raise ValueError("invalid scope_hint")
+        scope_hints.add(tuple(hint))
     for raw in events if isinstance(events, list) else []:
         if isinstance(raw, dict):
             v = raw.get("vehicle")

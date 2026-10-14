@@ -342,6 +342,7 @@ def redecode_mf4(mf4_path, mapper, vehicle, epoch, meta, units, conn,
     epoch coexists.
     """
     stored, skipped = 0, 0
+    batch = []
     for can_id, data, ns in iter_frames(mf4_path, capture_frames):
         try:
             msg_def = mapper.get_message_by_frame_id(can_id)
@@ -399,8 +400,9 @@ def redecode_mf4(mf4_path, mapper, vehicle, epoch, meta, units, conn,
                             vehicle, mapping.vss_name, ns, epoch,
                             num, text, boolean),
                         meta, units, num, text, boolean, time.time_ns())
-                    if vr.store_update(conn, last, mapping.vss_name, row):
-                        stored += 1
+                    batch.append((mapping.vss_name, row))
+    if batch:
+        stored = vr.store_updates(conn, last, batch)
     return stored, skipped
 
 

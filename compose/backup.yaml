@@ -20,23 +20,23 @@
 #
 # Automated S3 workflow (all inside scripts/storage/backup.py, boto3 pinned via
 # backup-deps venv; real B2 unverified — needs live credentials):
-# S3 backup: offline check -> SST objects copied from s3://BUCKET/ROOT/ to
-#   the immutable s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/sst/ (SHA256+size
-#   streamed and verified per object; failure rolls back own copies) -> local tar (0600,
-#   embeds manifest.json incl. the SST record) + .sha256 -> tar + sidecar +
+# S3 backup: offline check -> exclusive shared-pool claim -> reuse unchanged
+#   s3://BUCKET/S3_BACKUP_PREFIX/_sst/<identity> SSTs, conditional server-side
+#   COPY only new identities (source/destination HEAD, no SST body GET) -> local tar (0600,
+#   embeds manifest.json with the full recovery inventory) + .sha256 -> tar + sidecar +
 #   manifest uploaded to s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/ and
-#   GET-and-hash verified -> COMPLETE marker written -> only then old local
-#   generations pruned (never the file just written; remote objects never
-#   pruned, except a failed run's own writes). Overlapping live/backup
-#   prefixes fail closed. File mode keeps the same offline/tar/restore
+#   HEAD size/digest-metadata verified -> COMPLETE marker written -> only then old local
+#   generations pruned (never the file just written), then claim released. Remote
+#   retention requires reviewed dry-run + approval; GC preserves all surviving SST refs.
+#   Overlapping live/backup prefixes fail closed. File mode keeps the same offline/tar/restore
 #   contract with no S3 at all.
 # S3 restore: offline check -> missing local archive auto-downloads the
 #   selected (BACKUP_FILE id/name) or newest COMPLETE remote backup and
 #   SHA-verifies it -> refuses non-empty local targets (no force flag) ->
-#   reuses live SST objects only after matching SHA256+size; conflicts or
-#   unreadable objects fail closed -> restores missing SSTs with per-object
-#   verification -> staged tar populate. Failure deletes only this run's
-#   writes. Legacy archives without an SST record are unrestorable in S3 mode.
+#   reuses live SSTs matching recorded size/ETag identity; conflicts or
+#   unreadable objects fail closed -> restores missing SSTs with HEAD checks
+#   (historical SHA256 snapshots retain their original restore checks) -> staged
+#   tar populate. Failure deletes only this run's writes. Metadata is not byte proof.
 # Never set lifecycle expiry on the backup prefix; the raw MF4 bucket is
 # separate and never touched.
 # Fresh-host/disaster recovery: fresh COMPOSE_PROJECT_NAME (empty volumes by
@@ -71,7 +71,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "3"
+      datalake.storage-metrics-revision: "5"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -83,16 +83,24 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       S3_REGION: ${S3_REGION:-}
       STORAGE_METRICS_INTERVAL_SEC: ${STORAGE_METRICS_INTERVAL_SEC:-3600}
+      STORAGE_COST_FREE_EGRESS_MULTIPLIER: ${STORAGE_COST_FREE_EGRESS_MULTIPLIER:-3}
+      STORAGE_COST_EGRESS_USD_PER_GB: ${STORAGE_COST_EGRESS_USD_PER_GB:-0.01}
+      STORAGE_COST_MAX_MONTHLY_EGRESS_GIB: ${STORAGE_COST_MAX_MONTHLY_EGRESS_GIB:-2400}
+      STORAGE_COST_MAX_MONTHLY_OVERAGE_USD: ${STORAGE_COST_MAX_MONTHLY_OVERAGE_USD:-0}
       CAN_RECEIVER_ARCHIVE: /can-raw/raw.sqlite3
       CAN_RECEIVER_DISK_RESERVE_BYTES: "67108864"
     volumes:
       - backup-venv:/opt/venv:ro
       - greptime-data:/greptime-data:ro
       - backup-data:/ops:ro
+      - can-backup-data:/can-ops:ro
       - can-receiver-raw:/can-raw:ro
     configs:
       - source: storage_metrics_py
         target: /app/scripts/storage/storage_metrics.py
+        mode: 0444
+      - source: s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
         mode: 0444
       - source: greptime_preflight
         target: /app/scripts/database/greptime_preflight.py
@@ -106,12 +114,21 @@ services:
   backup:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
+    labels:
+      datalake.backup-revision: "4"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
     environment:
       BACKUP_DIR: /backup
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
+      BACKUP_REMOTE_RETENTION_MODE: ${BACKUP_REMOTE_RETENTION_MODE:-off}
+      BACKUP_REMOTE_RETAIN_COUNT: ${BACKUP_REMOTE_RETAIN_COUNT:-7}
+      BACKUP_REMOTE_RETAIN_DAYS: ${BACKUP_REMOTE_RETAIN_DAYS:-0}
+      BACKUP_REMOTE_MIN_RECOVERY: ${BACKUP_REMOTE_MIN_RECOVERY:-1}
+      BACKUP_REMOTE_INCOMPLETE_GRACE_SEC: ${BACKUP_REMOTE_INCOMPLETE_GRACE_SEC:-86400}
+      BACKUP_REMOTE_PINNED: ${BACKUP_REMOTE_PINNED:-}
+      BACKUP_REMOTE_RETENTION_APPROVE: ${BACKUP_REMOTE_RETENTION_APPROVE:-}
       BACKUP_FILE: ${BACKUP_FILE:-}
       BACKUP_RESERVE_BYTES: ${BACKUP_RESERVE_BYTES:-67108864}
       BACKUP_OFFLINE_CONFIRMED: ${BACKUP_OFFLINE_CONFIRMED:-}
@@ -133,6 +150,9 @@ services:
       - source: backup_py
         target: /app/scripts/storage/backup.py
         mode: 0444
+      - source: s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
+        mode: 0444
       - source: greptime_preflight
         target: /app/scripts/database/greptime_preflight.py
     working_dir: /app
@@ -151,6 +171,8 @@ services:
   can-backup:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
+    labels:
+      datalake.backup-revision: "4"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -186,6 +208,9 @@ services:
       - source: backup_py
         target: /app/scripts/storage/backup.py
         mode: 0444
+      - source: s3_cost_py
+        target: /app/scripts/storage/s3_cost.py
+        mode: 0444
       - source: greptime_preflight
         target: /app/scripts/database/greptime_preflight.py
     working_dir: /app
@@ -200,6 +225,8 @@ configs:
     x-source: scripts/storage/can_backup.py
   storage_metrics_py:
     x-source: scripts/storage/storage_metrics.py
+  s3_cost_py:
+    x-source: scripts/storage/s3_cost.py
 
 
 volumes:

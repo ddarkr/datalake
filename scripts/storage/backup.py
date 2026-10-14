@@ -5,6 +5,7 @@ Commands (operator runs only these; `.env` holds all settings):
   backup    offline snapshot -> local tar -> verified S3 upload -> prune
   restore   fetch archive (local or S3) -> verify -> restore SST + volumes
   list      local archives (+ remote COMPLETE backup ids when S3 configured)
+  retention evaluate remote generations (dry-run default; explicit approve to delete)
 
 Procedure:
   stop:    docker compose --profile server stop
@@ -28,38 +29,53 @@ s3://<S3_BUCKET>/<S3_ROOT>/ are live state. A local tar alone is NOT a
 point-in-time snapshot: after the DB resumes, compaction/GC may delete SSTs
 the local files referenced. A restorable S3 backup is all of one backup id:
 the local tar (WAL/metadata, embeds manifest.json incl. the SST snapshot
-record) + the immutable SST snapshot prefix
-s3://<bucket>/<S3_BACKUP_PREFIX>/<backup-id>/sst/ + the verified off-host tar
+record) + backup-owned immutable pooled SST objects under
+s3://<bucket>/<S3_BACKUP_PREFIX>/_sst/ + the off-host tar
 copy + a COMPLETE marker carrying tar_sha256/sidecar_sha256/manifest_sha256
-and the full SST digest list. Every restore path (downloaded AND local tars)
-is refused unless the tar, sidecar, embedded manifest, snapshot objects and
+and the full SST size/ETag/snapshot_key list. COMPLETE inventories are the
+authoritative pooled destination-ETag ledger; no per-object ledger objects are
+written. Canonical unreferenced pool data keys remain discoverable for GC
+retries. Every restore path (downloaded AND local tars)
+is refused unless the tar, sidecar, embedded manifest, snapshot records and
 COMPLETE record all agree. Retention of the backup prefix is a dependency of
-restore: never set lifecycle expiry on it; this tool never deletes remote
-objects except its own failed-run writes (rollback). The raw MF4 bucket is
-separate and never touched. With GREPTIME_STORAGE_TYPE=File the local tar is
-the whole backup (same offline/tar/restore contract, no S3).
+restore: never set lifecycle expiry on it; besides its own failed-run writes
+(rollback), this tool deletes remote objects only via explicit retention
+enforce+approval (refs/RETIRING-guarded generation retirement + shared-pool
+GC for pool keys no live generation references). The raw MF4
+bucket is separate and never touched. With GREPTIME_STORAGE_TYPE=File the local
+tar is the whole backup (same offline/tar/restore contract, no S3).
 
-Content verification (never ETag): object copies and uploads are verified by
-streaming SHA256 GETs in 1 MiB chunks (multipart CopyObject ETags differ
-legitimately, so ETags are never compared). Large objects are never read
-wholly into memory: the tar downloads stream to a .tmp file with incremental
-hashing and only atomically replace into place after the COMPLETE digest
-matches. Ownership/rollback: the backup id namespace is proven empty before
-the first write, every destination key is registered BEFORE its write, and
-any failure deletes the whole owned set including a half-written COMPLETE
-marker (no dangling COMPLETE can point at rolled-back objects).
-Backup ids are time-sortable with a random suffix; an occupied remote
-namespace is never written into. Restores require the SAME root —
-cross-root migration is not claimed.
+Immutable pool invariant: bucket+root+relative-key+size+source-ETag maps deterministically
+to one backup-owned pool key. The first backup copies each live SST once;
+an identical second backup adds only bounded control bytes (tar + sidecar +
+manifest + COMPLETE, <=.02 of live SST bytes on meaningful fixtures) with
+zero SST COPY/PUT. A same-key changed source gets a new pool entry. Pool
+objects outlive live compaction; approved retention retires generations, then
+sweeps unreferenced pool keys and never keys another live/held/retained/pinned/
+referenced/retiring generation names. Historical per-generation sst/ snapshots
+remain restorable (legacy compatibility).
+
+Backup verification does not download object bodies: server-side copies use
+HEAD size/metadata and CopySourceIfMatch ETag preconditions, comparing server
+checksums when available. Conditional COPY without comparable checksums is an
+identity-guarded server copy, not a content-digest proof. Uploads PUT
+ChecksumSHA256 and require the echoed
+response plus HEAD ChecksumSHA256 to match, else fail closed. Metadata sha256
+is a legacy identity hint, never verification. Missing upload checksum support
+fails the run (no GET fallback). Wrong-checksum PUTs
+are rejected by the server before storage. Multipart ETags are identity
+tokens, not whole-object content hashes.
 
 S3 backup order: offline check -> claim fresh id (local + remote namespace
-empty) -> copy each live object to the snapshot prefix (per-object streaming
-SHA verify; failure deletes the owned set) -> write local tar (0600) +
-.sha256 sidecar -> upload tar + sidecar + manifest copy (GET-and-hash
-verified) -> write COMPLETE marker (tracked, verified) -> only then prune
-old LOCAL generations (never the file just written; remote objects are never
-pruned). Overlapping live/backup prefixes fail closed. Missing S3 settings
-fail closed: a local-only S3 tar is unrestorable, so it is not written.
+empty) -> snapshot each live object (HEAD identity; COPY to _sst/ only on
+miss with CopySourceIfMatch + checksum verification; failure rolls back only
+newly owned keys, never reused pool keys) -> write local tar (0600) +
+.sha256 sidecar -> upload tar + sidecar + manifest copy (PUT ChecksumSHA256,
+echo + HEAD verified) -> write COMPLETE marker (tracked, checksum verified)
+-> only then prune old LOCAL generations (never the file just written; remote
+objects are never pruned). Overlapping live/backup prefixes fail closed.
+Missing S3 settings fail closed: a local-only S3 tar is unrestorable, so it
+is not written.
 
 S3 restore order: offline check -> resolve archive locally, else download the
 selected (BACKUP_FILE id/name) or newest COMPLETE remote backup (exact
@@ -68,14 +84,18 @@ remote sidecar + manifest cross-check, atomic replace) -> local S3 tars must
 also carry a sidecar and match their remote COMPLETE record (a local tar
 from a failed upload is NOT restorable) -> schema/identity/boundary checks
 (no force flag, legacy archives without an SST record refused, duplicate SST
-keys refused, snapshot prefix must equal backup-prefix/backup-id/sst
-exactly) -> refuse when local targets are non-empty; live SST keys already
-matching the manifest size+SHA256 are reused, missing snapshot keys are
-copied back and streaming-verified against the manifest digest, conflicting
-live contents refuse without overwriting (failure deletes only own writes)
+keys refused, shared-v1 generations require the _sst/ scope and identity-derived
+snapshot_key records) -> refuse when local targets are non-empty; live SST keys already
+matching recorded size/checksum identity are reused, missing keys are copied
+from the backup-owned pool and checksum-verified; historical SHA256 snapshots
+keep their original restore checks. Conflicting live objects refuse without
+overwriting (failure deletes only own writes)
 -> staged tar populate; any failure also removes the SST keys just written
 and rolls targets back to empty.
-Prefixes without COMPLETE are incomplete and ignored (safe to delete by hand).
+Incomplete/corrupt inventories block pool GC; never broadly delete shared SSTs.
+Old per-SST .json entries are optional controls, not the reuse ledger. GC
+reclaims an unreferenced control only after proving its canonical owner;
+unknown controls refuse reclamation and partial deletes remain retryable.
 
 Secrets: greptime-etc holds credentials (auth/users, S3 secret in
 greptimedb.toml), so archives/sidecars are 0600 under umask 077. Restored
@@ -94,11 +114,18 @@ Failed runs delete only their own writes; the source is never mutated.
 Exit codes: 0 ok, 1 usage/env error, 2 precondition failure, 3 IO error.
 """
 
+import base64
+import calendar
 import glob
-from contextlib import closing
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
+from functools import wraps
+import socket
+from scripts.storage.s3_cost import CountingS3, persist_cost
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import secrets
@@ -110,6 +137,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 
 from scripts.database.greptime_preflight import derive_b2_region
 
@@ -118,7 +146,13 @@ BACKUP_SUFFIX = ".tar.gz"
 SIDECAR_SUFFIX = ".sha256"
 MANIFEST_NAME = "manifest.json"
 COMPLETE_NAME = "COMPLETE"
+RETIRING_NAME = "RETIRING"
+REFS_DIR = "refs/"
+SHARED_LAYOUT = "shared-v1"
+POOL_DIR = "_sst/"
+POOL_LOCK_DIR = "_locks/"
 LABELS = ("greptime-data", "greptime-etc")
+TOOL = "backup.py v6"
 S3ENV = ("S3_ENDPOINT_URL", "S3_BUCKET", "S3_REGION", "S3_ACCESS_KEY_ID", "S3_SECRET_ACCESS_KEY")
 SHA_RE = re.compile(r"^[0-9a-f]{64}$")
 CHUNK = 1 << 20
@@ -228,11 +262,11 @@ def require_https_endpoint(value, name):
         raise ValueError(name + " must be an https:// URL with a host")
     return value.strip()
 
-def make_s3_client():
+def make_s3_client(component="backup"):
     endpoint = require_https_endpoint(env("S3_ENDPOINT_URL"), "S3_ENDPOINT_URL")
     import boto3  # noqa: pinned dep, lazy so import errors stay local
     from botocore.config import Config
-    return boto3.client(
+    raw = boto3.client(
         "s3", endpoint_url=endpoint,
         region_name=env("S3_REGION") or derive_b2_region(env("S3_ENDPOINT_URL")) or None,
         aws_access_key_id=env("S3_ACCESS_KEY_ID") or None,
@@ -241,7 +275,7 @@ def make_s3_client():
                       request_checksum_calculation="when_required",
                       response_checksum_validation="when_required",
                       connect_timeout=10, read_timeout=60))
-
+    return CountingS3(raw, component)
 
 def s3_missing():
     return [n for n in S3ENV if not env(n)
@@ -304,9 +338,17 @@ def s3_get_control(client, bucket, key, cap=None):
 
 
 def s3_delete_keys(client, bucket, keys):
+    """Delete keys; per-key partial failures raise IOError naming survivors."""
+    errors = []
     for i in range(0, len(keys), 1000):
         chunk = [{"Key": k} for k in keys[i:i + 1000]]
-        client.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
+        resp = client.delete_objects(Bucket=bucket, Delete={"Objects": chunk})
+        for err in (resp or {}).get("Errors") or []:
+            errors.append("%s: %s" % (err.get("Key"), err.get("Code", "delete failed")))
+    if errors:
+        raise IOError("partial delete failed (%d): %s%s"
+                      % (len(errors), "; ".join(errors[:5]),
+                         "..." if len(errors) > 5 else ""))
 
 
 def rollback_owned(client, bucket, owned):
@@ -316,33 +358,257 @@ def rollback_owned(client, bucket, owned):
         pass
 
 
-def s3_copy_content_verified(client, bucket, src, dst):
-    """Copy then stream-verify both sides by content hash (never ETag:
-    multipart CopyObject ETags legitimately differ from source ETags)."""
-    src_sha, src_size = s3_stream_hash(client, bucket, src)
-    client.copy_object(Bucket=bucket, CopySource={"Bucket": bucket, "Key": src}, Key=dst)
-    dst_sha, dst_size = s3_stream_hash(client, bucket, dst)
-    if dst_sha != src_sha or dst_size != src_size:
-        raise IOError("copy verify mismatch: %s -> %s" % (src, dst))
-    return src_sha, src_size
+def _sha256_b64_of_head(head, key):
+    """Server checksum from a ChecksumMode=ENABLED HEAD; absent means unsupported."""
+    cksum = head.get("ChecksumSHA256")
+    if not isinstance(cksum, str) or not cksum:
+        raise IOError("server checksum unsupported for %s (refusing: no GET fallback)" % key)
+    return cksum
+
+
+def pool_prefix(backup_prefix):
+    return norm_prefix(backup_prefix) + POOL_DIR
+
+
+def shared_sst_key(bucket, root_pfx, bp, key, size, source_etag):
+    """Object-identity address, not a cryptographic digest of SST bytes."""
+    identity = json.dumps([bucket, norm_prefix(root_pfx), key, size, source_etag],
+                          separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return norm_prefix(bp) + POOL_DIR + hashlib.sha256(identity).hexdigest()
+
+
+def snapshot_object_key(snap, obj):
+    if snap.get("layout") == SHARED_LAYOUT:
+        return obj["snapshot_key"]
+    return snap["snap_prefix"] + obj["key"]
+
+
+def s3_head_checksum(client, bucket, key):
+    return client.head_object(Bucket=bucket, Key=key, ChecksumMode="ENABLED")
+
+
+def head_checksums(head):
+    fields = ("ChecksumSHA256", "ChecksumSHA1", "ChecksumCRC32", "ChecksumCRC32C",
+              "ChecksumCRC64NVME")
+    return {k: head[k] for k in fields if isinstance(head.get(k), str) and head[k]}
+
+
+def common_checksum_fields(left, right):
+    common = set(head_checksums(left)) & set(head_checksums(right))
+    def kind(head, field):
+        return head.get("ChecksumType") or (
+            "COMPOSITE" if re.search(r"-[0-9]+$", head[field]) else "FULL_OBJECT")
+    return {field for field in common if kind(left, field) == kind(right, field)}
+
+
+def checksum_match(left, right):
+    common = common_checksum_fields(left, right)
+    if common:
+        return all(left[k] == right[k] for k in common)
+    etag = left.get("ETag", "")
+    # Multipart ETags remain version tokens, never whole-object MD5 digests.
+    return bool(re.fullmatch(r'"[0-9a-fA-F]{32}"', etag) and etag == right.get("ETag"))
+
+
+def s3_copy_head_verified(client, bucket, src, dst, source=None):
+    """Bind COPY to the already observed source version; never re-HEAD it."""
+    source = source if source is not None else s3_head_checksum(client, bucket, src)
+    result = client.copy_object(
+        Bucket=bucket, CopySource={"Bucket": bucket, "Key": src},
+        CopySourceIfMatch=source["ETag"], Key=dst).get("CopyObjectResult", {})
+    target = s3_head_checksum(client, bucket, dst)
+    if (target["ContentLength"] != source["ContentLength"]
+            or target.get("Metadata", {}) != source.get("Metadata", {})):
+        raise IOError("copy HEAD mismatch: %s -> %s" % (src, dst))
+    if result.get("ETag") is not None and result["ETag"] != target["ETag"]:
+        raise IOError("copy returned ETag mismatch: " + dst)
+    returned = head_checksums(result)
+    if returned:
+        if any(target[k] != v for k, v in returned.items() if k in target):
+            raise IOError("copy returned checksum mismatch: " + dst)
+    # No returned checksum is an identity-guarded COPY, not a digest proof.
+    # S3 versions with no checksum headers still support conditional COPY.
+    common = common_checksum_fields(source, target)
+    if any(source[k] != target[k] for k in common):
+        raise IOError("copy checksum mismatch: %s -> %s" % (src, dst))
+    return {"size": source["ContentLength"], "source_etag": source["ETag"],
+            "etag": target["ETag"], "checksums": head_checksums(target)}
+
+
+_POOL_GUARD = ContextVar("backup_pool_guard", default=None)
+_POOL_INVENTORY = ContextVar("backup_pool_inventory", default=None)
+
+
+@contextmanager
+def shared_pool_lock(client, bucket, bp, token=None):
+    """Exclusive unique claims require strongly consistent LIST/PUT.
+
+    ponytail: serialize this backup prefix; per-object guards only if measured
+    contention justifies a more complex publication/GC protocol. A crashed claim
+    requires independently proving its owner exited before manual removal.
+    """
+    identity = (bucket, norm_prefix(bp))
+    if _POOL_GUARD.get() == identity:
+        yield
+        return
+    locks = norm_prefix(bp) + POOL_LOCK_DIR
+    if s3_list_all(client, bucket, locks):
+        raise IOError("pool writer/GC already active (claim present)")
+    claim_token = token or uuid.uuid4().hex
+    if not isinstance(claim_token, str) or "/" in claim_token or claim_token in (".", ".."):
+        raise IOError("unsafe shared SST pool lock token")
+    key = locks + claim_token
+    token = None
+    inventory_token = None
+    try:
+        claim = {"claim": key.rsplit("/", 1)[-1], "pid": os.getpid(),
+                 "host": socket.gethostname(), "created_ns": time.time_ns()}
+        s3_put_bytes_verified(client, bucket, key, json.dumps(claim).encode())
+        if {o["Key"] for o in s3_list_all(client, bucket, locks)} != {key}:
+            raise IOError("pool writer/GC claim collision (refusing)")
+        token = _POOL_GUARD.set(identity)
+        inventory_token = _POOL_INVENTORY.set({})
+        yield
+    finally:
+        if inventory_token is not None:
+            _POOL_INVENTORY.reset(inventory_token)
+        if token is not None:
+            _POOL_GUARD.reset(token)
+        s3_delete_keys(client, bucket, [key])
+
+
+def pool_inventory(client, bucket, bp, excluding=None):
+    """Published COMPLETE inventories are the pool identity ledger.
+
+    LIST also discovers unpublished canonical pool objects. Unknown names or
+    incomplete/corrupt inventories refuse reclamation; no object-body reads.
+    """
+    bp = norm_prefix(bp)
+    pp = pool_prefix(bp)
+    scope = s3_list_all(client, bucket, bp)
+    sizes = {o["Key"]: o.get("Size") for o in scope}
+    names = {key[len(pp):] for key in sizes if key.startswith(pp)}
+    if any(not re.fullmatch(r"[0-9a-f]{64}(?:\.json)?", key) for key in names):
+        raise IOError("pool GC blocked by unknown pool object")
+    # Old per-SST .json objects are auxiliary controls, never data or a required ledger.
+    pool = {key for key in names if SHA_RE.fullmatch(key)}
+    ids = {key[len(bp):].split("/")[0] for key in sizes
+           if key[len(bp):].split("/")[0] not in (POOL_DIR.rstrip("/"), POOL_LOCK_DIR.rstrip("/"))}
+    records = {}
+    for bid in sorted(ids):
+        if bid == excluding:
+            continue
+        base = remote_base(bp, bid)
+        required = {base + bid + BACKUP_SUFFIX,
+                    base + bid + BACKUP_SUFFIX + SIDECAR_SUFFIX,
+                    base + MANIFEST_NAME, base + COMPLETE_NAME}
+        if base + RETIRING_NAME in sizes or not required.issubset(sizes):
+            raise IOError("pool GC blocked by incomplete/retiring generation: " + bid)
+        complete, error = fetch_complete(client, bucket, bp, bid)
+        if error is not None or sizes[base + bid + BACKUP_SUFFIX] != complete["tar_size"]:
+            raise IOError("pool GC blocked by unknown references: " + bid)
+        if complete.get("sst_layout") != SHARED_LAYOUT:
+            if any(base + "sst/" + obj["key"] not in sizes
+                   or sizes[base + "sst/" + obj["key"]] != obj["size"]
+                   for obj in complete["sst"]):
+                raise IOError("pool GC blocked by incomplete historical generation: " + bid)
+            continue
+        for record in complete["sst"]:
+            key = record["snapshot_key"]
+            suffix = key[len(pp):]
+            if (key != shared_sst_key(bucket, env("S3_ROOT"), bp, record["key"],
+                                      record["size"], record["source_etag"])
+                    or sizes.get(key) != record["size"]):
+                raise IOError("pool GC blocked by invalid pool/source reference")
+            if suffix in records and records[suffix] != record:
+                raise IOError("pool GC blocked by conflicting pool identities")
+            records[suffix] = record
+    return pool, records
+
+
+def delete_pool_targets(client, bucket, bp, targets):
+    """Remaining canonical data keys are durable retry identities themselves."""
+    if targets:
+        s3_delete_keys(client, bucket, targets)
+        live = {o["Key"] for o in s3_list_all(client, bucket, pool_prefix(bp))}
+        if live.intersection(targets):
+            raise IOError("pool data delete incomplete (remaining keys retained)")
+
+
+def shared_sst_record(client, bucket, root_pfx, bp, rel, source, owned):
+    """Capture one source version; COMPLETE inventories are the sole reuse ledger."""
+    if _POOL_GUARD.get() != (bucket, norm_prefix(bp)):
+        raise IOError("pool write requires a publication guard")
+    cache = _POOL_INVENTORY.get()
+    if "pool" not in cache:
+        cache["pool"], cache["records"] = pool_inventory(client, bucket, bp)
+    pool, records = cache["pool"], cache["records"]
+    size = source["ContentLength"]
+    dst = shared_sst_key(bucket, root_pfx, bp, rel, size, source["ETag"])
+    suffix = dst[len(pool_prefix(bp)):]
+    existed = suffix in pool
+    if existed:
+        # LIST proved presence: missing/unreadable HEAD is not a missing object.
+        have = s3_head_checksum(client, bucket, dst)
+        record = records.get(suffix)
+        if record is not None:
+            if (have["ContentLength"] != size or have["ETag"] != record["etag"]
+                    or record["key"] != rel or record["source_etag"] != source["ETag"]
+                    or any(have.get(k) != source[k] for k in
+                           common_checksum_fields(have, source))):
+                raise IOError("pool identity/checksum collision (never overwritten): " + rel)
+            return record
+        if have["ContentLength"] == size and checksum_match(source, have):
+            # Adopt a failed generation's object only with server checksum/MD5.
+            records[suffix] = {"key": rel, "snapshot_key": dst, "size": size,
+                               "source_etag": source["ETag"], "etag": have["ETag"]}
+            return records[suffix]
+        # An unpublished object has no authoritative destination identity.
+        # Re-copy the captured source version, but never roll back an unowned key.
+    else:
+        owned.append(dst)  # BEFORE COPY; reused/unpublished existing keys are not owned.
+    try:
+        copied = s3_copy_head_verified(client, bucket, norm_prefix(root_pfx) + rel,
+                                       dst, source=source)
+    except Exception:
+        if not existed:
+            rollback_owned(client, bucket, [dst])
+        raise
+    pool.add(suffix)
+    records[suffix] = {"key": rel, "snapshot_key": dst, "size": size,
+                       "source_etag": source["ETag"], "etag": copied["etag"]}
+    return records[suffix]
 
 
 def s3_put_bytes_verified(client, bucket, key, blob):
-    client.put_object(Bucket=bucket, Key=key, Body=blob, ContentLength=len(blob))
-    got_sha, got_size = s3_stream_hash(client, bucket, key)
-    want = hashlib.sha256(blob).hexdigest()
-    if got_sha != want or got_size != len(blob):
-        raise IOError("upload verify mismatch: " + key)
+    digest = hashlib.sha256(blob).hexdigest()
+    sent = base64.b64encode(hashlib.sha256(blob).digest()).decode("ascii")
+    resp = client.put_object(Bucket=bucket, Key=key, Body=blob, ContentLength=len(blob),
+                             Metadata={"sha256": digest}, ChecksumSHA256=sent) or {}
+    if resp.get("ChecksumSHA256") != sent:
+        raise IOError("upload checksum unsupported/mismatch (refusing): " + key)
+    head = s3_head_checksum(client, bucket, key)
+    if (head["ContentLength"] != len(blob)
+            or head.get("Metadata", {}).get("sha256") != digest
+            or _sha256_b64_of_head(head, key) != sent):
+        raise IOError("upload HEAD mismatch: " + key)
 
 
 def s3_put_file_verified(client, bucket, key, path, digest, size):
+    raw = bytes.fromhex(digest)
+    sent = base64.b64encode(raw).decode("ascii")
     with open(path, "rb") as f:
-        client.put_object(Bucket=bucket, Key=key, Body=f,
-                          ContentLength=size,
-                          Metadata={"sha256": digest})
-    got_sha, got_size = s3_stream_hash(client, bucket, key)
-    if got_sha != digest or got_size != size:
-        raise IOError("upload verify mismatch: " + key)
+        resp = client.put_object(Bucket=bucket, Key=key, Body=f,
+                                 ContentLength=size,
+                                 Metadata={"sha256": digest},
+                                 ChecksumSHA256=sent) or {}
+    if resp.get("ChecksumSHA256") != sent:
+        raise IOError("upload checksum unsupported/mismatch (refusing): " + key)
+    head = s3_head_checksum(client, bucket, key)
+    if (head["ContentLength"] != size
+            or head.get("Metadata", {}).get("sha256") != digest
+            or _sha256_b64_of_head(head, key) != sent):
+        raise IOError("upload HEAD mismatch: " + key)
 
 
 def snapshot_prefix(backup_prefix, backup_id):
@@ -353,6 +619,56 @@ def remote_base(backup_prefix, backup_id):
     return norm_prefix(backup_prefix) + backup_id + "/"
 
 
+def persist_run_cost(component, backup_dir, run_id, client):
+    persist_cost(backup_dir, component, run_id, client.snapshot())
+
+
+_COST_RUN = ContextVar("backup_cost_run", default=None)
+
+
+def open_s3_client(component="backup"):
+    client = make_s3_client(component=component)
+    if not isinstance(client, CountingS3):
+        client = CountingS3(client, component)
+    run = _COST_RUN.get()
+    if run is not None:
+        run["clients"].append(client)
+        if run["operation"] == "cmd_backup" and component == "backup":
+            guard = shared_pool_lock(client, env("S3_BUCKET"), current_identity()["backup_prefix"])
+            guard.__enter__()
+            run["guard"] = guard
+    return client
+
+
+def costed_command(fn, component, directory_var):
+    """Report early returns and failures without consuming archive-name entropy."""
+    @wraps(fn)
+    def run(*args, **kwargs):
+        state = {"clients": [], "guard": None, "operation": fn.__name__}
+        token = _COST_RUN.set(state)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            try:
+                if state["guard"] is not None:
+                    state["guard"].__exit__(None, None, None)
+            finally:
+                _COST_RUN.reset(token)
+                if state["clients"]:
+                    run_id = fn.__name__ + "-" + uuid.uuid4().hex
+                    for i, client in enumerate(state["clients"]):
+                        persist_run_cost(component, env(directory_var, "/backup"),
+                                         run_id + "-" + str(i), client)
+    return run
+
+
+def pool_serialized(fn):
+    @wraps(fn)
+    def guarded(client, bucket, bp, *args, **kwargs):
+        with shared_pool_lock(client, bucket, bp):
+            return fn(client, bucket, bp, *args, **kwargs)
+    return guarded
+
 def cmd_list():
     d = backup_dir()
     if d is None:
@@ -362,7 +678,7 @@ def cmd_list():
         sys.stdout.write(os.path.basename(f) + "\n")
     if storage_type() == "S3" and not s3_missing():
         try:
-            client = make_s3_client()
+            client = open_s3_client()
             bp = norm_prefix(env("S3_BACKUP_PREFIX", "greptime-backups"))
             ids = remote_complete_ids(client, env("S3_BUCKET"), bp)
             for bid in ids:
@@ -373,7 +689,7 @@ def cmd_list():
 
 
 def write_local_tar(d, name, srcs, manifest):
-    raw_manifest = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+    raw_manifest = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
     if len(raw_manifest) > CONTROL_CAP:
         raise IOError("manifest exceeds control size limit (%d bytes)" % CONTROL_CAP)
     path = os.path.join(d, name)
@@ -513,7 +829,7 @@ def cmd_backup():
             return fail("backup prefix overlaps live root (would snapshot snapshots): "
                          + bp + " vs " + root_pfx, code=2)
         try:
-            s3 = make_s3_client()
+            s3 = open_s3_client()
         except Exception as e:
             return fail("S3 client failed: " + str(e)[:200], code=3)
     try:
@@ -529,14 +845,12 @@ def cmd_backup():
         "root": ident["root"],
         "backup_prefix": ident["backup_prefix"],
         "labels": list(LABELS),
-        "tool": "backup.py v4",
+        "tool": TOOL,
     }
     owned = []
-    snap = None
     snap_objects = []
     if s3 is not None:
         try:
-            snap = snapshot_prefix(ident["backup_prefix"], bid)
             seen = set()
             for obj in s3_list_all(s3, bucket, root_pfx):
                 rel = obj["Key"][len(root_pfx):]
@@ -545,20 +859,20 @@ def cmd_backup():
                 if rel in seen:
                     raise IOError("duplicate key in live listing: " + rel)
                 seen.add(rel)
-                dst = snap + rel
-                owned.append(dst)  # registered BEFORE the write
-                sha, size = s3_copy_content_verified(s3, bucket, obj["Key"], dst)
-                snap_objects.append({"key": rel, "size": size, "sha256": sha})
+                live_head = s3_head_checksum(s3, bucket, obj["Key"])
+                snap_objects.append(shared_sst_record(
+                    s3, bucket, root_pfx, bp, rel, live_head, owned))
             manifest["sst_snapshot"] = {
                 "bucket": bucket,
                 "src_prefix": root_pfx,
-                "snap_prefix": snap,
+                "layout": SHARED_LAYOUT,
+                "snap_prefix": pool_prefix(bp),
                 "objects": snap_objects,
             }
         except Exception as e:
             rollback_owned(s3, bucket, owned)
             return fail("snapshot failed (own writes rolled back): "
-                         + str(e)[:200], code=3)
+                        + str(e)[:200], code=3)
     try:
         path, digest, raw_manifest = write_local_tar(d, name, srcs, manifest)
     except IOError as e:
@@ -579,9 +893,9 @@ def cmd_backup():
                 "sidecar_sha256": sidecar_sha,
                 "manifest_sha256": manifest_sha,
                 "sst_count": len(snap_objects),
-                "sst": [{"key": o["key"], "size": o["size"], "sha256": o["sha256"]}
-                        for o in snap_objects],
-            }, sort_keys=True).encode("utf-8")
+                "sst_layout": SHARED_LAYOUT,
+                "sst": snap_objects,
+            }, separators=(",", ":"), sort_keys=True).encode("utf-8")
             if len(complete) > CONTROL_CAP:
                 raise IOError("COMPLETE exceeds control size limit (%d bytes)" % CONTROL_CAP)
             owned.append(rbase + name)  # BEFORE each write
@@ -595,8 +909,16 @@ def cmd_backup():
         except Exception as e:
             rollback_owned(s3, bucket, owned)
             return fail("off-host upload failed (local tar kept, remote rolled back"
-                         " including COMPLETE): " + str(e)[:200], code=3)
+                        " including COMPLETE): " + str(e)[:200], code=3)
         prune_local(d, path, keep)
+        # Retention is a separate pool operation, after publication releases its claim.
+        state = _COST_RUN.get()
+        guard, state["guard"] = state["guard"], None
+        guard.__exit__(None, None, None)
+        try:
+            cmd_retention(current_bid=bid)  # off/dry-run/enforce; warnings never fail backup
+        except Exception as e:
+            sys.stderr.write("backup: warning: retention skipped: " + str(e)[:150] + "\n")
         sys.stdout.write("backup: ok: %s (sst %d, off-host verified)\n"
                          % (name, len(snap_objects)))
     else:
@@ -660,8 +982,23 @@ def validate_sst_record(obj):
         return "sst record unsafe key: " + obj["key"]
     if not isinstance(obj.get("size"), int) or obj["size"] < 0:
         return "sst record bad size: " + obj["key"]
-    if not isinstance(obj.get("sha256"), str) or not SHA_RE.match(obj["sha256"]):
-        return "sst record bad sha256: " + obj["key"]
+    if "sha256" in obj:
+        if not isinstance(obj["sha256"], str) or not SHA_RE.match(obj["sha256"]):
+            return "sst record bad sha256: " + obj["key"]
+    else:
+        if not all(isinstance(obj.get(field), str) and obj[field]
+                   for field in ("etag", "source_etag")):
+            return "sst record missing ETag identity: " + obj["key"]
+    if "pool" in obj:
+        return "obsolete pooled SST record (refusing)"
+    if "snapshot_key" in obj:
+        if "sha256" in obj:
+            return "shared SST record cannot use a historical SHA256 layout"
+        ident = current_identity()
+        expected = shared_sst_key(ident["bucket"], ident["root"], ident["backup_prefix"],
+                                   obj["key"], obj["size"], obj["source_etag"])
+        if obj["snapshot_key"] != expected:
+            return "shared SST key outside its identity address (refusing): " + obj["key"]
     return None
 
 
@@ -698,8 +1035,12 @@ def validate_manifest(manifest):
         if snap.get("src_prefix") != norm_prefix(str(manifest["root"])):
             return ("snapshot src_prefix is not the live root"
                     " (refusing: cross-root migration unproven)")
-        want_snap = (norm_prefix(str(manifest["backup_prefix"]))
-                     + manifest["backup_id"] + "/sst/")
+        layout = snap.get("layout")
+        if layout not in (None, SHARED_LAYOUT) or "pool_prefix" in snap:
+            return "unknown SST snapshot layout (refusing)"
+        want_snap = (pool_prefix(manifest["backup_prefix"])
+                     if layout == SHARED_LAYOUT else
+                     snapshot_prefix(manifest["backup_prefix"], manifest["backup_id"]))
         if snap.get("snap_prefix") != want_snap:
             return ("snapshot prefix outside this backup namespace"
                     " (refusing): " + repr(snap.get("snap_prefix")))
@@ -711,6 +1052,8 @@ def validate_manifest(manifest):
             problem = validate_sst_record(obj)
             if problem is not None:
                 return problem
+            if ("snapshot_key" in obj) != (layout == SHARED_LAYOUT):
+                return "SST record layout differs from snapshot (refusing)"
             if obj["key"] in seen:
                 return "duplicate SST key in manifest: " + obj["key"]
             seen.add(obj["key"])
@@ -730,11 +1073,16 @@ def validate_complete(complete, bid):
     sst = complete.get("sst")
     if not isinstance(sst, list):
         return "COMPLETE sst not a list"
+    layout = complete.get("sst_layout")
+    if layout not in (None, SHARED_LAYOUT) or "pool_prefix" in complete:
+        return "COMPLETE unknown SST layout"
     seen = set()
     for obj in sst:
         problem = validate_sst_record(obj)
         if problem is not None:
             return "COMPLETE " + problem
+        if ("snapshot_key" in obj) != (layout == SHARED_LAYOUT):
+            return "COMPLETE SST record layout mismatch"
         if obj["key"] in seen:
             return "COMPLETE duplicate SST key: " + obj["key"]
         seen.add(obj["key"])
@@ -887,7 +1235,9 @@ def staged_populate(d, path):
 def remote_complete_ids(client, bucket, bp):
     objs = s3_list_all(client, bucket, bp)
     return sorted({o["Key"][len(bp):].split("/")[0]
-                   for o in objs if o["Key"].endswith("/" + COMPLETE_NAME)})
+                   for o in objs if o["Key"].endswith("/" + COMPLETE_NAME)
+                   and o["Key"][len(bp):].split("/")[0]
+                   not in (POOL_DIR.rstrip("/"), POOL_LOCK_DIR.rstrip("/"))})
 
 
 def fetch_complete(client, bucket, bp, bid):
@@ -925,8 +1275,8 @@ def check_against_complete(path, side_digest, raw_manifest, sst_objs, complete):
         return "sidecar bytes differ from COMPLETE record (refusing)"
     if hashlib.sha256(raw_manifest).hexdigest() != complete["manifest_sha256"]:
         return "embedded manifest differs from COMPLETE record (refusing)"
-    want = sorted((o["key"], o["size"], o["sha256"]) for o in sst_objs)
-    got = sorted((o["key"], o["size"], o["sha256"]) for o in complete["sst"])
+    want = sorted(sst_objs, key=lambda o: o["key"])
+    got = sorted(complete["sst"], key=lambda o: o["key"])
     if want != got:
         return "SST list differs from COMPLETE record (refusing)"
     return None
@@ -934,16 +1284,24 @@ def check_against_complete(path, side_digest, raw_manifest, sst_objs, complete):
 
 def download_remote_backup(d, client, bucket, bp, want):
     """Fetch a COMPLETE backup id. Exact top-level basename match only;
-    streams to .tmp, verifies against COMPLETE, then atomically replaces.
-    Returns (path, complete, errmsg)."""
+    registers a refs/ reader lease first (conditional: COMPLETE present,
+    no RETIRING), streams to .tmp, verifies against COMPLETE, then
+    atomically replaces. Returns (path, complete, ref_key_or_errmsg):
+    ref_key on success (caller releases after verify), errmsg when path
+    is None. The caller releases the ref on every path after use."""
     ids = remote_complete_ids(client, bucket, bp)
     if not ids:
         return None, None, "no COMPLETE backups under s3://%s/%s" % (bucket, bp)
     bid = want if want in ids else (ids[-1] if not want else None)
     if bid is None:
         return None, None, "remote backup not found: %s (have: %s)" % (want, ",".join(ids))
+    try:
+        ref_key = acquire_generation_ref(client, bucket, bp, bid)
+    except IOError as e:
+        return None, None, str(e)[:250]
     complete, cerr = fetch_complete(client, bucket, bp, bid)
     if cerr is not None:
+        release_generation_ref(client, bucket, ref_key)
         return None, None, cerr
     rbase = remote_base(bp, bid)
     expected_tar = bid + BACKUP_SUFFIX
@@ -954,11 +1312,14 @@ def download_remote_backup(d, client, bucket, bp, want):
             continue  # nested inventory (e.g. sst/ tree) never an archive
         top.add(rel)
     if expected_tar not in top:
+        release_generation_ref(client, bucket, ref_key)
         return None, None, ("remote backup %s has no exact top-level archive %s"
                              % (bid, expected_tar))
     if expected_tar + SIDECAR_SUFFIX not in top:
+        release_generation_ref(client, bucket, ref_key)
         return None, None, ("remote backup %s missing sidecar (refusing)" % bid)
     if MANIFEST_NAME not in top:
+        release_generation_ref(client, bucket, ref_key)
         return None, None, ("remote backup %s missing manifest copy (refusing)" % bid)
     path = os.path.join(d, expected_tar)
     tmp = path + ".tmp"
@@ -993,52 +1354,70 @@ def download_remote_backup(d, client, bucket, bp, want):
             f.write(side_raw)
         os.chmod(path + SIDECAR_SUFFIX, 0o600)
     except IOError as e:
+        release_generation_ref(client, bucket, ref_key)
         try:
             os.unlink(tmp)
         except OSError:
             pass
         return None, None, str(e)[:250]
     except Exception as e:
+        release_generation_ref(client, bucket, ref_key)
         try:
             os.unlink(tmp)
         except OSError:
             pass
         return None, None, "remote download failed: " + str(e)[:200]
-    return path, complete, None
+    return path, complete, ref_key
 
 
 def s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
-    """Restore snapshot objects under the live root, reusing pre-existing
-    keys whose size+SHA256 already match the manifest. Only missing keys
-    are copied (each verified against the manifest digest); a pre-existing
-    key with different contents is a conflict and refuses without
-    overwriting anything. Each destination is registered BEFORE its write;
-    failure deletes only keys this run actually wrote, never pre-existing
-    or unrelated live objects."""
+    """Restore missing SSTs, refuse conflicting live keys, roll back own writes.
+
+    Pool generations copy from backup-owned pool objects (no GET); per-key
+    server checksums verify the copy. Historical SHA256 snapshots retain
+    their original restore verification contract.
+    """
     planned = [root_pfx + o["key"] for o in objs]
     if len(set(planned)) != len(planned):
         raise IOError("duplicate SST destination (refusing)")
-    snap_pfx = snap["snap_prefix"]
     written = []
     try:
         live = {o["Key"] for o in s3_list_all(s3, bucket, root_pfx)}
         for obj in objs:
             dst = root_pfx + obj["key"]
-            src = snap_pfx + obj["key"]
-            if dst in live:
+            src = snapshot_object_key(snap, obj)
+            if "sha256" not in obj:
+                source = s3_head_checksum(s3, bucket, src)
+                if (source["ContentLength"] != obj["size"]
+                        or source["ETag"] != obj["etag"]):
+                    raise IOError("snapshot identity mismatch: " + obj["key"])
+                if dst in live:
+                    target = s3_head_checksum(s3, bucket, dst)
+                    if (target["ContentLength"] == obj["size"]
+                            and (target["ETag"] in (obj["source_etag"], obj["etag"])
+                                 or checksum_match(target, source))):
+                        continue
+                    raise IOError("live object conflicts with snapshot (refusing,"
+                                  " not overwriting): " + obj["key"])
+                written.append(dst)
+                copied = s3_copy_head_verified(s3, bucket, src, dst, source=source)
+                if copied["size"] != obj["size"]:
+                    raise IOError("restored object identity mismatch: " + obj["key"])
+            else:
+                if dst in live:
+                    got_sha, got_size = s3_stream_hash(s3, bucket, dst)
+                    if got_sha == obj["sha256"] and got_size == obj["size"]:
+                        continue
+                    raise IOError("live object conflicts with snapshot (refusing,"
+                                  " not overwriting): " + obj["key"])
+                written.append(dst)  # registered BEFORE the write
+                s3.copy_object(Bucket=bucket,
+                               CopySource={"Bucket": bucket, "Key": src},
+                               Key=dst)
                 got_sha, got_size = s3_stream_hash(s3, bucket, dst)
-                if got_sha == obj["sha256"] and got_size == obj["size"]:
-                    continue  # intact SST already live: reuse, write nothing
-                raise IOError("live object conflicts with snapshot (refusing,"
-                              " not overwriting): " + obj["key"])
-            written.append(dst)  # registered BEFORE the write
-            s3.copy_object(Bucket=bucket,
-                           CopySource={"Bucket": bucket, "Key": src},
-                           Key=dst)
-            got_sha, got_size = s3_stream_hash(s3, bucket, dst)
-            if got_sha != obj["sha256"] or got_size != obj["size"]:
-                raise IOError("restored object differs from manifest digest: "
-                              + obj["key"])
+                if got_sha != obj["sha256"] or got_size != obj["size"]:
+                    raise IOError("restored object differs from manifest digest: "
+                                  + obj["key"])
     except Exception:
         rollback_owned(s3, bucket, written)
         raise
@@ -1073,6 +1452,7 @@ def cmd_restore():
     path, want = resolve_local_archive(d)
     s3 = None
     complete = None
+    ref_key = None
     ident = current_identity()
     if path is None:
         if ident["storage_type"] != "S3":
@@ -1083,77 +1463,89 @@ def cmd_restore():
         if miss:
             return fail("no local archive and S3 download needs: " + ", ".join(miss), code=2)
         try:
-            s3 = make_s3_client()
-            path, complete, derr = download_remote_backup(
+            s3 = open_s3_client()
+            got = download_remote_backup(
                 d, s3, env("S3_BUCKET"), norm_prefix(ident["backup_prefix"]), want)
+            path, complete, derr_or_ref = got[0], got[1], got[2]
+            if path is None:
+                return fail(derr_or_ref, code=2)
+            ref_key = derr_or_ref
         except Exception as e:
             return fail("remote download failed: " + str(e)[:200], code=3)
-        if derr is not None:
-            return fail(derr, code=2)
+    def _fail_ref(msg, code=1):
+        if ref_key is not None and s3 is not None:
+            release_generation_ref(s3, env("S3_BUCKET"), ref_key)
+        return fail(msg, code=code)
     if not os.path.isfile(path):
-        return fail("backup file not found: " + path, code=2)
+        return _fail_ref("backup file not found: " + path, code=2)
     side_digest, serr = read_sidecar_digest(path)
     if serr is not None:
-        return fail(serr, code=2)
+        return _fail_ref(serr, code=2)
     if ident["storage_type"] == "File" and sha256_file(path) != side_digest:
-        return fail("backup hash mismatch (torn/corrupt download?): " + path, code=2)
+        return _fail_ref("backup hash mismatch (torn/corrupt download?): " + path, code=2)
     manifest, raw_manifest, members, merr, mcode = load_manifest(path)
     if merr is not None:
-        return fail(merr, code=mcode)
+        return _fail_ref(merr, code=mcode)
     problem = ensure_targets_empty()
     if problem is not None:
-        return fail(problem, code=2)
+        return _fail_ref(problem, code=2)
     reserve, rerr = read_reserve()
     if rerr is not None:
-        return fail(rerr, code=1)
+        return _fail_ref(rerr, code=1)
     try:
         members_total = sum(m.size for m in members if m.isfile())
         tar_size = os.path.getsize(path)
         if shutil.disk_usage(d).free < tar_size + members_total + reserve:
-            return fail("restore refused: insufficient staging space in " + d,
-                        code=2)
+            return _fail_ref("restore refused: insufficient staging space in " + d,
+                             code=2)
         for target, _label in targets():
             if shutil.disk_usage(target).free < members_total + reserve:
-                return fail("restore refused: insufficient space for restore targets",
-                            code=2)
+                return _fail_ref("restore refused: insufficient space for restore targets",
+                                 code=2)
     except OSError as e:
-        return fail("restore preflight failed: " + str(e)[:200], code=3)
+        return _fail_ref("restore preflight failed: " + str(e)[:200], code=3)
     written_sst = []
     if ident["storage_type"] == "S3":
         miss = s3_missing()
         if miss:
-            return fail("S3 restore needs S3 settings: " + ", ".join(miss), code=2)
+            return _fail_ref("S3 restore needs S3 settings: " + ", ".join(miss), code=2)
         bucket = env("S3_BUCKET")
         root_pfx = norm_prefix(env("S3_ROOT", "greptime"))
         try:
             if s3 is None:
-                s3 = make_s3_client()
+                s3 = open_s3_client()
             if complete is None:
+                try:
+                    ref_key = acquire_generation_ref(
+                        s3, bucket, norm_prefix(ident["backup_prefix"]),
+                        manifest["backup_id"])
+                except IOError as e:
+                    return _fail_ref(str(e)[:250], code=2)
                 complete, cerr = fetch_complete(
                     s3, bucket, norm_prefix(ident["backup_prefix"]),
                     manifest["backup_id"])
                 if cerr is not None:
-                    return fail(cerr + " (a local tar from a failed upload is"
-                                " not restorable)", code=2)
+                    return _fail_ref(cerr + " (a local tar from a failed upload is"
+                                      " not restorable)", code=2)
             problem = check_against_complete(
                 path, side_digest, raw_manifest,
                 manifest["sst_snapshot"]["objects"], complete)
             if problem is not None:
-                return fail(problem, code=2)
+                return _fail_ref(problem, code=2)
             try:
                 written_sst = s3_restore_snapshot(
                     s3, bucket, root_pfx,
                     manifest["sst_snapshot"], manifest["sst_snapshot"]["objects"])
             except IOError as e:
                 if "conflicts with snapshot" in str(e):
-                    return fail(str(e)[:250], code=2)
-                return fail("SST restore failed (own writes rolled back): "
-                             + str(e)[:250], code=3)
+                    return _fail_ref(str(e)[:250], code=2)
+                return _fail_ref("SST restore failed (own writes rolled back): "
+                                 + str(e)[:250], code=3)
         except IOError as e:
-            return fail(str(e)[:300], code=3)
+            return _fail_ref(str(e)[:300], code=3)
         except Exception as e:
-            return fail("SST restore failed (own writes rolled back): "
-                         + str(e)[:200], code=3)
+            return _fail_ref("SST restore failed (own writes rolled back): "
+                             + str(e)[:200], code=3)
     try:
         staged_populate(d, path)
         record_restore_verification(d, manifest["backup_id"])
@@ -1165,21 +1557,484 @@ def cmd_restore():
                 pass
         if s3 is not None and written_sst:
             rollback_owned(s3, env("S3_BUCKET"), written_sst)
-        return fail(str(e)[:300], code=3)
+        return _fail_ref(str(e)[:300], code=3)
+    if ref_key is not None and s3 is not None:
+        release_generation_ref(s3, env("S3_BUCKET"), ref_key)
     sys.stdout.write("backup: restore ok: " + os.path.basename(path) + "\n"
                      + "backup: note: restored greptime-etc credentials are stale;"
                      " next preflight regenerates them from the current .env\n")
     return 0
 
 
+def retention_settings(current_bid=None):
+    """Parse remote-retention env. Returns (settings, errmsg). Off/dry-run/enforce."""
+    mode = env("BACKUP_REMOTE_RETENTION_MODE", "off").strip().lower() or "off"
+    if mode not in ("off", "dry-run", "enforce"):
+        return None, "BACKUP_REMOTE_RETENTION_MODE must be off|dry-run|enforce"
+    try:
+        count = int(env("BACKUP_REMOTE_RETAIN_COUNT", "7"))
+        minimum = int(env("BACKUP_REMOTE_MIN_RECOVERY", "1"))
+        grace = int(env("BACKUP_REMOTE_INCOMPLETE_GRACE_SEC", "86400"))
+        days = float(env("BACKUP_REMOTE_RETAIN_DAYS", "0"))
+    except ValueError:
+        return None, "retention count/min/grace/days must be numbers"
+    if not math.isfinite(days):
+        return None, "retention days must be a finite number"
+    if count < 1 or minimum < 1 or grace < 0 or days < 0:
+        return None, "retention count/minimum >= 1, grace/days >= 0"
+    pinned = {p.strip() for p in env("BACKUP_REMOTE_PINNED", "").split(",") if p.strip()}
+    for pin in sorted(pinned):
+        if "/" in pin or pin in (".", "..") or pin != os.path.basename(pin):
+            return None, "pinned id escapes backup scope (refusing): " + pin
+    return ({"mode": mode, "count": count, "days": days, "minimum": minimum,
+             "grace": grace, "pinned": pinned, "current": current_bid}, None)
+
+
+def complete_created_ns(complete, bid, now_ns=None):
+    """COMPLETE created_utc -> epoch ns. Unparseable or future-dated means
+    corrupt (fail closed): clock-skewed markers must not drive age policy."""
+    try:
+        stamp = complete["created_utc"]
+        dt, frac = stamp.split(".")
+        secs = calendar.timegm(time.strptime(dt, "%Y%m%dT%H%M%S"))
+        created = secs * 1_000_000_000 + int(frac.rstrip("Z"))
+    except Exception:
+        raise IOError("COMPLETE corrupt created_utc for %s (refusing)" % bid)
+    if now_ns is not None and created > now_ns:
+        raise IOError("COMPLETE created_utc in the future for %s (refusing)" % bid)
+    return created
+
+
+def remote_generations(client, bucket, bp, now_ns=None):
+    """Group objects under bp into verified recovery generations. Fail closed:
+    corrupt COMPLETE -> generation marked corrupt (never a deletion target,
+    never counted as recovery); missing sidecar/manifest/SST bytes -> incomplete.
+    A tar whose LIST size differs from COMPLETE is also incomplete.
+    Returns (generations, problems) sorted oldest-first by COMPLETE created_utc."""
+    if not bp or not bp.strip("/"):
+        raise IOError("backup prefix missing or empty (refusing to scope deletions)")
+    objs = s3_list_all(client, bucket, bp)
+    by_id = {}
+    for o in objs:
+        rel = o["Key"][len(bp):]
+        if rel.startswith((POOL_DIR, "_locks/")):
+            continue
+        bid = rel.split("/")[0]
+        if bid:
+            by_id.setdefault(bid, []).append(o)
+    pool_sizes = {o["Key"][len(pool_prefix(bp)):]: o.get("Size", 0)
+                  for o in objs if o["Key"].startswith(pool_prefix(bp))}
+    if now_ns is None:
+        now_ns = time.time_ns()
+    gens = []
+    for bid in sorted(by_id):
+        keys = {o["Key"] for o in by_id[bid]}
+        rbase = remote_base(bp, bid)
+        refs = sorted(k for k in keys if k.startswith(rbase + REFS_DIR))
+        retiring = rbase + RETIRING_NAME in keys
+        complete, cerr = fetch_complete(client, bucket, bp, bid)
+        base = {"backup_id": bid,
+                "keys": sorted(keys), "bytes": sum(o.get("Size", 0) for o in by_id[bid]),
+                "refs": refs, "retiring": retiring}
+        if cerr is not None:
+            gens.append(dict(base, status="incomplete", reason=cerr,
+                            complete=None, created_ns=None,
+                            pool_keys=[], pool_bytes=0,
+                            control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
+            continue
+        try:
+            created = complete_created_ns(complete, bid, now_ns)
+        except IOError as e:
+            gens.append(dict(base, status="corrupt", reason=str(e),
+                            complete=complete, created_ns=None,
+                            pool_keys=[], pool_bytes=0,
+                            control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
+            continue
+        want_top = {bid + BACKUP_SUFFIX, bid + BACKUP_SUFFIX + SIDECAR_SUFFIX,
+                    MANIFEST_NAME, COMPLETE_NAME}
+        top = {k[len(rbase):] for k in keys if k.startswith(rbase) and "/" not in k[len(rbase):]}
+        missing_top = want_top - top
+        sizes = {o["Key"]: o.get("Size") for o in by_id[bid]}
+        if complete.get("sst_layout") == SHARED_LAYOUT:
+            pool_keys = sorted(o["snapshot_key"][len(pool_prefix(bp)):]
+                               for o in complete["sst"])
+            pool_bytes = sum(pool_sizes.get(k, 0) for k in pool_keys)
+            missing_pool = sorted(k for k in pool_keys
+                                  if pool_prefix(bp) + k not in
+                                  {o["Key"] for o in objs})
+            size_mismatch = sorted(o["key"] for o in complete["sst"]
+                                   if o["snapshot_key"]
+                                   in {o2["Key"] for o2 in objs}
+                                   and pool_sizes.get(o["snapshot_key"][len(pool_prefix(bp)):]) != o["size"])
+            if missing_top or missing_pool or size_mismatch:
+                gens.append(dict(base, status="incomplete",
+                                reason="missing " + ",".join(sorted(missing_top | set(missing_pool[:3])))
+                                + ("; size mismatch " + ",".join(size_mismatch[:3]) if size_mismatch else ""),
+                                complete=complete, created_ns=created,
+                                pool_keys=pool_keys, pool_bytes=pool_bytes,
+                                control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
+                continue
+        else:
+            pool_keys, pool_bytes = [], 0
+            want_sst = {rbase + "sst/" + o["key"] for o in complete["sst"]}
+            missing_sst = sorted(want_sst - keys)
+            size_mismatch = sorted(o["key"] for o in complete["sst"]
+                                   if rbase + "sst/" + o["key"] in keys
+                                   and sizes.get(rbase + "sst/" + o["key"]) != o["size"])
+            if missing_top or missing_sst or size_mismatch:
+                gens.append(dict(base, status="incomplete",
+                                reason="missing " + ",".join(sorted(missing_top | set(missing_sst[:3])))
+                                + ("; size mismatch " + ",".join(size_mismatch[:3]) if size_mismatch else ""),
+                                complete=complete, created_ns=created,
+                                pool_keys=pool_keys, pool_bytes=pool_bytes,
+                                control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
+                continue
+        if sizes.get(rbase + bid + BACKUP_SUFFIX) != complete["tar_size"]:
+            gens.append(dict(base, status="incomplete",
+                             reason="tar size differs from COMPLETE record",
+                             complete=complete, created_ns=created,
+                             pool_keys=pool_keys, pool_bytes=pool_bytes,
+                             control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
+            continue
+        gens.append(dict(base, status="complete", reason="",
+                         complete=complete, created_ns=created,
+                         pool_keys=pool_keys,
+                         pool_bytes=pool_bytes,
+                         control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
+    gens.sort(key=lambda g: (g["created_ns"] is None, g["created_ns"] or 0, g["backup_id"]))
+    return gens, None
+
+
+def retention_plan(gens, settings, now_ns=None):
+    """Select deletion candidates among COMPLETE generations only. Never deletes:
+    live root (not listed here), outside-prefix keys (never listed), pinned,
+    the just-written id, newest `count`, younger-than-days, newest `minimum`,
+    referenced (active restore/backup reader) or retiring generations.
+    A retiring generation is an interrupted prior delete: it is resumed by
+    name (not re-planned) so the planner never double-selects it.
+    Returns (keep_ids, delete_gens, skipped)."""
+    if now_ns is None:
+        now_ns = time.time_ns()
+    complete = [g for g in gens if g["status"] == "complete"]
+    keep = set()
+    for g in complete[-settings["count"]:]:
+        keep.add(g["backup_id"])
+    if settings["days"] > 0:
+        cutoff = now_ns - int(settings["days"] * 86400 * 1_000_000_000)
+        for g in complete:
+            if g["created_ns"] is not None and g["created_ns"] >= cutoff:
+                keep.add(g["backup_id"])
+    for g in complete[-settings["minimum"]:]:
+        keep.add(g["backup_id"])
+    keep |= (settings["pinned"] & {g["backup_id"] for g in complete})
+    if settings["current"]:
+        keep.add(settings["current"])
+    deletes, skipped = [], []
+    for g in complete:
+        if g.get("retiring"):
+            skipped.append((g["backup_id"], "retiring: resume by retry (not re-planned)"))
+        elif g.get("refs"):
+            skipped.append((g["backup_id"], "referenced by %d active reader(s): refusing" % len(g["refs"])))
+        elif g["backup_id"] in keep:
+            skipped.append((g["backup_id"], "retained"))
+        else:
+            deletes.append(g)
+    for g in gens:
+        if g["status"] != "complete":
+            skipped.append((g["backup_id"], g["status"] + ": " + g["reason"][:120]))
+    return sorted(keep), deletes, skipped
+
+def generation_ref_key(bp, bid, token):
+    return remote_base(bp, bid) + REFS_DIR + token
+
+
+def acquire_generation_ref(client, bucket, bp, bid, token=None):
+    """Register an active reader (restore/backup verify) of one generation.
+
+    Two-phase handshake over strongly consistent S3 reads: precheck
+    (COMPLETE present, no RETIRING), PUT a unique ref, then recheck
+    marker + COMPLETE before ANY consumption. A failed recheck releases
+    the just-written ref and refuses, so a writer that won the race can
+    proceed and the reader never consumes a retiring/retired generation.
+    Returns the ref key."""
+    rbase = remote_base(bp, bid)
+    live = {o["Key"] for o in s3_list_all(client, bucket, rbase)}
+    if rbase + COMPLETE_NAME not in live:
+        raise IOError("generation %s has no COMPLETE (retired/incomplete: refusing)" % bid)
+    if rbase + RETIRING_NAME in live:
+        raise IOError("generation %s is retiring (refusing new readers)" % bid)
+    token = token or (("%016x" % time.time_ns()) + secrets.token_hex(4))
+    if "/" in token or token in (".", ".."):
+        raise IOError("ref token escapes generation scope (refusing)")
+    key = generation_ref_key(bp, bid, token)
+    client.put_object(Bucket=bucket, Key=key, Body=b"ref", ContentLength=3)
+    recheck = {o["Key"] for o in s3_list_all(client, bucket, rbase)}
+    if rbase + RETIRING_NAME in recheck or rbase + COMPLETE_NAME not in recheck:
+        try:
+            s3_delete_keys(client, bucket, [key])
+        except Exception:
+            pass
+        raise IOError("generation %s retired during ref acquire (refusing)" % bid)
+    return key
+
+
+def release_generation_ref(client, bucket, key):
+    """Release one reader ref. Best effort; missing keys are already gone."""
+    try:
+        s3_delete_keys(client, bucket, [key])
+    except Exception:
+        pass
+
+
+def read_retiring_identity(client, bucket, bp, bid):
+    """Validate the RETIRING marker body names exactly this backup id.
+
+    The marker is the durable resume identity: a stray or cross-generation
+    marker must never authorize payload deletion."""
+    rbase = remote_base(bp, bid)
+    try:
+        raw = s3_get_control(client, bucket, rbase + RETIRING_NAME, SIDECAR_CAP)
+    except Exception as e:
+        raise IOError("RETIRING marker unreadable for %s (refusing): %s"
+                      % (bid, str(e)[:120]))
+    try:
+        body = raw.decode("utf-8").strip()
+    except Exception:
+        raise IOError("RETIRING marker not text for %s (refusing)" % bid)
+    if body != bid:
+        raise IOError("RETIRING marker identity mismatch for %s (refusing)" % bid)
+    return True
+
+@pool_serialized
+def resume_retiring(client, bucket, bp, bid):
+    """Finish an interrupted retirement: re-list live keys (durable identity
+    is the REAL remaining objects under the prefix), validate the RETIRING
+    marker names this generation, refuse active refs, then delete COMPLETE
+    alone, confirm its absence, and only then delete payload before the
+    RETIRING marker. Idempotent."""
+    rbase = remote_base(bp, bid)
+    live = [o["Key"] for o in s3_list_all(client, bucket, rbase)]
+    if not live:
+        return 0
+    if rbase + RETIRING_NAME not in set(live):
+        raise IOError("generation %s has no RETIRING marker (not a started"
+                      " retirement: refusing)" % bid)
+    read_retiring_identity(client, bucket, bp, bid)
+    refs = sorted(k for k in live if k.startswith(rbase + REFS_DIR))
+    if refs:
+        raise IOError("generation %s referenced by %d active reader(s): refusing"
+                      % (bid, len(refs)))
+    if rbase + COMPLETE_NAME in set(live):
+        s3_delete_keys(client, bucket, [rbase + COMPLETE_NAME])
+        if rbase + COMPLETE_NAME in {o["Key"] for o in s3_list_all(client, bucket, rbase)}:
+            raise IOError("COMPLETE still present for %s (refusing payload delete)" % bid)
+    live = [o["Key"] for o in s3_list_all(client, bucket, rbase)]
+    payload = sorted(k for k in live if k != rbase + RETIRING_NAME)
+    if payload:
+        s3_delete_keys(client, bucket, payload)
+        live = [o["Key"] for o in s3_list_all(client, bucket, rbase)]
+        payload = sorted(k for k in live if k != rbase + RETIRING_NAME)
+        if payload:
+            raise IOError("retirement incomplete for %s (%d keys remain)" % (bid, len(payload)))
+    # Pool sweep follows generation retirement under the same publication guard.
+    # Canonical data and validated auxiliary controls remain discoverable after interruption.
+    if rbase + RETIRING_NAME in {o["Key"] for o in s3_list_all(client, bucket, rbase)}:
+        s3_delete_keys(client, bucket, [rbase + RETIRING_NAME])
+    return len(payload)
+
+
+@pool_serialized
+def retire_generation(client, bucket, bp, gen):
+    """Retire one planned generation with a durable identity. Steps:
+    1. re-list live keys (never trust the stale plan listing);
+    2. refuse when active refs/RETIRING exist (precheck);
+    3. write RETIRING marker (resume identity), then recheck refs after the
+    marker before touching COMPLETE: late readers that passed the reader
+    precheck see the marker on postcheck, release, and refuse, so the
+    writer must abort here, leaving marker+COMPLETE (a safe resume state);
+    4. delete COMPLETE alone, confirm its absence;
+    5. delete payload, confirm empty, remove RETIRING last.
+    Interrupted runs resume via resume_retiring(); reruns are idempotent."""
+    bid = gen["backup_id"] if isinstance(gen, dict) else gen
+    rbase = remote_base(bp, bid)
+    live = {o["Key"] for o in s3_list_all(client, bucket, rbase)}
+    if not live:
+        return 0  # fully retired already: idempotent rerun
+    if rbase + RETIRING_NAME in live:
+        return resume_retiring(client, bucket, bp, bid)
+    refs = sorted(k for k in live if k.startswith(rbase + REFS_DIR))
+    if refs:
+        raise IOError("generation %s referenced by %d active reader(s): refusing"
+                      % (bid, len(refs)))
+    if rbase + COMPLETE_NAME not in live:
+        raise IOError("generation %s has no COMPLETE (not a planned delete: refusing)" % bid)
+    marker = ("%s\n" % bid).encode("utf-8")
+    s3_put_bytes_verified(client, bucket, rbase + RETIRING_NAME, marker)
+    post = {o["Key"] for o in s3_list_all(client, bucket, rbase)}
+    post_refs = sorted(k for k in post if k.startswith(rbase + REFS_DIR))
+    if post_refs:
+        raise IOError("generation %s referenced by %d active reader(s): aborting"
+                      " (marker+COMPLETE preserved for resume)" % (bid, len(post_refs)))
+    s3_delete_keys(client, bucket, [rbase + COMPLETE_NAME])
+    if rbase + COMPLETE_NAME in {o["Key"] for o in s3_list_all(client, bucket, rbase)}:
+        raise IOError("COMPLETE still present for %s (refusing payload delete)" % bid)
+    return resume_retiring(client, bucket, bp, bid) + 1
+
+
+@pool_serialized
+def reclaim_pool_orphans(client, bucket, bp):
+    """Reserved canonical pool keys minus all verified live COMPLETE references."""
+    gens, _ = remote_generations(client, bucket, bp)
+    garbage, reason = pool_gc_plan(client, bucket, bp, gens)
+    if reason:
+        raise IOError("pool GC blocked: " + reason)
+    targets = [o["Key"] for o in garbage]
+    if targets:
+        delete_pool_targets(client, bucket, bp, targets)
+    return len(targets)
+
+
+def pool_gc_plan(client, bucket, bp, gens, removed_ids=()):
+    """Full surviving inventories prove references; auxiliary controls prove their own owner."""
+    removed = set(removed_ids)
+    referenced = set()
+    for gen in gens:
+        if gen["backup_id"] in removed and not gen["refs"]:
+            continue
+        if gen["status"] != "complete" or gen.get("retiring"):
+            return [], "unverified generation " + gen["backup_id"]
+        if gen["complete"].get("sst_layout") == SHARED_LAYOUT:
+            referenced.update(obj["snapshot_key"] for obj in gen["complete"]["sst"])
+    pp = pool_prefix(bp)
+    objects = s3_list_all(client, bucket, pp)
+    if any(not re.fullmatch(r"[0-9a-f]{64}(?:\.json)?", o["Key"][len(pp):])
+           for o in objects):
+        return [], "unknown object in shared SST pool"
+    garbage = []
+    for obj in objects:
+        key = obj["Key"]
+        data_key = key[:-5] if key.endswith(".json") else key
+        if data_key in referenced:
+            continue
+        if key.endswith(".json"):
+            try:
+                record = json.loads(s3_get_control(client, bucket, key, SIDECAR_CAP))
+                if (validate_sst_record(record) is not None
+                        or record.get("snapshot_key") != data_key):
+                    return [], "unknown auxiliary owner " + key
+            except Exception:
+                return [], "unreadable auxiliary owner " + key
+        garbage.append(obj)
+    return garbage, None
+
+
+def cmd_retention(current_bid=None):
+    """Evaluate remote generations; delete only in enforce+approved mode.
+    Prints candidates + expected bytes; dry-run output matches enforce selection."""
+    ident = current_identity()
+    if ident["storage_type"] != "S3":
+        return fail("retention needs GREPTIME_STORAGE_TYPE=S3", code=2)
+    miss = s3_missing()
+    if miss:
+        return fail("retention needs S3 settings: " + ", ".join(miss), code=2)
+    if not env("S3_ROOT", "").strip() or not ident["backup_prefix"].strip():
+        return fail("S3 mode needs S3_ROOT and S3_BACKUP_PREFIX set", code=2)
+    bp = norm_prefix(ident["backup_prefix"])
+    if prefixes_overlap(norm_prefix(env("S3_ROOT", "greptime")), bp):
+        return fail("backup prefix overlaps live root (refusing)", code=2)
+    settings, serr = retention_settings(current_bid)
+    if serr is not None:
+        return fail(serr, code=1)
+    if settings["mode"] == "off":
+        sys.stdout.write("retention: off (no evaluation performed)\n")
+        return 0
+    try:
+        client = open_s3_client()
+        with shared_pool_lock(client, env("S3_BUCKET"), bp):
+            return execute_retention(client, env("S3_BUCKET"), bp, settings)
+    except IOError as e:
+        return fail(str(e)[:300], code=3)
+    except Exception as e:
+        return fail("retention failed: " + str(e)[:200], code=3)
+
+
+def execute_retention(client, bucket, bp, settings):
+    gens, _ = remote_generations(client, bucket, bp)
+    # Resume interrupted retirements first: a RETIRING marker is the
+    # durable identity (marker body names the generation; resume
+    # validates it, refuses active refs, confirms COMPLETE absence
+    # before payload, and removes RETIRING last). A started retirement
+    # whose COMPLETE is already gone classifies as incomplete with
+    # created_ns=None, so it must never sit in the grace gate: waiting
+    # cannot age a None timestamp. Fresh incomplete prefixes with no
+    # RETIRING (concurrent backup with no COMPLETE yet) still block
+    # enforce inside grace; aged ones are reported, never deleted.
+    retiring = [g for g in gens if g.get("retiring")]
+    now_ns = time.time_ns()
+    blocking = [g for g in gens
+                if g["status"] == "incomplete" and not g.get("retiring") and (
+                    g["created_ns"] is None
+                    or now_ns - g["created_ns"] < settings["grace"] * 1_000_000_000)]
+    keep, deletes, skipped = retention_plan(gens, settings, now_ns)
+    garbage, gc_reason = pool_gc_plan(client, bucket, bp, gens,
+                                      [g["backup_id"] for g in deletes + retiring])
+    gc_bytes = sum(o.get("Size", 0) for o in garbage)
+    expect = sum(g["bytes"] for g in deletes) + gc_bytes
+    for g in deletes:
+        sys.stdout.write("retention: candidate %s bytes=%d objects=%d\n"
+                         % (g["backup_id"], g["bytes"], len(g["keys"])))
+    for g in retiring:
+        sys.stdout.write("retention: resume %s bytes=%d objects=%d\n"
+                         % (g["backup_id"], g["bytes"], len(g["keys"])))
+    sys.stdout.write("retention: pool-gc objects=%d bytes=%d\n" % (len(garbage), gc_bytes))
+    if gc_reason:
+        sys.stdout.write("retention: pool-gc blocked (%s)\n" % gc_reason)
+    sys.stdout.write("retention: mode=%s keep=%d delete=%d resume=%d bytes=%d\n"
+                     % (settings["mode"], len(keep), len(deletes),
+                        len(retiring), expect))
+    for bid, why in skipped:
+        sys.stdout.write("retention: skip %s (%s)\n" % (bid, why))
+    if settings["mode"] != "enforce":
+        return 0
+    if env("BACKUP_REMOTE_RETENTION_APPROVE", "") != "1":
+        return fail("retention enforce needs BACKUP_REMOTE_RETENTION_APPROVE=1"
+                    " after reviewing the dry-run list", code=2)
+    if settings["grace"] > 0 and blocking:
+        return fail("retention refused: incomplete generation %s"
+                    " unaged or within grace (concurrent run? clean up"
+                    " by hand or wait)" % blocking[0]["backup_id"], code=2)
+    for g in retiring:
+        resume_retiring(client, bucket, bp, g["backup_id"])
+    for g in deletes:
+        retire_generation(client, bucket, bp, g)
+    # Re-read surviving inventories after retirement; never delete from a stale plan.
+    survivors, _ = remote_generations(client, bucket, bp)
+    garbage, gc_reason = pool_gc_plan(client, bucket, bp, survivors)
+    if gc_reason:
+        sys.stdout.write("retention: pool-gc blocked (%s)\n" % gc_reason)
+    else:
+        delete_pool_targets(client, bucket, bp, [o["Key"] for o in garbage])
+        sys.stdout.write("retention: pool-gc deleted=%d bytes=%d\n"
+                         % (len(garbage), sum(o.get("Size", 0) for o in garbage)))
+    sys.stdout.write("retention: deleted %d generations (resumed %d)\n"
+                     % (len(deletes), len(retiring)))
+    return 0
+cmd_backup = costed_command(cmd_backup, "backup", "BACKUP_DIR")
+cmd_restore = costed_command(cmd_restore, "backup", "BACKUP_DIR")
+cmd_list = costed_command(cmd_list, "backup", "BACKUP_DIR")
+cmd_retention = costed_command(cmd_retention, "backup", "BACKUP_DIR")
+
+
 def main(argv):
-    if len(argv) != 2 or argv[1] not in ("backup", "restore", "list"):
-        sys.stderr.write("usage: python -m scripts.storage.backup [backup|restore|list]\n")
+    if len(argv) != 2 or argv[1] not in ("backup", "restore", "list", "retention"):
+        sys.stderr.write("usage: python -m scripts.storage.backup [backup|restore|list|retention]\n")
         return 1
     if argv[1] == "backup":
         return cmd_backup()
     if argv[1] == "restore":
         return cmd_restore()
+    if argv[1] == "retention":
+        return cmd_retention()
     return cmd_list()
 
 

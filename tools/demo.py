@@ -204,6 +204,10 @@ def start(directory):
            "STORAGE_METRICS_INTERVAL_SEC": "10", "INFRA_SCRAPE_INTERVAL": "15s",
            "BATTERY_ANALYSIS_CONFIG_JSON": json.dumps({"energy": {"current_sign": "positive_charge",
                                                                    "field_calibration": calibration}})}
+    # Honor the existing image overrides without importing operator credentials.
+    for key in ("PYTHON_IMAGE", "BACKUP_IMAGE", "GREPTIME_IMAGE", "GRAFANA_IMAGE", "ALLOY_IMAGE"):
+        if key in os.environ:
+            env[key] = os.environ[key]
     private_write(directory / "demo.env", "".join(f"{key}='{value}'\n" for key, value in env.items()))
     # Docker allocates free ports atomically; no reserve/release socket race.
     services = {"greptimedb": [4000, 4002], "grafana": [3000]}
@@ -214,7 +218,7 @@ def start(directory):
                  "    command: [run, --stability.level=public-preview, --server.http.listen-addr=0.0.0.0:12345, "
                  "--storage.path=/var/lib/alloy/data, /etc/alloy/config.alloy]\n"
                  "    environment:\n      GREPTIME_HTTP_URL: http://demo-wire:18144\n")
-    wire = {"image": "python:3.12.8-slim-bookworm", "profiles": ["server"],
+    wire = {"image": env.get("PYTHON_IMAGE", "python:3.12.8-slim-bookworm"), "profiles": ["server"],
             "command": ["sh", "-ec", "pip install --disable-pip-version-check --no-cache-dir opentelemetry-proto==1.39.1 && python /demo/demo.py _wire"],
             "ports": ["127.0.0.1::18144"], "environment": env | {"GREPTIME_HTTP_URL": "http://greptimedb:4000", "OTLP_HTTP_URL": "http://alloy:4318"},
             "volumes": [f"{ROOT / 'tools/demo.py'}:/demo/demo.py:ro", f"{ROOT / 'tests/test_privacy.py'}:/demo/test_privacy.py:ro",
@@ -271,7 +275,10 @@ def grafana_check(state, rows):
 
 def battery_dashboard_check(state):
     window = sql(state, "SELECT window_start, window_end FROM vehicle_analysis WHERE vehicle = 'demo-car' "
-                 "AND metric = 'battery.energy.latest_power_kw' ORDER BY window_start DESC, computed_at DESC LIMIT 1")[0]
+                 "AND source = 'fleet' AND decode_epoch = 'fleet-v1' "
+                 "AND window_start = (SELECT DATE_TRUNC('hour', MAX(event_time)) FROM vehicle_signal "
+                 "WHERE vehicle = 'demo-car' AND source = 'fleet' AND decode_epoch = 'fleet-v1') "
+                 "AND metric = 'battery.energy.latest_power_kw' ORDER BY computed_at DESC, revision DESC LIMIT 1")[0]
     from_ms = window["window_start"] // 1_000_000 - 3_600_000
     to_ms = (window["window_end"] + 1) // 1_000_000 + 60_000
     checked = []
@@ -291,7 +298,7 @@ def battery_dashboard_check(state):
                     expected = 400
                 else:
                     continue
-                for variable, value in (("vehicle", "'demo-car'"), ("source", "''"), ("epoch", "''")):
+                for variable, value in (("vehicle", "'demo-car'"), ("vehicle_ids", "'demo-car'"), ("source", "''"), ("epoch", "''")):
                     query = query.replace("${" + variable + ":sqlstring}", value)
                 rows = grafana_query(state, query, from_ms, to_ms, target.get("format", "table"))
                 values = ([row["reading"] for row in rows] if panel["type"] == "stat" else
@@ -336,9 +343,16 @@ def restore_check(state):
 
 
 def calibrated_battery(state):
-    rows = sql(state, "SELECT metric, value, unit FROM vehicle_analysis WHERE vehicle = 'demo-car' "
-               "AND source = 'fleet' AND metric IN "
-               "('battery.energy.latest_power_kw', 'battery.energy.latest_pack_voltage_v')")
+    # Check the fixture's observed hour, not unrelated empty-window reasons.
+    # Rank before inspecting values: a newer failure must invalidate success.
+    rows = sql(state, "WITH ranked AS (SELECT metric, value, unit, "
+               "ROW_NUMBER() OVER (PARTITION BY metric ORDER BY computed_at DESC, revision DESC) AS rank "
+               "FROM vehicle_analysis WHERE vehicle = 'demo-car' "
+               "AND source = 'fleet' AND decode_epoch = 'fleet-v1' "
+               "AND window_start = (SELECT DATE_TRUNC('hour', MAX(event_time)) FROM vehicle_signal "
+               "WHERE vehicle = 'demo-car' AND source = 'fleet' AND decode_epoch = 'fleet-v1') "
+               "AND metric IN ('battery.energy.latest_power_kw', 'battery.energy.latest_pack_voltage_v')) "
+               "SELECT metric, value, unit FROM ranked WHERE rank = 1")
     expected = {"battery.energy.latest_power_kw": (-40, "kW"),
                 "battery.energy.latest_pack_voltage_v": (400, "V")}
     observed = {row["metric"]: (row["value"], row["unit"]) for row in rows}

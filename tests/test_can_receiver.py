@@ -19,7 +19,7 @@ import urllib.parse
 import urllib.request
 
 from scripts.ingest.can.can_decoder import Decoder
-from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Rejection, Worker, _dirty_inserts, _ns_timestamp, archive_status, encode_body, render_insert
+from scripts.ingest.can.can_receiver import Archive, COLUMNS, ConfigurationError, DEFAULT_MAX_BODY_BYTES, DownstreamError, Greptime, Receiver, Rejection, Worker, _dirty_inserts, _ns_timestamp, archive_status, candidate_sql, encode_body, render_insert
 from scripts.ingest.can.can_otlp_wire import MAX_REQUEST_BYTES, WireError, check_response, decode_batch, encode_batch
 
 
@@ -425,6 +425,9 @@ class ReceiverBehavior(unittest.TestCase):
             with archive.connect() as conn:
                 conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
                              (big["event_id"], decoder.epoch, json.dumps(big)))
+                conn.execute("INSERT INTO archive_meta(key,value) VALUES('outbox_rows',1),('outbox_bytes',?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+                             (len(json.dumps(big).encode()),))
                 conn.commit()
             small_budget = len(encode_body(render_insert([big]))) - 1
             stuck = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", max_body_bytes=small_budget)
@@ -475,6 +478,9 @@ class ReceiverBehavior(unittest.TestCase):
             with archive.connect() as conn:
                 conn.executemany("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
                                  [(r["event_id"], decoder.epoch, json.dumps(r)) for r in rows])
+                conn.execute("INSERT INTO archive_meta(key,value) VALUES('outbox_rows',?),('outbox_bytes',?) "
+                             "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+                             (len(rows), sum(len(json.dumps(r).encode()) for r in rows)))
                 conn.commit()
             sink = HTTPServer(("127.0.0.1", 0), CountingSink)
             thread = threading.Thread(target=sink.serve_forever, daemon=True)
@@ -591,15 +597,22 @@ class ReceiverBehavior(unittest.TestCase):
                              "collector_id": "fixture", "quality": "reported_unverified",
                              "mapping_revision": decoder.mapping_revision, "vehicle_firmware": "synthetic"})
                 with archive.connect() as conn:
+                    blob = json.dumps(dict(base, event_id="zz-oversized", value_text="x" * 5000))
                     conn.execute("INSERT INTO outbox(event_id,epoch,row_json) VALUES(?,?,?)",
-                                 ("zz-oversized", decoder.epoch, json.dumps(dict(base, event_id="zz-oversized",
-                                            value_text="x" * 5000))))
+                                 ("zz-oversized", decoder.epoch, blob))
+                    conn.execute("INSERT INTO archive_meta(key,value) VALUES('outbox_rows',1),('outbox_bytes',?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=value+excluded.value",
+                                 (len(blob.encode()),))
                     conn.commit()
                 tiny = Greptime("http://127.0.0.1:9", "synthetic", "test", "test", max_body_bytes=64)
                 with self.assertRaises(DownstreamError):
                     archive.flush_once(tiny)
                 with archive.connect() as conn:
+                    doomed = conn.execute("SELECT row_json FROM outbox WHERE event_id='zz-oversized'").fetchone()
                     conn.execute("DELETE FROM outbox WHERE event_id='zz-oversized'")
+                    conn.execute("UPDATE archive_meta SET value=value-1 WHERE key='outbox_rows'")
+                    conn.execute("UPDATE archive_meta SET value=value-? WHERE key='outbox_bytes'",
+                                 (len(doomed[0].encode()),))
                     conn.commit()
                 sink.mode = "success"
                 # Dirty failure retains the whole prefix: hold the dirty ACK by
@@ -759,6 +772,284 @@ class ReceiverBehavior(unittest.TestCase):
             self.assertIsNone(live._connection)
             live.close()
 
+    def test_pending_index_reawakens_epochs_resume_and_rebuild(self):
+        """Pending membership drives selection; completion/receive/epoch/crash/rebuild stay consistent."""
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "pending-a", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        frame = b"t12320200\r"
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            path = Path(directory) / "raw.sqlite"
+            archive = Archive(path, disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(meta, [{"seq": seq, "offset_ns": seq, "phase": "capture", "data": frame}
+                                  for seq in range(2)])
+            archive.accept(dict(meta, session_id="pending-b"), [
+                {"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (decoder.epoch,)).fetchone()[0], 2)
+                # Pending-driven, not plan-text: hiding one member from the
+                # shipped bounded frontier must divert the merge to the
+                # survivor without touching any raw row; reinsert goes
+                # through the maintained head contract (rebuild_pending),
+                # never a raw hand-insert without head_id.
+                full = conn.execute(candidate_sql(), (decoder.epoch,)).fetchall()
+                self.assertEqual(len(full), 2)
+                victim = conn.execute("SELECT session FROM decode_pending WHERE epoch=? LIMIT 1",
+                                      (decoder.epoch,)).fetchone()[0]
+                survivor = conn.execute("SELECT session FROM decode_pending WHERE epoch=? AND session!=?",
+                                        (decoder.epoch, victim)).fetchone()[0]
+                conn.execute("DELETE FROM decode_pending WHERE epoch=? AND session=?", (decoder.epoch, victim))
+                conn.commit()
+            archive.rebuild_pending()
+            with archive.connect() as conn:
+                repaired = conn.execute(candidate_sql(), (decoder.epoch,)).fetchall()
+                self.assertEqual({row["session"] for row in repaired}, {victim, survivor})
+                conn.execute("DELETE FROM decode_pending WHERE epoch=? AND session=?", (decoder.epoch, victim))
+                picked = conn.execute(candidate_sql(10), (decoder.epoch,)).fetchall()
+                self.assertEqual([row["session"] for row in picked], [survivor])
+            archive.rebuild_pending()
+            with archive.connect() as conn:
+                # Operational boundedness: actual VM steps of the shipped
+                # bounded frontier (limit 1), not plan wording.
+                steps = {"n": 0}
+
+                def counter():
+                    steps["n"] += 1
+                    return False
+                conn.set_progress_handler(counter, 1000)
+                conn.execute(candidate_sql(1), (decoder.epoch,)).fetchall()
+                conn.set_progress_handler(None, 0)
+                self.assertLessEqual(steps["n"], 5)
+            # All sessions complete, so the pending set drains to empty.
+            while archive.decode_once(decoder):
+                pass
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (decoder.epoch,)).fetchone()[0], 0)
+                self.assertFalse(archive.decode_once(decoder))
+                outbox_before = [r[0] for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                events_before = {(json.loads(r)["event_id"], json.loads(r)["decode_epoch"]) for r in outbox_before}
+                state_before = {(r["session"], r["epoch"], r["next_seq"], r["state_json"], r["counts_json"], r["rows"])
+                                for r in conn.execute("SELECT session,epoch,next_seq,state_json,counts_json,rows FROM decode_states")}
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
+            # Completed session reawakens on new raw; resend overlap does not duplicate rows.
+            archive.accept(meta, [{"seq": 2, "offset_ns": 2, "phase": "capture", "data": frame}])
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (decoder.epoch,)).fetchone()[0], 1)
+            self.assertEqual(archive.accept(meta, [{"seq": 2, "offset_ns": 2, "phase": "capture", "data": frame}]), 0)
+            with self.assertRaises(Rejection):
+                archive.accept(meta, [{"seq": 2, "offset_ns": 2, "phase": "capture", "data": b"t12320500\r"}])
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (decoder.epoch,)).fetchone()[0], 1)
+            while archive.decode_once(decoder):
+                pass
+            with archive.connect() as conn:
+                outbox_after = [r[0] for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                self.assertEqual(len(outbox_after), len(outbox_before) + 1)
+                self.assertEqual(len({json.loads(r)["event_id"] for r in outbox_after}), len(outbox_after))
+                self.assertTrue(events_before.issubset({(json.loads(r)["event_id"], json.loads(r)["decode_epoch"])
+                                                        for r in outbox_after}))
+                cursors_after = {r["session"]: r["next_seq"] for r in
+                                 conn.execute("SELECT session,next_seq FROM decode_states WHERE epoch=?", (decoder.epoch,))}
+                cursors_before = {s: n for (s, e, n, _, _, _) in state_before if e == decoder.epoch}
+                self.assertEqual(set(cursors_after), set(cursors_before))
+                advanced = [s for s in cursors_after if cursors_after[s] == cursors_before[s] + 1]
+                held = [s for s in cursors_after if cursors_after[s] == cursors_before[s]]
+                self.assertEqual(len(advanced), 1)
+                self.assertEqual(len(held), len(cursors_after) - 1)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
+            # New epoch replays all originals regardless of prior completion.
+            replay = synthetic_decoder(directory, revision="synthetic-v2")
+            archive.register_epoch(replay, explicit=True)
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (replay.epoch,)).fetchone()[0], 2)
+                with self.assertRaises(ConfigurationError):
+                    archive.register_epoch(synthetic_decoder(directory, revision="synthetic-v3"))
+            while archive.decode_once(replay):
+                pass
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (replay.epoch,)).fetchone()[0], 0)
+                replay_rows = conn.execute("SELECT COUNT(*) FROM outbox WHERE epoch=?", (replay.epoch,)).fetchone()[0]
+                self.assertEqual(replay_rows, 4)
+                replay_ids = [json.loads(r[0])["event_id"] for r in
+                              conn.execute("SELECT row_json FROM outbox WHERE epoch=? ORDER BY id", (replay.epoch,))]
+                self.assertEqual(len(set(replay_ids)), 4)
+            # Crash before commit leaves pending and data in agreement.
+            baseline = archive.status()
+            archive.accept(dict(meta, session_id="pending-c"), [
+                {"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+
+            def crash(meta_arg, chunk, state, budget):
+                raise RuntimeError("injected crash before commit")
+            with patch.object(decoder, "decode_some", crash):
+                with self.assertRaises(RuntimeError):
+                    archive.decode_once(decoder)
+            with archive.connect() as conn:
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending WHERE epoch=?",
+                                              (decoder.epoch,)).fetchone()[0], 1)
+                crashed = archive.status()
+                self.assertEqual(crashed["sessions"], baseline["sessions"] + 1)
+                self.assertEqual(crashed["raw_chunks"], baseline["raw_chunks"] + 1)
+                for key in ("pending_rows", "errors", "oldest_pending_id", "counters"):
+                    self.assertEqual(crashed[key], baseline[key], key)
+            while archive.decode_once(decoder):
+                pass
+            while archive.decode_once(replay):
+                pass
+            # Outside-writer archive migrates and rebuilds to the exact pending set
+            # (all sessions complete here, so the set is empty).
+            with archive.connect() as conn:
+                conn.execute("DELETE FROM decode_pending")
+                conn.execute("DELETE FROM archive_meta WHERE key='pending_migrated'")
+                conn.commit()
+            reopened = Archive(path, disk_reserve_bytes=0)
+            with reopened.connect() as conn:
+                got = {(r[0], r[1]) for r in conn.execute("SELECT session,epoch FROM decode_pending")}
+                want = set()
+                for (epoch,) in conn.execute("SELECT epoch FROM epochs"):
+                    for (sid,) in conn.execute(
+                        "SELECT s.id FROM sessions s LEFT JOIN decode_states d ON d.session=s.id AND d.epoch=? "
+                        "WHERE EXISTS(SELECT 1 FROM raw_chunks c WHERE c.session=s.id AND c.seq>=COALESCE(d.next_seq,0))",
+                        (epoch,)):
+                        want.add((sid, epoch))
+                self.assertEqual(got, want)
+                self.assertEqual(got, set())
+            reopened.rebuild_pending()
+            with reopened.connect() as conn:
+                again = {(r[0], r[1]) for r in conn.execute("SELECT session,epoch FROM decode_pending")}
+                self.assertEqual(again, want)
+
+    def test_prefetch_merge_keeps_arrival_order_split_resume_and_conflict(self):
+        """Heap merge stages global raw-id order, not per-session pages; partial resume chains in batch."""
+        frame = b"t12320200\r"
+        split = (b"t12320", b"200\r")
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "started_ns": 1800000000000000000, "vehicle_firmware": "synthetic"}
+        first, second = dict(base, session_id="merge-a"), dict(base, session_id="merge-b")
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            path = Path(directory) / "raw.sqlite"
+            archive = Archive(path, disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            # Interleaved arrival: A0, B0, A1(split head), A2(split tail).
+            archive.accept(first, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            archive.accept(second, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            archive.accept(first, [{"seq": 1, "offset_ns": 1, "phase": "capture", "data": split[0]}])
+            archive.accept(first, [{"seq": 2, "offset_ns": 2, "phase": "capture", "data": split[1]}])
+            self.assertEqual(archive.decode_once(decoder, limit=4), 4)
+            with archive.connect() as conn:
+                rows = [json.loads(row[0]) for row in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                cursors = {row["session"]: row["next_seq"] for row in
+                           conn.execute("SELECT session,next_seq FROM decode_states WHERE epoch=?", (decoder.epoch,))}
+                sessions = {row["session_id"]: row["id"] for row in
+                            conn.execute("SELECT id,session_id FROM sessions")}
+            # Sequential oracle: A0, B0, then the split A1/A2 chain (same parser state).
+            state_a, state_b = None, None
+            want_ids = []
+            for meta, chunk, slot in ((first, {"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}, "a"),
+                                      (second, {"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}, "b"),
+                                      (first, {"seq": 1, "offset_ns": 1, "phase": "capture", "data": split[0]}, "a"),
+                                      (first, {"seq": 2, "offset_ns": 2, "phase": "capture", "data": split[1]}, "a")):
+                if slot == "a":
+                    chunk_rows, state_a, _, done = decoder.decode_some(meta, chunk, state_a, 2000)
+                else:
+                    chunk_rows, state_b, _, done = decoder.decode_some(meta, chunk, state_b, 2000)
+                self.assertTrue(done)
+                want_ids.extend(row["event_id"] for row in chunk_rows)
+            self.assertEqual([row["event_id"] for row in rows], want_ids)
+            self.assertEqual(cursors, {sessions["merge-a"]: 3, sessions["merge-b"]: 1})
+            self.assertEqual(archive.decode_once(decoder), 0)
+            # Concurrent append during CPU work cannot slip into this batch:
+            # the commit CAS sees the moved cursor and rolls everything back.
+            archive.accept(dict(base, session_id="merge-d"), [
+                {"seq": 0, "offset_ns": 0, "phase": "capture", "data": frame}])
+            before = archive.status()
+            real_decode = decoder.decode_some
+
+            def append_during_decode(meta, chunk, state, budget):
+                rows, state, counts, done = real_decode(meta, chunk, state, budget)
+                archive.accept(dict(base, session_id="merge-d"), [
+                    {"seq": 1, "offset_ns": 1, "phase": "capture", "data": frame}])
+                with archive.connect() as conn:
+                    conn.execute("INSERT INTO decode_states(session,epoch,next_seq,state_json,counts_json,rows) "
+                                 "VALUES((SELECT id FROM sessions WHERE session_id='merge-d'),?,99,'{}','{}',0) "
+                                 "ON CONFLICT(session,epoch) DO UPDATE SET next_seq=99", (decoder.epoch,))
+                    conn.commit()
+                return rows, state, counts, done
+            with patch.object(decoder, "decode_some", append_during_decode):
+                with self.assertRaisesRegex(ValueError, "decode cursor moved during decode"):
+                    archive.decode_once(decoder, limit=1)
+            after = archive.status()
+            # Raw/outbox/counters keep atomicity: the concurrent raw append
+            # persists (accept committed it), but the decode batch commits
+            # nothing, so outbox rows and decoded counters are unchanged.
+            self.assertEqual(after["raw_chunks"], before["raw_chunks"] + 1)
+            for key in ("pending_rows", "counters"):
+                self.assertEqual(after[key], before[key], key)
+            with archive.connect() as conn:
+                conn.execute("DELETE FROM decode_states WHERE session="
+                             "(SELECT id FROM sessions WHERE session_id='merge-d') AND epoch=?",
+                             (decoder.epoch,))
+                conn.commit()
+            while archive.decode_once(decoder):
+                pass
+            with archive.connect() as conn:
+                tail_ids = [json.loads(row[0])["event_id"] for row in
+                            conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+            self.assertEqual(len(tail_ids), len(set(tail_ids)))
+
+    def test_prefetch_page_and_byte_boundaries_preserve_order_and_partial_completion(self):
+        frame = b"t12320200\r"
+        base = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "started_ns": 1800000000000000000, "vehicle_firmware": "synthetic"}
+        for boundary in ("page", "bytes"):
+            with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
+                decoder = synthetic_decoder(directory)
+                archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+                archive.register_epoch(decoder)
+                metas = {name: dict(base, session_id=name) for name in ("a", "b", "dense")}
+                data = frame if boundary == "page" else frame + b"\r" * (65536 - len(frame))
+                a = [{"seq": i, "offset_ns": i, "phase": "capture", "data": data}
+                     for i in range(80 if boundary == "page" else 20)]
+                b = {"seq": 0, "offset_ns": 1000, "phase": "capture", "data": frame}
+                arrival = ([("a", c) for c in a] + [("b", b)] if boundary == "page" else
+                           [("a", a[0]), ("b", b)] + [("a", c) for c in a[1:]])
+                dense = [{"seq": i, "offset_ns": i, "phase": "capture", "data": payload}
+                         for i, payload in enumerate((frame * 3, frame * 6000, frame))]
+                arrival.extend(("dense", c) for c in dense)
+                with patch("scripts.ingest.can.can_receiver.time.time_ns", return_value=1800000000000000001):
+                    for name, c in arrival:
+                        archive.accept(metas[name], [c])
+                    # Force row/byte boundaries, not machine-dependent timing.
+                    with patch("scripts.ingest.can.can_receiver.time.monotonic", return_value=0):
+                        while archive.decode_once(decoder):
+                            pass
+                    expected, states, totals = [], {}, {}
+                    for name, c in arrival:
+                        rows, state, counts = decoder.decode(metas[name], c, states.get(name))
+                        expected.extend(rows)
+                        states[name] = state
+                        own = totals.setdefault(name, {})
+                        for key, value in counts.items():
+                            own[key] = value if key == "tail_bytes" else own.get(key, 0) + value
+                with archive.connect() as conn:
+                    actual = [json.loads(r[0]) for r in conn.execute("SELECT row_json FROM outbox ORDER BY id")]
+                    self.assertEqual(actual, expected)
+                    for row in conn.execute(
+                            "SELECT s.session_id,d.state_json,d.counts_json,d.rows FROM decode_states d "
+                            "JOIN sessions s ON s.id=d.session WHERE d.epoch=?", (decoder.epoch,)):
+                        self.assertEqual(json.loads(row[1]), states[row[0]])
+                        self.assertEqual(json.loads(row[2]), totals[row[0]])
+                        self.assertEqual(row[3], totals[row[0]]["rows"])
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_partial").fetchone()[0], 0)
+                    self.assertEqual(conn.execute("SELECT COUNT(*) FROM decode_pending").fetchone()[0], 0)
+
 if __name__ == "__main__":
     unittest.main()
-

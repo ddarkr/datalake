@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { appendFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,8 +13,7 @@ import test from 'node:test';
 import { handleHook } from '../plugins/codex/hook.mjs';
 import { collectUsage } from '../plugins/codex/usage.mjs';
 import { install, installationPlan } from '../plugins/codex/install.mjs';
-import { serializeEvent } from '../plugins/otel.mjs';
-import { openOutbox, readRoute } from '../plugins/outbox.mjs';
+import { createDirectTelemetry, serializeEvent } from '../plugins/otel.mjs';
 
 const execute = promisify(execFile);
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
@@ -24,7 +24,7 @@ const tokens = (input, output, cached = 0, reasoning = 0) => ({ input_tokens: in
 const usage = (total, last = total) => line('event_msg', { type: 'token_count', info: { total_token_usage: total, last_token_usage: last } });
 const context = turn => line('turn_context', { turn_id: turn, model: 'gpt-test', cwd: secret, base_instructions: secret });
 const metadata = id => line('session_meta', { id, session_id: id, model_provider: 'openai', cli_version: '0.142.4', base_instructions: secret });
-const capture = () => { const events = []; return { events, telemetry: { enqueue: async event => { events.push(event); return true; }, flushLocal: async () => {} } }; };
+const capture = () => { const events = []; return { events, telemetry: { send: async event => { events.push(event); return true; }, flush: async () => {} } }; };
 async function until(predicate) {
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
@@ -34,34 +34,9 @@ async function until(predicate) {
   }
   assert.fail('Isolated asynchronous operation did not complete');
 }
-async function stopWorkers(directory) {
-  let entries;
-  try { entries = await readdir(directory, { withFileTypes: true }); }
-  catch (error) { if (error.code === 'ENOENT') return; throw error; }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const path = join(directory, entry.name);
-    if (entry.name !== 'worker.lock') { await stopWorkers(path); continue; }
-    try {
-      const { pid } = JSON.parse(await readFile(join(path, 'owner.json'), 'utf8'));
-      if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid) continue;
-      const running = async () => {
-        try {
-          const { stdout } = await execute('ps', ['-p', String(pid), '-o', 'stat=', '-o', 'command='], { timeout: 5000 });
-          const match = /^\s*(\S+)\s+([\s\S]*)$/.exec(stdout);
-          return Boolean(match && !match[1].startsWith('Z') && match[2].includes('sender.mjs') && match[2].includes(directory));
-        } catch (error) { if (error.code === 1 || error.code === 'ESRCH') return false; throw error; }
-      };
-      if (await running()) {
-        try { process.kill(pid, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; }
-        await until(async () => !await running());
-      }
-    } catch (error) { if (error.code !== 'ENOENT') throw error; }
-  }
-}
 async function temporary(t) {
   const dir = await mkdtemp(join(tmpdir(), 'datalake-codex-'));
-  t.after(async () => { try { await stopWorkers(dir); } finally { await rm(dir, { recursive: true, force: true }); } });
+  t.after(() => rm(dir, { recursive: true, force: true }));
   return dir;
 }
 async function hookExecutable(executable, input, directory, extra = {}) {
@@ -69,29 +44,38 @@ async function hookExecutable(executable, input, directory, extra = {}) {
     ...process.env, HOME: directory, CODEX_HOME: join(directory, '.codex'),
     XDG_STATE_HOME: join(directory, 'xdg-state'), PLUGIN_DATA: join(directory, 'state'), ...extra,
   };
-  return await new Promise((resolve, reject) => {
+  return await new Promise((resolvePromise, reject) => {
     const child = spawn(process.execPath, [executable], { env, stdio: ['pipe', 'pipe', 'pipe'], timeout: 15_000 });
     let stdout = ''; let stderr = '';
     child.stdout.on('data', value => { stdout += value; });
     child.stderr.on('data', value => { stderr += value; });
     child.on('error', reject);
-    child.on('close', (code, signal) => resolve({ code, signal, stdout, stderr }));
+    child.on('close', (code, signal) => resolvePromise({ code, signal, stdout, stderr }));
     child.stdin.end(JSON.stringify(input));
   });
 }
-async function drained(dataRoot, done) {
-  const base = join(dataRoot, 'outbox');
-  const roots = await readdir(base);
-  const root = join(base, roots[0]);
-  const outbox = await openOutbox({ root, route: await readRoute(root) });
-  await until(async () => {
-    const status = await outbox.status();
-    return status.pending === 0 && status.done === done;
+// Direct-mode loopback: one HTTP request per send, no sender process, no queue.
+async function wireFixture(t, respond = null, timeoutMs = 30_000) {
+  const dir = await temporary(t);
+  const bodies = [];
+  const server = createServer(async (req, res) => {
+    let body = '';
+    for await (const chunk of req) body += chunk;
+    bodies.push(JSON.parse(body));
+    const action = typeof respond === 'function' ? await respond(bodies.length, bodies[bodies.length - 1]) : respond;
+    const { status = 200, payload = '{}' } = action ?? {};
+    res.writeHead(status, { 'content-type': 'application/json' });
+    res.end(payload);
   });
-  await until(async () => {
-    try { await readFile(join(root, 'worker.lock', 'owner.json'), 'utf8'); return false; }
-    catch (error) { if (error.code === 'ENOENT') return true; throw error; }
-  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  const configPath = join(dir, 'otel.json');
+  await writeFile(configPath, JSON.stringify({ endpoint: `http://127.0.0.1:${server.address().port}`, timeoutMs }), { mode: 0o600 });
+  const stateDir = join(dir, 'metadata');
+  const telemetry = createDirectTelemetry('codex', { configPath });
+  return { dir, bodies, configPath, stateDir, telemetry,
+    spans: () => bodies.flatMap(body => body.resourceSpans ?? []).flatMap(resource => resource.scopeSpans ?? []).flatMap(scope => scope.spans ?? []),
+  };
 }
 async function persisted(dir) { let text = ''; for (const entry of await readdir(dir, { withFileTypes: true })) text += entry.isDirectory() ? await persisted(join(dir, entry.name)) : await readFile(join(dir, entry.name), 'utf8'); return text; }
 
@@ -120,79 +104,64 @@ test('hook lifecycles retain stable identities and reject content and invented o
   assert.equal((await persisted(stateDir)).includes(secret), false);
 });
 
-test('metadata retries retain the first full event and accepted duplicates do not enqueue again', async t => {
+test('direct failure is attempted once and never replayed; first observation wins', async t => {
   const stateDir = await temporary(t);
   const attempts = [];
   let outcome = false;
-  const telemetry = { enqueue: async event => {
+  const telemetry = { send: async event => {
     attempts.push(structuredClone(event));
     if (outcome instanceof Error) throw outcome;
     return outcome;
-  } };
+  }, flush: async () => {} };
   const input = { session_id: 'session-retry', turn_id: 'turn-1', hook_event_name: 'PostToolUse', tool_use_id: 'call-1', tool_name: 'Bash', model: 'first-model' };
   assert.deepEqual(await handleHook(input, { telemetry, stateDir, now: () => 1000 }), []);
-  outcome = new Error('synthetic enqueue failure');
+  assert.equal(attempts.length, 1);
+  outcome = new Error('synthetic send failure');
   assert.deepEqual(await handleHook({ ...input, model: 'later-model' }, { telemetry, stateDir, now: () => 2000 }), []);
+  assert.equal(attempts.length, 1, 'failed observation is not retried by a repeated hook');
   outcome = true;
-  assert.deepEqual(await handleHook({ ...input, tool_name: 'changed-tool' }, { telemetry, stateDir, now: () => 3000 }), [attempts[0]]);
-  assert.deepEqual(attempts, [attempts[0], attempts[0], attempts[0]]);
-  assert.equal(attempts[0].startTimeMs, 1000);
-  assert.equal(attempts[0].endTimeMs, 1000);
+  assert.deepEqual(await handleHook({ ...input, tool_name: 'changed-tool' }, { telemetry, stateDir, now: () => 3000 }), []);
+  assert.equal(attempts.length, 1);
   assert.equal(attempts[0].attributes['gen_ai.request.model'], 'first-model');
-  const acceptedState = await persisted(stateDir);
+  const attemptedState = await persisted(stateDir);
   assert.deepEqual(await handleHook(input, { telemetry, stateDir, now: () => 4000 }), []);
-  assert.equal(attempts.length, 3);
-  assert.equal(await persisted(stateDir), acceptedState);
+  assert.equal(attempts.length, 1);
+  assert.equal(await persisted(stateDir), attemptedState);
 });
 
-test('held metadata enqueue does not block a distinct completion or duplicate its accepted wire body', { timeout: 5000 }, async t => {
-  const dir = await temporary(t);
-  const stateDir = join(dir, 'metadata');
-  const queue = await openOutbox({ root: join(dir, 'outbox'), route: { key: '1'.repeat(64), endpointHash: '2'.repeat(64) } });
+test('distinct completions send concurrently while duplicates stay single-attempt', async t => {
+  const stateDir = await temporary(t);
   const attempts = [];
   let release;
-  let entered;
   const held = new Promise(resolve => { release = resolve; });
-  const firstEnqueued = new Promise(resolve => { entered = resolve; });
-  const telemetry = { enqueue: async event => {
+  let entered;
+  const firstSent = new Promise(resolve => { entered = resolve; });
+  const telemetry = { send: async event => {
     attempts.push(structuredClone(event));
-    const accepted = await queue.put(serializeEvent('codex', event));
     if (event.eventId === 'session-start') { entered(); await held; }
-    return accepted;
-  } };
+    return true;
+  }, flush: async () => {} };
   const input = { session_id: 'session-held', model: 'first-model', prompt: secret };
   const start = { ...input, hook_event_name: 'SessionStart' };
   const completion = { ...input, hook_event_name: 'PostToolUse', turn_id: 'turn-1', tool_use_id: 'call-1', tool_name: 'Bash', tool_response: secret };
   const first = handleHook(start, { telemetry, stateDir, now: () => 1000 });
-  let firstResult;
   try {
-    await firstEnqueued;
-    assert.equal((await queue.status()).pending, 1);
+    await firstSent;
     assert.deepEqual(await handleHook(completion, { telemetry, stateDir, now: () => 2000 }), [attempts[1]]);
-    assert.equal(attempts.length, 2, 'Both identities enqueue while the first is still held');
-    assert.equal((await queue.status()).pending, 2);
+    assert.equal(attempts.length, 2, 'Both identities send while the first is still held');
     assert.deepEqual(await handleHook({ ...start, model: 'changed-model' }, { telemetry, stateDir, now: () => 3000 }), []);
     assert.deepEqual(await handleHook({ ...completion, tool_name: 'changed-tool' }, { telemetry, stateDir, now: () => 3000 }), []);
-    assert.equal(attempts.length, 2, 'A held or accepted duplicate does not enqueue another body');
+    assert.equal(attempts.length, 2, 'A held or delivered duplicate does not send another body');
   } finally {
     release();
-    firstResult = await first;
+    assert.deepEqual(await first, [attempts[0]]);
   }
-  assert.deepEqual(firstResult, [attempts[0]]);
-  const acceptedState = await persisted(stateDir);
   assert.deepEqual(await handleHook({ ...start, model: 'changed-model' }, { telemetry, stateDir, now: () => 4000 }), []);
   assert.deepEqual(await handleHook({ ...completion, tool_name: 'changed-tool' }, { telemetry, stateDir, now: () => 4000 }), []);
-  assert.equal(await persisted(stateDir), acceptedState);
   assert.equal(attempts.length, 2);
-  const pending = await queue.pending();
-  assert.deepEqual(pending.map(event => event.body).sort(), attempts.map(event => serializeEvent('codex', event).body).sort());
-  assert.equal(pending.some(event => event.body.includes(secret)), false);
-  for (const event of pending) await queue.finish(event.identity, true);
-  assert.equal((await queue.status()).done, 2);
-  assert.deepEqual(await queue.pending(), []);
 });
 
-test('event-scoped handoff retains existing source snapshots and queued receipts', async t => {
+test('legacy queued receipts are treated as attempted without new sends', async t => {
   const stateDir = await temporary(t);
   const hash = value => createHash('sha256').update(value).digest('hex');
   const sessionId = 'session-migrated';
@@ -212,7 +181,7 @@ test('event-scoped handoff retains existing source snapshots and queued receipts
   assert.deepEqual(events, [tool]);
   assert.deepEqual(JSON.parse(await readFile(path('event:session-start'), 'utf8')), source);
   assert.deepEqual(JSON.parse(await readFile(path('queued:session-start'), 'utf8')), queued);
-  assert.deepEqual(JSON.parse(await readFile(path(`queued:${tool.eventId}`), 'utf8')), queued);
+  assert.ok(JSON.parse(await readFile(path(`attempted:${tool.eventId}`), 'utf8')).attempted);
 });
 
 test('numeric rollout increments are deduplicated, incremental and limited to the active native turn', async t => {
@@ -250,7 +219,7 @@ test('numeric rollout increments are deduplicated, incremental and limited to th
   assert.equal(Object.keys(events[0].attributes).some(key => /cost/i.test(key)), false);
 });
 
-test('failed exports remain retryable, mismatched sessions and synthetic counter adjustments are not billed', async t => {
+test('failed usage sends still advance the baseline; mismatched sessions are not billed', async t => {
   const dir = await temporary(t);
   const transcript = join(dir, 'active.jsonl');
   const stateDir = join(dir, 'state');
@@ -263,68 +232,79 @@ test('failed exports remain retryable, mismatched sessions and synthetic counter
   const prefix = metadata('session-1') + context('turn-1');
   await writeFile(transcript, prefix + usage(tokens(20, 5)));
   const attempts = [];
-  const rejected = { enqueue: async event => { attempts.push(structuredClone(event)); return false; } };
+  const rejected = { send: async event => { attempts.push(structuredClone(event)); return false; }, flush: async () => {} };
   assert.deepEqual(await collectUsage(input, { telemetry: rejected, stateDir }), []);
-  const failedState = await persisted(stateDir);
+  assert.equal(attempts.length, 1, 'failed usage is attempted once');
   const cursorName = (await readdir(stateDir)).find(name => name.endsWith('.json'));
-  const failedCursor = JSON.parse(await readFile(join(stateDir, cursorName), 'utf8'));
-  assert.deepEqual(failedCursor.total, [0, 0, 0, 0, 0]);
-  assert.equal(failedCursor.offset, Buffer.byteLength(prefix));
-  assert.deepEqual(await collectUsage(input, { telemetry: { enqueue: async event => { attempts.push(structuredClone(event)); throw new Error('synthetic enqueue failure'); } }, stateDir }), []);
-  assert.equal(await persisted(stateDir), failedState);
-  await collectUsage(input, { telemetry, stateDir });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].attributes['gen_ai.usage.input_tokens'], 20);
-  assert.deepEqual(attempts, [events[0], events[0]]);
-  await collectUsage(input, { telemetry, stateDir });
-  assert.equal(events.length, 1);
+  const cursor = JSON.parse(await readFile(join(stateDir, cursorName), 'utf8'));
+  assert.deepEqual(cursor.total, [20, 0, 5, 0, 25]);
+  assert.deepEqual(await collectUsage(input, { telemetry, stateDir }), [], 'advanced baseline is never replayed');
+  assert.equal(events.length, 0);
+  assert.deepEqual(attempts, attempts.slice(0, 1));
   await appendFile(transcript, usage(tokens(1000, 5), tokens(20, 5)));
   await collectUsage(input, { telemetry, stateDir });
-  assert.equal(events.length, 1);
+  assert.equal(events.length, 0, 'synthetic counter adjustments are not billed');
 });
 
-test('an old live usage owner retains its cursor lock while independent cursors remain available', async t => {
+test('loopback HTTP rejection and partial success attempt once without replay', async t => {
+  const f = await wireFixture(t, { status: 500, payload: '{}' });
+  const input = { session_id: 'session-http', turn_id: 'turn-1', hook_event_name: 'PostToolUse', tool_use_id: 'call-1', tool_name: 'Bash' };
+  assert.deepEqual(await handleHook(input, { telemetry: f.telemetry, stateDir: f.stateDir, now: () => 1000 }), []);
+  assert.deepEqual(await handleHook({ ...input, tool_name: 'changed-tool' }, { telemetry: f.telemetry, stateDir: f.stateDir, now: () => 2000 }), []);
+  await f.telemetry.flush();
+  await until(() => f.bodies.length >= 1);
+  await delay(100);
+  assert.equal(f.bodies.length, 1);
+  const g = await wireFixture(t, { status: 200, payload: '{"partialSuccess":{"rejectedSpans":"1"}}' });
+  assert.deepEqual(await handleHook(input, { telemetry: g.telemetry, stateDir: g.stateDir, now: () => 1000 }), []);
+  assert.deepEqual(await handleHook(input, { telemetry: g.telemetry, stateDir: g.stateDir, now: () => 2000 }), []);
+  await g.telemetry.flush();
+  await until(() => g.bodies.length >= 1);
+  await delay(100);
+  assert.equal(g.bodies.length, 1);
+});
+
+test('loopback timeout bounds the hook and duplicate hooks do not resend', async t => {
   const dir = await temporary(t);
-  const transcript = join(dir, 'active.jsonl');
-  const stateDir = join(dir, 'state');
-  const { telemetry, events } = capture();
-  const input = { session_id: 'session-1', turn_id: 'turn-1', hook_event_name: 'Stop', transcript_path: transcript };
-  await writeFile(transcript, metadata('session-1') + context('turn-1'));
-  await collectUsage(input, { telemetry, stateDir, prime: true });
-  const cursorFile = (await readdir(stateDir)).find(name => name.endsWith('.json'));
-  const cursorBefore = await readFile(join(stateDir, cursorFile), 'utf8');
-  const lock = join(stateDir, `${cursorFile}.lock`, 'hook.lock');
-  await mkdir(lock, { mode: 0o700 });
-  const owner = JSON.stringify({ pid: process.pid });
-  await writeFile(join(lock, 'owner.json'), owner, { mode: 0o600 });
-  const old = new Date(1000);
-  await utimes(join(stateDir, `${cursorFile}.lock`), old, old);
-  await utimes(lock, old, old);
-  await appendFile(transcript, usage(tokens(20, 5)));
-  assert.deepEqual(await collectUsage(input, { telemetry, stateDir }), []);
-  assert.equal(await readFile(join(stateDir, cursorFile), 'utf8'), cursorBefore);
-  assert.equal(await readFile(join(lock, 'owner.json'), 'utf8'), owner);
-  const independent = join(dir, 'independent.jsonl');
-  await writeFile(independent, metadata('session-2') + context('turn-2') + usage(tokens(7, 2)));
-  await collectUsage({ ...input, session_id: 'session-2', turn_id: 'turn-2', transcript_path: independent }, { telemetry, stateDir });
-  assert.equal(events.length, 1);
-  assert.equal(events[0].sessionId, 'session-2');
-  await rm(lock, { recursive: true });
-  await collectUsage(input, { telemetry, stateDir });
-  assert.equal(events.length, 2);
-  assert.equal(events[1].attributes['gen_ai.usage.input_tokens'], 20);
+  const server = createServer(() => {});
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
+  const configPath = join(dir, 'otel.json');
+  await writeFile(configPath, JSON.stringify({ endpoint: `http://127.0.0.1:${server.address().port}`, timeoutMs: 300 }), { mode: 0o600 });
+  const telemetry = createDirectTelemetry('codex', { configPath });
+  const stateDir = join(dir, 'metadata');
+  const input = { session_id: 'session-timeout', turn_id: 'turn-1', hook_event_name: 'PostToolUse', tool_use_id: 'call-1', tool_name: 'Bash' };
+  const started = Date.now();
+  assert.deepEqual(await handleHook(input, { telemetry, stateDir, now: () => 1000 }), []);
+  assert.ok(Date.now() - started < 10_000);
+  await telemetry.flush().catch(() => {});
+  assert.deepEqual(await handleHook(input, { telemetry, stateDir, now: () => 2000 }), []);
+});
+
+test('direct mode leaves legacy runtime queue data byte-unchanged', async t => {
+  const f = await wireFixture(t);
+  const legacy = join(f.dir, 'legacy-route');
+  await mkdir(legacy, { recursive: true });
+  const obstacle = join(legacy, 'queue.sqlite');
+  await writeFile(obstacle, Buffer.from([0x53, 0x51, 0x4c, 0x69, 0x74, 0x65, 0x00]));
+  const before = await readFile(obstacle);
+  const input = { session_id: 'session-legacy', turn_id: 'turn-1', hook_event_name: 'PostToolUse', tool_use_id: 'call-1', tool_name: 'Bash' };
+  await handleHook(input, { telemetry: f.telemetry, stateDir: f.stateDir, now: () => 1000 });
+  await f.telemetry.flush();
+  await until(() => f.bodies.length >= 1);
+  assert.deepEqual(await readFile(obstacle), before);
+  assert.deepEqual(await readdir(legacy), ['queue.sqlite']);
 });
 
 test('symlinked hook executable emits OTLP metadata and never changes Codex hook decisions', async t => {
   const dir = await temporary(t);
   const requests = [];
-  let acknowledge = false;
-  const reply = response => { response.writeHead(200, { 'content-type': 'application/json' }); response.end('{}'); };
   const server = createServer(async (request, response) => {
     let body = '';
     for await (const chunk of request) body += chunk;
-    requests.push({ path: request.url, body, response });
-    if (acknowledge) reply(response);
+    requests.push({ path: request.url, body });
+    response.writeHead(200, { 'content-type': 'application/json' });
+    response.end('{}');
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(() => { server.closeAllConnections(); return new Promise(resolve => server.close(resolve)); });
@@ -339,11 +319,9 @@ test('symlinked hook executable emits OTLP metadata and never changes Codex hook
   const result = await hookExecutable(executable, input, dir, { DATALAKE_OTEL_CONFIG: configPath });
   assert.equal(result.code, 0);
   assert.deepEqual(JSON.parse(result.stdout), {});
-  await until(() => requests.length > 0);
-  acknowledge = true;
-  for (const { response } of requests) reply(response);
   await until(() => requests.length === 2);
-  await drained(join(dir, 'state'), 2);
+  await delay(100);
+  assert.equal(requests.length, 2, 'tool completion plus one usage increment, no sender redelivery');
   assert.ok(requests.every(request => request.path === '/v1/traces'));
   assert.equal(JSON.stringify(requests.map(({ path, body }) => ({ path, body }))).includes(secret), false);
   assert.equal(result.stderr.includes(secret), false);
@@ -363,7 +341,7 @@ test('symlinked hook executable emits OTLP metadata and never changes Codex hook
   const duplicate = await hookExecutable(executable, { ...input, model: 'changed-model', tool_name: 'changed-tool' }, dir, { DATALAKE_OTEL_CONFIG: configPath });
   assert.equal(duplicate.code, 0);
   assert.deepEqual(JSON.parse(duplicate.stdout), {});
-  await drained(join(dir, 'state'), 2);
+  await delay(300);
   assert.deepEqual(requests.map(request => request.body), bodies);
 });
 
@@ -392,13 +370,15 @@ test('installed sources deliver without repository modules and native mode leave
   const args = ['--home', home, '--config', configPath, '--codex', binary, '--apply'];
   const plan = await install(args);
   assert.equal(await readFile(configFile, 'utf8'), toml);
+  await assert.rejects(readFile(join(plan.pluginRoot, 'outbox.mjs')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(plan.pluginRoot, 'sender.mjs')), { code: 'ENOENT' });
   const executable = join(plan.pluginRoot, 'codex', 'hook.mjs');
   const input = { hook_event_name: 'SessionStart', session_id: 'installed-session', model: 'gpt-test', prompt: secret };
   const result = await hookExecutable(executable, input, home);
   assert.equal(result.code, 0);
   assert.deepEqual(JSON.parse(result.stdout), {});
   await until(() => requests.length === 1);
-  await drained(join(home, 'state'), 1);
+  await delay(100);
   const span = JSON.parse(requests[0]).resourceSpans[0].scopeSpans[0].spans[0];
   assert.equal(span.name, 'coding_agent.session');
   const expected = serializeEvent('codex', { kind: 'session', sessionId: 'installed-session', eventId: 'session-start', startTimeMs: 0, endTimeMs: 0, attributes: {} }).identity;
@@ -419,6 +399,29 @@ test('installed sources deliver without repository modules and native mode leave
   assert.equal(await readFile(configFile, 'utf8'), toml);
   await install([...args, '--uninstall']);
   assert.equal(await readFile(configFile, 'utf8'), toml);
+});
+
+test('upgrade removes obsolete managed queue modules without touching runtime data', async t => {
+  const dir = await temporary(t);
+  const home = join(dir, 'home');
+  const codexHome = join(home, '.codex');
+  await mkdir(codexHome, { recursive: true });
+  await writeFile(join(codexHome, 'config.toml'), 'model = "gpt-test"\n');
+  const binary = join(dir, 'isolated-codex');
+  await writeFile(binary, `#!${process.execPath}\nprocess.exit(0);\n`, { mode: 0o700 });
+  const configPath = join(dir, 'private-config.json');
+  await writeFile(configPath, JSON.stringify({ endpoint: 'http://127.0.0.1:9', timeoutMs: 1_000 }), { mode: 0o600 });
+  const args = ['--home', home, '--config', configPath, '--codex', binary, '--apply'];
+  const plan = await install(args);
+  await writeFile(join(plan.pluginRoot, 'outbox.mjs'), '// obsolete managed copy');
+  await writeFile(join(plan.pluginRoot, 'sender.mjs'), '// obsolete managed copy');
+  const queueData = join(home, 'doda-datalake-state', 'outbox', 'route');
+  await mkdir(queueData, { recursive: true });
+  await writeFile(join(queueData, 'queue.sqlite'), 'legacy runtime bytes');
+  await install(args);
+  await assert.rejects(readFile(join(plan.pluginRoot, 'outbox.mjs')), { code: 'ENOENT' });
+  await assert.rejects(readFile(join(plan.pluginRoot, 'sender.mjs')), { code: 'ENOENT' });
+  assert.equal(await readFile(join(queueData, 'queue.sqlite'), 'utf8'), 'legacy runtime bytes');
 });
 
 test('native installer dry-run, apply and removal preserve unrelated TOML settings and comments', async t => {

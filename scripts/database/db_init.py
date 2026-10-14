@@ -22,6 +22,8 @@ from scripts.telemetry.activity import ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIE
 
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 TTL_RE = re.compile(r"^[0-9]+[smhd]$")
+OTEL_TABLES = ("opentelemetry_traces", "opentelemetry_logs")
+UNLIMITED_TTL = "0s"  # Greptime 0s means no expiry, not immediate expiry.
 # Shared activity count/value fields and trace attribute keys. The raw
 # repository URL is never stored; ingest hashes it into
 # coding_agent.repository.id before the durable queue.
@@ -211,6 +213,7 @@ def ddl_statements(otel_ttl):
 """
     traces_tail = """  "span_attributes.cost_usd" Float64 NULL,
   "span_attributes.pi.gen_ai.cost.estimated_usd" Float64 NULL,
+  "span_attributes.ttft_ms" Float64 NULL,
   "span_attributes.pi.gen_ai.cost.source" STRING NULL,
   "span_attributes.error.type" STRING NULL,
   "resource_attributes.service.version" STRING NULL,
@@ -543,14 +546,34 @@ def ddl_statements(otel_ttl):
   "committed_at" TIMESTAMP(9) NOT NULL,
   PRIMARY KEY ("vehicle", "source", "decode_epoch")
 )"""))
+    # AI incremental checkpoint: one mutable row with scope='ai' (default
+    # last_row merge overwrites). Written only after all summary writes
+    # succeed; missing table means full rebuild. No TTL.
+    ddls.append(("ai_aggregate_state", """CREATE TABLE IF NOT EXISTS "ai_aggregate_state" (
+  "state_mark" TIMESTAMP(9) NOT NULL TIME INDEX,
+  "scope" STRING NOT NULL,
+  "fence" STRING NULL,
+  "price_digest" STRING NULL,
+  "config_revision" STRING NULL,
+  "input_digest" STRING NULL,
+  "committed_at" TIMESTAMP(9) NOT NULL,
+  PRIMARY KEY ("scope")
+) WITH (ttl = '0s')"""))
     return ddls
 
 
 def alter_statements():
     """Non-destructive ADD COLUMN repairs for pre-existing tables."""
     stmts = [
+        'ALTER TABLE "ai_aggregate_state" ADD COLUMN IF NOT EXISTS'
+        ' "fence" STRING',
+        'ALTER TABLE "ai_aggregate_state" SET \'ttl\' = \'0s\'',
+        'ALTER TABLE "ai_aggregate_state" ADD COLUMN IF NOT EXISTS'
+        ' "input_digest" STRING',
         'ALTER TABLE "opentelemetry_traces" ADD COLUMN IF NOT EXISTS'
         ' "span_attributes.cost_usd" Float64',
+        'ALTER TABLE "opentelemetry_traces" ADD COLUMN IF NOT EXISTS'
+        ' "span_attributes.ttft_ms" Float64',
         'ALTER TABLE "opentelemetry_logs" ADD COLUMN IF NOT EXISTS'
         ' "trace_flags" UInt32',
         'ALTER TABLE "ai_daily_summary" ADD COLUMN IF NOT EXISTS'
@@ -590,6 +613,9 @@ def alter_statements():
     ):
         stmts.append('ALTER TABLE "vehicle_signal" ADD COLUMN IF NOT EXISTS'
                      ' "' + name + '" ' + coltype)
+    # ponytail: metadata only; build old SST indexes in an authorized maintenance run.
+    stmts.append('ALTER TABLE "vehicle_signal" MODIFY COLUMN'
+                 ' "source_field" SET INVERTED INDEX')
     for name, coltype in (
         ("episode_id", "STRING"),
         ("quality", "STRING"),
@@ -665,10 +691,11 @@ def main():
     for label, stmt in ddls:
         try:
             sql_request(base_url, auth, db, stmt, timeout=30)
-            # CREATE IF NOT EXISTS does not update retention. Explicit 0s
+            # CREATE IF NOT EXISTS does not update retention, so re-running
+            # init with a changed OTEL_TTL rewrites the existing TTL too
+            # (finite shrink can expire old rows irreversibly). Explicit 0s
             # also prevents long-term tables inheriting a database-wide TTL.
-            ttl = (otel_ttl or "0s") if label in (
-                "opentelemetry_traces", "opentelemetry_logs") else "0s"
+            ttl = (otel_ttl or UNLIMITED_TTL) if label in OTEL_TABLES else UNLIMITED_TTL
             sql_request(base_url, auth, db,
                         "ALTER TABLE " + qident(label) + " SET 'ttl'='" + ttl + "'",
                         timeout=30)

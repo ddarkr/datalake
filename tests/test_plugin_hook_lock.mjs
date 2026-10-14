@@ -8,7 +8,7 @@ import { promisify } from 'node:util';
 import test from 'node:test';
 import { handleHook } from '../plugins/claude-code/hook.mjs';
 import { withStateLock } from '../plugins/otel.mjs';
-import { processIncarnation } from '../plugins/outbox.mjs';
+import { processIncarnation } from '../plugins/process-lock.mjs';
 
 const run = promisify(execFile);
 async function sandbox(t) {
@@ -104,7 +104,7 @@ console.log('bounded unsafe-owner rejection');`], { timeout: 5000, killSignal: '
 test('Concurrent hooks recover a crashed owner and drain usage once', async t => {
   const path = await sandbox(t), stateRoot = join(path, 'state'), transcript = join(path, 'active.jsonl'), accepted = [];
   const invoke = hook_event_name => handleHook({ session_id: 'session_1', hook_event_name, transcript_path: transcript }, {
-    stateRoot, now: 1000, context: async () => ({}), telemetry: { enqueue: async event => { accepted.push(event); return true; }, flushLocal: async () => {} },
+    stateRoot, now: 1000, context: async () => ({}), telemetry: { send: async event => { accepted.push(event); return true; }, flush: async () => {} },
   });
   await writeFile(transcript, '');
   await invoke('SessionStart');

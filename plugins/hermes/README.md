@@ -33,7 +33,6 @@ On the pinned Hermes revision, `agent/moa_loop.py:1166–1173,1195–1203` retur
 
 **`capture_auxiliary` defaults to false**: only main completions bill, preventing this overlap without core edits. This is partial coverage, not complete MoA accounting: advisors, standalone synthesizers, compression and other auxiliary spend are omitted. No task blacklist is used. Boolean `capture_auxiliary: true` restores auxiliary capture, including standalone synthesis, but reintroduces the known main-MoA double count; use only when the overlapping path is absent or an upstream physical-request correlation contract is added.
 
-Boolean `export_paused` defaults to false. Set it true before a safe hot reload when production sends are prohibited: hooks continue spooling locally but the new worker neither claims nor sends events. Existing pending bodies and endpoint/credentials are preserved. Changing this setting requires another reload; it does not cancel requests in an already-running old worker.
 
 ### Token and cost semantics
 
@@ -41,19 +40,13 @@ Hermes canonical `input_tokens` excludes cache. OTLP `gen_ai.usage.input_tokens`
 
 Upstream `CanonicalUsage` initializes missing buckets to zero before observer dispatch. The exporter cannot recover unknown-versus-zero information already erased by Hermes. It preserves distinctions that still exist in the hook dictionary, and never estimates tokens from character lengths.
 
-## Outbox and lifecycle
+## Transport and lifecycle
 
-- `$HERMES_HOME/usage-otel/outbox.sqlite3`, private owner-only directory/file (0700/0600); refuse symlink directories, symlink files, shared hardlinks, unsafe ownership/permissions.
-- SQLite `synchronous=FULL`, per-operation connections, 50 ms lock wait, transactional insert/lease/ack. Hooks do a local durability write, **never network I/O**. Filesystem latency is not hard-real-time bounded. An event that cannot be persisted because of contention, disk failure or capacity is not recoverable from this plugin; diagnostics are sanitized and the agent continues.
-- Persist the complete immutable OTLP body before transport; duplicate IDs never replace it. Delivered rows become compact tombstones (`body=NULL`) and still deduplicate later callbacks.
-- One daemon worker per plugin instance, one request at a time, at most four request starts/second per process. Multiprocess instances share 30-second leases; stale claim holders cannot acknowledge another lease.
-- HTTP failures, malformed/oversized responses and OTLP `partialSuccess.rejectedSpans != 0` keep the event. Exponential retry delay 1–60 seconds. Response/error bodies never enter diagnostics. No redirects or ambient proxies. Socket timeout 0.1–5 seconds; DNS resolution may exceed socket timeout on some systems.
-- Unload/normal interpreter exit gives the existing worker 250 ms to drain, then prevents new work. A running HTTP request may finish later in its daemon thread; forced process termination leaves a lease that expires after 30 seconds. Short flush is best effort, not a delivery guarantee.
-- Capacity defaults to **100,000 ledger identities including tombstones**, configurable up to 1,000,000. At capacity, new events are rejected with a sanitized warning: there is no silent eviction. Monitor capacity and increase deliberately. No automatic tombstone pruning/rotation is provided; deleting the ledger loses dedup history.
-
-Delivery is **at least once**, not exactly once: collector acknowledgment can be lost, or a process can die after HTTP acceptance before SQLite acknowledgment. Replays retain exactly the same IDs/timestamps/body. The collector/database must deduplicate these IDs; that downstream behavior is not proven by this plugin's tests. Permanent 4xx responses are retained for retry, so correcting collector configuration is necessary to resume progress. Changing endpoint routes existing pending bodies to the new endpoint.
-
-Both Hermes and the Node plugins separate local durable handoff from network work; local persistence is not collector acknowledgment. Their runtimes and storage are independent: Hermes keeps this SQLite ledger and an **in-process daemon thread**, not the Node file outbox or detached sender subprocess. The Node sender's ability to survive its producer's exit does not apply to Hermes, nor does Node endpoint pinning change Hermes's existing endpoint behavior above. Hermes deployment, authentication and access requirements are unchanged.
+- Hooks do a direct bounded HTTP POST per event: no redirects or ambient proxies, 64 KiB reply cap, whole-operation socket deadline 0.1–5 seconds (DNS may exceed it on some systems). Response/error bodies never enter diagnostics.
+- Collector full ACK is 2xx with `partialSuccess.rejectedSpans == 0` (integer zero or all-zero string). Anything else — HTTP error, timeout, malformed/oversized reply, or any rejection — returns false and the event is dropped without retry.
+- No background thread, no unload hook, no cross-process coordination: synchronous hook sends complete before the callback returns, so there is nothing to drain or release. Forced process termination loses only in-flight unsent events.
+- Stable dedup is in-memory only: repeated hook deliveries of the same identity within the process are suppressed, never persisted, never replayed. Existing `$HERMES_HOME/usage-otel/outbox.sqlite3` files from queue-era installs are never opened, replayed, migrated, or deleted by this version.
+- Delivery is **at most once per process per identity**. Two processes firing the same hook each send once; downstream dedup on trace/span IDs is not proven by this plugin's tests.
 
 ## Installation (only after separate approval)
 
@@ -66,10 +59,7 @@ mkdir -p "$HERMES_HOME/plugins/datalake-usage"
 cp plugins/hermes/__init__.py plugins/hermes/plugin.yaml "$HERMES_HOME/plugins/datalake-usage/"
 hermes config set plugins.entries.datalake-usage.settings.endpoint 'https://collector.example/v1/traces'
 hermes config set plugins.entries.datalake-usage.settings.timeout_seconds 2
-hermes config set plugins.entries.datalake-usage.settings.capacity 100000
 hermes config set plugins.entries.datalake-usage.settings.capture_auxiliary false
-# Pause until transport/auth and deployment authorization are verified.
-hermes config set plugins.entries.datalake-usage.settings.export_paused true
 ```
 
 Secrets **do not belong in config.yaml**. Supply either:
@@ -83,13 +73,11 @@ Cookie, host, content-length/type, connection, transfer-encoding and proxy-autho
 # Only after privacy, endpoint/authentication and downstream dedup review.
 hermes plugins enable datalake-usage
 # For a running compatible gateway, use the supported control socket reload:
-# Resume only after authenticated transport verification and authorization.
-hermes config set plugins.entries.datalake-usage.settings.export_paused false
 HERMES_HOME="$HERMES_HOME" /path/to/hermes-agent/venv/bin/python -c 'from pathlib import Path; from hermes_constants import get_hermes_home; from gateway.control_socket import reload_gateway_plugins; print(reload_gateway_plugins(Path(get_hermes_home())))'
 # Check reloaded=true and the datalake-usage activation hooks in the response.
 ```
 
-A missing endpoint registers no observers or worker. Invalid configuration disables the exporter with a generic warning. HTTPS is required except literal loopback HTTP; private-LAN plaintext HTTP is intentionally not supported. URLs may not contain credentials, query or fragment.
+A missing endpoint registers no observers. Invalid configuration disables the exporter with a generic warning. HTTPS is required except literal loopback HTTP; private-LAN plaintext HTTP is intentionally not supported. URLs may not contain credentials, query or fragment. Queue-era `capacity`/`export_paused` keys are ignored; existing profile outbox databases are left untouched (never opened, replayed, or deleted).
 
 ### Rollback
 
@@ -99,7 +87,6 @@ hermes plugins disable datalake-usage
 # Verify datalake-usage no longer appears in gateway activation summaries.
 ```
 
-Keep the private outbox for later replay. To remove the plugin, first stop its owning processes, then remove only the two installed plugin files/directory and optionally its profile-local credentials using the normal approved file-removal workflow. Do not delete state.db or other profile data. Deleting the usage outbox is a deliberate loss of pending telemetry and dedup history.
 
 ## Tests
 
@@ -107,17 +94,17 @@ From repository root, Python 3.9+ and Node 22+:
 
 ```sh
 python3 -B -m unittest discover -s plugins/hermes/tests -v
-# Core/HTTP/multiprocess suite; three optional native tests skip without HERMES_SOURCE.
+# Core/HTTP suite; three optional native tests skip without HERMES_SOURCE.
 
 HERMES_SOURCE=/path/to/verified/hermes-agent \
   /path/to/hermes-agent/venv/bin/python -B -m unittest discover -s plugins/hermes/tests -v
 ```
 
-Native tests use a temporary candidate package and isolated scratch Hermes home, the real manifest scanner/PluginManager/observer dispatcher/unloader and actual installed main/aux usage normalizers. Only fixture metadata is posted to an ephemeral loopback HTTP server. No provider call, production collector, live profile, installed plugin directory, gateway service, credentials or Wiki is touched.
+Native tests use a temporary candidate package and isolated scratch Hermes home, the real manifest scanner/PluginManager/observer dispatcher/unloader and actual installed main/aux usage normalizers. Only fixture metadata is posted to an ephemeral loopback HTTP server, and direct sends complete inside the hook with no worker drain. No provider call, production collector, live profile, installed plugin directory, gateway service, credentials or Wiki is touched.
 
-Tests cover malicious/poisoned hook fields, no raw identities/content, unknown versus zero, consistency validation, JavaScript canonical IDs, durable immutable retry, partial successes, independent processes racing on one ledger, stale leases, private permissions, bounded socket behavior, native profile binding and short unload. The shared ID/timestamp oracle calls only `serializeEvent('hermes', event).body` in Node; it does not create a Node exporter, enqueue records or mock a network fetch. Provider fixtures separately cover OpenAI Chat, Codex Responses and Anthropic canonical normalizers; these are **adapter-shape tests, not live vendor accounting validation**.
+Tests cover malicious/poisoned hook fields, no raw identities/content, unknown versus zero, consistency validation, JavaScript canonical IDs, direct success/failure/partial/malformed/oversized/trickling sends with no retry, in-memory duplicate suppression with no created database files, endpoint/credential validation and native profile binding. The shared ID/timestamp oracle calls only `serializeEvent('hermes', event).body` in Node; it does not create a Node exporter, enqueue records or mock a network fetch. Provider fixtures separately cover OpenAI Chat, Codex Responses and Anthropic canonical normalizers; these are **adapter-shape tests, not live vendor accounting validation**.
 
-For existing repository CI, add `python -B -m unittest discover -s plugins/hermes/tests -v` alongside the coding-agent plugin privacy tests after Python and Node setup. Native compatibility requires an explicitly supplied, pinned Hermes checkout and its environment; the default CI should not download or activate Hermes implicitly. A missing `HERMES_SOURCE` skips the three native tests; passing core/HTTP/multiprocess and serializer-oracle checks does not satisfy that gate. In the current shared Node verification, those Hermes native gates were skipped because the verified external checkout was unavailable; Hermes runtime was unchanged. Node syntax checks also do not substitute for an LSP check (none was configured) or native Hermes compatibility.
+For existing repository CI, add `python -B -m unittest discover -s plugins/hermes/tests -v` alongside the coding-agent plugin privacy tests after Python and Node setup. Native compatibility requires an explicitly supplied, pinned Hermes checkout and its environment; the default CI should not download or activate Hermes implicitly. A missing `HERMES_SOURCE` skips the three native tests; passing core/HTTP and serializer-oracle checks does not satisfy that gate. In the current shared Node verification, those Hermes native gates were skipped because the verified external checkout was unavailable; Hermes runtime was unchanged. Node syntax checks also do not substitute for an LSP check (none was configured) or native Hermes compatibility.
 
 ## Coverage limits
 

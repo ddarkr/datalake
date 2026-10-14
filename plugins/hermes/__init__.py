@@ -3,58 +3,41 @@ import hashlib
 import json
 import math
 import re
-from contextlib import contextmanager
-from decimal import Decimal
+import stat
 import os
+from decimal import Decimal
 from pathlib import Path
-import sqlite3
 import time
-import uuid
 import logging
 import urllib.request
 from urllib.parse import urlsplit, urlunsplit
-import stat
-import threading
-import atexit
 
 
 class Runtime:
-    """Capture profile once; hooks do bounded local writes, worker owns HTTP."""
+    """Capture profile once; hooks send direct bounded HTTP, no queue or worker."""
     def __init__(self, home, config):
         self.scope = hashlib.sha256(str(home.resolve()).encode()).hexdigest()
-        self.outbox = Outbox(home / 'usage-otel' / 'outbox.sqlite3', capacity=config['capacity'])
-        self.exporter = Exporter(self.outbox, config['endpoint'], config['headers'], config['timeout'])
-        self.export_paused = config.get('export_paused', False)
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._run, name='datalake-usage', daemon=True)
-        self.thread.start()
-        atexit.register(self.close)
+        self.exporter = Exporter(config['endpoint'], config['headers'], config['timeout'])
+        # Stable in-memory dedup only: suppress repeated hook deliveries of the
+        # same identity within this process. Never persisted, never replayed.
+        self.seen = set()
 
     def observe(self, data, auxiliary=False):
         try:
             body = project(data, self.scope, auxiliary)
-            if body is not None and not self.outbox.put(body):
-                _LOG.warning('Usage event duplicate or ledger capacity reached; not appended')
+            if body is None:
+                return
+            span = body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
+            identity = span['traceId'] + span['spanId']
+            if identity in self.seen:
+                _LOG.warning('Usage event duplicate; not resent')
+                return
+            self.seen.add(identity)
+            if not self.exporter.send(body):
+                _LOG.warning('Usage export not acknowledged; dropped without retry (details suppressed)')
         except Exception:
-            _LOG.warning('Usage event not persisted (details suppressed)')
+            _LOG.warning('Usage event not exported (details suppressed)')
 
-    def _run(self):
-        while not self.stop.is_set():
-            try:
-                if not self.export_paused:
-                    self.exporter.send_once()
-            except Exception:
-                _LOG.warning('Usage outbox unavailable; retry deferred (details suppressed)')
-            self.stop.wait(0.25)
-
-    def close(self):
-        # Give the single worker a short opportunity to drain; never block exit
-        # on network timeout. In-flight events stay leased and replay on restart.
-        if self.stop.is_set():
-            return
-        self.thread.join(0.25)
-        self.stop.set()
-        atexit.unregister(self.close)
 
 
 def register(ctx):
@@ -67,9 +50,8 @@ def register(ctx):
             return
         runtime = Runtime(home, config)
     except Exception:
-        _LOG.warning('Usage exporter disabled: invalid configuration or private outbox (details suppressed)')
+        _LOG.warning('Usage exporter disabled: invalid configuration (details suppressed)')
         return
-    ctx.on_unload(runtime.close)
     def main(**kwargs):
         runtime.observe(kwargs)
     def auxiliary(**kwargs):
@@ -125,16 +107,14 @@ def settings(ctx, home, environ=None):
         if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}", key) or key.lower() in forbidden or type(value) is not str or len(value) > 8192 or re.search(r'[\x00-\x1f\x7f]', value):
             raise ValueError('invalid headers')
     timeout = ctx.get_config('timeout_seconds', 2)
-    capacity = ctx.get_config('capacity', 100000)
-    if type(timeout) not in (int, float) or not 0.1 <= timeout <= 5 or type(capacity) is not int or not 1 <= capacity <= 1000000:
-        raise ValueError('invalid limits')
+    if type(timeout) not in (int, float) or not 0.1 <= timeout <= 5:
+        raise ValueError('invalid timeout')
     capture_auxiliary = ctx.get_config('capture_auxiliary', False)
     if type(capture_auxiliary) is not bool:
         raise ValueError('capture_auxiliary must be boolean')
-    export_paused = ctx.get_config('export_paused', False)
-    if type(export_paused) is not bool:
-        raise ValueError('export_paused must be boolean')
-    return dict(endpoint=endpoint, headers=headers, timeout=timeout, capacity=capacity, capture_auxiliary=capture_auxiliary, export_paused=export_paused)
+    # Legacy capacity/export_paused keys from queue-era profiles are ignored:
+    # there is no ledger to size or pause, and old databases are never opened.
+    return dict(endpoint=endpoint, headers=headers, timeout=timeout, capture_auxiliary=capture_auxiliary)
 
 
 _LOG = logging.getLogger('datalake.hermes')
@@ -146,18 +126,19 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Exporter:
-    """One span/request, no redirects or ambient HTTP proxies, bounded replies."""
-    def __init__(self, outbox, endpoint, headers, timeout=2):
-        self.outbox, self.endpoint, self.headers, self.timeout = outbox, endpoint, headers, timeout
+    """One span/request, no redirects or ambient HTTP proxies, bounded replies.
+
+    Direct fire-and-report: send() returns collector full ACK as a boolean and
+    never retries. Callers drop failures; there is no queue or replay.
+    """
+    def __init__(self, endpoint, headers, timeout=2):
+        self.endpoint, self.headers, self.timeout = endpoint, headers, timeout
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 
-    def send_once(self, now=None):
-        claim = self.outbox.claim(now)
-        if claim is None:
-            return False
-        success = False
+    def send(self, body):
         try:
-            request = urllib.request.Request(self.endpoint, data=claim[2].encode(), method='POST',
+            payload = json.dumps(body, separators=(',', ':'), allow_nan=False).encode()
+            request = urllib.request.Request(self.endpoint, data=payload, method='POST',
                                              headers={**self.headers, 'Content-Type': 'application/json'})
             deadline = time.monotonic() + self.timeout
             with self.opener.open(request, timeout=self.timeout) as response:
@@ -187,77 +168,9 @@ class Exporter:
                 rejected = partial.get('rejectedSpans', 0)
                 if not ((type(rejected) is int and rejected == 0) or (type(rejected) is str and re.fullmatch(r'0+', rejected))):
                     raise ValueError('partial rejection')
-                success = 200 <= response.status < 300
+                return 200 <= response.status < 300
         except Exception:
-            _LOG.warning('Usage export not acknowledged; retained for retry (details suppressed)')
-        self.outbox.finish(claim, success, now)
-        return success
-
-
-
-class Outbox:
-    """Private SQLite ledger: immutable payloads, transactional leases, tombstones.
-
-    A connection per operation supports hook/worker threads and multiple processes.
-    Capacity includes tombstones: never silently evict a pending event or dedup ID.
-    """
-    def __init__(self, path, capacity=100000):
-        self.path = Path(path)
-        self.capacity = capacity
-        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        parent = self.path.parent.lstat()
-        if not stat.S_ISDIR(parent.st_mode) or parent.st_mode & 0o077 or parent.st_uid != os.getuid():
-            raise ValueError('unsafe outbox directory')
-        fd = os.open(self.path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
-        try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_uid != os.getuid() or info.st_nlink != 1:
-                raise ValueError('unsafe outbox permissions')
-        finally:
-            os.close(fd)
-        with self._connect() as db:
-            db.execute('CREATE TABLE IF NOT EXISTS events (id TEXT PRIMARY KEY, body TEXT, state TEXT NOT NULL, lease TEXT, due REAL NOT NULL DEFAULT 0, attempts INTEGER NOT NULL DEFAULT 0)')
-
-    @contextmanager
-    def _connect(self):
-        db = sqlite3.connect(str(self.path), timeout=0.05)
-        try:
-            db.execute('PRAGMA synchronous=FULL')
-            with db:
-                yield db
-        finally:
-            db.close()
-
-    def put(self, body):
-        span = body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
-        identity = span['traceId'] + span['spanId']
-        encoded = json.dumps(body, separators=(',', ':'), allow_nan=False)
-        with self._connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            if db.execute('SELECT COUNT(*) FROM events').fetchone()[0] >= self.capacity:
-                return False
-            return db.execute('INSERT OR IGNORE INTO events(id,body,state) VALUES (?, ?, ?)', (identity, encoded, 'pending')).rowcount == 1
-
-    def claim(self, now=None):
-        now = time.time() if now is None else now
-        with self._connect() as db:
-            db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT id,body,attempts FROM events WHERE state != 'done' AND due <= ? ORDER BY due,id LIMIT 1", (now,)).fetchone()
-            if row is None:
-                return None
-            lease = uuid.uuid4().hex
-            db.execute("UPDATE events SET state='leased',lease=?,due=? WHERE id=?", (lease, now + 30, row[0]))
-            return row[0], lease, row[1], row[2]
-
-    def finish(self, claim, success, now=None):
-        now = time.time() if now is None else now
-        with self._connect() as db:
-            if success:
-                result = db.execute("UPDATE events SET state='done',body=NULL,lease=NULL WHERE id=? AND lease=?", claim[:2])
-            else:
-                result = db.execute("UPDATE events SET state='pending',lease=NULL,due=?,attempts=attempts+1 WHERE id=? AND lease=?",
-                                    (now + min(60, 2 ** min(claim[3], 6)), claim[0], claim[1]))
-            return result.rowcount == 1
+            return False
 
 
 

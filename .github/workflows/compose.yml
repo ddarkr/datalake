@@ -3,12 +3,23 @@ name: Compose validation
 on:
   push:
   pull_request:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      rows:
+        description: 'Synthetic row count for the manual Greptime storage run'
+        required: false
+        default: '10000000'
 
 permissions:
   contents: read
 
 jobs:
   secrets:
+    # The nightly schedule exists only for greptime-storage-budget; normal
+    # validation jobs must not run again on the timer.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -29,8 +40,12 @@ jobs:
           "$RUNNER_TEMP/gitleaks" git . --redact=100 --ignore-gitleaks-allow \
             --log-opts="--all --full-history"
   validate:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    env:
+      PYTHON_IMAGE: mirror.gcr.io/library/python:3.12.8-slim-bookworm
+      GREPTIME_IMAGE: mirror.gcr.io/greptime/greptimedb:v1.2.1
     steps:
       - uses: actions/checkout@v5
         with:
@@ -43,7 +58,7 @@ jobs:
           python -m pip install --only-binary=:all: PyYAML==6.0.2 \
             python-can==4.6.1 asammdf==8.8.27 zstd==1.5.6.1 \
             cantools==40.7.1 py-expression-eval==0.3.14 boto3==1.43.98 \
-            opentelemetry-proto==1.38.0
+            opentelemetry-proto==1.38.0 grpcio==1.84.0 pyarrow==25.0.1 protobuf==6.33.6
       - uses: actions/setup-node@v6
         with:
           node-version: '22'
@@ -65,15 +80,29 @@ jobs:
           python -m tests.test_backup
           python -m tests.test_can_backup
           python -m tests.test_storage_metrics
+          python -m tests.test_storage_cost_budget
+          python -m tests.test_storage_cost_benchmark
           python -m tests.test_storage
           python -m tests.test_database
+          python -m tests.test_otel_retention
+          python -m tests.test_retention_capacity
+          python -m tests.test_ai_incremental
           python -m tests.test_dashboards
+          python -m tests.test_grafana_folders
           python -m tests.test_activity
           python -m tests.test_vehicle_aggregate
           python -m tests.test_fleet
           python -m tests.test_can_receiver
+          python -m tests.test_can_http_deadline
+          python -m tests.test_can_encoding
+          python -m unittest tests.test_can_prefetch
+          python -m unittest tests.test_can_decode_benchmark
+          python -m unittest discover -s tests -p test_can_processes.py
+          python -m unittest discover -s tests -p test_can_files.py
           python -m tests.test_can_decoder
           python -m tests.test_can_otlp_wire
+          python -m tests.test_greptime_storage_budget
+          python -m tests.test_greptime_storage_lifecycle
           python tools/demo.py regressions
           python -m tests.test_vss
           python -m tests.test_vss_setup
@@ -99,8 +128,17 @@ jobs:
             docker compose --env-file .env.example --profile server --profile "$profile" config --quiet
           done
   synthetic-runtime:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      # Use the public cache directly: never fall back to quota-limited Hub pulls.
+      # Production image defaults and pinned versions remain unchanged.
+      PYTHON_IMAGE: mirror.gcr.io/library/python:3.12.8-slim-bookworm
+      BACKUP_IMAGE: mirror.gcr.io/library/python:3.12.8-slim-bookworm
+      GREPTIME_IMAGE: mirror.gcr.io/greptime/greptimedb:v1.2.1
+      GRAFANA_IMAGE: mirror.gcr.io/grafana/grafana:12.4.0
+      ALLOY_IMAGE: mirror.gcr.io/grafana/alloy:v1.19.2
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -118,3 +156,510 @@ jobs:
           if test -f "$RUNNER_TEMP/datalake-demo/state.json"; then
             python tools/demo.py stop --state "$RUNNER_TEMP/datalake-demo"
           fi
+
+  can-decode-perf:
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the PR base / push before commit exists for git archive.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install pinned synthetic CAN decode dependencies
+        run: |
+          python -m pip install --only-binary=:all: cantools==40.7.1 \
+            opentelemetry-proto==1.38.0 protobuf==6.33.6
+      - name: Materialize baseline archive under RUNNER_TEMP
+        id: baseline
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          unavailable() {
+            printf '{"baseline_available": false, "cases": {}, "max_slowdown": 0.25, "mismatch": [], "note": "synthetic fixture only; baseline unavailable (%s); no regression gate claimed", "regressions": [], "synthetic": true}\n' "$1" > "$RUNNER_TEMP/can-decode-perf.json"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          }
+          sha=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            sha="$PR_BASE_SHA"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            sha="$PUSH_BEFORE_SHA"
+          else
+            unavailable "unsupported-event"
+            exit 1
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            unavailable "untrusted-or-missing-sha"
+            exit 1
+          fi
+          if [ "$sha" = "0000000000000000000000000000000000000000" ]; then
+            unavailable "initial-push-has-no-before-commit"
+            exit 0
+          fi
+          if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+            unavailable "object-not-present"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/can-decode-baseline"
+          mkdir -p "$RUNNER_TEMP/can-decode-baseline"
+          git archive "$sha" | tar -x -C "$RUNNER_TEMP/can-decode-baseline"
+          echo "available=true" >> "$GITHUB_OUTPUT"
+      - name: Run synthetic CAN decode regression gate
+        if: steps.baseline.outputs.available == 'true'
+        run: |
+          python tools/benchmark_can_decode.py \
+            --baseline-root "$RUNNER_TEMP/can-decode-baseline" \
+            --chunks 2000 --repeats 3 --no-instrument \
+            --max-slowdown 0.25 \
+            --json-out "$RUNNER_TEMP/can-decode-perf.json"
+      - name: Upload synthetic decode measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: can-decode-perf
+          path: ${{ runner.temp }}/can-decode-perf.json
+          if-no-files-found: error
+  storage-cost-budget:
+    # Stable merge-required status: every push and PR runs the actual CostGate
+    # runner + checker CLIs against a secured base archive. Fork-PR safe: no
+    # secrets, no pull_request_target; the base SHA is validated before git
+    # archive, and the baseline lives under RUNNER_TEMP. Missing measurements
+    # or a missing baseline (except the defined initial-push bootstrap) fails
+    # closed; JSON, summary, and artifacts are kept even on failure.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the PR base / push before commit exists for git archive.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Materialize baseline archive under RUNNER_TEMP
+        id: baseline
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          fail_closed() {
+            printf '## storage-cost-budget\n%s\n' "$1" > "$RUNNER_TEMP/storage-cost-summary.md"
+            printf '{"schema":"storage-cost-measurements/1","status":"fail","failures":["%s"]}\n' "$1" > "$RUNNER_TEMP/storage-cost-measurements.json"
+            printf '{"schema":"storage-cost-check/1","status":"fail","policy":"not-checked","failures":["%s"]}\n' "$1" > "$RUNNER_TEMP/storage-cost-result.json"
+          }
+          sha=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            sha="$PR_BASE_SHA"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            sha="$PUSH_BEFORE_SHA"
+          else
+            fail_closed "Unsupported event; failing closed."
+            echo "mode=unsupported" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            fail_closed "Untrusted or missing base SHA; failing closed."
+            echo "mode=invalid" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if [ "$sha" = "0000000000000000000000000000000000000000" ]; then
+            if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+              fail_closed "Only an initial push may omit the base commit."
+              exit 1
+            fi
+            # Initial push: no baseline exists. Bootstrap mode still runs the
+            # current absolute gates; the checker marks the exception explicitly.
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "policy=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+            fail_closed "Base commit is not present locally; failing closed."
+            echo "mode=unavailable" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/storage-cost-baseline"
+          mkdir -p "$RUNNER_TEMP/storage-cost-baseline"
+          git archive "$sha" | tar -x -C "$RUNNER_TEMP/storage-cost-baseline"
+          if git cat-file -e "$sha:config/cost-budget.json" 2>/dev/null; then
+            # Base policy, when it exists, constrains candidate relaxation.
+            git show "$sha:config/cost-budget.json" > "$RUNNER_TEMP/base-cost-budget.json"
+            echo "policy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "policy=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "mode=gated" >> "$GITHUB_OUTPUT"
+      - name: Run storage-cost benchmark (current plus baseline)
+        if: steps.baseline.outputs.mode == 'gated' || steps.baseline.outputs.mode == 'bootstrap'
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.baseline.outputs.mode }}" = "bootstrap" ]; then
+            python tools/benchmark_backup_retention.py --no-baseline \
+              --json-out "$RUNNER_TEMP/storage-cost-measurements.json"
+          else
+            python tools/benchmark_backup_retention.py \
+              --baseline-root "$RUNNER_TEMP/storage-cost-baseline" \
+              --json-out "$RUNNER_TEMP/storage-cost-measurements.json"
+          fi
+      - name: Check cost budget (absolute plus baseline-relative gates)
+        if: always() && (steps.baseline.outputs.mode == 'gated' || steps.baseline.outputs.mode == 'bootstrap')
+        run: |
+          set -euo pipefail
+          args=(--measurements "$RUNNER_TEMP/storage-cost-measurements.json"
+            --budget config/cost-budget.json
+            --summary-out "$RUNNER_TEMP/storage-cost-summary.md")
+          if [ "${{ steps.baseline.outputs.mode }}" = "gated" ] && [ "${{ steps.baseline.outputs.policy }}" = "true" ]; then
+            args+=(--baseline-budget "$RUNNER_TEMP/base-cost-budget.json")
+          fi
+          python tools/check_cost_budget.py "${args[@]}" | tee "$RUNNER_TEMP/storage-cost-result.json"
+      - name: Publish cost summary
+        if: always()
+        run: |
+          if test -f "$RUNNER_TEMP/storage-cost-summary.md"; then
+            cat "$RUNNER_TEMP/storage-cost-summary.md" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "storage-cost-budget produced no summary." >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Require real measurement and result evidence
+        # Absent evidence fails: no warn-hidden pass when the runner or the
+        # checker left nothing behind. The checker writes its failure-schema
+        # result JSON to stdout (captured above), so a missing result file
+        # means the pipeline itself broke, not a budget verdict.
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/storage-cost-measurements.json"
+          test -s "$RUNNER_TEMP/storage-cost-result.json"
+          test -s "$RUNNER_TEMP/storage-cost-summary.md"
+      - name: Upload storage-cost measurements and verdict
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: storage-cost-budget
+          path: |
+            ${{ runner.temp }}/storage-cost-measurements.json
+            ${{ runner.temp }}/storage-cost-result.json
+            ${{ runner.temp }}/storage-cost-summary.md
+            ${{ runner.temp }}/base-cost-budget.json
+          if-no-files-found: error
+  greptime-storage-budget:
+    # Heavy native bench: the same synthetic workload runs against the current
+    # and baseline Greptime preflight settings/images. PRs and pushes touching
+    # Greptime-relevant paths run it; irrelevant ones report not-applicable and
+    # succeed. The nightly schedule (10M rows) and workflow_dispatch always run
+    # explicit absolute-only (no baseline claimed). The Greptime/Python images
+    # come per-tree from each checkout's compose/core.yaml; MinIO is the
+    # bench's pinned official release binary with SHA256 verification inside
+    # the Python container (no registry tag); this job never changes
+    # production profile defaults.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # Full history so the PR base / push before commit exists for git archive.
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Decide scope (relevance, baseline mode, rows)
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+          DISPATCH_ROWS: ${{ inputs.rows }}
+        run: |
+          set -euo pipefail
+          # Fail-closed evidence: every early rejection writes both the human
+          # summary and the bench failure-schema JSON, so the red step always
+          # leaves an artifact explaining why (never a silent skip or warn).
+          fail_closed() {
+            printf '## greptime-storage-budget\n%s\n' "$1" > "$RUNNER_TEMP/greptime-storage-summary.md"
+            printf '{"benchmark": "greptime_storage", "status": "failure", "error": "%s"}\n' "$1" > "$RUNNER_TEMP/greptime-storage-budget.json"
+          }
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then
+            # Explicit absolute-only run: no baseline is claimed.
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "rows=$(python -c 'import json; print(json.load(open("config/cost-budget.json"))["greptime"]["rows_nightly"])')" >> "$GITHUB_OUTPUT"
+            echo "reason=nightly-absolute-no-baseline" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            # Explicit absolute-only run: no baseline is claimed. Bad row
+            # inputs are rejected, never silently defaulted.
+            rows="$DISPATCH_ROWS"
+            valid=no
+            if printf '%s' "$rows" | grep -Eq '^[0-9]+$'; then
+              if [ "${#rows}" -le 8 ] && [ "$rows" -ge 1 ] && [ "$rows" -le 10000000 ]; then
+                valid=yes
+              fi
+            fi
+            if [ "$valid" != "yes" ]; then
+              fail_closed "Invalid rows input; must be a positive integer <= 10000000."
+              exit 1
+            fi
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "rows=$rows" >> "$GITHUB_OUTPUT"
+            echo "reason=manual-absolute-no-baseline" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            base="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
+          elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            base="$PUSH_BEFORE_SHA"
+            head="$GITHUB_SHA"
+          else
+            fail_closed "Unsupported event; failing closed."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "mode=na" >> "$GITHUB_OUTPUT"
+            echo "rows=0" >> "$GITHUB_OUTPUT"
+            echo "reason=unsupported-event" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+          if ! printf '%s' "$base" | grep -Eq '^([0-9a-f]{40}|0{40})$'; then
+            fail_closed "Untrusted or missing base SHA; failing closed."
+            exit 1
+          fi
+          if ! printf '%s' "$head" | grep -Eq '^[0-9a-f]{40}$'; then
+            fail_closed "Untrusted or missing head SHA; failing closed."
+            exit 1
+          fi
+          if [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+              fail_closed "Only an initial push may omit the base commit."
+              exit 1
+            fi
+            # Only defined exception: an initial push has no before-commit,
+            # so the bench runs absolute-only with no baseline claimed.
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mode=bootstrap" >> "$GITHUB_OUTPUT"
+            echo "rows=$(python -c 'import json; print(json.load(open("config/cost-budget.json"))["greptime"]["rows_pr"])')" >> "$GITHUB_OUTPUT"
+            echo "reason=initial-push-has-no-before-commit" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            fail_closed "Base commit is not present locally; failing closed."
+            exit 1
+          fi
+          if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            fail_closed "Head commit is not present locally; failing closed."
+            exit 1
+          fi
+          relevant=no
+          # A broken path diff must fail the gate: an unreadable tree change
+          # set can never excuse a not-applicable pass.
+          if ! git diff --name-only "$base" "$head" -- > "$RUNNER_TEMP/greptime-paths.txt"; then
+            fail_closed "Could not list changed paths; failing closed."
+            exit 1
+          fi
+          while IFS= read -r f || [ -n "$f" ]; do
+            case "$f" in
+              '' ) continue ;;
+              compose/core.yaml|compose/database.yaml|compose/backup.yaml|compose/ingest.yaml|compose/grafana.yaml|compose/can-receiver.yaml|compose/vehicle-raw.yaml|compose/vehicle-vss.yaml|compose/tesla-fleet.yaml|compose/redecode.yaml|\
+              scripts/database/*|scripts/analytics/*|scripts/ingest/*|scripts/vehicle/*|scripts/storage/*|scripts/telemetry/*|\
+              tools/benchmark_greptime_storage.py|tools/greptime_cache_reset.py|tools/s3_meter.py|tools/check_cost_budget.py|tools/render.py|\
+              config/cost-budget.json|.env.example|.github/workflows/compose.yml|tests/test_greptime_storage_budget.py|tests/test_greptime_storage_lifecycle.py)
+                relevant=yes; break ;;
+            esac
+          done < "$RUNNER_TEMP/greptime-paths.txt"
+          if [ "$relevant" = "yes" ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "mode=gated" >> "$GITHUB_OUTPUT"
+            echo "rows=$(python -c 'import json; print(json.load(open("config/cost-budget.json"))["greptime"]["rows_pr"])')" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "mode=na" >> "$GITHUB_OUTPUT"
+            echo "rows=0" >> "$GITHUB_OUTPUT"
+          fi
+          echo "reason=path-detection" >> "$GITHUB_OUTPUT"
+      - name: Materialize Greptime baseline archive under RUNNER_TEMP
+        id: baseline
+        if: steps.scope.outputs.mode == 'gated'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          sha=""
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            sha="$PR_BASE_SHA"
+          else
+            sha="$PUSH_BEFORE_SHA"
+          fi
+          if ! printf '%s' "$sha" | grep -Eq '^[0-9a-f]{40}$'; then
+            printf '## greptime-storage-budget\nUntrusted or missing base SHA; failing closed.\n' > "$RUNNER_TEMP/greptime-storage-summary.md"
+            printf '{"benchmark": "greptime_storage", "status": "failure", "error": "Untrusted or missing base SHA; failing closed."}\n' > "$RUNNER_TEMP/greptime-storage-budget.json"
+            exit 1
+          fi
+          if ! git cat-file -e "$sha^{commit}" 2>/dev/null; then
+            printf '## greptime-storage-budget\nBase commit is not present locally; failing closed.\n' > "$RUNNER_TEMP/greptime-storage-summary.md"
+            printf '{"benchmark": "greptime_storage", "status": "failure", "error": "Base commit is not present locally; failing closed."}\n' > "$RUNNER_TEMP/greptime-storage-budget.json"
+            exit 1
+          fi
+          rm -rf "$RUNNER_TEMP/greptime-storage-baseline"
+          mkdir -p "$RUNNER_TEMP/greptime-storage-baseline"
+          git archive "$sha" | tar -x -C "$RUNNER_TEMP/greptime-storage-baseline"
+          # The trusted current harness drives both variants, so the base tree
+          # only needs the production files the bench actually consumes per
+          # tree (preflight settings + core image pins). A base predating the
+          # new runner file is still a valid baseline, not a red presence gate.
+          if ! test -f "$RUNNER_TEMP/greptime-storage-baseline/scripts/database/greptime_preflight.py" \
+            || ! test -f "$RUNNER_TEMP/greptime-storage-baseline/compose/core.yaml"; then
+            printf '## greptime-storage-budget\nBase tree lacks the Greptime preflight or core image pin; failing closed (no baseline claim).\n' > "$RUNNER_TEMP/greptime-storage-summary.md"
+            printf '{"benchmark": "greptime_storage", "status": "failure", "error": "Base tree lacks the Greptime preflight or core image pin; failing closed (no baseline claim)."}\n' > "$RUNNER_TEMP/greptime-storage-budget.json"
+            exit 1
+          fi
+          if git cat-file -e "$sha:config/cost-budget.json" 2>/dev/null; then
+            git show "$sha:config/cost-budget.json" > "$RUNNER_TEMP/base-cost-budget.json"
+            echo "policy=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "policy=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Validate candidate and constrain it with the base cost policy
+        # The shared checker owns policy semantics: candidate Greptime bounds
+        # must be present, finite/nonnegative/typed, and no looser than base.
+        # Validate even in nightly/manual/initial-push bootstrap mode. A valid
+        # historical tree without this new policy still runs the actual bench.
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          args=(config/cost-budget.json "$RUNNER_TEMP/greptime-storage-policy.json")
+          if [ "${{ steps.scope.outputs.mode }}" = "gated" ] && [ "${{ steps.baseline.outputs.policy }}" = "true" ]; then
+            args+=("$RUNNER_TEMP/base-cost-budget.json")
+          fi
+          python - "${args[@]}" <<'EOF'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+          from tools.check_cost_budget import compare_policy, load_policy
+          report = {"policy": "baseline" if len(sys.argv) == 4 else "bootstrap",
+                    "status": "fail", "failures": []}
+          try:
+              candidate = load_policy(sys.argv[1])
+              if len(sys.argv) == 4:
+                  base = load_policy(sys.argv[3])
+                  report["failures"] = compare_policy(candidate, base)
+              if report["failures"]:
+                  raise ValueError("; ".join(report["failures"]))
+              report["status"] = "pass"
+          except Exception as error:
+              if not report["failures"]:
+                  report["failures"] = [str(error)]
+              root = Path(os.environ["RUNNER_TEMP"])
+              failure = {"benchmark": "greptime_storage", "status": "failure",
+                         "error": "cost policy rejected", "policy_check": report}
+              (root / "greptime-storage-budget.json").write_text(
+                  json.dumps(failure, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+              (root / "greptime-storage-summary.md").write_text(
+                  "## greptime-storage-budget\nCost policy rejected:\n"
+                  + "\n".join("- " + reason for reason in report["failures"]) + "\n",
+                  encoding="utf-8")
+              (root / "greptime-storage-exit.txt").write_text("1\n", encoding="utf-8")
+          Path(sys.argv[2]).write_text(
+              json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
+          print(json.dumps(report, allow_nan=False))
+          sys.exit(0 if report["status"] == "pass" else 1)
+          EOF
+      - name: Report not-applicable for unrelated changes
+        if: steps.scope.outputs.run == 'false'
+        run: |
+          set -euo pipefail
+          printf '{"benchmark": "greptime_storage", "status": "not-applicable", "applicable": false, "reason": "no Greptime-relevant paths changed", "synthetic": true}\n' > "$RUNNER_TEMP/greptime-storage-budget.json"
+          printf '## greptime-storage-budget\nNot applicable: no Greptime-relevant paths changed.\n' > "$RUNNER_TEMP/greptime-storage-summary.md"
+          echo "0" > "$RUNNER_TEMP/greptime-storage-exit.txt"
+      - name: Run native Greptime storage benchmark
+        if: steps.scope.outputs.run == 'true'
+        run: |
+          set -euo pipefail
+          rows="${{ steps.scope.outputs.rows }}"
+          # Revalidate here: a tampered or empty output cannot silently shrink
+          # the nightly/manual workload; bad values fail, never default.
+          valid=no
+          if printf '%s' "$rows" | grep -Eq '^[0-9]+$'; then
+            if [ "${#rows}" -le 8 ] && [ "$rows" -ge 1 ] && [ "$rows" -le 10000000 ]; then
+              valid=yes
+            fi
+          fi
+          if [ "$valid" != "yes" ]; then
+            printf '## greptime-storage-budget\nInvalid rows value; failing closed.\n' > "$RUNNER_TEMP/greptime-storage-summary.md"
+            printf '{"benchmark": "greptime_storage", "status": "failure", "error": "Invalid rows value; failing closed."}\n' > "$RUNNER_TEMP/greptime-storage-budget.json"
+            exit 1
+          fi
+          args=(--rows "$rows" --json-out "$RUNNER_TEMP/greptime-storage-budget.json"
+            --budget config/cost-budget.json)
+          if [ "${{ steps.scope.outputs.mode }}" = "gated" ]; then
+            args+=(--baseline-root "$RUNNER_TEMP/greptime-storage-baseline")
+            if [ "${{ steps.baseline.outputs.policy }}" = "true" ]; then
+              args+=(--baseline-budget "$RUNNER_TEMP/base-cost-budget.json")
+            fi
+          else
+            args+=(--no-baseline)
+          fi
+          set +e
+          python tools/benchmark_greptime_storage.py "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/greptime-storage-bench.log"
+          code="${PIPESTATUS[0]}"
+          echo "$code" > "$RUNNER_TEMP/greptime-storage-exit.txt"
+          if ! test -s "$RUNNER_TEMP/greptime-storage-budget.json"; then
+            printf '## greptime-storage-budget\nBench left no measurement JSON; failing closed.\n' > "$RUNNER_TEMP/greptime-storage-summary.md"
+            printf '{"benchmark": "greptime_storage", "status": "failure", "error": "Bench left no measurement JSON; failing closed."}\n' > "$RUNNER_TEMP/greptime-storage-budget.json"
+            echo 1 > "$RUNNER_TEMP/greptime-storage-exit.txt"
+            exit 1
+          fi
+          exit "$code"
+      - name: Publish Greptime storage summary
+        if: always()
+        run: |
+          # Preserve fail-closed gate evidence: only create the generic summary
+          # when no earlier step wrote one (early SHA failures write first).
+          if ! test -f "$RUNNER_TEMP/greptime-storage-summary.md"; then
+            {
+              echo "## greptime-storage-budget"
+              echo "- event: $GITHUB_EVENT_NAME, mode: ${{ steps.scope.outputs.mode }}, rows: ${{ steps.scope.outputs.rows }}, reason: ${{ steps.scope.outputs.reason }}"
+              if test -f "$RUNNER_TEMP/greptime-storage-exit.txt"; then
+                echo "- bench exit: $(cat "$RUNNER_TEMP/greptime-storage-exit.txt") (0 means the bench gate passed; details in the JSON artifact)"
+              else
+                echo "- bench did not run."
+              fi
+            } > "$RUNNER_TEMP/greptime-storage-summary.md"
+          fi
+          cat "$RUNNER_TEMP/greptime-storage-summary.md" >> "$GITHUB_STEP_SUMMARY"
+      - name: Require real measurement and result evidence
+        # Absent evidence fails: no warn-hidden pass when the bench or the
+        # checker left nothing behind.
+        if: always()
+        run: |
+          set -euo pipefail
+          test -s "$RUNNER_TEMP/greptime-storage-budget.json"
+          test -s "$RUNNER_TEMP/greptime-storage-summary.md"
+          test -s "$RUNNER_TEMP/greptime-storage-exit.txt"
+          if [ "${{ steps.scope.outputs.run }}" = "true" ]; then
+            test -s "$RUNNER_TEMP/greptime-storage-policy.json"
+          fi
+      - name: Upload Greptime storage measurements
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: greptime-storage-budget
+          path: |
+            ${{ runner.temp }}/greptime-storage-budget.json
+            ${{ runner.temp }}/greptime-storage-bench.log
+            ${{ runner.temp }}/greptime-storage-summary.md
+            ${{ runner.temp }}/greptime-storage-exit.txt
+            ${{ runner.temp }}/base-cost-budget.json
+            ${{ runner.temp }}/greptime-storage-policy.json
+          if-no-files-found: error

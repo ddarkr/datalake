@@ -20,7 +20,7 @@ services:
     restart: unless-stopped
     # Inline script changes need a service revision to trigger recreation.
     labels:
-      datalake.recorder-revision: "6"
+      datalake.recorder-revision: "7"
     stop_grace_period: 30s
     depends_on:
       fleet-deps:

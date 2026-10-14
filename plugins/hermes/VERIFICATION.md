@@ -1,5 +1,7 @@
 # Implementation verification / TDD record
 
+Historical queue-era implementation evidence. Queue, lease, tombstone, pause, worker, and retry results below describe the retired implementation, not the current direct HTTP transport. Current behavior and verification commands are in [README.md](README.md).
+
 Implementation used incremental test-first slices, running each missing-behavior test before implementing and rerunning the suite after each change. This record summarizes observed tool results; it is not a replacement for the execution logs.
 
 | Slice | Observed RED | GREEN implementation |

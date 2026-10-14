@@ -42,8 +42,8 @@ export function agentDirectory({ home = homedir(), profile, isolated = false, en
   return agentDir;
 }
 
-function loader(configPath, moduleURL = extensionURL, profile) {
-  const options = { ...(configPath ? { configPath } : {}), ...(profile ? { profile } : {}) };
+function loader(configPath, moduleURL = extensionURL) {
+  const options = { ...(configPath ? { configPath } : {}) };
   return marker + `import extension from ${JSON.stringify(moduleURL)};\nexport default pi => extension(pi, ${JSON.stringify(options)});\n`;
 }
 
@@ -54,11 +54,16 @@ function ownedLoader(text) {
   try {
     const url = JSON.parse(match[1]);
     const options = JSON.parse(match[2]);
-    return typeof url === 'string' && url.startsWith('file:') && options &&
-      Object.keys(options).every(key => key === 'configPath' || key === 'profile') &&
-      (options.configPath === undefined || typeof options.configPath === 'string') &&
-      (options.profile === undefined || typeof options.profile === 'string') &&
-      text === loader(options.configPath, url, options.profile);
+    if (typeof url !== 'string' || !url.startsWith('file:') || !options || typeof options !== 'object' ||
+      !Object.keys(options).every(key => key === 'configPath' || key === 'profile') ||
+      (options.configPath !== undefined && typeof options.configPath !== 'string') ||
+      (options.profile !== undefined && typeof options.profile !== 'string')) return false;
+    if (text !== loader(options.configPath, url)) {
+      if (typeof options.profile !== 'string') return false;
+      const legacy = marker + `import extension from ${JSON.stringify(url)};\nexport default pi => extension(pi, ${JSON.stringify({ ...(options.configPath ? { configPath: options.configPath } : {}), profile: options.profile })});\n`;
+      if (text !== legacy) return false;
+    }
+    return { url, configPath: options.configPath, profile: options.profile };
   } catch { return false; }
 }
 
@@ -86,10 +91,11 @@ export async function install(args = process.argv.slice(2), env = process.env) {
   let existing;
   try { existing = await readFile(path, 'utf8'); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
-  if (existing !== undefined && !ownedLoader(existing)) throw new Error('기존 파일이 관리 로더와 다릅니다. 변경하지 않았습니다.');
+  const owned = existing === undefined ? false : ownedLoader(existing);
+  if (existing !== undefined && !owned) throw new Error('기존 파일이 관리 로더와 다릅니다. 변경하지 않았습니다.');
   const configPath = values.config ? resolve(values.config) : undefined;
-  const content = loader(configPath, extensionURL, directory);
-  const migrate = existing === loader(configPath) && existing !== content;
+  const content = loader(configPath);
+  const migrate = !!owned && owned.url === extensionURL && owned.configPath === configPath && owned.profile === directory && existing !== content;
   if (!values.uninstall && existing !== undefined && existing !== content && !migrate) {
     throw new Error('설치 옵션이 기존 로더와 다릅니다. 먼저 --uninstall --apply로 제거하세요.');
   }

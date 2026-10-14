@@ -3,9 +3,10 @@
 Covers: frame codec provenance, segment rotation/recovery, MF4 bus-logging
 round-trip via MF4Reader (payload/FD/RTR/error, pre-rename verify gate,
 crash-resume reuse, torn-tail salvage vs mid-corruption quarantine),
-deterministic remote keys, triple-upload ack rule (all locals kept on any
-failure, manifest-pin drift fail-closed to quarantine, partial sets
-invisible), replay safety gate.
+deterministic remote keys, triple-upload ack rule (all locals deleted only
+on server-ChecksumSHA256 + HEAD size + Metadata-sha256 ack of all three
+legs; all locals kept on any failure, manifest-pin drift fail-closed to
+quarantine, partial sets invisible), replay safety gate.
 """
 import json
 import os
@@ -276,53 +277,201 @@ class MF4Test(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(spool, "quarantine", "m3_mid.jsonl")))
             self.assertFalse(os.path.exists(cp2))
+            cp4 = os.path.join(dirs["closed"], "m3_utf8.jsonl")
+            damaged = (good[0] + "\n").encode() + b"\xff\n"
+            with open(cp4, "wb") as fh:
+                fh.write(damaged)
+            with self.assertRaises(ValueError):
+                rec.finalize_segment(cp4, dirs["sealed"], spool=spool)
+            with open(os.path.join(spool, "quarantine", "m3_utf8.jsonl"),
+                      "rb") as fh:
+                self.assertEqual(fh.read(), damaged)
+            self.assertEqual(os.listdir(dirs["sealed"]), [])
 
+    def test_finalize_empty_whitespace_torn_tail_returns_none(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            for name, body in (
+                    ("m3_empty.jsonl", b""),
+                    ("m3_blank.jsonl", b"  \n\n \t\n"),
+                    ("m3_torn_only.jsonl", b'{"v":'),
+            ):
+                cp = os.path.join(dirs["closed"], name)
+                with open(cp, "wb") as fh:
+                    fh.write(body)
+                stats = {}
+                out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                           stats=stats)
+                self.assertIsNone(out)  # prior empty policy: None, no triple
+                self.assertFalse(os.path.exists(cp))  # empty closed consumed
+                stem = name[:-len(".jsonl")]
+                for suffix in (".mf4", ".ingress.jsonl.gz",
+                               ".mf4.manifest.json", ".stage.tmp"):
+                    self.assertFalse(os.path.exists(
+                        os.path.join(dirs["sealed"], stem + suffix)))
+                leftovers = [n for n in os.listdir(dirs["sealed"])
+                             if n.startswith(stem + ".")]
+                self.assertEqual(leftovers, [])
+
+    def test_finalize_combined_tmp_budget_fails_closed(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = BoundedMemoryTest()._frames(60)
+            stem = "m3_20260921T000017Z_deadbeef_017"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            # Calibrate on the same spill path (mem_frames=1): full
+            # finalize succeeds, so every partial sum fits a huge budget.
+            from unittest.mock import patch
+            stats = {}
+            match_bytes = []
+            note_live = rec.SortedFrameStore._note_live
+
+            def measure_live(store, extra_paths=()):
+                total = note_live(store, extra_paths)
+                stage_size = sum(os.path.getsize(p) for p in extra_paths)
+                match_bytes.append(total - stage_size)
+                return total
+
+            with patch.object(rec.SortedFrameStore, "_note_live", measure_live):
+                out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                           mem_frames=1, stats=stats)
+            combined = int(stats["peak_temp_bytes"])
+            staged_bytes = os.path.getsize(out)
+            for suffix in (".mf4", ".ingress.jsonl.gz",
+                           ".mf4.manifest.json"):
+                os.unlink(os.path.join(dirs["sealed"], stem + suffix))
+            store = rec.SortedFrameStore(dirs["sealed"], stem, 1, 2 << 30)
+            try:
+                for f in frames:
+                    store.add(f)
+                store.finish_staging()
+                sort_only = rec._enforce_tmp_budget(store.dir, 2 << 30)
+            finally:
+                store.destroy()
+            # Keep both partials below the cap, with room for MF4 metadata
+            # size variation between writes; the combined footprint exceeds it.
+            partial_peak = max(sort_only + staged_bytes, max(match_bytes))
+            cap = (partial_peak + combined) // 2
+            self.assertLess(sort_only + staged_bytes, cap)
+            self.assertLess(max(match_bytes), cap)
+            with self.assertRaises(rec.NoSpace):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     mem_frames=1, tmp_max_bytes=cap)
+            self.assertTrue(os.path.exists(cp))  # source kept for retry
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".mf4")))
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".mf4.manifest.json")))
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".ingress.jsonl.gz")))
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".stage.tmp")))
 
 class _Missing(Exception):
-    """Mimics botocore ClientError for a missing key (NoSuchKey)."""
-    def __init__(self):
+    """Mimics botocore ClientError for a missing key."""
+    def __init__(self, code="NoSuchKey"):
         super().__init__("missing key")
-        self.response = {"Error": {"Code": "NoSuchKey"},
+        self.response = {"Error": {"Code": code},
                          "ResponseMetadata": {"HTTPStatusCode": 404}}
 
 
-class FakeBody:
-    def __init__(self, data):
-        self.data = data
-        self.closed = False
-
-    def iter_chunks(self, chunk_size=1 << 20):
-        yield self.data
-
-    def close(self):
-        self.closed = True
+class _HeadError(Exception):
+    """Mimics a non-missing botocore failure (never means missing)."""
+    def __init__(self, code, status):
+        super().__init__("head failed: %s" % code)
+        self.response = {"Error": {"Code": code},
+                         "ResponseMetadata": {"HTTPStatusCode": status}}
 
 
 class FakeS3:
-    def __init__(self, corrupt=False, fail_put=0, unreadable=False):
+    """HEAD + PUT fake with server ChecksumSHA256 semantics.
+
+    store maps (Bucket, Key) -> (bytes, metadata, checksum_b64) where the
+    checksum is the actual SHA256 of the stored bytes. put_object demands
+    ChecksumSHA256 and rejects a corrupt upload body like a server would;
+    head_object reports the checksum of the (possibly corrupted) bytes.
+    """
+    def __init__(self, corrupt=False, fail_put=0, unreadable=False,
+                 missing_code="NoSuchKey", head_error=None,
+                 no_checksum=False, wrong_checksum=False,
+                 unsupported_checksum=False, same_size_corrupt=False,
+                 put_no_echo=False):
         self.store = {}
         self.corrupt = corrupt
         self.fail_put = fail_put
         self.unreadable = unreadable
+        self.missing_code = missing_code
+        self.head_error = head_error
+        self.no_checksum = no_checksum
+        self.wrong_checksum = wrong_checksum
+        self.unsupported_checksum = unsupported_checksum
+        self.same_size_corrupt = same_size_corrupt
+        self.put_no_echo = put_no_echo
         self.puts = 0
+        self.gets = 0
 
-    def put_object(self, Bucket, Key, Body, ContentLength, Metadata):
+    @staticmethod
+    def _b64(data):
+        import base64 as _b64
+        import hashlib as _hl
+        return _b64.b64encode(_hl.sha256(data).digest()).decode("ascii")
+
+    def put_object(self, Bucket, Key, Body, ContentLength, Metadata,
+                   ChecksumSHA256=None):
         if self.fail_put > 0:
             self.fail_put -= 1
             raise ConnectionError("boom")
+        if self.unsupported_checksum:
+            raise _HeadError("InvalidRequest", 400)
+        blob = Body.read()
+        actual = self._b64(blob)
+        if ChecksumSHA256 != actual:
+            # Server rejects an upload whose bytes fail checksum validation.
+            raise IOError("checksum mismatch on PUT")
         self.puts += 1
-        self.store[(Bucket, Key)] = Body.read()
+        self.store[(Bucket, Key)] = (blob, dict(Metadata or {}), actual)
+        if self.put_no_echo:
+            return {}
+        return {"ChecksumSHA256": actual}
 
-    def get_object(self, Bucket, Key):
+    def head_object(self, Bucket, Key, ChecksumMode=None):
         if self.unreadable:
             raise ConnectionError("denied")
+        if self.head_error is not None:
+            raise self.head_error
         try:
-            data = self.store[(Bucket, Key)]
+            data, meta, csum = self.store[(Bucket, Key)]
         except KeyError:
-            raise _Missing()
+            raise _Missing(self.missing_code)
+        # MinIO-proven semantics: checksum returned only with ENABLED.
+        enabled = (ChecksumMode == "ENABLED")
         if self.corrupt:
-            data = b"tampered" + data
-        return {"Body": FakeBody(data), "ContentLength": len(data)}
+            data = b"tampered" + data  # wrong length: HEAD size mismatches
+        elif self.same_size_corrupt:
+            data = bytes(b ^ 0xFF for b in data)  # equal size, wrong bytes
+        out = {"ContentLength": len(data), "Metadata": dict(meta)}
+        if enabled:
+            out["ChecksumSHA256"] = self._b64(data)
+        if self.no_checksum:
+            out.pop("ChecksumSHA256", None)
+        elif self.wrong_checksum:
+            out["ChecksumSHA256"] = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        return out
+
+    def get_object(self, Bucket, Key):  # tripwire: readback must never happen
+        self.gets += 1
+        raise AssertionError("GET body readback is forbidden in raw upload")
 
 
 class UploadTest(unittest.TestCase):
@@ -384,7 +533,7 @@ class UploadTest(unittest.TestCase):
     def test_mismatch_keeps_all_locals(self):
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
-            cli = FakeS3(corrupt=True)
+            cli = FakeS3(corrupt=True)  # post-PUT HEAD size mismatches
             n = upl.run_once(cli, "b", spool, "m3", 0)
             self.assertEqual(n, 1)
             for kept in (p, s, m, cp):  # unacked: everything stays
@@ -392,11 +541,13 @@ class UploadTest(unittest.TestCase):
 
     def test_manifest_leg_failure_keeps_all(self):
         class ManifestDown(FakeS3):
-            def put_object(self, Bucket, Key, Body, ContentLength, Metadata):
+            def put_object(self, Bucket, Key, Body, ContentLength, Metadata,
+                           ChecksumSHA256=None):
                 if Key.endswith(".manifest.json"):
                     raise ConnectionError("manifest down")
                 return super().put_object(Bucket, Key, Body, ContentLength,
-                                          Metadata)
+                                          Metadata,
+                                          ChecksumSHA256=ChecksumSHA256)
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
             cli = ManifestDown()
@@ -454,19 +605,86 @@ class UploadTest(unittest.TestCase):
                                       (s, upl.sidecar_key(key)),
                                       (m, upl.manifest_key(key))):
                 with open(leg_path, "rb") as fh:
-                    cli.store[("b", leg_key)] = b"CONFLICT" + fh.read()
+                    blob = fh.read()
+                # Same byte length, wrong digest: HEAD metadata conflicts.
+                clashing = bytes(b ^ 0xFF for b in blob)
+                cli.store[("b", leg_key)] = (
+                    clashing, {"sha256": "0" * 64}, FakeS3._b64(clashing))
             before = dict(cli.store)
             self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
             self.assertEqual(cli.store, before)  # conflict: bytes untouched
             for kept in (p, s, m, cp):
                 self.assertTrue(os.path.exists(kept))
 
+    def test_missing_metadata_fails_closed(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            for leg_path, leg_key in ((p, key),
+                                      (s, upl.sidecar_key(key)),
+                                      (m, upl.manifest_key(key))):
+                with open(leg_path, "rb") as fh:
+                    blob = fh.read()
+                cli.store[("b", leg_key)] = (blob, {}, FakeS3._b64(blob))
+            before = dict(cli.store)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, before)  # no digest: never trusted
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_wrong_size_fails_closed(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            with open(p, "rb") as fh:
+                blob = fh.read() + b"\x00"
+            cli.store[("b", key)] = (blob, {"sha256": upl.sha256_file(p)},
+                                     FakeS3._b64(blob))
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_head_404_code_means_missing(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(missing_code="404")  # botocore HEAD 404: upload
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for gone in (p, s, m, cp):
+                self.assertFalse(os.path.exists(gone))
+
+    def test_head_nonmissing_error_never_deleted(self):
+        for err in (_HeadError("Forbidden", 403),
+                    _HeadError("NoSuchBucket", 404)):
+            with tempfile.TemporaryDirectory() as spool:
+                p, s, m, cp = self._triple(spool)
+                cli = FakeS3(head_error=err)  # never means missing
+                self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+                self.assertEqual(cli.store, {})
+                for kept in (p, s, m, cp):
+                    self.assertTrue(os.path.exists(kept))
+
+    def test_failed_upload_logs_no_private_key_path_or_remote_error(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as spool:
+            paths = self._triple(spool, name="private_vehicle_marker_segment")
+            cli = FakeS3(head_error=_HeadError("private_remote_error_marker", 403))
+            captured = io.StringIO()
+            with contextlib.redirect_stderr(captured):
+                upl.run_once(cli, "b", spool, "private_vehicle_marker", 0)
+            for marker in (spool, "private_vehicle_marker", "private_remote_error_marker"):
+                self.assertNotIn(marker, captured.getvalue())
+            self.assertEqual(cli.store, {})
+            self.assertTrue(all(os.path.exists(path) for path in paths))
+
     def test_unreadable_live_object_retried_never_deleted(self):
         with tempfile.TemporaryDirectory() as spool:
             p, s, m, cp = self._triple(spool)
             cli = FakeS3(unreadable=True)
             self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
-            self.assertEqual(cli.store, {})  # denied reads: nothing uploaded
+            self.assertEqual(cli.store, {})  # denied HEAD: nothing uploaded
             for kept in (p, s, m, cp):
                 self.assertTrue(os.path.exists(kept))
 
@@ -512,6 +730,232 @@ class UploadTest(unittest.TestCase):
             for gone in (p2, s2, m2, cp2):
                 self.assertFalse(os.path.exists(gone))
 
+    def test_equal_size_corruption_fails_closed_never_deletes(self):
+        # Same ContentLength and same metadata digest, but the stored bytes
+        # differ: only the server checksum distinguishes them. Ack must
+        # refuse and every local must stay.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(same_size_corrupt=True)
+            n = upl.run_once(cli, "b", spool, "m3", 0)
+            self.assertEqual(n, 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+            self.assertEqual(cli.gets, 0)  # no GET body readback, ever
+
+    def test_metadata_match_without_server_checksum_fails_closed(self):
+        # A live object with matching size+metadata but no server checksum
+        # (checksum-less backend) must NOT ack or delete locals.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            cli = FakeS3(no_checksum=True)
+            for leg_path, leg_key in ((p, key),
+                                      (s, upl.sidecar_key(key)),
+                                      (m, upl.manifest_key(key))):
+                with open(leg_path, "rb") as fh:
+                    blob = fh.read()
+                cli.store[("b", leg_key)] = (
+                    blob, {"sha256": upl.sha256_file(leg_path)},
+                    FakeS3._b64(blob))
+            before = dict(cli.store)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, before)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_unsupported_checksum_fails_closed_keeps_locals(self):
+        # Backend rejecting ChecksumSHA256 is an explicit failure: no trust,
+        # no GET fallback, all locals retained on every leg.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(unsupported_checksum=True)
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, {})
+            self.assertEqual(cli.gets, 0)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_put_response_without_checksum_keeps_locals(self):
+        # PUT accepted bytes but returned no checksum echo: unverified.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = FakeS3(put_no_echo=True)
+            # _put_checked alone: missing echo raises through retries.
+            digest = upl.sha256_file(p)
+            with self.assertRaises(IOError):
+                upl._put_checked(cli, "b", "k", p, os.path.getsize(p),
+                                 digest)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+
+    def test_replay_after_verified_ack_needs_no_put_no_readback(self):
+        # Fresh complete triple acks; a crash-restored replay reuses all
+        # three legs with no extra PUT and no GET body read.
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            saved = {}
+            for f in (p, s, m):
+                with open(f, "rb") as fh:
+                    saved[f] = fh.read()
+            cli = FakeS3()
+            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+            for (k, path), digest in zip(
+                    ((key, p), (upl.sidecar_key(key), s),
+                     (upl.manifest_key(key), m)),
+                    [upl.sha256_file(x) for x in (p, s, m)]):
+                self.assertTrue(
+                    upl.upload_verified(cli, "b", k, path, digest, 0))
+            puts = cli.puts
+            for (k, path), digest in zip(
+                    ((key, p), (upl.sidecar_key(key), s),
+                     (upl.manifest_key(key), m)),
+                    [upl.sha256_file(x) for x in (p, s, m)]):
+                self.assertTrue(
+                    upl.upload_verified(cli, "b", k, path, digest, 0))
+            self.assertEqual(cli.puts, puts)  # replay: reuse, no PUT
+            self.assertEqual(cli.gets, 0)  # replay: no body readback
+
+    def test_any_leg_unsupported_checksum_preserves_all_locals(self):
+        # Manifest leg PUT rejected for checksum support: MF4/sidecar may
+        # already be stored, but the triple is unacked -- all locals stay.
+        class ManifestUnsupported(FakeS3):
+            def put_object(self, Bucket, Key, Body, ContentLength,
+                           Metadata, ChecksumSHA256=None):
+                if Key.endswith(".manifest.json"):
+                    raise _HeadError("InvalidRequest", 400)
+                return super().put_object(
+                    Bucket, Key, Body, ContentLength, Metadata,
+                    ChecksumSHA256=ChecksumSHA256)
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = self._triple(spool)
+            cli = ManifestUnsupported()
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            for kept in (p, s, m, cp):
+                self.assertTrue(os.path.exists(kept))
+            self.assertEqual(cli.gets, 0)
+
+
+
+class RawBindingTest(unittest.TestCase):
+    def _triple(self, spool):
+        import gzip
+        import hashlib
+        sealed = os.path.join(spool, "sealed")
+        closed = os.path.join(spool, "closed")
+        os.makedirs(sealed)
+        os.makedirs(closed)
+        stem = "m3_20260921T140000Z_binding"
+        p = os.path.join(sealed, stem + ".mf4")
+        s = os.path.join(sealed, stem + ".ingress.jsonl.gz")
+        m = p + ".manifest.json"
+        cp = os.path.join(closed, stem + ".jsonl")
+        ingress = b'{"seq":1}\n'
+        blobs = {p: b"sealed MF4 bytes", s: gzip.compress(ingress, mtime=0),
+                 cp: ingress}
+        blobs[m] = json.dumps({
+            "mf4_sha256": hashlib.sha256(blobs[p]).hexdigest(),
+            "ingress_sha256": hashlib.sha256(ingress).hexdigest(),
+            "ingress_sidecar_sha256": hashlib.sha256(blobs[s]).hexdigest(),
+        }, sort_keys=True).encode()
+        for path, blob in blobs.items():
+            with open(path, "wb") as fh:
+                fh.write(blob)
+        return (p, s, m, cp), blobs
+
+    def test_preflight_returns_exact_pins_and_parses_manifest_once(self):
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as spool:
+            paths, blobs = self._triple(spool)
+            p, s, m, cp = paths
+            with patch.object(upl, "_load_manifest", wraps=upl._load_manifest) as load:
+                ok, reason, snap = upl.fail_closed_check(*paths)
+                self.assertTrue(ok, reason)
+                self.assertEqual(snap["manifest_bytes"], blobs[m])
+                self.assertEqual(snap["manifest_digest"], upl.sha256_file(m))
+                self.assertEqual(snap["mf4_digest"], upl.sha256_file(p))
+                self.assertEqual(snap["sidecar_digest"], upl.sha256_file(s))
+                self.assertEqual(snap["sizes"], tuple(len(blobs[x]) for x in (p, s, m)))
+                ok, reason, checked = upl.fail_closed_check(*paths, snap=snap)
+                self.assertTrue(ok, reason)
+                self.assertIs(checked, snap)
+                self.assertEqual(load.call_count, 1)
+
+    def test_post_preflight_drift_never_acks_or_deletes_fresh_or_replay(self):
+        from unittest.mock import patch
+        for replay in (False, True):
+            for timing in ("preflight", "last_ack"):
+                for leg in range(4):
+                    with self.subTest(replay=replay, timing=timing, leg=leg):
+                        with tempfile.TemporaryDirectory() as spool:
+                            paths, blobs = self._triple(spool)
+                            p, s, m, cp = paths
+                            cli = FakeS3()
+                            key = upl.remote_key(p, "m3", upl.sha256_file(m))
+                            keys = (key, upl.sidecar_key(key), upl.manifest_key(key))
+                            if replay:
+                                for k, path in zip(keys, paths[:3]):
+                                    self.assertTrue(upl.upload_verified(
+                                        cli, "b", k, path, upl.sha256_file(path), 0))
+                            before = dict(cli.store)
+                            puts = cli.puts
+                            uploaded = upl._M["uploaded_files"]
+                            failed = upl._M["failed"]
+                            target = paths[leg]
+                            # Whitespace-only manifest drift preserves every
+                            # JSON pin while changing its content address.
+                            changed = (blobs[target] + b" " if target == m else
+                                       bytes([blobs[target][0] ^ 0xFF]) +
+                                       blobs[target][1:])
+                            real_check = upl.fail_closed_check
+                            real_upload = upl.upload_verified
+
+                            def drift():
+                                with open(target, "wb") as fh:
+                                    fh.write(changed)
+
+                            def check_then_drift(*args, **kwargs):
+                                result = real_check(*args, **kwargs)
+                                if result[0] and kwargs.get("snap") is None:
+                                    drift()
+                                return result
+
+                            def upload_then_drift(*args, **kwargs):
+                                result = real_upload(*args, **kwargs)
+                                if result and args[2] == keys[2]:
+                                    drift()
+                                return result
+
+                            if timing == "preflight":
+                                hook = patch.object(upl, "fail_closed_check",
+                                                    side_effect=check_then_drift)
+                            else:
+                                hook = patch.object(upl, "upload_verified",
+                                                    side_effect=upload_then_drift)
+                            with hook:
+                                self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+                            self.assertEqual(upl._M["uploaded_files"], uploaded)
+                            self.assertGreater(upl._M["failed"], failed)
+                            self.assertEqual(cli.gets, 0)
+                            for path in paths:
+                                kept = path if os.path.exists(path) else os.path.join(
+                                    spool, "quarantine", os.path.basename(path))
+                                self.assertTrue(os.path.exists(kept))
+                                with open(kept, "rb") as fh:
+                                    self.assertEqual(fh.read(), changed if path == target
+                                                     else blobs[path])
+                            # Any remote legs must contain the original pinned
+                            # bytes, including the exact manifest serialization.
+                            for (_, k), (data, meta, checksum) in cli.store.items():
+                                path = paths[keys.index(k)]
+                                self.assertEqual(data, blobs[path])
+                                self.assertEqual(checksum, FakeS3._b64(blobs[path]))
+                            if replay:
+                                self.assertEqual(cli.puts, puts)
+                                self.assertEqual(cli.store, before)
+                            elif timing == "last_ack":
+                                self.assertEqual(cli.puts, 3)
+
 
 class EndpointGateTest(unittest.TestCase):
     def test_plaintext_and_hostless_endpoints_refused(self):
@@ -527,6 +971,8 @@ class EndpointGateTest(unittest.TestCase):
                 os.environ.pop("RAW_S3_ENDPOINT_URL", None)
             else:
                 os.environ["RAW_S3_ENDPOINT_URL"] = old
+
+
 class ReplayGateTest(unittest.TestCase):
     def test_gate(self):
         old = os.environ.get("RAW_REPLAY_ALLOW")
@@ -544,6 +990,395 @@ class ReplayGateTest(unittest.TestCase):
                 os.environ.pop("RAW_REPLAY_ALLOW", None)
             else:
                 os.environ["RAW_REPLAY_ALLOW"] = old
+
+
+class BoundedMemoryTest(unittest.TestCase):
+    def _frames(self, n, start=1):
+        out = []
+        for i in range(n):
+            out.append({"seq": start + i,
+                        "twall_ns": 1_700_000_000_000_000_000
+                        + (n - 1 - i) * 1_000_000,
+                        "tcan": 1700000000.0 + i * 0.001, "bus": "can0",
+                        "id": 0x100 + (i % 3), "ext": bool(i % 2),
+                        "rtr": False, "err": False, "fd": False,
+                        "brs": False, "esi": False, "dlc": 8,
+                        "data": bytes([(i + b) % 256 for b in range(8)])})
+        return out
+
+    def test_stream_torn_tail_only(self):
+        with tempfile.TemporaryDirectory() as spool:
+            cp = os.path.join(spool, "s.jsonl")
+            good = [json.dumps(rec.encode_frame(
+                f["seq"], f["twall_ns"], f["tcan"], f["bus"], f["id"],
+                f["ext"], f["rtr"], f["err"], f["fd"], f["brs"], f["esi"],
+                f["dlc"], f["data"]), separators=(",", ":")) for f in SYN[:3]]
+            with open(cp, "wb") as fh:
+                fh.write(("\n".join(good) + "\n{truncated").encode())
+            stream = rec.IngressStream(cp)
+            self.assertEqual(len(list(stream)), 3)
+            self.assertTrue(stream.torn)
+            with open(cp, "wb") as fh:
+                fh.write(("\n".join(good) + "\n{bad}\n").encode())
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write(good[0] + "\n{bad}\n" + good[1] + "\n")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            # Chunk-split multibyte UTF-8 decodes, it never fails a split.
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write(good[0] + "\n" + good[1] + "\n")
+            self.assertEqual(len(list(rec.IngressStream(cp))), 2)
+
+    def test_stream_rejects_non_utf8(self):
+        with tempfile.TemporaryDirectory() as spool:
+            cp = os.path.join(spool, "s.jsonl")
+            with open(cp, "wb") as fh:
+                fh.write(b"\xff\xfe\n")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+
+    def test_finalize_spills_and_verifies(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(300)
+            stem = "m3_20260921T000010Z_deadbeef_010"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=50)
+            with open(out + ".manifest.json", encoding="utf-8") as fh:
+                man = json.load(fh)
+            self.assertEqual(man["frames"], 300)
+            # Shuffled arrival, chronological manifest bounds.
+            self.assertEqual(man["twall_ns_first"],
+                             1_700_000_000_000_000_000)
+            self.assertEqual(man["twall_ns_last"],
+                             1_700_000_000_000_000_000 + 299 * 1_000_000)
+            self.assertEqual((man["seq_first"], man["seq_last"]), (300, 1))
+            # No temp runs leak after success.
+            for n in os.listdir(dirs["sealed"]):
+                self.assertFalse(n.endswith(".tmp") and ".run-" in n, n)
+                p = os.path.join(dirs["sealed"], n)
+                if os.path.isdir(p):
+                    self.assertFalse(any(
+                        x.startswith("run-") for x in os.listdir(p)), n)
+            rec.verify_sealed_mf4(out, frames)  # list path parity
+
+    def test_duplicate_frames_match_chronologically(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            base = {"tcan": 1700000000.0, "bus": "can0", "id": 0x100,
+                    "ext": False, "rtr": False, "err": False, "fd": False,
+                    "brs": False, "esi": False, "dlc": 8,
+                    "data": b"\x01" * 8}
+            frames = [dict(base, seq=i + 1,
+                           twall_ns=1_700_000_000_000_000_000 + i * 1_000)
+                      for i in range(10)]
+            stem = "m3_20260921T000011Z_deadbeef_011"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=3)
+            seen = [f["seq"] for _m, f in rec.matched_mf4_frames(out, frames)]
+            self.assertEqual(sorted(seen), [f["seq"] for f in frames])
+
+    def test_tmp_budget_fails_closed(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(100)
+            stem = "m3_20260921T000012Z_deadbeef_012"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            with self.assertRaises(rec.NoSpace):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     mem_frames=5, tmp_max_bytes=10)
+            self.assertTrue(os.path.exists(cp))  # ingress kept, retry later
+            self.assertFalse(os.path.exists(
+                os.path.join(dirs["sealed"], stem + ".mf4")))
+
+    def test_many_runs_single_fd_and_small_budget(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(2500)
+            stem = "m3_20260921T000014Z_deadbeef_014"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            stats = {}
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=50, stats=stats)
+            self.assertTrue(os.path.exists(out))
+            # One sqlite file, never a run-file list: FD count cannot grow.
+            leftovers = [n for n in os.listdir(dirs["sealed"])
+                         if n.endswith(".tmp")]
+            self.assertEqual(leftovers, [])
+            with open(out + ".manifest.json", encoding="utf-8") as fh:
+                man = json.load(fh)
+            self.assertEqual(man["frames"], 2500)
+            self.assertLessEqual(stats["peak_resident_frames"], 50)
+            self.assertEqual(stats["budget_frames"], 50)
+            self.assertGreaterEqual(stats["peak_temp_bytes"], 0)
+            # Chronological identity match still wins on the real path.
+            seen = [f["seq"] for _m, f in
+                    rec.matched_mf4_frames(out, frames)]
+            self.assertEqual(sorted(seen), [f["seq"] for f in frames])
+
+    def test_match_disk_budget_enforced(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(200)
+            stem = "m3_20260921T000015Z_deadbeef_015"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            store = rec.SortedFrameStore(dirs["sealed"], stem, 50, 2 << 30)
+            try:
+                for f in frames:
+                    store.add(f)
+                store.max_bytes = 10  # shrink only for the match stage
+                with self.assertRaises(rec.NoSpace):
+                    list(rec._matched_mf4_store(
+                        os.path.join(dirs["sealed"], stem + ".missing.mf4"),
+                        store))
+            finally:
+                store.destroy()
+
+    def test_budgets_reject_nonpositive(self):
+        for bad in (0, -1):
+            with self.assertRaises(ValueError):
+                rec.SortedFrameStore(tempfile.gettempdir(), "stem", bad,
+                                     2 << 30)
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            stem = "m3_20260921T000016Z_deadbeef_016"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, self._frames(2))
+            with self.assertRaises(ValueError):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     mem_frames=0)
+            with self.assertRaises(ValueError):
+                rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                     tmp_max_bytes=0)
+
+    def test_oversize_line_quarantines_and_whitespace_passes(self):
+        with tempfile.TemporaryDirectory() as spool:
+            cp = os.path.join(spool, "s.jsonl")
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write(" " * (rec._LINE_MAX_BYTES + 8) + "\n")
+                fh.write(json.dumps(rec.encode_frame(
+                    1, 1_700_000_000_000_000_000, 1700000000.0, "can0",
+                    0x100, False, False, False, False, False, False, 8,
+                    b"\x01" * 8), separators=(",", ":")) + "\n")
+            self.assertEqual(len(list(rec.IngressStream(cp))), 1)
+            with open(cp, "w", encoding="utf-8") as fh:
+                fh.write("x" * (rec._LINE_MAX_BYTES + 8) + "\n")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            # Damaged unterminated tail still quarantines, never salvages.
+            with open(cp, "wb") as fh:
+                fh.write(b"\xff\xfe")
+            with self.assertRaises(rec.CorruptSegment):
+                list(rec.IngressStream(cp))
+            stream = rec.IngressStream(cp)
+            try:
+                list(stream)
+            except rec.CorruptSegment:
+                pass
+            self.assertFalse(stream.torn)
+
+    def test_interrupted_tmp_swept_and_restarted(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            frames = self._frames(120)
+            stem = "m3_20260921T000013Z_deadbeef_013"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            stale = os.path.join(dirs["sealed"], stem + ".xyz")
+            os.makedirs(stale)
+            with open(os.path.join(stale, "run-00000.tmp"), "w") as fh:
+                fh.write("interrupted")
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=10)
+            self.assertTrue(os.path.exists(out))
+            self.assertFalse(os.path.exists(stale))
+            # Restart recovery sweeps sort dirs too, keeping the JSONL.
+            stale2 = os.path.join(dirs["sealed"], stem + ".abc")
+            os.makedirs(stale2)
+            with open(os.path.join(stale2, "frames.sqlite3"), "w") as fh:
+                fh.write("interrupted")
+            _recovered, swept = rec.recover_spool(spool)
+            self.assertGreaterEqual(swept, 1)
+            self.assertFalse(os.path.exists(stale2))
+            self.assertTrue(os.path.exists(cp))
+
+    def test_gunzip_chunk_boundaries(self):
+        import gzip
+        import hashlib
+        with tempfile.TemporaryDirectory() as spool:
+            body = b'{"v":1}\n' * 500
+            sc = os.path.join(spool, "s.gz")
+            with open(sc, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                                   mtime=0) as gz:
+                    gz.write(body)
+            want = hashlib.sha256(body).hexdigest()
+            ok, _ = upl.gunzip_compare(sc, want, None, chunk_bytes=7)
+            self.assertTrue(ok)
+            ok, reason = upl.gunzip_compare(sc, "0" * 64, None,
+                                            chunk_bytes=7)
+            self.assertFalse(ok)
+            self.assertIn("drifted", reason)
+            # Truncated member fails closed, never a partial pass.
+            with open(sc, "r+b") as fh:
+                fh.truncate(os.path.getsize(sc) - 5)
+            ok, reason = upl.gunzip_compare(sc, want, None, chunk_bytes=7)
+            self.assertFalse(ok)
+            self.assertIn("gunzip failed", reason)
+            # Multi-member gzip: every member verified.
+            mm = os.path.join(spool, "m.gz")
+            with open(mm, "wb") as fh:
+                fh.write(gzip.compress(b"AAA\n", mtime=0)
+                         + gzip.compress(b"BBB\n", mtime=0))
+            ok, _ = upl.gunzip_compare(
+                mm, hashlib.sha256(b"AAA\nBBB\n").hexdigest(), None,
+                chunk_bytes=3)
+            self.assertTrue(ok)
+            # Closed comparison is byte-exact across chunk splits.
+            cp = os.path.join(spool, "c.jsonl")
+            with open(cp, "wb") as fh:
+                fh.write(body)
+            sc2 = os.path.join(spool, "s2.gz")
+            with open(cp, "rb") as src, open(sc2, "wb") as raw:
+                with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+                                   mtime=0) as gz:
+                    gz.write(body)
+            ok, _ = upl.gunzip_compare(sc2, want, cp, chunk_bytes=11)
+            self.assertTrue(ok)
+            with open(cp, "r+b") as fh:
+                fh.seek(10)
+                fh.write(b"\xff")
+            ok, reason = upl.gunzip_compare(sc2, want, cp, chunk_bytes=11)
+            self.assertFalse(ok)
+            self.assertIn("drifted", reason)
+
+    def test_preflight_drift_never_uploads_never_deletes(self):
+        with tempfile.TemporaryDirectory() as spool:
+            p, s, m, cp = UploadTest()._triple(spool)
+            with open(s, "r+b") as fh:  # post-seal sidecar corruption
+                fh.seek(20)
+                fh.write(b"\xff")
+            cli = FakeS3()
+            self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+            self.assertEqual(cli.store, {})
+            for kept_moved in (p, s, m, cp):
+                self.assertFalse(os.path.exists(kept_moved))
+                self.assertTrue(os.path.exists(
+                    os.path.join(spool, "quarantine",
+                                 os.path.basename(kept_moved))))
+
+    def test_stale_shm_tmp_swept(self):
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            stem = "m3_20260921T000018Z_deadbeef_018"
+            stale = os.path.join(dirs["sealed"], stem + ".crash")
+            os.makedirs(stale)
+            with open(os.path.join(stale, "frames.sqlite3-shm"),
+                      "w") as fh:
+                fh.write("interrupted")
+            self.assertEqual(rec._sweep_stale_tmp(dirs["sealed"], stem), 1)
+            self.assertFalse(os.path.exists(stale))
+            stale2 = os.path.join(dirs["sealed"], "other." + stem)
+            os.makedirs(stale2)
+            with open(os.path.join(stale2, "match.sqlite3-shm"),
+                      "w") as fh:
+                fh.write("interrupted")
+            _recovered, swept = rec.recover_spool(spool)
+            self.assertGreaterEqual(swept, 1)
+            self.assertFalse(os.path.exists(stale2))
+
+    def test_identical_timestamps_match_by_seq(self):
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            base = {"tcan": 1700000000.0, "bus": "can0", "id": 0x100,
+                    "ext": False, "rtr": False, "err": False, "fd": False,
+                    "brs": False, "esi": False, "dlc": 8,
+                    "data": b"\x02" * 8,
+                    "twall_ns": 1_700_000_000_000_000_000}
+            frames = [dict(base, seq=i + 1) for i in range(10)]
+            stem = "m3_20260921T000019Z_deadbeef_019"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, frames)
+            out = rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                       mem_frames=3)
+            with open(out + ".manifest.json", encoding="utf-8") as fh:
+                man = json.load(fh)
+            self.assertEqual(man["frames"], 10)
+            self.assertEqual(man["twall_ns_first"], man["twall_ns_last"])
+            seen = [f["seq"] for _m, f in rec.matched_mf4_frames(out, frames)]
+            self.assertEqual(seen, [f["seq"] for f in frames])
+
+    def test_temp_dir_enospc_fails_closed(self):
+        import errno
+        from unittest.mock import patch
+        try:
+            import can.io.mf4  # noqa
+        except ImportError:
+            self.skipTest("python-can/asammdf not installed")
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            dirs = rec.seg_dirs(spool)
+            stem = "m3_20260921T000020Z_deadbeef_020"
+            cp = os.path.join(dirs["closed"], stem + ".jsonl")
+            _write_ingress(cp, self._frames(10))
+            with self.assertRaises(rec.NoSpace):
+                with patch.object(rec.tempfile, "mkdtemp", side_effect=OSError(
+                        errno.ENOSPC, "No space left on device")):
+                    rec.finalize_segment(cp, dirs["sealed"], spool=spool,
+                                         mem_frames=5)
+            self.assertTrue(os.path.exists(cp))  # ingress kept, retry later
+            sealed = os.listdir(dirs["sealed"])
+            self.assertFalse(any(n.endswith(".mf4") for n in sealed), sealed)
+            self.assertFalse(any(n.endswith(".manifest.json")
+                                 for n in sealed), sealed)
+            self.assertFalse(any(os.path.isdir(os.path.join(dirs["sealed"], n))
+                                 for n in sealed), sealed)
 
 
 if __name__ == "__main__":

@@ -98,6 +98,10 @@ export async function install(args = process.argv.slice(2)) {
       if (typeof existing === 'object') {
         if (existing.package !== directory) doc.next = applyEdits(doc.next, modify(doc.next, ['plugins', keep, 'package'], directory, options));
         if (existing.options?.configPath !== configPath) doc.next = applyEdits(doc.next, modify(doc.next, ['plugins', keep, 'options', 'configPath'], configPath, options));
+        // Obsolete runtime queue options never reach setup; drop them on migrate.
+        for (const stale of ['stateRoot', 'profile', 'nodeBinary']) {
+          if (existing.options?.[stale] !== undefined) doc.next = applyEdits(doc.next, modify(doc.next, ['plugins', keep, 'options', stale], undefined, options));
+        }
       } else doc.next = applyEdits(doc.next, modify(doc.next, ['plugins', keep], replacement, options));
     }
     for (const index of indices.toReversed()) {
