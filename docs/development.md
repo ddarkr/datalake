@@ -237,6 +237,8 @@ native 벤치는 운영 default를 변경하지 않는 bench 전용 SWCS compact
 
 GreptimeDB 1.2.1은 S3에서 TOML `enable_write_cache=false`여도 persistent write cache를 강제로 사용합니다. 재시작이나 false 설정만으로 cold를 주장하지 않습니다. harness는 소유 project/container/volume·단독 volume 사용·알려진 TOML layout을 확인하고 **소유 Greptime 컨테이너만 정지**한 뒤 `/data/cache/object/write`와 `/data/cache/object/manifest`만 삭제합니다. 동일 컨테이너·named volume을 다시 시작하며 WAL·primary data·auth·MinIO 객체와 meter는 보존합니다. 알 수 없는 mount/layout·공유 volume·symlink는 거부하며 운영 cache 정리 명령이 아닙니다.
 
+cache 정리 helper는 network 없음·read-only rootfs·capability 없음·`no-new-privileges`를 유지합니다. Linux runner 소유의 `0600` TOML은 capless root가 bind mount로 읽을 수 없으므로, 소유 host process가 같은 TOML을 stdin으로 전달하고 helper가 layout을 다시 검증합니다. 파일 권한을 공개하거나 `DAC_OVERRIDE`를 추가하지 않으며 helper에 인증 파일·Docker socket·S3 볼륨을 마운트하지 않습니다.
+
 cold 증거는 재기동 완료 후 **실제 query window 안의 성공한 SST GET 수/bytes 증가**입니다. startup GET·metadata GET·404는 이를 대신하지 못합니다. flush·실제 완료된 compaction 뒤 Grafana 형태 쿼리 20개를 독립 deterministic oracle과 비교하고, warm 두 pass의 동일 결과와 cold보다 낮은 SST 읽기 합계를 확인합니다. 격리 GreptimeDB 1.2.1의 20,000행 현재·공개 기준 비교와 10,000,000행 absolute-only 실행이 통과했습니다. 10M 실행은 20,000회 batch로 적재했고 cold SST GET 29회/1,534,108 bytes, warm 두 pass 각각 0 bytes, 20개 oracle 일치와 소유 자원 잔존 0을 확인했습니다. 공개 정책은 64MiB SST/cold 읽기, 1MiB warm 읽기, 4,096 요청 상한과 noise allowance 없는 20% 회귀를 적용합니다. 이는 고정 합성 workload 결과이지 실제 공급자나 운영 사용량 검증은 아닙니다.
 
 공개 `75bed47` 기준의 최적화 후 결정적 backup+RAW 비교와 실제 격리 MinIO의 동일 비교는 모든 비용 게이트를 통과했습니다. 실제 공급자 과금·운영 배포를 뜻하지 않습니다. 브라우저 렌더링은 SQL/API·오프라인 dashboard 회귀와 별도로 확인합니다. 비용 UI는 보관 보고 gauge의 불완전 계정 범위를 유지하고 ephemeral 요청 수에 rate를 적용하지 않으며, UTC 달력일/월과 최근 30일을 분리합니다. 이력 검증은 30s cadence만 지원하고 다른 custom 설정은 unknown입니다.

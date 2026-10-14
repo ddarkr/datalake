@@ -637,7 +637,7 @@ services:
     read_only: true
     cap_drop: ["ALL"]
     security_opt: ["no-new-privileges:true"]
-    volumes: ["greptime-data:/data", "%(cache_helper)s:/cache-reset.py:ro", "./greptimedb.toml:/etc/greptime/greptimedb.toml:ro"]
+    volumes: ["greptime-data:/data", "%(cache_helper)s:/cache-reset.py:ro"]
 volumes:
   minio-data:
   greptime-data:
@@ -690,14 +690,15 @@ def _startup_diag(tmp, project, env, evidence, note):
     return diag
 
 
-def compose_run(tmp, project, env, *args, timeout=600):
+def compose_run(tmp, project, env, *args, timeout=600, input=None):
     # Only the isolated port mapping is forwarded; production env is never
     # passed to the owned project (credentials are synthetic per run).
     run_env = clean_env()
     run_env.update(env)
     p = subprocess.run(["docker", "compose", "-p", project, "-f",
                         os.path.join(tmp, "docker-compose.yaml")] + list(args),
-                       capture_output=True, text=True, timeout=timeout, env=run_env)
+                       capture_output=True, text=True, timeout=timeout, env=run_env,
+                       input=input)
     return p.returncode, p.stdout.strip(), p.stderr.strip()[-2000:]
 
 def wait_minio(target, access, secret, timeout=180):
@@ -800,10 +801,13 @@ def reset_owned_cache(tmp, project, env, evidence):
             or not stopped["running"]["minio"] or not stopped["running"]["s3meter"]):
         raise RuntimeError("cache reset stop/ownership invariant failed")
     ids = before["volume_ids"]
+    with open(os.path.join(tmp, "greptimedb.toml"), encoding="utf-8") as source:
+        config = source.read()
     rc, out, _ = compose_run(
         tmp, project, env, "run", "--rm", "--no-deps", "-T",
         "-e", "CACHE_GREPTIME_VOLUME_ID=" + ids["greptime"],
-        "-e", "CACHE_MINIO_VOLUME_ID=" + ids["minio"], "cache-reset", timeout=300)
+        "-e", "CACHE_MINIO_VOLUME_ID=" + ids["minio"], "cache-reset",
+        timeout=300, input=config)
     if rc:
         raise RuntimeError("owned cache helper refused mutation")
     result = json.loads(out)

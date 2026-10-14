@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 import shutil
 import stat
+import sys
 import tomllib
 
 CACHE_DIRS = ("cache/object/write", "cache/object/manifest")
@@ -106,8 +107,9 @@ def main():
         if not re.fullmatch(r"[0-9a-f]{64}", value):
             raise RuntimeError("missing opaque owned volume identity")
         volumes[role] = value
-    with open("/etc/greptime/greptimedb.toml", encoding="utf-8") as source:
-        text = source.read()
+    # The capless helper cannot read the Linux runner's 0600 bind mount.
+    # Its owning host process supplies the same private TOML over stdin.
+    text = sys.stdin.read()
     result = reset_cache("/data", text)
     result["preserved_volume_ids"] = volumes
     print(json.dumps(result, sort_keys=True))
