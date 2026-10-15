@@ -241,6 +241,8 @@ claude plugin list --json
 
 현재 세션 transcript는 관측 checkpoint와 시도한 identity로 중복을 막습니다. 전송 실패도 자동 재처리하지 않으며 checkpoint는 수집기 ACK를 뜻하지 않습니다. 병행 훅은 세션별로 직렬화하며 살아 있는 프로세스의 lock을 시간만으로 빼앗지 않습니다. `SessionStart`는 기존 transcript의 EOF에서 시작하므로 재개한 과거 대화는 수집하지 않습니다.
 
+`--source plugin|native`는 사용량 소유자를 명시적으로 선택합니다(기본 `plugin`). `native`는 transcript LLM 사용량을 보내지 않고 상호작용 훅은 유지합니다. 선택은 `OTEL_*` 환경 변수가 제거되어도 남는 설치본 `config-path.json`에 저장되며, 재설치 때 생략하면 기존 선택을 유지합니다. 네이티브 OTel 활성화·인증 설정은 사용자가 별도로 해야 하며 설치기가 대신 켜지 않습니다. 새 `UserPromptSubmit`·`MessageDisplay` 훅은 같은 홈·설정으로 **재설치한 뒤 재시작 또는 `/reload-plugins`**해야 등록됩니다.
+
 ### AGY CLI (Antigravity)
 
 ```bash
@@ -253,7 +255,7 @@ node plugins/install.mjs agy --config "$DATALAKE_OTEL_CONFIG" --apply
 
 도구 오류는 원문 대신 고정 분류 `error.type=tool_error`만 전송합니다. transcript cursor와 도구·Stop 관측 상태는 중복 시도를 막기 위한 소스 checkpoint이며 수집기 ACK가 아닙니다. HTTP 실패 때문에 같은 구간이나 완료 이벤트를 자동 재전송하지 않습니다.
 
-AGY의 토큰 값은 기존 transcript 기반 **추정치**입니다. 네이티브 API의 정확한 사용량이나 실제 청구 토큰과 같다고 보장하지 않습니다.
+AGY는 토큰·캐시 사용량을 문자 수로 추정하지 않습니다. 보고된 사용량이 없는 invocation에는 토큰·tier·TTFT·첫 텍스트 필드를 보내지 않습니다. 새 `PreInvocation`·`PostInvocation` 훅을 등록하려면 같은 홈·설정으로 설치기를 다시 실행한 뒤 AGY를 재시작하세요.
 
 ### 공통: 직접 HTTP 전송
 
@@ -268,6 +270,35 @@ OMP·opencode2의 이벤트 처리는 HTTP를 기다리지 않고 정상 종료 
 기존 `~/.local/state/doda-datalake/otel`, Codex·Claude data root의 `outbox/`, Hermes의 기존 SQLite 큐는 읽거나 재전송·삭제하지 않습니다. 실행 중인 이전 호스트·sender는 소스 갱신만으로 종료되지 않습니다. 기존 큐를 임의로 삭제하거나 잠금을 지우지 마세요. 설치본을 갱신하고 정상 재시작으로 전환하세요.
 
 Codex의 `metadata/`, Claude의 `sessions/`, AGY의 임시 세션 상태는 사용량 관측·중복 방지용으로 남습니다. 전송용 큐가 아닙니다. 해당 상태를 삭제하면 과거 관측의 중복 방지에 영향을 줄 수 있습니다. 소스 checkpoint 잠금은 PID뿐 아니라 OS 부팅·프로세스 시작 identity를 확인하며 살아 있는 owner를 나이만으로 회수하지 않습니다.
+
+### 성능 필드와 해석
+
+아래는 구현이 읽을 수 있는 관측값입니다. 해당 upstream 이벤트·속성이 실제로 없으면 필드도 없습니다. 지원 목록은 현재 프로필 설치, 실제 공급자 호출, 운영 저장 확인을 뜻하지 않습니다.
+
+| 도구 / 사용량 소유자 | 시간 관측 | 설정·사용량과 한계 |
+|---|---|---|
+| OMP plugin / 선택한 native | plugin: `message.duration`은 `provider_call`, `message.ttft`는 검증된 Responses 경로에서 `first_output_item`, 나머지는 `provider_reported`; `message_update`의 첫 비어 있지 않은 text delta와 명확한 단일 입력만 상호작용 측정. native chat span은 `logical_call` | wire 또는 harness의 요청 tier·effort·명시 budget. `message.serviceTier`는 provider 응답이 아니라 요청 fallback일 수도 있어 **harness tier**로만 저장. native 사용량 소유 시 plugin LLM 사용량 중복 생략 |
+| Codex plugin / opt-in native | transcript 사용량은 시점 이벤트. native completion log의 공급자 보고 TTFT만 보존하며 **같은 요청의 duration은 없음** | 보고 사용량 및 native 요청 설정. 별도 `api_request`를 시간 근접성으로 연결하지 않음; request-total throughput 계산 불가 |
+| Claude plugin / opt-in native | native `llm_request` duration은 `logical_call`, TTFT는 `provider_reported`, `first_content_ms`는 vendor content block. 훅은 `hook_submit_to_display_ready` | native speed는 **요청 tier**, effort는 요청 설정. 훅의 동일 `prompt_id`, 유효 turn/message ID, 첫 non-final batch 0만 허용. human origin·UI paint는 알 수 없으며 SDK/`-p` final-only display는 생략 |
+| OpenCode2 plugin | 첫 output part는 `first_output_part`; ephemeral `session.text.delta`의 첫 비어 있지 않은 delta는 harness 첫 텍스트; `step.started`→`step.streamed`가 `stream` duration | 보고 사용량과 명시 model variant. `step.ended`까지의 tool settle을 stream 시간에 포함하지 않음. inboxID→응답 매핑이 없어 입력 latency 생략; tier/effort를 variant에서 추론하지 않음 |
+| Hermes plugin | `started_at`→`ended_at`은 retry 포함 `logical_call`; `first_chunk_at`은 첫 SDK/SSE **event**인 `first_stream_event`, 첫 text 아님 | `pre_api_request`에서 요청 tier·effort·명시 budget만 allowlist. 일부 provider/auxiliary 경로에는 관측값이 없고 실제 tier echo 없음. usage가 없어도 latency 유지; 무효 usage는 token으로 내보내지 않음 |
+| AGY plugin | 같은 conversation+invocationNum의 pre/post **훅 호출 간격**인 `hook_invocation` | 모델 네트워크 시간·첫 token·첫 text가 아님. 토큰·tier·effort·TTFT를 생성하지 않으며 invocation 시간으로 TPS 계산하지 않음 |
+
+시간 필드는 모두 **밀리초**입니다. native OMP `gen_ai.response.time_to_first_chunk`의 초 값만 collector가 ×1000으로 변환합니다. `ttft_ms`는 반드시 `coding_agent.ttft.kind`와 함께 해석하고 첫 text·사용자 응답·UI paint와 혼용하지 않습니다. native OMP는 정확한 OpenAI Codex 경로만 `first_output_item`, generic OpenAI는 `provider_reported`입니다. `coding_agent.signal_source`는 `datalake-plugin`/`native`, `request.settings_source`는 `wire`/`harness`/`native`이며 서로 다른 출처 의미입니다. harness version도 실제 보고값만 저장합니다.
+
+요청 tier(`request.service_tier`), 공급자가 echo한 실제 tier(`response.service_tier`), fallback 가능 harness tier(`harness.service_tier`)는 별개입니다. 요청 `auto`가 실제 처리 tier를 증명하지 않습니다. reasoning effort는 관측된 설정 enum이고 budget은 명시 정수 토큰 수, model variant는 독립 라벨입니다. 모델 이름·variant·tier에서 다른 값을 추정하지 않습니다.
+
+누락·NULL은 **unknown**, 숫자 0은 **관측된 0**입니다. 새 canonical token은 `usage.source=reported`일 때만 보고 사용량이며, reasoning은 output 상세로 중복 합산하지 않습니다. 네이티브 사용량 소유권은 사용자의 opt-in이고 설치가 이를 자동 변경하지 않습니다.
+
+Grafana의 **request-total output throughput**은 같은 기록의 보고 output tokens ÷ (`request.duration_ms`/1000), 양의 duration 및 `provider_call`/`logical_call`/`stream`만 대상으로 합니다. 생성 구간 TPS가 아니며 TTFT를 빼지 않습니다. 같은 workload·모델/variant·effort·요청/실제 tier·캐시·출력 길이·provider·동시성·timing kind·signal source를 맞추지 않은 도구 순위는 공정한 비교가 아닙니다. 서로 다른 trace/log를 시간 근접성으로 조인하지 않습니다.
+
+OMP·OpenCode2는 저장소 소스를 갱신한 뒤 실행 호스트/서버를 재로딩해야 합니다. Hermes는 설치 위치에 소스를 다시 복사하고 해당 프로필을 재시작합니다. Codex·Claude의 복사된 설치본과 AGY의 새 훅 등록은 재설치가 필요합니다. 이 안내는 설치 실행 지시나 live profile 변경 기록이 아닙니다. nullable schema·Alloy projection·Grafana 변경은 별도로 승인된 서버 배포가 필요하며 이번 로컬 작업으로 배포하지 않았습니다.
+
+#### 확인한 upstream 계약
+
+소스 조사 기준은 [OMP 18.11.0 / c2cb79e4](https://github.com/can1357/oh-my-pi/tree/c2cb79e4c227aa4b22c4ccb933ff72fd88bceba4)(`packages/ai/src/types.ts`, extension types, agent telemetry), [Codex 0.160.0](https://github.com/openai/codex/blob/rust-v0.160.0/codex-rs/otel/src/events/session_telemetry.rs), [OpenCode2 v2.0.12 / 2670273](https://github.com/anomalyco/opencode/tree/2670273ff17da96f85c5826ced57aa1b368754fa), [Hermes f42f579c](https://github.com/NousResearch/hermes-agent/tree/f42f579cf8bac4918ac9599bece71618afadd846), [Claude monitoring](https://code.claude.com/docs/en/monitoring-usage)·[hooks](https://code.claude.com/docs/en/hooks), [공식 AGY hooks](https://antigravity.google/docs/hooks.md)입니다. Claude native `first_content_ms`는 2.1.268+, effort는 2.1.274+ 계약이며 skills-dir 설치기는 2.1.223+를 요구합니다. 설치 가능 최소 버전이 모든 새 native 필드 지원을 뜻하지 않습니다.
+
+이 핀은 **조사한 upstream 계약**입니다. 로컬 adapter fixture/loopback 검증, 실제 upstream 바이너리 실행, 실제 공급자 호출은 별도의 증거가 필요합니다. 아래 과거 검증 기록을 이번 성능 필드의 최종 gate 통과나 live profile 갱신으로 해석하지 마세요.
 
 ## 6. 실제 사용량이 보이는지 확인하기
 
