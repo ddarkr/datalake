@@ -1,7 +1,7 @@
 import { createDirectTelemetry, loadConfig, repositoryContext } from '../otel.mjs';
 import { setTimeout as delay } from 'node:timers/promises';
 
-// OMP 18.2.6: extensions/types.ts, task/executor.ts and
+// OMP source contract c2cb79e4: extensions/types.ts, task/executor.ts and
 // tui/overlays/session-observer-registry.ts. Prepared factories are rebound
 // in children; the spawning session's bus supplies the cross-session link.
 // Coverage: live conversation messages, tool execution, task lifecycle and
@@ -18,6 +18,21 @@ const childRoutes = new Map();
 const number = value => typeof value === 'number' && Number.isFinite(value) && value >= 0;
 const identity = value => typeof value === 'string' && value.length > 0 && value.length <= 512;
 const messageId = (state, message) => `llm:${state.nativeId}:${message.timestamp}`;
+const tiers = new Set(['auto', 'default', 'flex', 'scale', 'priority', 'ultrafast', 'fast', 'normal']);
+const efforts = new Set(['none', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+function settings(pi, message) {
+  const attrs = {};
+  const effort = pi.getThinkingLevel?.();
+  if (efforts.has(effort)) attrs['coding_agent.request.reasoning.effort'] = effort;
+  const family = ['openai', 'openai-codex'].includes(message.provider) ? 'openai'
+    : message.api === 'anthropic-messages' ? 'anthropic'
+      : ['google', 'google-vertex'].includes(message.provider) ? 'google' : undefined;
+  const tier = family && pi.getServiceTiers?.()?.[family];
+  if (tiers.has(tier)) attrs['coding_agent.request.service_tier'] = tier;
+  if (Object.keys(attrs).length) attrs['coding_agent.request.settings_source'] = 'harness';
+  return attrs;
+}
 
 // OMP's native TRACE exporter owns usage only when it sends to this collector.
 // Generic OTLP endpoints append /v1/traces; signal-specific endpoints do not
@@ -121,6 +136,7 @@ export default function ompTelemetry(pi, options = {}) {
   }
 
   function close(state) {
+    state.input = state.interaction = state.request = state.nextSettings = undefined;
     if (!state.closed) {
       state.closed = true;
       state.end = clock();
@@ -132,13 +148,72 @@ export default function ompTelemetry(pi, options = {}) {
   }
 
   for (const name of ['session_start', 'session_switch', 'session_branch']) {
-    pi.on(name, (_event, ctx) => { stateFor(ctx); });
+    pi.on(name, (_event, ctx) => {
+      if (current) current.input = current.interaction = current.request = current.nextSettings = undefined;
+      const state = stateFor(ctx);
+      if (state) state.busy = state.ambiguous = false;
+    });
   }
+  pi.on('input', (event, ctx) => {
+    const state = stateFor(ctx);
+    if (!state) return;
+    if (event.source !== 'interactive' || state.busy || state.input !== undefined) {
+      state.input = undefined;
+      state.interaction = undefined;
+      state.ambiguous = true;
+    } else if (!state.ambiguous) state.input = clock();
+  });
+  pi.on('before_agent_start', (_event, ctx) => {
+    const state = stateFor(ctx);
+    if (!state) return;
+    state.interaction = !state.busy && !state.ambiguous ? state.input : undefined;
+    state.input = undefined;
+    state.busy = true;
+  });
+  pi.on('agent_end', (_event, ctx) => {
+    const state = stateFor(ctx);
+    if (state) {
+      state.busy = state.ambiguous = false;
+      state.input = state.interaction = state.request = state.nextSettings = undefined;
+    }
+  });
   pi.on('message_start', (event, ctx) => {
     const message = event.message;
     if (message?.role !== 'assistant' || !number(message.timestamp)) return;
     const state = stateFor(ctx);
-    if (state && !state.nativeUsage) state.lastMessage = messageId(state, message);
+    if (!state) return;
+    state.busy = true;
+    if (state.request) state.interaction = undefined;
+    state.request = { id: messageId(state, message), attributes: state.nextSettings ?? settings(pi, message) };
+    state.nextSettings = undefined;
+    if (!state.nativeUsage) state.lastMessage = state.request.id;
+  });
+  pi.on('before_provider_request', (event, ctx) => {
+    const state = stateFor(ctx);
+    if (!state) return;
+    const attributes = settings(pi, ctx.model ?? {});
+    const request = state.request ?? { attributes };
+    if (!state.request) state.nextSettings = attributes;
+    // Project only known scalar settings; never retain the provider body.
+    const payload = event.payload;
+    const tier = payload?.service_tier ?? payload?.serviceTier ?? payload?.speed;
+    const effort = payload?.reasoning?.effort ?? payload?.reasoning_effort;
+    const budget = payload?.thinking?.budget_tokens;
+    if (tiers.has(tier)) request.attributes['coding_agent.request.service_tier'] = tier;
+    if (efforts.has(effort)) request.attributes['coding_agent.request.reasoning.effort'] = effort;
+    if (number(budget) && Number.isInteger(budget)) request.attributes['coding_agent.request.reasoning.budget_tokens'] = budget;
+    if (tiers.has(tier) || efforts.has(effort) || (number(budget) && Number.isInteger(budget))) {
+      request.attributes['coding_agent.request.settings_source'] = 'wire';
+    }
+  });
+  pi.on('message_update', (event, ctx) => {
+    const state = stateFor(ctx);
+    const request = state?.request;
+    const update = event.assistantMessageEvent;
+    if (!request || event.message?.role !== 'assistant' ||
+        messageId(state, event.message) !== request.id || request.firstText !== undefined ||
+        update?.type !== 'text_delta' || typeof update.delta !== 'string' || !update.delta.length) return;
+    request.firstText = clock();
   });
   pi.on('message_end', (event, ctx) => {
     const message = event.message;
@@ -146,21 +221,54 @@ export default function ompTelemetry(pi, options = {}) {
     const state = stateFor(ctx);
     if (!state) return;
     const eventId = messageId(state, message);
+    const request = state.request?.id === eventId ? state.request : undefined;
+    const end = number(message.completedAt) ? message.completedAt : clock();
+    const failed = message.stopReason === 'error' || message.stopReason === 'aborted';
+    if (failed) state.interaction = state.input = undefined;
+    if (!failed && request?.firstText !== undefined && number(state.interaction) &&
+        request.firstText >= state.interaction) {
+      enqueue(state, {
+        kind: 'interaction', eventId: `interaction:${eventId}`, parentEventId: state.rootId,
+        startTimeMs: state.interaction, endTimeMs: request.firstText,
+        attributes: {
+          'coding_agent.interaction.first_response_ms': request.firstText - state.interaction,
+          'coding_agent.interaction.latency.kind': 'input_to_first_text',
+        },
+      });
+      state.interaction = undefined;
+    }
+    if (request) state.request = undefined;
     state.lastMessage = state.nativeUsage ? undefined : eventId;
     if (state.nativeUsage) return;
-    const attributes = usageAttributes(message.usage);
+    const usage = usageAttributes(message.usage);
+    const attributes = { ...request?.attributes, ...usage };
+    if (Object.keys(usage).some(key => key.startsWith('gen_ai.usage.'))) {
+      attributes['coding_agent.usage.source'] = 'reported';
+    }
+    if (number(message.duration)) {
+      attributes['coding_agent.request.duration_ms'] = message.duration;
+      attributes['coding_agent.duration.kind'] = 'provider_call';
+    }
+    if (number(message.ttft) && (!number(message.duration) || message.ttft <= message.duration)) {
+      attributes.ttft_ms = message.ttft;
+      attributes['coding_agent.ttft.kind'] = ['openai-responses', 'openai-codex-responses'].includes(message.api)
+        ? 'first_output_item' : 'provider_reported';
+    }
+    if (request?.firstText >= message.timestamp && request.firstText <= end &&
+        (!number(message.duration) || request.firstText - message.timestamp <= message.duration)) {
+      attributes['coding_agent.response.first_text_ms'] = request.firstText - message.timestamp;
+    }
+    if (tiers.has(message.serviceTier)) attributes['coding_agent.harness.service_tier'] = message.serviceTier;
     for (const [key, value] of [
       ['gen_ai.provider.name', message.provider],
       ['gen_ai.request.model', message.model],
       ['gen_ai.response.model', message.upstreamModel ?? message.model],
       ['gen_ai.response.id', message.responseId],
     ]) if (identity(value)) attributes[key] = value;
-    const end = number(message.completedAt) ? message.completedAt
-      : number(message.duration) ? message.timestamp + message.duration : clock();
     enqueue(state, {
       kind: 'llm.turn', eventId, parentEventId: state.rootId,
       startTimeMs: message.timestamp, endTimeMs: Math.max(message.timestamp, end), attributes,
-      error: message.stopReason === 'error' || message.stopReason === 'aborted',
+      error: failed,
     });
   });
   pi.on('tool_execution_start', (event, ctx) => {

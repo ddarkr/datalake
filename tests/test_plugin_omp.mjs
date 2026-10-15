@@ -23,6 +23,8 @@ function harness(options = {}, id = 'root-session', file = '/private/session.jso
   let now = 1_700_000_000_000;
   ompTelemetry({
     on: (name, fn) => handlers.set(name, fn),
+    getThinkingLevel: () => options.settings?.effort,
+    getServiceTiers: () => options.settings?.tiers ?? {},
     events: { on: (name, fn) => { bus.set(name, fn); return () => bus.delete(name); } },
   }, { telemetry, env: {}, clock: () => now++, repositoryContext: () => ({}), ...options });
   return { emitted, ctx,
@@ -37,6 +39,107 @@ function message(timestamp = 1_700_000_000_010) {
     errorMessage: secret, providerPayload: { secret },
   };
 }
+
+test('OMP separates provider timing, observed first text and unambiguous input with scalar snapshots', async () => {
+  let now = 100;
+  const settings = { effort: 'high', tiers: { openai: 'priority' } };
+  const h = harness({ clock: () => now, settings });
+  h.ctx.model = { provider: 'openai', api: 'openai-responses' };
+  h.event('session_start');
+  h.event('input', { source: 'interactive', text: secret });
+  h.event('before_agent_start', { prompt: secret });
+  now = 110;
+  const payload = { service_tier: 'flex', reasoning: { effort: 'low' }, thinking: { budget_tokens: 0 }, input: secret };
+  h.event('before_provider_request', { payload });
+  const m = { ...message(110), provider: 'openai', api: 'openai-responses', duration: 20, ttft: 0,
+    completedAt: 140, serviceTier: 'flex' };
+  h.event('message_start', { message: m });
+  settings.effort = 'max';
+  settings.tiers.openai = 'ultrafast';
+  payload.reasoning.effort = 'max';
+  now = 115;
+  h.event('message_update', { message: m, assistantMessageEvent: { type: 'thinking_delta', delta: secret, partial: m } });
+  h.event('message_update', { message: m, assistantMessageEvent: { type: 'text_delta', delta: '', partial: m } });
+  now = 120;
+  h.event('message_update', { message: m, assistantMessageEvent: { type: 'text_delta', delta: secret, contentIndex: 0, partial: m } });
+  now = 140;
+  h.event('message_end', { message: m });
+  h.event('message_end', { message: m });
+  await h.event('session_shutdown');
+  const request = h.emitted.find(e => e.kind === 'llm.turn');
+  assert.equal(request.endTimeMs - request.startTimeMs, 30);
+  assert.equal(request.attributes['coding_agent.request.duration_ms'], 20);
+  assert.equal(request.attributes['coding_agent.duration.kind'], 'provider_call');
+  assert.equal(request.attributes.ttft_ms, 0);
+  assert.equal(request.attributes['coding_agent.ttft.kind'], 'first_output_item');
+  assert.equal(request.attributes['coding_agent.response.first_text_ms'], 10);
+  assert.equal(request.attributes['coding_agent.request.service_tier'], 'flex');
+  assert.equal(request.attributes['coding_agent.harness.service_tier'], 'flex');
+  assert.equal(request.attributes['coding_agent.response.service_tier'], undefined);
+  assert.equal(request.attributes['coding_agent.request.reasoning.effort'], 'low');
+  assert.equal(request.attributes['coding_agent.request.reasoning.budget_tokens'], 0);
+  const interactions = h.emitted.filter(e => e.kind === 'interaction');
+  assert.equal(interactions.length, 1);
+  assert.equal(interactions[0].attributes['coding_agent.interaction.first_response_ms'], 20);
+  assert.ok(!Object.keys(interactions[0].attributes).some(k => k.startsWith('gen_ai.usage.')));
+  assert.ok(!JSON.stringify(h.emitted).includes(secret));
+});
+
+test('OMP omits ambiguous, switched and aborted input associations and unavailable timing', async () => {
+  for (const scenario of ['concurrent', 'steered', 'switched', 'aborted', 'missing']) {
+    let now = 100;
+    const h = harness({ clock: () => now });
+    h.event('session_start');
+    h.event('input', { source: 'interactive', text: secret });
+    if (scenario === 'concurrent') h.event('input', { source: 'interactive', text: secret });
+    h.event('before_agent_start', { prompt: secret });
+    const m = { ...message(110), completedAt: 150 };
+    if (scenario === 'aborted') m.stopReason = 'aborted';
+    h.event('message_start', { message: m });
+    if (scenario === 'steered') h.event('input', { source: 'interactive', text: secret });
+    if (scenario === 'switched') h.event('session_switch');
+    now = 120;
+    if (scenario !== 'missing') h.event('message_update', {
+      message: m, assistantMessageEvent: { type: 'text_delta', delta: secret, contentIndex: 0, partial: m },
+    });
+    h.event('message_end', { message: m });
+    await h.event('session_shutdown');
+    assert.equal(h.emitted.filter(e => e.kind === 'interaction').length, 0, scenario);
+    const attrs = h.emitted.find(e => e.kind === 'llm.turn').attributes;
+    assert.equal(attrs.ttft_ms, undefined);
+    assert.equal(attrs['coding_agent.ttft.kind'], undefined);
+    assert.equal(attrs['coding_agent.request.duration_ms'], undefined);
+    if (scenario === 'missing' || scenario === 'switched') assert.equal(attrs['coding_agent.response.first_text_ms'], undefined);
+    assert.ok(!JSON.stringify(h.emitted).includes(secret));
+  }
+});
+
+test('OMP freezes harness settings and preserves zero while rejecting malformed timing', async () => {
+  const settings = { effort: 'medium', tiers: { openai: 'priority' } };
+  const h = harness({ settings, clock: () => 100 });
+  const first = { ...message(100), provider: 'openai', api: 'openai-responses', ttft: 0, duration: 0, completedAt: 100 };
+  h.event('message_start', { message: first });
+  settings.effort = 'high';
+  settings.tiers.openai = 'flex';
+  h.event('message_end', { message: first });
+  const second = { ...message(200), provider: 'openai', ttft: 11, duration: 10 };
+  h.event('message_start', { message: second });
+  h.event('message_end', { message: second });
+  for (const [i, invalid] of [true, -1, Infinity, NaN].entries()) {
+    h.event('message_end', { message: { ...message(300 + i), ttft: invalid, duration: invalid } });
+  }
+  await h.event('session_shutdown');
+  const requests = h.emitted.filter(e => e.kind === 'llm.turn');
+  assert.equal(requests[0].attributes['coding_agent.request.reasoning.effort'], 'medium');
+  assert.equal(requests[0].attributes['coding_agent.request.service_tier'], 'priority');
+  assert.equal(requests[0].attributes['coding_agent.request.settings_source'], 'harness');
+  assert.equal(requests[0].attributes['coding_agent.request.duration_ms'], 0);
+  assert.equal(requests[0].attributes.ttft_ms, 0);
+  assert.equal(requests[1].attributes['coding_agent.request.reasoning.effort'], 'high');
+  assert.equal(requests[1].attributes['coding_agent.request.service_tier'], 'flex');
+  for (const request of requests.slice(1)) assert.equal(request.attributes.ttft_ms, undefined);
+  for (const request of requests.slice(2)) assert.equal(request.attributes['coding_agent.request.duration_ms'], undefined);
+});
 
 async function bounded(operation, description, timeoutMs = 30000) {
   let timer;
@@ -174,7 +277,14 @@ test('OMP same-collector native traces own usage across the inherited tree', asy
   try {
     const root = harness({ env, configPath });
     await root.event('session_start');
-    await root.event('message_end', { message: message() });
+    root.event('input', { source: 'interactive', text: secret });
+    root.event('before_agent_start', { prompt: secret });
+    const nativeMessage = message(1_700_000_000_000);
+    root.event('message_start', { message: nativeMessage });
+    root.event('message_update', { message: nativeMessage, assistantMessageEvent: {
+      type: 'text_delta', delta: secret, contentIndex: 0, partial: nativeMessage,
+    } });
+    root.event('message_end', { message: nativeMessage });
     const spawn = { id: 'NativeChild', agent: 'scout', parentToolCallId: 'native-spawn', sessionFile: '/private/native-child.jsonl' };
     await root.lifecycle({ ...spawn, status: 'started' });
     // Even a changed child environment cannot switch source halfway through a tree.
@@ -185,6 +295,8 @@ test('OMP same-collector native traces own usage across the inherited tree', asy
     await root.lifecycle({ ...spawn, status: 'completed' });
     await root.event('session_shutdown');
     assert.equal([...root.emitted, ...child.emitted].filter(e => e.kind === 'llm.turn').length, 0);
+    assert.equal(root.emitted.filter(e => e.kind === 'interaction').length, 1);
+    assert.ok(![...root.emitted, ...child.emitted].some(e => Object.keys(e.attributes).some(k => k.startsWith('gen_ai.usage.'))));
     assert.equal(root.emitted.filter(e => e.kind === 'subagent').length, 1);
     assert.ok(diagnostics.some(line => line.includes('native traces')));
     assert.ok(!diagnostics.join('').includes(secret));
