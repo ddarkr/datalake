@@ -312,7 +312,7 @@ test('v2 event lifecycle exports usage deltas once and excludes private content'
     native(1, 'session.created', { sessionID, title: privateValue, metadata: { secret: privateValue } }),
     native(2, 'session.execution.started', { sessionID }),
     native(3, 'session.step.started', { sessionID, assistantMessageID, started: 1025, agent: 'build', model: { id: 'test-model', providerID: 'openai' } }),
-    native(4, 'session.text.delta', { sessionID, assistantMessageID, delta: privateValue }),
+    { id: 'evt_delta', type: 'session.text.delta', created: 1040, data: { sessionID, assistantMessageID, ordinal: 0, delta: privateValue } },
     native(5, 'session.tool.input.started', { sessionID, assistantMessageID, id: 'call_read', name: 'read' }),
     native(6, 'session.tool.called', { sessionID, assistantMessageID, id: 'call_read', input: { path: privateValue }, executed: true }),
     native(7, 'session.tool.success', { sessionID, assistantMessageID, id: 'call_read', content: [{ text: privateValue }], executed: true }),
@@ -372,6 +372,97 @@ test('interleaved sessions, repeated executions, failures and absent usage remai
   const [midSession] = createEventMapper()(native(30, 'session.step.ended', { sessionID, assistantMessageID, tokens, cost: 0 }));
   assert.equal(midSession.startTimeMs, midSession.endTimeMs);
   assert.equal(midSession.attributes.cost_usd, 0);
+});
+
+test('native ephemeral text, interleaving and tool settlement keep stream timing private and distinct', () => {
+  const map = createEventMapper();
+  const secret = 'PRIVATE-STREAM-CANARY';
+  const a = { sessionID, assistantMessageID: 'msg_a' };
+  const b = { sessionID, assistantMessageID: 'msg_b' };
+  const delta = (id, data, created, text) => ({
+    id, type: 'session.text.delta', created, data: { ...data, ordinal: 0, delta: text },
+  });
+  map(native(1, 'session.step.started', { ...a, started: 100, model: { id: 'm', variant: 'fast' } }, 110));
+  map(native(2, 'session.step.started', { ...b, started: 120 }, 125));
+  map(native(3, 'session.reasoning.started', { ...a, ordinal: 0, state: { secret } }, 130));
+  map(delta('evt_empty', a, 135, ''));
+  map(native(4, 'session.text.started', { ...a, ordinal: 0 }, 140));
+  const text = delta('evt_text', a, 160, secret);
+  map(text);
+  map(text);
+  map(delta('evt_b', b, 170, secret));
+  // A late durable replay cannot move the observed watermark or reset dispatch.
+  map(native(2, 'session.step.started', { ...a, started: 0 }, 180));
+  map(native(5, 'session.tool.input.started', { ...a, id: 'call', name: 'read' }, 180));
+  map(native(6, 'session.step.streamed', a, 200));
+  map(delta('evt_late', a, 250, secret));
+  const [turnB] = map(native(7, 'session.step.ended', { ...b, tokens }, 300));
+  const ended = native(8, 'session.step.ended', {
+    ...a, tokens, providerState: { service_tier: 'priority', secret },
+  }, 10000);
+  const [turnA] = map(ended);
+  assert.deepEqual(map(ended), []);
+  map(delta('evt_after_end', a, 150, secret));
+  const attrs = turnA.attributes;
+  assert.equal(attrs.ttft_ms, 30);
+  assert.equal(attrs['coding_agent.ttft.kind'], 'first_output_part');
+  assert.equal(attrs['coding_agent.response.first_text_ms'], 60);
+  assert.equal(attrs['coding_agent.request.duration_ms'], 100);
+  assert.equal(attrs['coding_agent.duration.kind'], 'stream');
+  assert.equal(attrs['coding_agent.usage.source'], 'reported');
+  assert.equal(attrs['gen_ai.usage.output_tokens'], 6);
+  assert.equal(attrs['gen_ai.usage.input_tokens'], 20);
+  assert.equal(attrs['coding_agent.model.variant'], 'fast');
+  for (const key of ['coding_agent.request.service_tier', 'coding_agent.response.service_tier',
+    'coding_agent.request.reasoning.effort', 'coding_agent.interaction.first_response_ms']) {
+    assert.equal(key in attrs, false);
+  }
+  assert.equal(turnB.attributes['coding_agent.response.first_text_ms'], 50);
+  assert.equal('coding_agent.request.duration_ms' in turnB.attributes, false);
+  assert.equal(JSON.stringify([turnA, turnB]).includes(secret), false);
+});
+
+test('tool output part and missing or invalid dispatch never fabricate duration', () => {
+  for (const started of [undefined, -1, true, Infinity, 200]) {
+    const map = createEventMapper();
+    const data = { sessionID, assistantMessageID };
+    map(native(1, 'session.step.started', { ...data, started }, 100));
+    map(native(2, 'session.tool.input.started', { ...data, id: 'tool', name: 'read' }, 110));
+    map(native(3, 'session.step.streamed', data, 120));
+    const [turn] = map(native(4, 'session.step.ended', { ...data, tokens }, 1000));
+    assert.equal('coding_agent.request.duration_ms' in turn.attributes, false);
+    assert.equal('ttft_ms' in turn.attributes, false);
+    assert.equal(turn.attributes['gen_ai.usage.output_tokens'], 6);
+  }
+  const map = createEventMapper();
+  const data = { sessionID, assistantMessageID };
+  map(native(1, 'session.step.started', { ...data, started: 0 }, 0));
+  map(native(2, 'session.tool.input.started', { ...data, id: 'tool', name: 'read' }, 0));
+  map(native(3, 'session.step.streamed', data, 20));
+  const [turn] = map(native(4, 'session.step.ended', { ...data, tokens }, 200));
+  assert.equal(turn.attributes.ttft_ms, 0);
+  assert.equal(turn.attributes['coding_agent.request.duration_ms'], 20);
+  assert.equal('coding_agent.response.first_text_ms' in turn.attributes, false);
+});
+
+test('execution cleanup discards timing and unsafe variants without retaining delta content', () => {
+  for (const terminal of ['session.execution.succeeded', 'session.deleted']) {
+    const map = createEventMapper();
+    const data = { sessionID, assistantMessageID };
+    map(native(1, 'session.step.started', {
+      ...data, started: 10, model: { variant: 'https://private.example/secret' },
+    }, 10));
+    map(native(2, 'session.text.started', { ...data, ordinal: 0 }, 20));
+    map(native(3, terminal, { sessionID }, 30));
+    map({ id: 'evt_late_delta', created: 25, type: 'session.text.delta',
+      data: { ...data, ordinal: 0, delta: 'PRIVATE-CLEANUP-CANARY' } });
+    const [turn] = map(native(4, 'session.step.ended', { ...data, tokens }, 40));
+    for (const key of ['ttft_ms', 'coding_agent.response.first_text_ms',
+      'coding_agent.request.duration_ms', 'coding_agent.model.variant']) {
+      assert.equal(key in turn.attributes, false);
+    }
+    assert.equal(JSON.stringify(turn).includes('PRIVATE-CLEANUP-CANARY'), false);
+  }
 });
 
 test('installer defaults to dry-run and preserves JSONC, unrelated plugins and file mode', async t => {

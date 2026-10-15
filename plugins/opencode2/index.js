@@ -8,6 +8,7 @@ const observed = new Set([
   'session.created', 'session.execution.started', 'session.execution.succeeded',
   'session.execution.failed', 'session.execution.interrupted', 'session.deleted',
   'session.step.started', 'session.step.ended', 'session.step.failed',
+  'session.step.streamed', 'session.text.started', 'session.reasoning.started', 'session.text.delta',
   'session.usage.recorded', 'session.tool.input.started', 'session.tool.called',
   'session.tool.success', 'session.tool.failed',
 ]);
@@ -19,6 +20,7 @@ function modelAttributes(data) {
   const attributes = {};
   if (label(data.model?.id)) attributes['gen_ai.request.model'] = data.model.id;
   if (label(data.model?.providerID)) attributes['gen_ai.provider.name'] = data.model.providerID;
+  if (label(data.model?.variant)) attributes['coding_agent.model.variant'] = data.model.variant;
   if (label(data.agent)) attributes['coding_agent.agent.id'] = data.agent;
   return attributes;
 }
@@ -41,6 +43,7 @@ function usageAttributes(data) {
       ['gen_ai.usage.reasoning.output_tokens', tokens.reasoning],
     ]) if (numeric(value)) attributes[key] = value;
   }
+  if (Object.keys(attributes).length) attributes['coding_agent.usage.source'] = 'reported';
   if (numeric(data.cost)) attributes.cost_usd = data.cost;
   return attributes;
 }
@@ -52,7 +55,8 @@ export function createEventMapper(baseAttributes = {}) {
   return event => {
     if (!observed.has(event?.type) || !identifier(event.id) || !numeric(event.created)) return [];
     const data = event.data;
-    if (!data || !identifier(data.sessionID) || !Number.isSafeInteger(event.durable?.seq)) return [];
+    const ephemeral = event.type === 'session.text.delta';
+    if (!data || !identifier(data.sessionID) || (!ephemeral && !Number.isSafeInteger(event.durable?.seq))) return [];
     const sessionId = data.sessionID;
     let state = sessions.get(sessionId);
     if (!state) {
@@ -62,8 +66,10 @@ export function createEventMapper(baseAttributes = {}) {
     // This is an observed-native watermark, not durable-local acceptance.
     // Pending projections retain their identities independently; a partial
     // acceptance is never reconstructed or replayed from a later native item.
-    if (event.durable.seq <= state.observedSeq) return [];
-    state.observedSeq = event.durable.seq;
+    if (!ephemeral) {
+      if (event.durable.seq <= state.observedSeq) return [];
+      state.observedSeq = event.durable.seq;
+    }
     const endTimeMs = event.created;
     const make = (kind, eventId, startTimeMs, attributes, parentEventId) => ({
       kind, sessionId, eventId, startTimeMs, endTimeMs,
@@ -128,17 +134,44 @@ export function createEventMapper(baseAttributes = {}) {
     if (event.type === 'session.step.started') {
       // v2.0.12 supplies request dispatch time; event.created is the later
       // durable publication boundary and would omit provider wait latency.
-      state.steps.set(stepId, {
-        start: numeric(data.started) && data.started <= endTimeMs ? data.started : endTimeMs,
+      if (!state.steps.has(stepId)) state.steps.set(stepId, {
+        start: numeric(data.started) && data.started <= endTimeMs ? data.started : undefined,
         attributes: modelAttributes(data),
       });
       return [];
     }
+    const activeStep = state.steps.get(stepId);
+    if (['session.text.started', 'session.reasoning.started', 'session.tool.input.started', 'session.text.delta', 'session.step.streamed'].includes(event.type)) {
+      if (activeStep && numeric(activeStep.start) && endTimeMs >= activeStep.start) {
+        // Retain timestamps only: deltas are ephemeral, batched display-input
+        // observations, never provider-token arrival or rendered-pixel timing.
+        const key = event.type === 'session.step.streamed' ? 'streamed'
+          : event.type === 'session.text.delta' ? 'firstText' : 'firstOutput';
+        if (key !== 'firstText' || (typeof data.delta === 'string' && data.delta.length > 0)) {
+          activeStep[key] = Math.min(activeStep[key] ?? endTimeMs, endTimeMs);
+        }
+      }
+      if (event.type !== 'session.tool.input.started') return [];
+    }
     if (event.type === 'session.step.ended' || event.type === 'session.step.failed') {
       const step = state.steps.get(stepId);
       state.steps.delete(stepId);
+      const timing = {};
+      if (numeric(step?.start)) {
+        const boundary = numeric(step.streamed) && step.streamed <= endTimeMs ? step.streamed : undefined;
+        if (boundary !== undefined) {
+          timing['coding_agent.request.duration_ms'] = boundary - step.start;
+          timing['coding_agent.duration.kind'] = 'stream';
+        }
+        for (const [key, attribute] of [['firstOutput', 'ttft_ms'], ['firstText', 'coding_agent.response.first_text_ms']]) {
+          if (numeric(step[key]) && step[key] <= (boundary ?? endTimeMs)) {
+            timing[attribute] = step[key] - step.start;
+            if (key === 'firstOutput') timing['coding_agent.ttft.kind'] = 'first_output_part';
+          }
+        }
+      }
       return [make('llm.turn', stepId, step?.start ?? endTimeMs, {
-        'gen_ai.operation.name': 'chat', ...step?.attributes, ...usageAttributes(data),
+        'gen_ai.operation.name': 'chat', ...step?.attributes, ...usageAttributes(data), ...timing,
       }, state.execution?.id)];
     }
     if (!identifier(data.id)) return [];
