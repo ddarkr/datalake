@@ -14,6 +14,59 @@ import { acquireProcessLock, ownerIsDead, processIncarnation } from '../plugins/
 
 const execFileAsync = promisify(execFile);
 
+test('performance metadata preserves observations without fabricating timing or tier provenance', () => {
+  const project = (attributes, kind = 'llm.turn') => {
+    const result = serializeEvent('codex', { kind, sessionId: 'session', eventId: 'event', startTimeMs: 100, endTimeMs: 100, attributes });
+    const span = JSON.parse(result.body).resourceSpans[0].scopeSpans[0].spans[0];
+    return { span, body: result.body, attrs: Object.fromEntries(span.attributes.map(({ key, value }) => [key, value])) };
+  };
+  const numeric = ['ttft_ms', 'first_content_ms', 'coding_agent.request.duration_ms', 'coding_agent.response.first_text_ms', 'coding_agent.interaction.first_response_ms', 'coding_agent.request.reasoning.budget_tokens'];
+  for (const key of numeric) {
+    for (const value of [undefined, null, true, false, '0', -1, NaN, Infinity, -Infinity]) {
+      assert.equal(project({ [key]: value, 'coding_agent.ttft.kind': 'provider_reported' }).attrs[key], undefined);
+    }
+    assert.deepEqual(project({ [key]: 0, 'coding_agent.ttft.kind': 'provider_reported' }).attrs[key], { intValue: '0' });
+  }
+  assert.equal(project({ 'coding_agent.request.reasoning.budget_tokens': 1.5 }).attrs['coding_agent.request.reasoning.budget_tokens'], undefined);
+  assert.equal(project({ ttft_ms: 1 }).attrs.ttft_ms, undefined);
+  const observed = {
+    'coding_agent.request.duration_ms': 10, 'coding_agent.duration.kind': 'stream',
+    ttft_ms: 2, 'coding_agent.ttft.kind': 'first_output_part', first_content_ms: 3,
+    'coding_agent.response.first_text_ms': 4, 'coding_agent.usage.source': 'reported',
+    'coding_agent.request.service_tier': 'auto', 'coding_agent.harness.service_tier': 'priority',
+    'coding_agent.request.reasoning.effort': 'high', 'coding_agent.request.settings_source': 'wire',
+    'coding_agent.model.variant': 'model-high', 'coding_agent.harness.version': '1.2.3',
+  };
+  const valid = project(observed).attrs;
+  for (const [key, value] of Object.entries(observed)) {
+    assert.deepEqual(valid[key], typeof value === 'string' ? { stringValue: value } : { intValue: String(value) });
+  }
+  assert.equal(valid['coding_agent.response.service_tier'], undefined);
+  assert.deepEqual(project({ 'coding_agent.response.service_tier': 'flex' }).attrs['coding_agent.response.service_tier'], { stringValue: 'flex' });
+  for (const key of ['coding_agent.ttft.kind', 'coding_agent.duration.kind', 'coding_agent.request.service_tier', 'coding_agent.response.service_tier', 'coding_agent.harness.service_tier', 'coding_agent.request.reasoning.effort', 'coding_agent.request.settings_source', 'coding_agent.usage.source', 'coding_agent.interaction.latency.kind']) {
+    assert.equal(project({ [key]: 'unknown' }).attrs[key], undefined);
+  }
+  assert.deepEqual(project({ 'coding_agent.interaction.latency.kind': 'hook_submit_to_display_ready' }, 'interaction').attrs['coding_agent.interaction.latency.kind'], { stringValue: 'hook_submit_to_display_ready' });
+  for (const key of Object.keys(observed).filter(key => typeof observed[key] === 'string')) {
+    const invalid = project({ [key]: 'PRIVATE BODY\nsecret', 'gen_ai.prompt': 'PRIVATE BODY' });
+    assert.equal(invalid.attrs[key], undefined);
+    assert.doesNotMatch(invalid.body, /PRIVATE BODY/);
+  }
+  for (const key of ['ttft_ms', 'first_content_ms', 'coding_agent.response.first_text_ms']) {
+    assert.equal(project({ ...observed, [key]: 11 }).attrs[key], undefined);
+  }
+  const interaction = project({
+    'coding_agent.interaction.first_response_ms': 500,
+    'coding_agent.interaction.latency.kind': 'submit_to_display_ready',
+    'coding_agent.request.duration_ms': 10, 'gen_ai.usage.output_tokens': 9,
+    'pi.gen_ai.usage.total_tokens': 12,
+  }, 'interaction');
+  assert.equal(interaction.span.name, 'coding_agent.interaction');
+  assert.deepEqual(interaction.attrs['coding_agent.interaction.first_response_ms'], { intValue: '500' });
+  assert.equal(interaction.attrs['gen_ai.usage.output_tokens'], undefined);
+  assert.equal(interaction.attrs['pi.gen_ai.usage.total_tokens'], undefined);
+});
+
 // Shared contract: stable identity/privacy/ID boundaries, repository context,
 // protected config, sendPayload response parsing, and direct HTTP regression.
 // Real loopback collector; no durable queue, no sender, no disk spool.

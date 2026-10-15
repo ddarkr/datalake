@@ -23,7 +23,7 @@ export async function withStateLock(directory, action) {
 }
 
 export const defaultConfigPath = () => process.env.DATALAKE_OTEL_CONFIG || join(homedir(), '.config', 'doda-datalake', 'otel.json');
-const kinds = new Set(['session', 'llm.turn', 'tool.call', 'edit.decision', 'subagent', 'git.commit', 'git.pull_request']);
+const kinds = new Set(['session', 'llm.turn', 'interaction', 'tool.call', 'edit.decision', 'subagent', 'git.commit', 'git.pull_request']);
 const numericKeys = new Set([
   'gen_ai.usage.input_tokens', 'gen_ai.usage.output_tokens',
   'gen_ai.usage.cache_read.input_tokens', 'gen_ai.usage.cache_write.input_tokens',
@@ -37,6 +37,8 @@ const numericKeys = new Set([
   'coding_agent.session.pr_count', 'coding_agent.session.duration_ms',
   'coding_agent.subagent.duration_ms', 'coding_agent.edit.lines.added',
   'coding_agent.edit.lines.removed', 'duration_ms', 'ttft_ms', 'attempt',
+  'first_content_ms', 'coding_agent.request.duration_ms', 'coding_agent.response.first_text_ms',
+  'coding_agent.interaction.first_response_ms', 'coding_agent.request.reasoning.budget_tokens',
 ]);
 const stringKeys = new Set([
   'gen_ai.operation.name', 'gen_ai.provider.name', 'gen_ai.request.model',
@@ -50,6 +52,17 @@ const stringKeys = new Set([
   'vcs.ref.head.name', 'vcs.ref.head.revision', 'error.type',
   'pi.gen_ai.tool.status', 'turn.id', 'request_id', 'tool_use_id',
 ]);
+const enumKeys = {
+  'coding_agent.ttft.kind': ['first_output_item', 'first_output_part', 'first_stream_event', 'provider_reported'],
+  'coding_agent.duration.kind': ['provider_call', 'logical_call', 'stream', 'hook_invocation'],
+  'coding_agent.request.service_tier': ['auto', 'default', 'flex', 'scale', 'priority', 'ultrafast', 'fast', 'normal'],
+  'coding_agent.response.service_tier': ['auto', 'default', 'flex', 'scale', 'priority', 'ultrafast', 'fast', 'normal'],
+  'coding_agent.harness.service_tier': ['auto', 'default', 'flex', 'scale', 'priority', 'ultrafast', 'fast', 'normal'],
+  'coding_agent.request.reasoning.effort': ['none', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+  'coding_agent.request.settings_source': ['wire', 'harness', 'native'],
+  'coding_agent.usage.source': ['reported', 'estimated'],
+  'coding_agent.interaction.latency.kind': ['input_to_first_text', 'submit_to_display_ready', 'hook_submit_to_display_ready'],
+};
 const forbiddenHeaders = new Set(['host', 'content-length', 'content-type', 'connection', 'transfer-encoding', 'cookie']);
 const hash = (value, length) => createHash('sha256').update(value).digest('hex').slice(0, length);
 const diagnostic = message => console.error(`[datalake-otel] ${message}`);
@@ -145,6 +158,27 @@ function spanFor(client, event) {
   for (const key of stringKeys) {
     const value = event.attributes?.[key];
     if (typeof value === 'string' && value.length <= 256 && !/[\x00-\x1f\x7f]/.test(value)) metadata[key] = value;
+  }
+  for (const [key, values] of Object.entries(enumKeys)) {
+    const value = event.attributes?.[key];
+    if (values.includes(value)) metadata[key] = value;
+  }
+  for (const key of ['coding_agent.model.variant', 'coding_agent.harness.version']) {
+    const value = event.attributes?.[key];
+    if (typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9_.:/+-]{0,159}$/.test(value)) metadata[key] = value;
+  }
+  if (!Number.isSafeInteger(metadata['coding_agent.request.reasoning.budget_tokens'])) delete metadata['coding_agent.request.reasoning.budget_tokens'];
+  if (!metadata['coding_agent.ttft.kind']) delete metadata.ttft_ms;
+  const duration = metadata['coding_agent.request.duration_ms'];
+  if (duration !== undefined) {
+    for (const key of ['ttft_ms', 'first_content_ms', 'coding_agent.response.first_text_ms']) {
+      if (metadata[key] > duration) delete metadata[key];
+    }
+  }
+  if (event.kind === 'interaction') {
+    for (const key of Object.keys(metadata)) {
+      if (key.startsWith('gen_ai.usage.') || key.startsWith('pi.gen_ai.usage.')) delete metadata[key];
+    }
   }
   if (metadata['coding_agent.repository.id'] && !/^[a-f0-9]{64}$/.test(metadata['coding_agent.repository.id'])) delete metadata['coding_agent.repository.id'];
   Object.assign(metadata, {
