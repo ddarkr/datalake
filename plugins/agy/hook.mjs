@@ -67,12 +67,6 @@ async function save(path, value) {
   } finally { await unlink(temporary).catch(error => { if (error.code !== 'ENOENT') throw error; }); }
 }
 
-// 텍스트 길이 기반 고정밀 토큰 근사치 계산 (Gemini/Claude 표준: ~3.8 글자당 1토큰)
-function estimateTokens(text) {
-  if (!text) return 0;
-  const len = typeof text === 'string' ? text.length : JSON.stringify(text).length;
-  return Math.max(1, Math.round(len / 3.8));
-}
 
 // 트랜스크립트 파일 경로 자동 탐색 및 폴백 안전장치
 async function resolveTranscriptPath(payload) {
@@ -143,48 +137,14 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
       try { steps.push(JSON.parse(line)); } catch {}
     }
 
-    let accumulatedPromptChars = 1000;
-
     for (let i = 0; i < steps.length; i++) {
       const step = steps[i];
       const stepIndex = step.step_index ?? i;
 
-      if (step.type === 'USER_INPUT') {
-        accumulatedPromptChars += (step.content?.length || 0);
-      } else if (step.type === 'PLANNER_RESPONSE') {
-        const thinkingText = step.thinking || '';
-        const contentText = step.content || '';
-        const toolCallsText = step.tool_calls ? JSON.stringify(step.tool_calls) : '';
-
+      if (step.type === 'PLANNER_RESPONSE') {
         if (stepIndex > cursor.lastProcessedIndex) {
           const turnTime = step.created_at ? new Date(step.created_at).getTime() : clock;
-          const prevStep = steps[i - 1];
-          const prevTime = prevStep?.created_at ? new Date(prevStep.created_at).getTime() : turnTime - 1000;
-          const turnDurationMs = Math.max(100, turnTime - prevTime);
-          const inputTokens = estimateTokens(accumulatedPromptChars);
-          const reasoningTokens = estimateTokens(thinkingText);
-          const outputTokens = estimateTokens(contentText + toolCallsText) + reasoningTokens;
-          const cacheReadTokens = i > 1 ? Math.round(inputTokens * 0.75) : 0;
-
-          const turnEvent = {
-            kind: 'llm.turn',
-            sessionId: String(sessionId),
-            eventId: `turn:${stepIndex}`,
-            startTimeMs: prevTime,
-            endTimeMs: turnTime,
-            attributes: {
-              ...baseAttrs,
-              'gen_ai.request.model': String(model).slice(0, 128),
-              'gen_ai.usage.input_tokens': inputTokens,
-              'gen_ai.usage.output_tokens': outputTokens,
-              'gen_ai.usage.reasoning.output_tokens': reasoningTokens,
-              'gen_ai.usage.cache_read.input_tokens': cacheReadTokens,
-              'duration_ms': turnDurationMs,
-              'turn.id': String(stepIndex),
-            },
-          };
-
-          const stepEvents = [turnEvent];
+          const stepEvents = [];
 
           // 서브에이전트 호출 발견 시 계층 트레이스(subagent span) 생성
           if (step.tool_calls && Array.isArray(step.tool_calls)) {
@@ -206,7 +166,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
                       'coding_agent.agent.id': subagentId,
                       'coding_agent.agent.parent_id': String(sessionId),
                       'coding_agent.subagent.type': String(sa.Role || sa.TypeName || 'subagent').slice(0, 128),
-                      'gen_ai.request.model': String(sa.Model || model).slice(0, 128),
+                      ...((sa.Model || model) ? { 'gen_ai.request.model': String(sa.Model || model).slice(0, 128) } : {}),
                     },
                   };
                   stepEvents.push(subagentEvent);
@@ -216,13 +176,12 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
           }
 
           for (const event of stepEvents) {
-            await attemptOnce(event, event.kind === 'llm.turn' ? turns : subagents);
+            await attemptOnce(event, subagents);
           }
           cursor.lastProcessedIndex = stepIndex;
           await save(cPath, cursor);
         }
 
-        accumulatedPromptChars += (thinkingText.length + contentText.length + toolCallsText.length);
       }
     }
 
@@ -239,23 +198,63 @@ export async function handleHook(payload, options = {}) {
   return await withStateLock(directory, () => handleSerialized(payload, options)) ?? [];
 }
 
-async function handleSerialized(payload, { telemetry, now = Date.now, cwd = process.cwd(), isPreTool = false, isPostInvocation = false } = {}) {
+async function handleSerialized(payload, { telemetry, now = Date.now, cwd = process.cwd(), isPreTool = false, isPreInvocation = false, isPostInvocation = false } = {}) {
   const sessionId = payload?.conversationId || payload?.session_id;
   if (!sessionId) return [];
 
   const clock = now();
   const repoAttrs = await repositoryContext(cwd);
-  const model = payload.modelName || 'gemini-3.8-flash';
+  const model = payload.modelName;
   const events = [];
 
   const baseAttrs = {
     ...repoAttrs,
-    'gen_ai.request.model': String(model).slice(0, 128),
+    ...(model ? { 'gen_ai.request.model': String(model).slice(0, 128) } : {}),
   };
 
   const isStop = Boolean(payload.terminationReason) || process.argv.includes('--stop');
   const preToolFlag = isPreTool || process.argv.includes('--pre-tool');
   const postInvocFlag = isPostInvocation || process.argv.includes('--post-invocation');
+  const preInvocFlag = isPreInvocation || process.argv.includes('--pre-invocation');
+  if (preInvocFlag || postInvocFlag) {
+    const number = payload.invocationNum;
+    if (!Number.isSafeInteger(number) || number < 0 || !Number.isFinite(clock)) return [];
+    const path = join(stateDir(sessionId), `invocation-${number}.json`);
+    let state;
+    try { state = JSON.parse(await readFile(path, 'utf8')); } catch {}
+    const eventId = `invocation:${number}`;
+    if (state && (state.sessionId !== String(sessionId) || state.eventId !== eventId)) return [];
+    state ??= { sessionId: String(sessionId), eventId };
+    if (state.attempted || state.closed) return [];
+    if (preInvocFlag) {
+      if (state.startTimeMs === undefined) {
+        state.startTimeMs = clock;
+        await save(path, state);
+      }
+      return [];
+    }
+    // A post observed before its pre cannot be paired with a later invocation.
+    if (!Number.isFinite(state.startTimeMs) || clock < state.startTimeMs) {
+      state.closed = true;
+      await save(path, state);
+      return [];
+    }
+    const event = {
+      kind: 'llm.turn', sessionId: String(sessionId), eventId,
+      startTimeMs: state.startTimeMs, endTimeMs: clock,
+      attributes: {
+        ...baseAttrs,
+        'coding_agent.request.duration_ms': clock - state.startTimeMs,
+        'coding_agent.duration.kind': 'hook_invocation',
+      },
+    };
+    state.attempted = true;
+    await save(path, state);
+    let ok = false;
+    try { ok = await telemetry.send(event); } catch {}
+    await telemetry.flush().catch(() => {});
+    return ok === true ? [event] : [];
+  }
 
   // 1. PreToolUse: 도구 실행 시작 시각 기록 (0ms duration 방지)
   if (preToolFlag) {
@@ -390,6 +389,7 @@ if (isMain(import.meta.url)) {
       options: {
         config: { type: 'string' },
         'pre-tool': { type: 'boolean' },
+        'pre-invocation': { type: 'boolean' },
         'post-invocation': { type: 'boolean' },
         stop: { type: 'boolean' },
       },
@@ -408,6 +408,7 @@ if (isMain(import.meta.url)) {
     await handleHook(payload, {
       telemetry,
       isPreTool: values['pre-tool'],
+      isPreInvocation: values['pre-invocation'],
       isPostInvocation: values['post-invocation'],
     });
   } catch {}

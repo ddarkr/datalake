@@ -1,5 +1,11 @@
 {
   "datalake-telemetry": {
+    "PreInvocation": [
+      { "type": "command", "command": "node hook.mjs --pre-invocation", "timeout": 5 }
+    ],
+    "PostInvocation": [
+      { "type": "command", "command": "node hook.mjs --post-invocation", "timeout": 5 }
+    ],
     "PreToolUse": [
       {
         "matcher": "*",

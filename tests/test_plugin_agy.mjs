@@ -58,14 +58,14 @@ async function wireFixture(t, respond = null, timeoutMs = 30_000) {
 }
 
 for (const failure of ['false', 'throw']) {
-  test(`AGY failed ${failure} on turn:1 still sends turn:2 once, never retries turn:1`, async t => {
+  test(`AGY failed ${failure} on subagent still sends later children once without estimated turns`, async t => {
     const box = await sandbox(t, steps()), acknowledged = [], attempts = [];
     const child0 = `subagent:${box.sessionId}:1:0`, child1 = `subagent:${box.sessionId}:1:1`;
     let fail = true;
     const telemetry = {
       send: async event => {
         attempts.push(event.eventId);
-        if (event.eventId === 'turn:1' && fail) {
+        if (event.eventId === child0 && fail) {
           fail = false;
           if (failure === 'throw') throw new Error('synthetic transport failure');
           return false;
@@ -77,25 +77,24 @@ for (const failure of ['false', 'throw']) {
     };
     const invoke = () => handleHook({ conversationId: box.sessionId, transcriptPath: box.transcript, terminationReason: 'model_stop' }, { telemetry, cwd: box.path, now: () => 1500 });
     await invoke();
-    assert.deepEqual(attempts.filter(id => id === 'turn:1'), ['turn:1'], 'failed turn attempted once, then dropped');
-    assert.deepEqual(attempts.filter(id => id === 'turn:2'), ['turn:2'], 'later independent turn still sent');
-    assert.deepEqual(acknowledged.filter(event => event.kind === 'llm.turn').map(event => event.eventId), ['turn:2']);
-    assert.deepEqual(acknowledged.filter(event => event.kind === 'subagent').map(event => event.eventId), [child0, child1]);
+    assert.deepEqual(attempts.filter(id => id === child0), [child0]);
+    assert.deepEqual(attempts.filter(id => id === child1), [child1]);
+    assert.deepEqual(acknowledged.filter(event => event.kind === 'llm.turn'), []);
+    assert.deepEqual(acknowledged.filter(event => event.kind === 'subagent').map(event => event.eventId), [child1]);
     const cursor = JSON.parse(await readFile(join(box.state, 'cursor.json'), 'utf8'));
     assert.equal(cursor.version, 3);
     assert.equal(cursor.lastProcessedIndex, 2, 'attempted-identity checkpoint advances regardless of ACK');
-    assert.ok(cursor.attemptedEventIds?.includes('turn:1'));
-    // A repeated hook with changed transcript content never retries the attempted turn.
+    assert.ok(cursor.attemptedEventIds?.includes(child0));
+    // A repeated hook with changed transcript content never retries an attempted child.
     const changed = steps();
     changed[1].content = 'different later transcript observation';
     changed[1].tool_calls[0].args.Subagents[1].Role = 'LaterRole';
     await writeFile(box.transcript, changed.map(step => JSON.stringify(step)).join('\n') + '\n');
     await invoke();
     await invoke();
-    assert.deepEqual(attempts.filter(id => id === 'turn:1'), ['turn:1']);
-    assert.deepEqual(attempts.filter(id => id === 'turn:2'), ['turn:2']);
+    assert.deepEqual(attempts.filter(id => id === child0), [child0]);
+    assert.deepEqual(attempts.filter(id => id === child1), [child1]);
     assert.ok(!attempts.includes(`${child1}-retry`), 'no synthetic replay identities appear');
-    void child0;
   });
 
   test(`AGY preserves the observed tool completion and duration through ${failure} without replay`, async t => {
@@ -196,14 +195,14 @@ test('AGY retains stable tool identity even when its name contains path componen
   assert.equal(accepted[0].error, false);
 });
 
-test('AGY serializes concurrent transcript drains without duplicate usage', async t => {
+test('AGY serializes concurrent transcript drains without duplicate subagents', async t => {
   const box = await sandbox(t, steps()), acknowledged = [];
   let entered, release, first = true;
   const started = new Promise(resolve => { entered = resolve; });
   const blocked = new Promise(resolve => { release = resolve; });
   const telemetry = {
     send: async event => {
-      if (event.kind === 'llm.turn' && first) { first = false; entered(); await blocked; }
+      if (event.kind === 'subagent' && first) { first = false; entered(); await blocked; }
       acknowledged.push(event);
       return true;
     }, flush: async () => {},
@@ -215,7 +214,8 @@ test('AGY serializes concurrent transcript drains without duplicate usage', asyn
   await delay(20);
   release();
   await Promise.all([one, two]);
-  assert.deepEqual(acknowledged.filter(event => event.kind === 'llm.turn').map(event => event.eventId), ['turn:1', 'turn:2']);
+  assert.deepEqual(acknowledged.filter(event => event.kind === 'llm.turn'), []);
+  assert.equal(acknowledged.filter(event => event.kind === 'subagent').length, 2);
 });
 
 test('AGY tool errors export only a fixed category on the direct OTLP wire', async t => {
@@ -259,7 +259,7 @@ test('AGY treats legacy sent IDs as attempted without replaying historical turns
     telemetry: { send: async event => { accepted.push(event); return true; }, flush: async () => {} },
     cwd: box.path, now: () => 1500,
   });
-  assert.deepEqual(accepted.filter(event => event.kind === 'llm.turn').map(event => event.eventId), ['turn:2']);
+  assert.deepEqual(accepted.filter(event => event.kind === 'llm.turn'), []);
   assert.deepEqual(accepted.filter(event => event.kind === 'subagent').map(event => event.eventId), [`subagent:${box.sessionId}:1:1`]);
   const cursor = JSON.parse(await readFile(join(box.state, 'cursor.json'), 'utf8'));
   assert.equal(cursor.version, 3);
@@ -370,6 +370,10 @@ test('AGY installer dry-run/install/uninstall preserve unrelated JSON and safely
   const manifest = JSON.parse(await readFile(join(installed.targetPluginDir, 'plugin.json'), 'utf8'));
   assert.deepEqual(Object.keys(manifest).sort(), ['description', 'name']);
   const hooks = JSON.parse(await readFile(join(installed.targetPluginDir, 'hooks.json'), 'utf8'));
+  for (const event of ['PreInvocation', 'PostInvocation']) {
+    assert.equal(hooks['datalake-telemetry'][event][0].type, 'command');
+    assert.ok(hooks['datalake-telemetry'][event][0].command.includes('--config'));
+  }
   const command = hooks['datalake-telemetry'].PreToolUse[0].hooks[0].command;
   const child = spawn('/bin/sh', ['-c', command], {
     cwd: home, env: { PATH: process.env.PATH, HOME: home, XDG_STATE_HOME: join(home, 'state'), DATALAKE_OTEL_CONFIG: join(home, 'absent.json') },
@@ -395,6 +399,58 @@ test('AGY installer dry-run/install/uninstall preserve unrelated JSON and safely
   assert.deepEqual(JSON.parse(await readFile(join(installed.targetPluginDir, 'user-state.json'), 'utf8')), { keep: true });
   await assert.rejects(stat(join(installed.targetPluginDir, 'plugin.json')), { code: 'ENOENT' });
 });
+
+test('AGY invocation hooks measure only matched boundaries and never transcript estimates', async t => {
+  const box = await sandbox(t, steps());
+  const { accepted, telemetry } = direct();
+  const payload = { conversationId: box.sessionId, invocationNum: 0, modelName: 'observed-model', transcriptPath: box.transcript, prompt: 'PRIVATE_INVOCATION_MARKER', initialNumSteps: 123 };
+  const invoke = (value, clock, options) => handleHook(value, { telemetry, cwd: box.path, now: () => clock, ...options });
+  await invoke(payload, 1000, { isPreInvocation: true });
+  await invoke(payload, 1100, { isPreInvocation: true });
+  await invoke(payload, 1400, { isPostInvocation: true });
+  await invoke(payload, 1500, { isPostInvocation: true });
+  await invoke(payload, 1600, { isPreInvocation: true });
+  assert.equal(accepted.length, 1);
+  assert.equal(accepted[0].attributes['coding_agent.request.duration_ms'], 400);
+  assert.equal(accepted[0].attributes['coding_agent.duration.kind'], 'hook_invocation');
+  assert.equal(accepted[0].startTimeMs, 1000);
+  assert.equal(accepted[0].endTimeMs, 1400);
+  assert.equal((await stat(join(box.state, 'invocation-0.json'))).mode & 0o777, 0o600);
+  for (const number of [1, 2, 3]) {
+    const next = { ...payload, invocationNum: number };
+    if (number === 1) await invoke(next, 2000, { isPreInvocation: true });
+    else {
+      await invoke(next, 2000, { isPostInvocation: true });
+      if (number === 3) {
+        await invoke(next, 2100, { isPreInvocation: true });
+        await invoke(next, 2300, { isPostInvocation: true });
+      }
+    }
+  }
+  await invoke({ ...payload, invocationNum: '4' }, 3000, { isPreInvocation: true });
+  await invoke({ ...payload, terminationReason: 'model_stop' }, 4000, {});
+  assert.equal(accepted.filter(event => event.kind === 'llm.turn').length, 1);
+  assert.equal(accepted.filter(event => event.kind === 'subagent').length, 2);
+  for (const event of accepted) {
+    assert.ok(!Object.keys(event.attributes).some(key => /usage|ttft|first_text|service_tier|reasoning/.test(key)));
+  }
+  assert.ok(!JSON.stringify(accepted).includes('PRIVATE_INVOCATION_MARKER'));
+  assert.ok(!(await readFile(join(box.state, 'invocation-0.json'), 'utf8')).includes('PRIVATE_INVOCATION_MARKER'));
+});
+
+for (const failure of ['false', 'throw']) {
+  test(`AGY invocation ${failure} delivery is attempted only once`, async t => {
+    const box = await sandbox(t);
+    const attempts = [];
+    const telemetry = { send: async event => { attempts.push(event); if (failure === 'throw') throw new Error('private failure'); return false; }, flush: async () => {} };
+    const payload = { conversationId: box.sessionId, invocationNum: 0 };
+    await handleHook(payload, { telemetry, cwd: box.path, now: () => 1000, isPreInvocation: true });
+    await handleHook(payload, { telemetry, cwd: box.path, now: () => 1000, isPostInvocation: true });
+    await handleHook(payload, { telemetry, cwd: box.path, now: () => 1200, isPostInvocation: true });
+    assert.equal(attempts.length, 1);
+    assert.equal(attempts[0].attributes['coding_agent.request.duration_ms'], 0);
+  });
+}
 
 for (const unsafe of ['malformed', 'symlink']) {
   test(`AGY installer refuses ${unsafe} existing config without overwriting it`, async t => {

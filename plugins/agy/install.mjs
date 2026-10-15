@@ -120,6 +120,7 @@ export async function installAgy(options = {}) {
   console.log(`[AGY Datalake Plugin Installer] ${apply ? '--apply' : 'Dry-run'}${uninstall ? ' uninstall' : ''}`);
   console.log(`- 플러그인: ${targetPluginDir}`);
   console.log(`- 설정: ${configPath}`);
+  console.log('- Hooks: PreInvocation, PostInvocation, PreToolUse, PostToolUse, Stop');
   if (!apply) return { targetPluginDir, configPath };
 
   if (uninstall) {
@@ -149,6 +150,8 @@ export async function installAgy(options = {}) {
     ...existingHooks,
     'datalake-telemetry': {
       ...existingHooks?.['datalake-telemetry'],
+      PreInvocation: [handler(' --pre-invocation')],
+      PostInvocation: [handler(' --post-invocation')],
       PreToolUse: [{ matcher: '*', hooks: [handler(' --pre-tool')] }],
       PostToolUse: [{ matcher: '*', hooks: [handler('')] }],
       Stop: [handler(' --stop')],
