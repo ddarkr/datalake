@@ -205,6 +205,11 @@ test('numeric rollout increments are deduplicated, incremental and limited to th
   assert.equal(events[0].attributes['gen_ai.usage.reasoning.output_tokens'], 1);
   assert.equal(events[0].startTimeMs, Date.parse(timestamp));
   assert.equal(events[0].endTimeMs, Date.parse(timestamp));
+  assert.equal(events[0].attributes['coding_agent.usage.source'], 'reported');
+  assert.equal(events[0].attributes['coding_agent.harness.version'], '0.142.4');
+  for (const key of ['ttft_ms', 'duration_ms', 'coding_agent.request.duration_ms', 'coding_agent.response.first_text_ms', 'coding_agent.request.service_tier', 'coding_agent.response.service_tier', 'coding_agent.request.reasoning.effort', 'tps']) {
+    assert.equal(events[0].attributes[key], undefined, `${key} cannot be inferred from transcript usage`);
+  }
   const partial = usage(tokens(150, 20, 26, 4), tokens(20, 5, 2, 1));
   await appendFile(transcript, partial.slice(0, -1));
   await collectUsage(input, { telemetry, stateDir });
@@ -217,6 +222,20 @@ test('numeric rollout increments are deduplicated, incremental and limited to th
   assert.equal(JSON.stringify(events).includes(secret), false);
   assert.equal((await persisted(stateDir)).includes(secret), false);
   assert.equal(Object.keys(events[0].attributes).some(key => /cost/i.test(key)), false);
+});
+
+test('rollout version is observed metadata, never a tested-version fallback', async t => {
+  const dir = await temporary(t);
+  const transcript = join(dir, 'active.jsonl');
+  for (const [index, version] of [undefined, 'PRIVATE VERSION\nbody', '9.8.7'].entries()) {
+    const sessionId = `version-${index}`;
+    await writeFile(transcript, line('session_meta', { id: sessionId, cli_version: version }) + context('turn-1') + usage(tokens(2, 1)));
+    const { telemetry, events } = capture();
+    await collectUsage({ session_id: sessionId, turn_id: 'turn-1', hook_event_name: 'Stop', transcript_path: transcript }, { telemetry, stateDir: join(dir, `state-${index}`) });
+    assert.equal(events.length, 1);
+    assert.equal(events[0].attributes['coding_agent.harness.version'], index === 2 ? '9.8.7' : undefined);
+    assert.equal(JSON.stringify(events).includes('PRIVATE VERSION'), false);
+  }
 });
 
 test('failed usage sends still advance the baseline; mismatched sessions are not billed', async t => {

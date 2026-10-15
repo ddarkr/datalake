@@ -77,6 +77,7 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
                 cursor.threadId = safeId(payload?.id);
                 cursor.verified = Boolean(cursor.threadId) && (input.agent_id ? payload.id === expectedId : payload.id === expectedId || payload.session_id === expectedId);
                 cursor.provider = safeLabel(payload?.model_provider);
+                cursor.version = safeLabel(payload?.cli_version);
               } else if (record?.type === 'turn_context') {
                 cursor.turn = safeId(payload?.turn_id);
                 cursor.model = safeLabel(payload?.model);
@@ -89,11 +90,12 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
                   const delta = total.map((value, i) => value - cursor.total[i]);
                   const timestamp = Date.parse(record.timestamp);
                   if (!prime && cursor.verified && cursor.turn === activeTurn && last && Number.isFinite(timestamp) && delta.some(value => value > 0) && delta.every((value, i) => value >= 0 && value === last[i])) {
-                    const attributes = {};
+                    const attributes = { 'coding_agent.usage.source': 'reported' };
                     ATTRIBUTES.forEach((key, i) => { attributes[key] = delta[i]; });
                     const model = cursor.model ?? safeLabel(input.model);
                     if (model) attributes['gen_ai.request.model'] = model;
                     if (cursor.provider) attributes['gen_ai.provider.name'] = cursor.provider;
+                    if (cursor.version) attributes['coding_agent.harness.version'] = cursor.version;
                     if (safeId(input.agent_id)) attributes['coding_agent.agent.id'] = input.agent_id;
                     const event = {
                       kind: 'llm.turn', sessionId: input.session_id,
