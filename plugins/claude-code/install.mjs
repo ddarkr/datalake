@@ -19,10 +19,10 @@ async function readOptional(path) {
 export async function install(argv = process.argv.slice(2)) {
   const { values } = parseArgs({ args: argv, options: {
     home: { type: 'string' }, config: { type: 'string' }, apply: { type: 'boolean' },
-    uninstall: { type: 'boolean' }, help: { type: 'boolean' },
+    uninstall: { type: 'boolean' }, help: { type: 'boolean' }, source: { type: 'string' },
   } });
   if (values.help) {
-    console.log('사용법: node plugins/claude-code/install.mjs [--home DIR] [--config PATH] [--apply] [--uninstall]\n기본값은 dry-run입니다. Claude Code 2.1.223+ skills-dir 플러그인으로 설치하며 기존 settings.json은 변경하지 않습니다. --home은 사용자 홈 디렉터리입니다.');
+    console.log('사용법: node plugins/claude-code/install.mjs [--home DIR] [--config PATH] [--source plugin|native] [--apply] [--uninstall]\n기본값은 dry-run입니다. Claude Code 2.1.223+ skills-dir 플러그인으로 설치하며 기존 settings.json은 변경하지 않습니다. --home은 사용자 홈 디렉터리입니다.');
     return;
   }
   const home = resolve(values.home || homedir());
@@ -47,6 +47,9 @@ export async function install(argv = process.argv.slice(2)) {
       } catch (error) { if (error.code !== 'ENOENT') throw error; }
     }
   }
+  const previousPointer = exists ? await readOptional(join(destination, 'claude-code', 'config-path.json')) : undefined;
+  const source = values.source ?? (previousPointer ? JSON.parse(previousPointer).source : undefined) ?? 'plugin';
+  if (!['plugin', 'native'].includes(source)) fail('--source는 plugin 또는 native여야 합니다.');
   if (!values.uninstall) {
     const settings = await readOptional(join(claudeDir, 'settings.json'));
     // Read only: even comments and formatting in existing settings remain byte-for-byte intact.
@@ -58,7 +61,7 @@ export async function install(argv = process.argv.slice(2)) {
     }
     for (const file of ownedFiles.slice(0, -1)) await lstat(join(root, file));
   }
-  console.log(JSON.stringify({ client: 'claude-code', action: values.uninstall ? 'uninstall' : 'install', apply: !!values.apply, destination, ...(values.uninstall ? {} : { configPath, plugin: `${pluginName}@skills-dir` }) }, null, 2));
+  console.log(JSON.stringify({ client: 'claude-code', action: values.uninstall ? 'uninstall' : 'install', apply: !!values.apply, destination, ...(values.uninstall ? {} : { configPath, source, plugin: `${pluginName}@skills-dir` }) }, null, 2));
   if (!values.apply) return;
   if (values.uninstall) {
     if (!exists) return;
@@ -86,7 +89,7 @@ export async function install(argv = process.argv.slice(2)) {
     if ((await lstat(join(destination, file)).catch(error => error.code === 'ENOENT' ? undefined : Promise.reject(error)))?.isSymbolicLink()) fail('설치 경로 내부의 심볼릭 링크를 따라 파일을 변경하지 않습니다.');
     await unlink(join(destination, file)).catch(error => { if (error.code !== 'ENOENT') throw error; });
   }
-  await writeFile(join(destination, 'claude-code', 'config-path.json'), JSON.stringify({ configPath }) + '\n', { mode: 0o600 });
+  await writeFile(join(destination, 'claude-code', 'config-path.json'), JSON.stringify({ configPath, source }) + '\n', { mode: 0o600 });
   console.log('설치 완료: Claude Code를 재시작하거나 /reload-plugins를 실행하세요. 조직 정책이나 프로젝트의 명시적 비활성화 설정은 우회하지 않습니다.');
 }
 

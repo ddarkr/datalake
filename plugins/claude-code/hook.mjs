@@ -10,7 +10,7 @@ const identifier = value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,256}$
 const number = value => Number.isSafeInteger(value) && value >= 0 ? value : undefined;
 const builtins = new Set(['Bash', 'PowerShell', 'Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'Glob', 'Grep', 'Agent', 'Task', 'WebFetch', 'WebSearch', 'AskUserQuestion', 'ExitPlanMode', 'EnterPlanMode', 'TodoWrite', 'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TaskOutput', 'TaskStop', 'Skill', 'ToolSearch']);
 const agentTypes = new Set(['Explore', 'Plan', 'general-purpose', 'Bash', 'statusline-setup', 'claude-code-guide']);
-const events = new Set(['SessionStart', 'SessionEnd', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'StopFailure']);
+const events = new Set(['SessionStart', 'SessionEnd', 'PreToolUse', 'PostToolUse', 'PostToolUseFailure', 'SubagentStart', 'SubagentStop', 'Stop', 'StopFailure', 'UserPromptSubmit', 'MessageDisplay']);
 const finished = new Set(['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'refusal', 'pause_turn', 'model_context_window_exceeded']);
 
 // Hooks expose content-bearing objects: build fresh metadata, never spread hook input.
@@ -33,6 +33,7 @@ export function usageEvent(record, { sessionId, sinceMs, agentId }) {
     if (value !== undefined) attributes[target] = value;
   }
   if (!Object.keys(attributes).some(key => key.startsWith('gen_ai.usage.'))) return;
+  attributes['coding_agent.usage.source'] = 'reported';
   if (agentId) attributes['coding_agent.agent.id'] = agentId;
   // A transcript records a message timestamp, not request duration. Never invent latency or cost.
   return { kind: 'llm.turn', sessionId, eventId: `message:${id}`, parentEventId: agentId ? `subagent:${agentId}` : undefined, startTimeMs: time, endTimeMs: time, attributes };
@@ -97,16 +98,42 @@ async function transcriptEvents(path, options, stateDir) {
   } finally { await file.close(); }
 }
 
-export async function handleHook(input, { telemetry, stateRoot, now = Date.now(), context = repositoryContext } = {}) {
+export async function handleHook(input, { telemetry, stateRoot, now = Date.now(), context = repositoryContext, source = 'plugin' } = {}) {
   const sessionId = identifier(input?.session_id);
   const hook = input?.hook_event_name;
   if (!sessionId || !events.has(hook)) return;
   const stateDir = join(stateRoot, hash(sessionId));
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  return withStateLock(stateDir, () => handleSerialized(input, { telemetry, stateDir, now, context }, sessionId, hook));
+  if (hook === 'MessageDisplay' || hook === 'UserPromptSubmit') {
+    const observationDir = join(stateDir, 'display');
+    await mkdir(observationDir, { recursive: true, mode: 0o700 });
+    // This lock protects disk checkpoints only, never HTTP or the session send lock.
+    return withStateLock(observationDir, async () => {
+      const path = join(observationDir, 'pending.json');
+      const pending = await json(path);
+      const promptId = identifier(input.prompt_id);
+      if (hook === 'UserPromptSubmit') {
+        await save(path, { promptId, submittedAtMs: now, ambiguous: !!pending || !promptId });
+        return;
+      }
+      // Non-final batch zero proves streaming rather than completed SDK/-p output.
+      // Prompt hooks also fire for automation: this is NOT human input-to-response time.
+      if (!pending || pending.ambiguous || pending.observed || !promptId || promptId !== pending.promptId ||
+          !identifier(input.turn_id) || !identifier(input.message_id) || input.index !== 0 ||
+          input.final !== false || typeof input.delta !== 'string' || input.delta.length === 0 || now < pending.submittedAtMs) return;
+      await save(join(observationDir, 'ready.json'), {
+        kind: 'interaction', sessionId, eventId: `display:${promptId}`,
+        startTimeMs: pending.submittedAtMs, endTimeMs: now,
+        attributes: { 'coding_agent.interaction.first_response_ms': now - pending.submittedAtMs,
+          'coding_agent.interaction.latency.kind': 'hook_submit_to_display_ready' },
+      });
+      await save(path, { ...pending, observed: true });
+    });
+  }
+  return withStateLock(stateDir, () => handleSerialized(input, { telemetry, stateDir, now, context, source }, sessionId, hook));
 }
 
-async function handleSerialized(input, { telemetry, stateDir, now, context }, sessionId, hook) {
+async function handleSerialized(input, { telemetry, stateDir, now, context, source }, sessionId, hook) {
   const sessionPath = join(stateDir, 'session.json');
   let session = await json(sessionPath);
   if (hook === 'SessionStart') {
@@ -151,6 +178,21 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
     return ok === true;
   }
   const completed = [];
+  if (!agentId) {
+    const observationDir = join(stateDir, 'display');
+    await mkdir(observationDir, { recursive: true, mode: 0o700 });
+    await withStateLock(observationDir, async () => {
+      const readyPath = join(observationDir, 'ready.json');
+      const ready = await json(readyPath);
+      if (ready) {
+        completed.push({ ...ready, parentEventId: session?.eventId });
+        await unlink(readyPath);
+      }
+      if (['Stop', 'StopFailure', 'SessionEnd'].includes(hook)) {
+        await unlink(join(observationDir, 'pending.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
+      }
+    });
+  }
   let checkpoint;
   if (isTool || hook === 'SubagentStop') {
     if (eventId) {
@@ -171,7 +213,7 @@ async function handleSerialized(input, { telemetry, stateDir, now, context }, se
       completed.push(event);
     }
   }
-  if (session && ['Stop', 'StopFailure', 'SessionEnd', 'SubagentStop', 'PostToolUse', 'PostToolUseFailure'].includes(hook)) {
+  if (source !== 'native' && session && ['Stop', 'StopFailure', 'SessionEnd', 'SubagentStop', 'PostToolUse', 'PostToolUseFailure'].includes(hook)) {
     const agent = hook === 'SubagentStop' && agentFile ? await json(agentFile) : undefined;
     const transcript = hook === 'SubagentStop' ? input.agent_transcript_path : input.transcript_path;
     // Missing SubagentStart cannot distinguish a new run from historical resumed content.
@@ -214,9 +256,7 @@ async function main() {
     input += chunk;
   }
   try {
-    // Native usage received by the datalake takes precedence; the native exporter may target
-    // a different backend or emit only metrics, so its enable flag must not suppress this path.
-    await handleHook(JSON.parse(input), { telemetry, stateRoot });
+    await handleHook(JSON.parse(input), { telemetry, stateRoot, source: pointer?.source === 'native' ? 'native' : 'plugin' });
   } finally { await telemetry.flush().catch(() => {}); }
 }
 

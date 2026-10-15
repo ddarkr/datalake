@@ -394,4 +394,84 @@ test('Copied Claude hooks send direct HTTP without a bundled queue and exit boun
   const spans = requests.flatMap(entry => entry.resourceSpans.flatMap(resource => resource.scopeSpans.flatMap(scope => scope.spans)));
   assert.equal(spans.reduce((sum, span) => sum + Number(span.attributes.find(attribute => attribute.key === 'gen_ai.usage.output_tokens').value.intValue), 0), 7);
   assert.equal(JSON.stringify(requests.map(entry => entry)).includes(secret), false);
+  await install(['--home', home, '--config', config, '--source', 'native', '--apply']);
+  await appendFile(transcript, JSON.stringify(record('native_owned', Date.now())) + '\n');
+  await invoke('Stop'); // Child has no OTEL environment; the private pointer owns selection.
+  assert.equal(requests.length, 1);
+});
+
+test('Claude native ownership suppresses transcript usage but retains tools and deferred display observations', async t => {
+  const stateRoot = await sandbox(t), transcript = join(stateRoot, 'current.jsonl');
+  await writeFile(transcript, '');
+  const { output, telemetry } = direct();
+  const run = (hook_event_name, now, extra = {}) => handleHook({
+    session_id: 'session_1', hook_event_name, transcript_path: transcript, ...extra,
+  }, { telemetry, stateRoot, now, source: 'native', context: async () => ({}) });
+  await run('SessionStart', 1000);
+  await appendFile(transcript, JSON.stringify(record()) + '\n');
+  await run('UserPromptSubmit', 1100, { prompt_id: 'prompt_1', prompt: secret });
+  await run('MessageDisplay', 1300, { prompt_id: 'prompt_1', turn_id: 'turn_1', message_id: 'message_1', index: 0, final: false, delta: secret });
+  assert.equal(output.length, 0);
+  await run('PreToolUse', 1400, { tool_use_id: 'tool_1', tool_name: 'Read' });
+  await run('PostToolUse', 1500, { tool_use_id: 'tool_1', tool_name: 'Read' });
+  await run('Stop', 1600);
+  assert.deepEqual(output.map(event => event.kind).sort(), ['interaction', 'tool.call']);
+  const interaction = output.find(event => event.kind === 'interaction');
+  assert.equal(interaction.attributes['coding_agent.interaction.first_response_ms'], 200);
+  assert.equal(interaction.attributes['coding_agent.interaction.latency.kind'], 'hook_submit_to_display_ready');
+  assert.equal(Object.keys(interaction.attributes).some(key => key.includes('usage')), false);
+  const observationDir = join(stateRoot, hash('session_1'), 'display');
+  for (const file of await readdir(observationDir)) assert.equal((await readFile(join(observationDir, file), 'utf8')).includes(secret), false);
+});
+
+test('Claude omits ambiguous display batches and missing associations without inferring human origin', async t => {
+  for (const variant of ['final', 'empty', 'missing-prompt', 'mismatch', 'overlap', 'late-index']) {
+    const stateRoot = await sandbox(t), { output, telemetry } = direct();
+    const run = (hook_event_name, now, extra = {}) => handleHook({ session_id: 'session_1', hook_event_name, ...extra },
+      { telemetry, stateRoot, now, context: async () => ({}) });
+    await run('SessionStart', 1000);
+    await run('UserPromptSubmit', 1100, variant === 'missing-prompt' ? {} : { prompt_id: 'prompt_1' });
+    if (variant === 'overlap') await run('UserPromptSubmit', 1150, { prompt_id: 'prompt_2' });
+    await run('MessageDisplay', 1200, { prompt_id: variant === 'mismatch' ? 'other' : 'prompt_1',
+      turn_id: 'turn_1', message_id: 'message_1', index: variant === 'late-index' ? 1 : 0,
+      final: variant === 'final', delta: variant === 'empty' ? '' : secret });
+    await run('Stop', 1300);
+    assert.equal(output.length, 0, variant);
+  }
+});
+
+test('Claude display checkpoint never waits for an in-flight telemetry ACK', async t => {
+  const stateRoot = await sandbox(t);
+  let release, started;
+  const sending = new Promise(resolve => { started = resolve; });
+  const ack = new Promise(resolve => { release = resolve; });
+  const telemetry = { send: async () => { started(); await ack; return true; } };
+  const run = (hook_event_name, now, extra = {}) => handleHook({ session_id: 'session_1', hook_event_name, ...extra },
+    { telemetry, stateRoot, now, context: async () => ({}) });
+  await run('SessionStart', 1000);
+  await run('PreToolUse', 1050, { tool_use_id: 'tool_1' });
+  const completion = run('PostToolUse', 1100, { tool_use_id: 'tool_1' });
+  await sending;
+  try {
+    await run('UserPromptSubmit', 1200, { prompt_id: 'prompt_1' });
+    await run('MessageDisplay', 1300, { prompt_id: 'prompt_1', turn_id: 'turn_1', message_id: 'message_1', index: 0, final: false, delta: secret });
+    assert.equal(JSON.parse(await readFile(join(stateRoot, hash('session_1'), 'display', 'ready.json'), 'utf8')).endTimeMs, 1300);
+  } finally { release(); await completion; }
+});
+
+test('Claude installer persists explicit ownership across upgrades without changing settings', async t => {
+  const home = await sandbox(t), settings = join(home, '.claude', 'settings.json');
+  await mkdir(join(home, '.claude'));
+  const original = JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: 'command', command: 'personal-hook' }] }] } });
+  await writeFile(settings, original);
+  const args = ['--home', home, '--apply'];
+  const pointer = join(home, '.claude', 'skills', 'doda-datalake-otel', 'claude-code', 'config-path.json');
+  await install([...args, '--source', 'native']);
+  await install(args);
+  assert.equal(JSON.parse(await readFile(pointer, 'utf8')).source, 'native');
+  assert.equal((await stat(pointer)).mode & 0o777, 0o600);
+  await install([...args, '--source', 'plugin']);
+  assert.equal(JSON.parse(await readFile(pointer, 'utf8')).source, 'plugin');
+  assert.equal(await readFile(settings, 'utf8'), original);
+  await assert.rejects(install([...args, '--source', 'invalid']));
 });
