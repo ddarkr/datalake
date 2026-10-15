@@ -6,6 +6,7 @@ import re
 import stat
 import os
 from decimal import Decimal
+from collections import OrderedDict
 from pathlib import Path
 import time
 import logging
@@ -21,10 +22,36 @@ class Runtime:
         # Stable in-memory dedup only: suppress repeated hook deliveries of the
         # same identity within this process. Never persisted, never replayed.
         self.seen = set()
+        self.pending = OrderedDict()
+
+    def _request_key(self, data):
+        if type(data) is dict and all(_identity(data.get(k)) for k in ('session_id', 'api_request_id')):
+            return _hash([self.scope, data['session_id'], data['api_request_id']], 64)
+        return None
+
+    def prepare(self, data):
+        key = self._request_key(data)
+        if key is None:
+            return
+        self.pending.pop(key, None)
+        projected = request_settings(data.get('request'))
+        if projected:
+            # Bounded scalar-only snapshots; abandoned requests evict oldest first.
+            self.pending[key] = projected
+            if len(self.pending) > 256:
+                self.pending.popitem(last=False)
+
+    def discard(self, data):
+        return self.pending.pop(self._request_key(data), {})
 
     def observe(self, data, auxiliary=False):
         try:
+            requested = {} if auxiliary else self.discard(data)
             body = project(data, self.scope, auxiliary)
+            if body is not None and requested:
+                body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]['attributes'].extend(
+                    {'key': k, 'value': {'intValue': str(v)} if type(v) is int else {'stringValue': v}}
+                    for k, v in requested.items())
             if body is None:
                 return
             span = body['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
@@ -56,6 +83,12 @@ def register(ctx):
         runtime.observe(kwargs)
     def auxiliary(**kwargs):
         runtime.observe(kwargs, auxiliary=True)
+    def before(**kwargs):
+        runtime.prepare(kwargs)
+    def failed(**kwargs):
+        runtime.discard(kwargs)
+    ctx.register_hook('pre_api_request', before)
+    ctx.register_hook('api_request_error', failed)
     ctx.register_hook('post_api_request', main)
     # f42f579 emits the main MoA aggregator through BOTH hooks with distinct
     # request IDs; aux_task cannot distinguish it from standalone synthesis.
@@ -191,6 +224,33 @@ def _nanoseconds(seconds):
     milliseconds = seconds * 1000
     return str(math.trunc(milliseconds) * 1000000 + math.floor((milliseconds % 1) * 1000000 + 0.5))
 
+def request_settings(request):
+    """Pinned Hermes wraps the final request as {method, body}; retain scalars only."""
+    if type(request) is not dict or type(request.get('body')) is not dict:
+        return {}
+    body = request['body']
+    result = {}
+    tier = body.get('service_tier')
+    if type(tier) is str and tier in ('auto', 'default', 'flex', 'scale', 'priority', 'ultrafast', 'fast', 'normal'):
+        result['coding_agent.request.service_tier'] = tier
+    reasoning = body.get('reasoning')
+    output = body.get('output_config')
+    thinking = body.get('thinking')
+    effort = body.get('reasoning_effort')
+    if effort is None and type(reasoning) is dict:
+        effort = reasoning.get('effort')
+    if effort is None and type(output) is dict:
+        effort = output.get('effort')
+    if type(effort) is str and effort in ('none', 'off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'):
+        result['coding_agent.request.reasoning.effort'] = effort
+    budget = thinking.get('budget_tokens') if type(thinking) is dict else None
+    if type(budget) is int and 0 <= budget <= 9007199254740991:
+        result['coding_agent.request.reasoning.budget_tokens'] = budget
+    if result:
+        result['coding_agent.request.settings_source'] = 'wire'
+    return result
+
+
 
 def project(data, scope, auxiliary=False):
     """Project canonical Hermes buckets (input excludes cache) into OTLP.
@@ -198,6 +258,8 @@ def project(data, scope, auxiliary=False):
     Unknown fields stay absent. Never inspect response/content objects.
     """
     if type(data) is not dict or not _identity(scope):
+        return None
+    if data.get('error') is not None:
         return None
     if auxiliary and (data.get('streaming') is True or data.get('error') is not None):
         return None
@@ -209,19 +271,14 @@ def project(data, scope, auxiliary=False):
     if not all(type(t) in (int, float) and 0 <= t <= 9007199254 and math.isfinite(t) for t in (start, end)) or end < start:
         return None
     usage = data.get('usage')
-    if type(usage) is not dict:
-        return None
     keys = ('input_tokens', 'output_tokens', 'cache_read_tokens', 'cache_write_tokens', 'reasoning_tokens', 'prompt_tokens', 'total_tokens')
-    counts = {k: usage[k] for k in keys if k in usage and usage[k] is not None}
-    if not counts or any(type(v) is not int or not 0 <= v <= 9007199254740991 for v in counts.values()):
-        return None
-    if not any(k in counts for k in ('prompt_tokens', 'output_tokens')):
-        return None
+    counts = {k: usage[k] for k in keys if k in usage and usage[k] is not None} if type(usage) is dict else {}
     buckets = ('input_tokens', 'cache_read_tokens', 'cache_write_tokens')
-    if all(k in counts for k in (*buckets, 'prompt_tokens')) and sum(counts[k] for k in buckets) != counts['prompt_tokens']:
-        return None
-    if all(k in counts for k in ('prompt_tokens', 'output_tokens', 'total_tokens')) and counts['prompt_tokens'] + counts['output_tokens'] != counts['total_tokens']:
-        return None
+    if (any(type(v) is not int or not 0 <= v <= 9007199254740991 for v in counts.values())
+            or not any(k in counts for k in ('prompt_tokens', 'output_tokens'))
+            or (all(k in counts for k in (*buckets, 'prompt_tokens')) and sum(counts[k] for k in buckets) != counts['prompt_tokens'])
+            or (all(k in counts for k in ('prompt_tokens', 'output_tokens', 'total_tokens')) and counts['prompt_tokens'] + counts['output_tokens'] != counts['total_tokens'])):
+        counts = {}
     response_model = data.get('response_model')
     if response_model is not None and not _label(response_model):
         return None
@@ -243,15 +300,20 @@ def project(data, scope, auxiliary=False):
         'coding_agent.content_capture_mode': 'metadata_only',
         'coding_agent.signal_source': 'datalake-plugin',
     })
+    if counts:
+        metadata['coding_agent.usage.source'] = 'reported'
     if response_model is not None:
         metadata['gen_ai.response.model'] = response_model
     metadata['request_id'] = _hash([scope, data['session_id'], event], 64)
     duration = (Decimal(str(end)) - Decimal(str(start))) * 1000
     metadata['duration_ms'] = int(duration) if duration == int(duration) else float(duration)
+    metadata['coding_agent.request.duration_ms'] = metadata['duration_ms']
+    metadata['coding_agent.duration.kind'] = 'logical_call'
     first = data.get('first_chunk_at')
-    if type(first) in (int, float) and math.isfinite(first) and start <= first <= end:
+    if type(first) in (int, float) and start <= first <= end and math.isfinite(first):
         ttft = (Decimal(str(first)) - Decimal(str(start))) * 1000
         metadata['ttft_ms'] = int(ttft) if ttft == int(ttft) else float(ttft)
+        metadata['coding_agent.ttft.kind'] = 'first_stream_event'
     attrs = [{'key': k, 'value': {'intValue': str(v)} if type(v) is int else {'doubleValue': v} if type(v) is float else {'stringValue': v}} for k, v in metadata.items()]
     span = dict(traceId=_hash(['hermes', session], 32), spanId=_hash(['hermes', session, event], 16),
                 name='coding_agent.llm.turn', kind=1,

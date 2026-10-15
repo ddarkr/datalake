@@ -4,7 +4,7 @@
 
 ## Contract and privacy
 
-Register `post_api_request` through `register(ctx)` by default; `post_auxiliary_call` requires explicit `capture_auxiliary: true`. Both callbacks accept `**kwargs`. The installed compatibility baseline is Hermes `f42f579cf8bac4918ac9599bece71618afadd846`.
+Register `pre_api_request`, `api_request_error`, and `post_api_request` through `register(ctx)` by default; `post_auxiliary_call` requires explicit `capture_auxiliary: true`. Callbacks accept `**kwargs`. The researched compatibility baseline is [Hermes f42f579cf8bac4918ac9599bece71618afadd846](https://github.com/NousResearch/hermes-agent/tree/f42f579cf8bac4918ac9599bece71618afadd846), not proof of installation in a live profile.
 
 Sources checked:
 
@@ -17,9 +17,9 @@ The hook's "sanitized" response can still contain assistant text. This exporter 
 - canonical usage: `prompt_tokens`, `output_tokens`, cache read/write, reasoning; `input_tokens` and `total_tokens` are used only for consistency validation;
 - request and session identity, auxiliary retry count;
 - provider, requested model, optional response model;
-- start/end times and optional first-chunk time.
+- start/end times and optional first-chunk time; allowlisted requested service tier, reasoning effort, and explicit integer thinking budget from `pre_api_request`.
 
-No messages, prompts, response objects, tools, request bodies, headers, raw base URLs, platform/sender metadata, cost snapshots, MoA references, state.db contents, filesystem paths, or exception text are exported or spooled. Model/provider labels have a restrictive 128-character ASCII identifier grammar; invalid labels, malformed identities, negative/fractional/bool counts, inconsistent totals, and invalid intervals are discarded. Arbitrary text placed by another plugin into an otherwise valid model identifier cannot be distinguished from a real identifier: this is metadata allowlisting, not a content-classification engine.
+No messages, prompts, response objects, tools, complete request bodies, headers, raw base URLs, platform/sender metadata, cost snapshots, MoA references, state.db contents, filesystem paths, or exception text are exported or spooled. Only safe request-setting scalars are retained by request ID until completion/error; pending state is bounded. Model/provider labels have a restrictive 128-character ASCII identifier grammar; invalid labels, malformed identities and invalid intervals are discarded. Malformed usage is omitted without discarding valid latency. Arbitrary text placed by another plugin into an otherwise valid model identifier cannot be distinguished from a real identifier: this is metadata allowlisting, not a content-classification engine.
 
 Session IDs are SHA-256 of `[profile_scope, session_id]`, where profile scope hashes the captured resolved Hermes home. Request IDs are hashed too. `traceId` and `spanId` use the same compact JSON/SHA-256 truncation contract as `serializeEvent()` in `plugins/otel.mjs`, with client `hermes`. The event identity is compact JSON `[hook_name, opaque_api_request_id, retry_count_or_zero]`. Do not parse Hermes IDs. Do not add a random process ID: it would defeat multiprocess replay deduplication. Moving a profile directory changes scope.
 
@@ -39,6 +39,16 @@ On the pinned Hermes revision, `agent/moa_loop.py:1166–1173,1195–1203` retur
 Hermes canonical `input_tokens` excludes cache. OTLP `gen_ai.usage.input_tokens` is **`prompt_tokens` (uncached + cache read + cache write)**, matching the repository's canonical OTel convention. Output already includes reasoning; reasoning is a detail, never added again. Optional absent/null counts stay absent; explicit zero stays zero. Cost attributes are absent (downstream must retain SQL null), never inferred as zero and never priced by this plugin.
 
 Upstream `CanonicalUsage` initializes missing buckets to zero before observer dispatch. The exporter cannot recover unknown-versus-zero information already erased by Hermes. It preserves distinctions that still exist in the hook dictionary, and never estimates tokens from character lengths.
+
+### Performance observations
+
+`coding_agent.request.duration_ms` is `(ended_at - started_at) * 1000`, kind `logical_call`: it includes retries, not just generation. `ttft_ms` is `(first_chunk_at - started_at) * 1000`, kind `first_stream_event`: the first SDK/SSE event may be metadata or reasoning, **not first text or UI paint**. Missing/`None` usage still permits latency-only spans; invalid explicit usage never becomes zero tokens. Valid usage is tagged `coding_agent.usage.source=reported`.
+
+`pre_api_request` settings have `request.settings_source=wire`; requested tier is not an echoed response tier. No actual tier, first-text or input-to-response latency is fabricated. Some provider and auxiliary paths do not expose these observations; auxiliary events do not inherit a guessed main-request setting. Effort, explicit budget and model variant are distinct; none is derived from another.
+
+Request-total output throughput means reported output tokens divided by positive logical-call seconds on the **same record**, not generation TPS. Compare only matching workloads, cache conditions, settings and timing provenance; absent values remain unknown rather than zero. See the [six-harness field matrix](../README.md#성능-필드와-해석).
+
+Updating repository files does not update a copied plugin: recopy into the approved profile and restart Hermes to load changes. Collector projection, nullable schema and Grafana changes require separately authorized server deployment; neither profile installation nor server deployment is performed by this documentation update.
 
 ## Transport and lifecycle
 
@@ -104,13 +114,13 @@ Native tests use a temporary candidate package and isolated scratch Hermes home,
 
 Tests cover malicious/poisoned hook fields, no raw identities/content, unknown versus zero, consistency validation, JavaScript canonical IDs, direct success/failure/partial/malformed/oversized/trickling sends with no retry, in-memory duplicate suppression with no created database files, endpoint/credential validation and native profile binding. The shared ID/timestamp oracle calls only `serializeEvent('hermes', event).body` in Node; it does not create a Node exporter, enqueue records or mock a network fetch. Provider fixtures separately cover OpenAI Chat, Codex Responses and Anthropic canonical normalizers; these are **adapter-shape tests, not live vendor accounting validation**.
 
-For existing repository CI, add `python -B -m unittest discover -s plugins/hermes/tests -v` alongside the coding-agent plugin privacy tests after Python and Node setup. Native compatibility requires an explicitly supplied, pinned Hermes checkout and its environment; the default CI should not download or activate Hermes implicitly. A missing `HERMES_SOURCE` skips the three native tests; passing core/HTTP and serializer-oracle checks does not satisfy that gate. In the current shared Node verification, those Hermes native gates were skipped because the verified external checkout was unavailable; Hermes runtime was unchanged. Node syntax checks also do not substitute for an LSP check (none was configured) or native Hermes compatibility.
+For existing repository CI, add `python -B -m unittest discover -s plugins/hermes/tests -v` alongside the coding-agent plugin privacy tests after Python and Node setup. Native compatibility requires an explicitly supplied, pinned Hermes checkout and its environment; the default CI should not download or activate Hermes implicitly. A missing `HERMES_SOURCE` skips the three native tests; passing core/HTTP and serializer-oracle checks does not satisfy that gate. The current local performance work passed 21 core tests and all three native loader/normalizer/MoA tests against pinned `f42f579c` in an isolated Python 3.14 environment. This is not live-provider or production validation. Node syntax checks do not substitute for an LSP check (none was configured).
 
 ## Coverage limits
 
 - Auxiliary capture is disabled by default to avoid nonstreaming main-MoA overlap. Opting in can double count that completion; standalone auxiliary calls remain captured when opted in.
 - Streamed auxiliary hooks fire before the stream is consumed and carry no final usage. They are omitted, even if a future payload happens to contain counts while `streaming=True`.
-- Auxiliary failures, absent usage, invalid identity/model/provider/timing, and turnless auxiliary calls with empty session/request IDs are omitted rather than fabricated or attributed to a synthetic session.
-- Optional providers/runtimes that bypass these hooks, provider adapters that discard usage details, and internal calls without canonical usage remain outside coverage.
+- Auxiliary failures, invalid identity/model/provider/timing, and turnless auxiliary calls with empty session/request IDs are omitted rather than fabricated or attributed to a synthetic session. Missing usage on an otherwise valid observation does not discard its latency.
+- Optional providers/runtimes that bypass these hooks and provider adapters that discard details remain outside coverage; usage fields cannot be recovered from latency-only observations.
 - No retrospective reconciliation, invoices, pricing, session hierarchy, or tool/edit/git spans. A separately authorized production deployment verified one real Codex session end to end and immutable replay accounting; see [DEPLOYMENT.md](DEPLOYMENT.md). This does not establish all-provider coverage or rendered dashboard filtering.
 - Verified against the installed revision above; schema/hook changes require rerunning native tests. Unix/macOS/Linux permissions are assumed; Windows is not supported by this version.

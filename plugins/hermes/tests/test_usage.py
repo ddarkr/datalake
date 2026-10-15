@@ -43,14 +43,13 @@ class ProjectionTests(unittest.TestCase):
         for changes in [dict(model='https://secret'), dict(provider='api key'),
                         dict(session_id='bad\nidentity'), dict(started_at=float('nan')),
                         dict(started_at=10 ** 1000), dict(ended_at=10 ** 1000),
-                        dict(ended_at=1), dict(usage={'input_tokens': True}),
-                        dict(usage={'prompt_tokens': -1}), dict(usage={'output_tokens': 1.5})]:
+                        dict(ended_at=1)]:
             with self.subTest(changes=changes):
                 self.assertIsNone(plugin.project(payload(**changes), 'scope-1'))
         a = attributes(plugin.project(payload(usage={'prompt_tokens': 0, 'output_tokens': 0}), 'scope-1'))
         self.assertEqual(a['gen_ai.usage.input_tokens'], '0')
         self.assertNotIn('gen_ai.usage.reasoning.output_tokens', a)
-        self.assertIsNone(plugin.project(payload(usage=None), 'scope-1'))
+        self.assertNotIn('coding_agent.usage.source', attributes(plugin.project(payload(usage=None), 'scope-1')))
         self.assertIsNone(plugin.project(payload(streaming=True), 'scope-1', auxiliary=True))
         self.assertIsNone(plugin.project(payload(error='PRIVATE'), 'scope-1', auxiliary=True))
         self.assertIsNotNone(plugin.project(payload(), 'scope-1', auxiliary=True))
@@ -89,7 +88,9 @@ class ProjectionTests(unittest.TestCase):
                       dict(payload()['usage'], total_tokens=100),
                       {'input_tokens': 1}, {'total_tokens': 42}]:
             with self.subTest(usage=usage):
-                self.assertIsNone(plugin.project(payload(usage=usage), 'scope-1'))
+                a = attributes(plugin.project(payload(usage=usage), 'scope-1'))
+                self.assertNotIn('coding_agent.usage.source', a)
+                self.assertFalse(any(k.startswith('gen_ai.usage.') for k in a))
 
     def test_no_raw_identity_and_optional_response_model_timing(self):
         body = plugin.project(payload(response_model='gpt-response', first_chunk_at=1700000000.625), 'scope-1')
@@ -97,10 +98,72 @@ class ProjectionTests(unittest.TestCase):
         self.assertEqual(a.get('gen_ai.response.model'), 'gpt-response')
         self.assertEqual(a.get('ttft_ms'), '500')
         self.assertEqual(a.get('duration_ms'), '1125')
+        self.assertEqual(a['coding_agent.ttft.kind'], 'first_stream_event')
+        self.assertEqual(a['coding_agent.request.duration_ms'], '1125')
+        self.assertEqual(a['coding_agent.duration.kind'], 'logical_call')
+        self.assertEqual(a['coding_agent.usage.source'], 'reported')
         self.assertEqual(len(a.get('request_id', '')), 64)
         self.assertNotIn('request-1', json.dumps(body))
         self.assertNotIn('session-1', json.dumps(body))
         self.assertIsNone(plugin.project(payload(response_model='https://PRIVATE'), 'scope-1'))
+
+    def test_latency_survives_absent_or_invalid_usage_without_fabricated_tokens(self):
+        missing = payload()
+        del missing['usage']
+        for data in [missing, payload(usage=None), *[
+                payload(usage=usage) for usage in (
+                    {}, [], {'output_tokens': True}, {'output_tokens': -1},
+                    {'output_tokens': float('nan')}, {'output_tokens': float('inf')},
+                    {'output_tokens': 1.5}, {'prompt_tokens': 1, 'output_tokens': 2, 'total_tokens': 9})]]:
+            a = attributes(plugin.project(dict(data, first_chunk_at=1700000000.625), 'scope-1'))
+            self.assertEqual(a['ttft_ms'], '500')
+            self.assertEqual(a['coding_agent.duration.kind'], 'logical_call')
+            self.assertNotIn('coding_agent.usage.source', a)
+            self.assertFalse(any(k.startswith('gen_ai.usage.') for k in a))
+        for first in (None, True, float('nan'), float('inf'), -1, 10 ** 1000, 1700000002):
+            a = attributes(plugin.project(payload(first_chunk_at=first), 'scope-1'))
+            self.assertNotIn('ttft_ms', a)
+            self.assertNotIn('coding_agent.ttft.kind', a)
+        self.assertIsNone(plugin.project(payload(error={'message': 'PRIVATE'}), 'scope-1'))
+        self.assertNotIn('ttft_ms', attributes(plugin.project(payload(streaming=False), 'scope-1')))
+        zero = attributes(plugin.project(payload(started_at=1, ended_at=1, first_chunk_at=1), 'scope-1'))
+        self.assertEqual(zero['ttft_ms'], '0')
+        self.assertEqual(zero['coding_agent.request.duration_ms'], '0')
+
+    def test_scalar_settings_are_isolated_bounded_and_cleared(self):
+        from unittest.mock import Mock
+        runtime = plugin.Runtime(Path('/tmp/hermes-test'), dict(endpoint='http://127.0.0.1:1', headers={}, timeout=1))
+        runtime.exporter.send = Mock(return_value=True)
+        request = {'body': {'service_tier': 'priority', 'reasoning': {'effort': 'high'},
+                            'thinking': {'budget_tokens': 0}, 'messages': ['PRIVATE'],
+                            'headers': {'Authorization': 'PRIVATE'}}}
+        runtime.prepare(payload(request=request))
+        self.assertNotIn('PRIVATE', repr(runtime.pending))
+        runtime.observe(payload(session_id='other'))
+        self.assertNotIn('coding_agent.request.service_tier', attributes(runtime.exporter.send.call_args.args[0]))
+        runtime.observe(payload(), auxiliary=True)
+        self.assertNotIn('coding_agent.request.service_tier', attributes(runtime.exporter.send.call_args.args[0]))
+        self.assertTrue(runtime.pending)
+        runtime.observe(payload())
+        a = attributes(runtime.exporter.send.call_args.args[0])
+        self.assertEqual(a['coding_agent.request.service_tier'], 'priority')
+        self.assertEqual(a['coding_agent.request.reasoning.effort'], 'high')
+        self.assertEqual(a['coding_agent.request.reasoning.budget_tokens'], '0')
+        self.assertEqual(a['coding_agent.request.settings_source'], 'wire')
+        self.assertNotIn('coding_agent.response.service_tier', a)
+        self.assertNotIn('coding_agent.interaction.first_response_ms', a)
+        self.assertFalse(runtime.pending)
+        runtime.prepare(payload(request=request))
+        runtime.discard(payload(error={'message': 'PRIVATE'}))
+        self.assertFalse(runtime.pending)
+        runtime.prepare(payload(request=request))
+        runtime.prepare(payload(request={'body': {'service_tier': 'PRIVATE', 'reasoning_effort': True}}))
+        self.assertFalse(runtime.pending)
+        for i in range(300):
+            runtime.prepare(payload(api_request_id=str(i), request=request))
+        self.assertEqual(len(runtime.pending), 256)
+        self.assertEqual(plugin.request_settings({'body': {'output_config': {'effort': 'max'}, 'thinking': {'budget_tokens': True}}}),
+                         {'coding_agent.request.reasoning.effort': 'max', 'coding_agent.request.settings_source': 'wire'})
 
 
 class DirectTransportTests(unittest.TestCase):

@@ -1,9 +1,11 @@
 manifest_version: 2
 name: datalake-usage
 version: "1.0.0"
-description: "Metadata-only request usage to OTLP over direct bounded HTTP. Opt-in."
+description: "Metadata-only request usage, logical-call latency and allowlisted wire settings over direct bounded OTLP HTTP. Opt-in; unavailable provider timing stays absent."
 kind: standalone
 provides_hooks:
+  - pre_api_request
+  - api_request_error
   - post_api_request
   - post_auxiliary_call
 config_schema:

@@ -61,8 +61,21 @@ class NativeLoadingTests(unittest.TestCase):
                             usage=dict(input_tokens=10, output_tokens=5, prompt_tokens=10),
                             response={'assistant_message': 'PRIVATE'}, request_messages=['PRIVATE'])
                 # Direct sends complete inside the hook; no worker drain to wait for.
-                manager.invoke_hook('post_api_request', **data)
+                manager.invoke_hook('pre_api_request', **dict(data, request={'method': 'POST', 'body': {
+                    'service_tier': 'priority', 'reasoning_effort': 'high', 'messages': ['PRIVATE']}}))
+                manager.invoke_hook('post_api_request', **dict(data, usage=None, first_chunk_at=1700000000.625))
                 self.assertEqual(len(received), 1)
+                def attrs(raw):
+                    span = json.loads(raw)['resourceSpans'][0]['scopeSpans'][0]['spans'][0]
+                    return {a['key']: next(iter(a['value'].values())) for a in span['attributes']}
+                observed = attrs(received[0])
+                self.assertEqual(observed['coding_agent.request.service_tier'], 'priority')
+                self.assertEqual(observed['coding_agent.request.reasoning.effort'], 'high')
+                self.assertEqual(observed['coding_agent.request.settings_source'], 'wire')
+                self.assertEqual(observed['ttft_ms'], '500')
+                self.assertEqual(observed['coding_agent.ttft.kind'], 'first_stream_event')
+                self.assertEqual(observed['coding_agent.duration.kind'], 'logical_call')
+                self.assertNotIn('coding_agent.usage.source', observed)
                 with self.assertLogs('datalake.hermes', level='WARNING') as logs:
                     manager.invoke_hook('post_api_request', **data)
                     manager.invoke_hook('post_api_request', **dict(data, auxiliary=True))
@@ -73,6 +86,15 @@ class NativeLoadingTests(unittest.TestCase):
                 # Explicit opt-in retains standalone MoA synthesis, not a task blacklist.
                 manager.invoke_hook('post_auxiliary_call', **dict(data, api_request_id='aux-1', aux_task='moa_aggregator', streaming=False))
                 self.assertEqual(len(received), 2)
+                self.assertNotIn('coding_agent.request.service_tier', attrs(received[1]))
+                failed = dict(data, api_request_id='failed-request')
+                manager.invoke_hook('pre_api_request', **dict(failed, request={'body': {'service_tier': 'flex'}}))
+                manager.invoke_hook('api_request_error', **dict(failed, error={'message': 'PRIVATE'}))
+                self.assertEqual(len(received), 2)
+                manager.invoke_hook('post_api_request', **failed)
+                self.assertEqual(len(received), 3)
+                self.assertNotIn('coding_agent.request.service_tier', attrs(received[2]))
+                self.assertNotIn('ttft_ms', attrs(received[2]))
                 self.assertNotIn(b'PRIVATE', b''.join(received))
                 self.assertEqual(list(home.rglob('*.sqlite3')), [])
                 start = time.monotonic()
@@ -89,7 +111,7 @@ class NativeLoadingTests(unittest.TestCase):
     def test_default_moa_overlap_bills_only_main_completion(self):
         """Real aux emitter + native hooks + direct loopback bodies + downstream billable()."""
         sys.path.insert(0, SOURCE)
-        sys.path.insert(0, str(ROOT.parents[1] / 'scripts'))
+        sys.path.insert(0, str(ROOT.parents[1]))
         from hermes_constants import set_hermes_home_override, reset_hermes_home_override
         from hermes_cli.plugins import PluginManager
         from hermes_cli.plugins_discovery import scan_directory
@@ -97,7 +119,7 @@ class NativeLoadingTests(unittest.TestCase):
         from agent.api_request_hooks import ApiRequestHooksMixin
         from types import SimpleNamespace
         from unittest.mock import patch
-        import aggregate
+        from scripts.analytics import aggregate
         import shutil
         received = []
         class Handler(BaseHTTPRequestHandler):
