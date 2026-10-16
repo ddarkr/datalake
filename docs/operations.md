@@ -48,12 +48,15 @@ S3 디스크 쓰기 캐시 상한의 기본값은 10GiB이며, 실제 점유량�
 - `server`는 `aggregate`를 포함하며 기본 300초 간격으로 AI/log/home/차량 요약과 조건을 충족하는 비-CAN 배터리 분석을 실행합니다. CAN은 기존 dirty/checkpoint 메타데이터에 따라 분·시간 rollup과 주행·충전 요약을 갱신하며 자동 배터리 분석에서는 제외합니다. 긴 기간 차트가 자동으로 raw로 대체된다고 가정하지 마세요.
 - `min_compaction_interval=0m`, `schedule_compaction_after_edit=true`로 정상 자동 컴팩션과 flush/compaction 결과 반영 뒤 후속 후보 검사를 허용합니다. 모든 edit가 즉시 병합된다는 뜻은 아니며 실제 병합은 엔진의 후보·자원 조건을 따릅니다. 정기 전체 수동 compaction을 별도로 추가하지 마세요.
 - 시작 시 인덱스 선다운로드(`preload_index_cache=false`)와 조회 후 전체 파일 cache refill(`enable_refill_cache_on_read=false`)을 끕니다. 필요한 조회·컴팩션은 S3를 읽을 수 있지만 조회를 계기로 전체 파일을 추가 다운로드하는 refill은 하지 않습니다. 반복 조회의 범위 GET은 남을 수 있습니다.
+- 스키마 초기화는 각 테이블의 `DESCRIBE`로 확인하며, 재배포 때 raw 테이블의 `SELECT 1 ... LIMIT 1`을 실행하지 않습니다. manifest·백업 완료 기록 등 metadata/control 읽기는 남을 수 있습니다.
+- 전체 버킷 inventory는 `STORAGE_METRICS_INTERVAL_SEC=0`으로 기본 비활성화합니다. 로컬 디스크·수집·저장된 status 메트릭은 유지하고 버킷 총량은 unknown으로 남깁니다. 필요하면 양수 간격(예: `3600`)으로 명시적으로 켜되, 기존 `.env`에 이미 양수가 있으면 그 값이 우선합니다. 버킷 inventory가 없을 때 무료 allowance/비용 전망은 정확한 버킷 크기에 기반한 값이 아닙니다.
+- raw uploader의 별도 inventory도 `RAW_INVENTORY_INTERVAL_SEC=0`이 기본이며, 이때 inventory thread와 버킷 LIST는 실행하지 않고 버킷 크기·객체 수·관측 시각은 unknown, inventory success는 inactive(0)로 남깁니다. 양수(예: `3600`)는 업로드와 독립된 주기 inventory를 켜며 기존 `.env`의 양수 override는 유지됩니다. 음수는 작업과 thread 시작 전에 거부합니다. 업로드용 S3 client와 PUT/HEAD checksum 검증, 재시작 replay, 검증 후 로컬 GC는 그대로 유지하며, checksum을 증명할 수 없을 때 GET 본문 검증으로 우회하지 않고 로컬 원본을 보존합니다.
 
 자동 집계와 컴팩션을 장기간 미루면 **SST 파일·중복 버전·만료 파일의 공간과 조회 비용이 증가할 수 있습니다.** 정상 스케줄은 Home의 `HOME_RAW_TTL` 정리와 aggregate retention watermark 갱신도 수행합니다. 엔진 TTL은 엄격한 삭제 기한을 보장하는 수단이 아니므로 용량·파일 수·조회 지연과 별도로 실제 보존 요구를 확인하세요.
 
 고정 버전의 [자동 컴팩션 간격 검사와 수동 요청 경로](https://github.com/GreptimeTeam/greptimedb/blob/179ff8e5099d35e217a5ffeb6e4096405824dd6c/src/mito2/src/worker/handle_compaction.rs)를 기준으로 한 정책입니다. 이후 엔진 버전으로 올릴 때는 이 경계와 로컬 실증을 다시 확인하세요.
 
-**기존 환경 이전:** `.env`에 명시된 `GREPTIME_MIN_COMPACTION_INTERVAL=36500d`는 새 기본값보다 우선하므로, 별도로 승인된 배포에서 `0m`으로 바꾸세요. 새 배포 파일과 설정 재생성, GreptimeDB 재기동이 필요합니다. 저장소 checkout에서 생성 파일을 갱신할 때는 `python3 tools/render.py`를 사용합니다. 이 문서 변경 자체는 운영 배포나 중지된 서버의 재기동을 승인하거나 수행하지 않습니다. 저장소 식별자·볼륨·런타임 데이터·비공개 배터리 교정은 그대로 보존하세요.
+**기존 환경 이전:** `.env`에 명시된 `GREPTIME_MIN_COMPACTION_INTERVAL=36500d`는 새 기본값보다 우선하므로, 별도로 승인된 배포에서 `0m`으로 바꾸세요. 기존 `COMPOSE_PROFILES=server,analytics`는 `server`로 바꾸고 Home/MQTT 등 실제 사용하는 다른 프로필은 유지합니다. 새 배포 파일과 설정 재생성, GreptimeDB 재기동이 필요합니다. 저장소 checkout에서 생성 파일을 갱신할 때는 `python3 tools/render.py`를 사용합니다. 이 문서 변경 자체는 운영 배포나 중지된 서버의 재기동을 승인하거나 수행하지 않습니다. 저장소 식별자·볼륨·런타임 데이터·비공개 배터리 교정은 그대로 보존하세요.
 
 수동 one-shot은 정기 스케줄을 대신 켜는 방법이 아닙니다. **DB와 초기화가 준비되어 있고 정기 aggregate 스케줄러가 실행되지 않는, 별도로 승인된 유지보수 창에서만** 다음 명령을 사용하세요. 정상 `server`가 실행 중이면 정기 pass에 맡기고 별도 작업을 시작하지 마세요. `--no-deps`는 중지된 DB·초기화 서비스를 시작하지 않으며, `AGG_RUN_ONCE=1`은 한 pass 뒤 종료하므로 별도 상주 스케줄러를 만들지 않습니다.
 
@@ -70,7 +73,9 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 `greptime-data` 볼륨과 `/data/cache/object/write`를 재배포·재시작 사이에 보존하세요. 캐시를 지우거나 볼륨을 교체하면 집계·compaction만으로도 다시 다운로드할 수 있습니다. 재시작 시 캐시 복구는 비동기이므로 파일 보존만으로 즉시 cache hit를 보장하지 않습니다. 저장소 종류·endpoint·버킷·prefix는 변경하지 않습니다.
 
-적용 전에는 [조회 외 S3 다운로드 실증](development.md#조회-외-s3-다운로드-실증)의 검증 범위를 확인하고, 허용된 운영 재기동 후에는 실제 수집·집계·compaction 중 `opendal_operation_bytes_sum{operation="read",scheme="s3"}` 증가량을 관찰하세요. 캐시 부족·유실은 다시 다운로드하는 정상 복구 경로이므로 이 구성은 비용의 절대 상한이 아닙니다. 서버가 중지된 상태라면 설정 검토만으로 재기동이 허용되지는 않습니다.
+적용 전에는 [로컬 S3 실증](development.md#조회-외-s3-다운로드-실증)을 실행하고, 허용된 운영 재기동 후에는 실제 수집·집계·compaction 중 `opendal_operation_bytes_sum{operation="read",scheme="s3"}` 증가량을 관찰하세요. 캐시 부족·유실은 다시 다운로드하는 정상 복구 경로이므로 이 구성은 비용의 절대 상한이 아닙니다. 서버가 중지된 상태라면 설정 검토만으로 재기동이 허용되지는 않습니다.
+
+별도의 [실험적 로컬 입력 엔진](development.md#실험적-s3-primary-로컬-입력-엔진)은 S3 주 저장소를 유지하면서 활성 SST·인덱스를 비퇴출 로컬 mirror에 보존합니다. 기본 이미지·기본 집계 정책과는 별개이며 기존 운영 볼륨에 자동 적용하지 않습니다. 로컬 입력이나 출력 여유가 부족하면 S3 fallback 대신 실패하므로 보존 이력에 맞는 디스크가 필요합니다. `AGG_LOCAL_SST_ONLY=1`만 기존 stock 이미지에 설정하면 지원 endpoint가 없어 집계가 실패합니다.
 
 `File` 모드에서는 S3 설정을 사용하지 않지만 DB·Grafana·OTLP 인증은 여전히 필수입니다. `GREPTIME_PASSWORD`에는 `=`과 개행을 넣을 수 없습니다. dotenv 값에 `$`가 있으면 작은따옴표로 감싸 Compose 변수 치환을 방지하세요.
 
@@ -88,7 +93,7 @@ docker volume create datalake_can-receiver-raw
 docker compose --env-file .env config --quiet
 docker compose --env-file .env up -d
 docker compose --env-file .env ps -a
-docker compose --env-file .env logs --tail 100 db-init db-schema alloy aggregate
+docker compose --env-file .env logs --tail 100 db-init db-schema alloy
 ```
 
 `config --quiet`는 Compose 구조 검사입니다. 비밀번호·스토리지 설정의 실제 유효성이나 DB 연결 성공까지 검증하지는 않습니다. `--quiet` 없는 `config` 출력에는 비밀값이 포함될 수 있으므로 공유하지 마세요.
@@ -121,6 +126,9 @@ Arcane 등 Compose 관리 도구에서도 같은 `compose.yaml`과 환경변수�
 - 플러그인 설치 후 클라이언트를 재시작하고 실제 새 세션을 확인해야 합니다. Codex는 훅 신뢰 승인도 필요합니다.
 - JavaScript·Hermes 플러그인은 호스트 또는 훅 프로세스 안에서 직접 HTTP 전송합니다. 영속 전송 큐·별도 sender·자동 재시도는 없으며 실패·오프라인·강제 종료 시 유실될 수 있습니다. 서버 Alloy 큐는 서버에 도착하지 못한 데이터를 복구하지 못합니다.
 - 기존 설치본의 큐와 이미 실행 중인 구 sender는 자동 이관·삭제·종료하지 않습니다. Codex·Claude의 복사된 설치본은 같은 설정·홈으로 재설치하고 장기 실행 호스트는 정상 재시작·재로딩하세요. 관측 checkpoint나 훅 종료를 collector ACK·DB 저장 증거로 취급하지 마세요.
+- 성능 필드의 지원 범위·단위·upstream 핀은 [6개 harness 비교 계약](../plugins/README.md#성능-필드와-해석)을 따릅니다. NULL/누락은 unknown이고 관측된 0과 다릅니다. 요청 tier·실제 provider echo·fallback 가능한 harness tier를 합치지 말고, TTFT kind·첫 text·hook display-ready를 구분하세요. request-total output throughput은 같은 기록의 보고 output / 양의 명시 duration이며 generation TPS가 아닙니다.
+- Claude는 같은 홈·설정으로 `--source plugin|native`를 선택해 재설치하고 재로딩해야 새 display 훅이 등록됩니다. 선택은 `config-path.json`에 보존되며 native 설정은 자동 활성화하지 않습니다. AGY도 invocation 훅 등록을 위해 재설치·재시작이 필요합니다. OMP·OpenCode2는 실행 호스트/서버 재로딩, Hermes는 승인된 설치본 재복사·재시작이 필요합니다. live profile 설치는 별도 사용자 선택입니다.
+- 새 성능 필드를 운영에서 조회하려면 nullable DB 스키마·Alloy allowlist/projection·Grafana를 함께 반영하는 **별도 승인된 서버 배포**가 필요합니다. 로컬 코드 변경은 배포·연결·실제 provider 검증 증거가 아니며 이번 작업에서 서버를 배포하거나 정지된 운영 서비스를 재개하지 않았습니다. 성능 비교용 새 주기 집계나 과거 스캔은 추가하지 않습니다.
 
 ### Home Assistant / MQTT
 

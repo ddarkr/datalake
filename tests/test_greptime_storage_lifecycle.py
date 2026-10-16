@@ -24,7 +24,66 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import tools.benchmark_greptime_storage as bench
+from tools import benchmark_greptime_egress as egress
 from tools.greptime_cache_reset import CACHE_DIRS, cache_config, reset_cache
+from tools import greptime_local_cases as local_cases
+
+
+class LocalInputProofTest(unittest.TestCase):
+    def test_native_config_is_toml_and_capability_is_required(self):
+        import tomllib
+        config = tomllib.loads(local_cases.mirror_toml("[region_engine.mito]\n"))
+        mito = config["region_engine"]["mito"]
+        self.assertEqual(mito["sst_mirror_path"], "/data/sst-mirror-v1")
+        self.assertEqual(mito["sst_mirror_capacity"], "256MiB")
+        text = 'command: ["standalone", "start", "--config-file", "/etc/greptime/greptimedb.toml"]'
+        command = json.loads(local_cases.strict_compose(text).split(": ", 1)[1])
+        self.assertIn("--require-local-sst-mirror-v1", command)
+        with self.assertRaises(ValueError):
+            local_cases.strict_compose("command: []")
+
+    def test_expected_failure_preserves_manifest_not_just_rows(self):
+        rows = [{"file_id": "input", "file_size": 12}]
+        def refuse():
+            raise RuntimeError("SST_MIRROR_MISS input")
+        result = local_cases.expect_preserved_failure(refuse, lambda: rows, "SST_MIRROR_MISS", lambda: "native logs")
+        self.assertTrue(result["manifest_preserved"])
+        self.assertFalse(result["completed_proven"])
+        def damage():
+            rows.clear()
+            refuse()
+        with self.assertRaises(AssertionError):
+            local_cases.expect_preserved_failure(damage, lambda: rows, "SST_MIRROR_MISS", lambda: "")
+
+    def test_guard_refusal_cannot_complete_acceptance(self):
+        cases = {name: {"proven": True} for name in local_cases.REQUIRED_CASES}
+        self.assertTrue(local_cases.require_complete(cases)["all_required_cases_proven"])
+        cases["missing_input_repair"] = {"completed_proven": False}
+        with self.assertRaisesRegex(RuntimeError, "missing_input_repair"):
+            local_cases.require_complete(cases)
+
+    def test_gc_requires_physical_deletion(self):
+        self.assertEqual(local_cases.gc_retired_ids(
+            [("prefix/input.parquet", 12), ("prefix/input.puffin", 3)], {"input"}), ["input"])
+        self.assertEqual(local_cases.gc_retired_ids([("prefix/output.parquet", 12)], {"input"}), [])
+    def test_payload_bound_includes_old_versioned_puffin(self):
+        active = [{"file_path": "table/a.parquet", "index_file_path": "table/index/a.2.puffin"}]
+        objects = [("root/table/a.parquet", 100), ("root/table/index/a.2.puffin", 20)]
+        local = [("table/a.parquet", 100), ("table/index/a.2.puffin", 20)]
+        self.assertTrue(local_cases.payload_bound(active, objects, local, "root")["proven"])
+        objects.append(("root/table/index/a.1.puffin", 19))
+        result = local_cases.payload_bound(active, objects, local, "root")
+        self.assertFalse(result["proven"])
+        self.assertEqual(result["stale_remote"], ["table/index/a.1.puffin"])
+
+    def test_disk_full_code_refuses_shared_filesystem_before_writing(self):
+        import io
+        mount = "1 2 0:1 / /data rw - ext4 /dev/shared rw\n"
+        with patch("builtins.open", return_value=io.StringIO(mount)) as opened:
+            with self.assertRaisesRegex(RuntimeError, "refuse non-tmpfs"):
+                exec(local_cases.tmpfs_fault_code(False), {})
+        opened.assert_called_once_with("/proc/self/mountinfo")
+
 
 
 def _oracle_stats(n):
@@ -306,6 +365,30 @@ enable_write_cache = false
             self.assertTrue(all(not (root / relative).exists() for relative in CACHE_DIRS))
             self.assertEqual(reset_cache(root, self.CONFIG)["deleted_bytes"], 0)
 
+    def test_mirror_hardlink_survives_but_unowned_links_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()
+            self.seed(root)
+            cached = root / CACHE_DIRS[0] / "nested/a.parquet"
+            mirror = root / "sst-mirror-v1/objects/region/a.parquet"
+            mirror.parent.mkdir(parents=True)
+            mirror.hardlink_to(cached)
+            config = self.CONFIG + 'sst_mirror_path = "/data/sst-mirror-v1"\n'
+            with self.assertRaises(RuntimeError):
+                reset_cache(root, self.CONFIG)
+            unrelated = root / "wal/unowned-link"
+            unrelated.hardlink_to(cached)
+            with self.assertRaises(RuntimeError):
+                reset_cache(root, config)
+            self.assertEqual(cached.read_bytes(), b"cached-sst")
+            unrelated.unlink()
+            inode = mirror.stat().st_ino
+            reset_cache(root, config)
+            self.assertFalse(cached.exists())
+            self.assertEqual(mirror.stat().st_ino, inode)
+            self.assertEqual(mirror.read_bytes(), b"cached-sst")
+            self.assertEqual((root / "wal/0001.log").read_bytes(), b"durable-wal")
+
     def test_symlink_in_second_cache_rejects_before_any_deletion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp).resolve()
@@ -426,6 +509,145 @@ class MeterDiscoveryGateTest(unittest.TestCase):
         self.assertEqual(diagnosis["cumulative_client_error_breakdown"], [row])
         snapshot["truncated_requests"] = 1
         self.assertFalse(bench.meter_error_diagnostics(snapshot)["sample_complete"])
+
+class EgressAccountingTest(unittest.TestCase):
+    @staticmethod
+    def snapshot(payload=0, metadata=0, unknown=0, control=0):
+        return {
+            "counters": {"response_bytes": payload + metadata + unknown + control,
+                         "read_bytes": payload + metadata + unknown,
+                         "payload_read_bytes": payload, "metadata_read_bytes": metadata,
+                         "unknown_read_bytes": unknown},
+            "response_bytes_by_object": {"sst": payload, "metadata": metadata,
+                                         "unknown": unknown, "control": control},
+            # A rotated log cannot be used to reconstruct complete costs.
+            "requests": [], "truncated_requests": 100,
+        }
+
+    def test_continuous_interval_keeps_gaps_shutdown_and_non_get_bodies(self):
+        start = self.snapshot()
+        # Phase-only sum would omit both the inter-phase and shutdown increments.
+        phase_end = self.snapshot(payload=10, metadata=2, control=3)
+        shutdown = self.snapshot(payload=17, metadata=5, unknown=4, control=11)
+        cost = egress.meter_delta(start, shutdown)
+        self.assertEqual(cost["response_bytes"], 37)
+        self.assertEqual(cost["read_bytes"], 26)
+        self.assertEqual(sum(cost["response_bytes_by_object"].values()), 37)
+        self.assertGreater(cost["response_bytes"],
+                           egress.meter_delta(start, phase_end)["response_bytes"])
+        self.assertFalse(egress.proven_zero_payload(cost))
+
+    def test_independent_backup_meter_merged_once_manual_work_not_excluded(self):
+        zero = self.snapshot()
+        db = egress.meter_delta(zero, self.snapshot(payload=40, control=5))
+        backup = egress.meter_delta(zero, self.snapshot(metadata=3, control=7))
+        query = egress.meter_delta(zero, self.snapshot(payload=10))
+        restore = egress.meter_delta(zero, self.snapshot(payload=12))
+        total = egress.combine_costs([db, backup])
+        nonquery = egress.combine_costs([db, backup], [query, restore])
+        self.assertEqual(total["response_bytes"], 55)
+        self.assertEqual(nonquery["response_bytes"], 33)
+        self.assertEqual(nonquery["payload_read_bytes"], 18)
+        self.assertFalse(egress.proven_zero_payload(nonquery))
+        with self.assertRaises(RuntimeError):
+            egress.combine_costs([db], [db, query])
+
+    def test_unknown_invalidates_zero_without_discarding_evidence(self):
+        zero = self.snapshot()
+        unknown = egress.meter_delta(zero, self.snapshot(unknown=1, control=8))
+        self.assertFalse(egress.proven_zero_payload(unknown))
+        self.assertTrue(egress.proven_zero_payload(
+            egress.meter_delta(zero, self.snapshot(metadata=5, control=8))))
+        broken = self.snapshot(metadata=2)
+        broken["response_bytes_by_object"]["metadata"] = 1
+        with self.assertRaises(RuntimeError):
+            egress.meter_delta(zero, broken)
+        broken = self.snapshot(metadata=2)
+        broken["counters"]["unknown_read_bytes"] = 1
+        with self.assertRaises(RuntimeError):
+            egress.meter_delta(zero, broken)
+
+
+class MaintenanceFixtureTest(unittest.TestCase):
+    def test_physical_inventory_includes_retired_and_nonactive_objects(self):
+        live = dict(file_id="live", file_size=100, index_file_size=10)
+        retired = dict(file_id="retired", file_size=80)
+        objects = [("greptime/data/live.parquet", 100), ("greptime/data/retired.parquet", 80),
+                   ("greptime/data/unknown.parquet", 60), ("greptime/data/live.puffin", 10)]
+        report = egress.maintenance_physical_inventory(objects, [live], [live, retired])
+        self.assertEqual(report["stored_object_bytes"], 250)
+        self.assertEqual(report["stored_sst_bytes"], 240)
+        self.assertEqual(report["active_manifest_bytes"], 100)
+        self.assertEqual(report["stored_nonactive_sst_bytes"], 140)
+        self.assertEqual(report["known_retired_sst_still_stored"], 1)
+        self.assertFalse(report["physical_storage_bound_proven"])
+        after = egress.maintenance_physical_inventory(
+            [item for item in objects if "retired" not in item[0]], [live], [live, retired])
+        self.assertEqual(after["known_retired_sst_absent"], 1)
+        self.assertEqual(after["stored_nonactive_sst_files"], 1)
+
+    def test_bounded_single_input_is_not_total_manifest_file_count(self):
+        rows = [
+            dict(level=1, min_ts=1767225600000000000, max_ts=1767229219999000000),
+            dict(level=0, min_ts=1767229200000000000, max_ts=1767232819999000000),
+        ]
+        self.assertEqual(egress.maintenance_range_inputs(
+            rows, "2026-01-01 02:00:00", "2026-01-01 03:00:00"), 1)
+        self.assertEqual(egress.maintenance_range_inputs(rows), 2)
+        self.assertEqual(egress.maintenance_range_inputs(
+            rows, "2026-01-01 00:00:00", "2026-01-01 03:00:00"), 2)
+        self.assertIsNone(egress.maintenance_range_inputs(
+            [dict(file_id="missing-bounds")], "2026-01-01 02:00:00", None))
+        # End is exclusive; the first input ends before the lower bound.
+        self.assertEqual(egress.maintenance_range_inputs(
+            [dict(min_ts=1767236400000000000, max_ts=1767236401000000000)],
+            "2026-01-01 02:00:00", "2026-01-01 03:00:00"), 0)
+
+    def test_native_manifest_order_does_not_prevent_completion_stability(self):
+        # Native ssts_manifest returns hash-map order, including nested key arrays.
+        first = dict(region_id=4398046511104, file_id="2ce52dab-b064-428f-9bff-693829f69e8f",
+                     file_size=683567, min_ts=1767236410008000000,
+                     max_ts=1767236415011000000, primary_key_min=[1, 1, 118, 48],
+                     index_file_size=None, visible=True)
+        second = dict(first, file_id="7e0256bd-6429-498b-be96-431074775025")
+        before = egress.maintenance_manifest_state([first, second])
+        self.assertEqual(before, egress.maintenance_manifest_state([second, first]))
+        replacement = dict(first, file_id="9d1d37-output", file_size=4684867, level=1)
+        self.assertNotEqual(before, egress.maintenance_manifest_state([replacement]))
+        self.assertEqual(egress.maintenance_manifest_state([]), ())
+
+    def test_separate_cache_budgets_keep_total_and_minimums(self):
+        for total in (64 * 1024, 1024**3, 5 * 1024**3):
+            budgets = egress.maintenance_cache_budgets(total)
+            self.assertEqual(budgets["parquet_bytes"] + budgets["index_bytes"], total)
+        self.assertEqual(egress.maintenance_cache_budgets(1024**3)["index_bytes"], 512 * 1024**2)
+        self.assertEqual(egress.maintenance_cache_budgets(5 * 1024**3)["index_bytes"], 1024**3)
+
+    def test_evolving_keys_replays_late_null_and_corrections(self):
+        expected = {}
+        for cycle in range(4):
+            writes = egress.maintenance_writes(cycle, 1000)
+            for stamp, vehicle, path, value, text in writes:
+                expected[stamp, vehicle, path] = value, text
+            self.assertEqual(len(expected), (cycle + 1) * 1000)
+            self.assertEqual(writes[:8], writes[1000:1008])
+        self.assertIsNone(expected[bench.BASE_MS, "v0", "p0"][0])
+        self.assertEqual(expected[bench.BASE_MS + 1, "v1", "p1"][0], -2.0)
+        self.assertEqual(len({key[0] // bench.HOUR_MS for key in expected}), 4)
+
+    def test_exact_oracle_rejects_duplicates_and_preserves_null(self):
+        oracle = {(bench.BASE_MS, "v0", "p0"): (None, "corrected")}
+        row = dict(event_time=bench.BASE_MS, vehicle="v0", path="p0",
+                   value_num=None, value_text="corrected")
+        with self.assertRaisesRegex(RuntimeError, "raw last-row"):
+            egress.maintenance_verify(lambda _: [row, row], oracle)
+        with self.assertRaisesRegex(RuntimeError, "raw last-row"):
+            egress.maintenance_verify(lambda _: [dict(row, value_num=0)], oracle)
+        summary = dict(bucket=bench.BASE_MS, vehicle="v0", path="p0",
+                       n=1, nn=0, s=None, lo=None, hi=None)
+        self.assertTrue(egress.maintenance_verify(
+            lambda sql: [summary] if "GROUP BY" in sql else [row], oracle)["null_correction_late_pass"])
+
 
 if __name__ == "__main__":
     unittest.main()

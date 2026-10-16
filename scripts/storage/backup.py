@@ -695,7 +695,7 @@ def write_local_tar(d, name, srcs, manifest):
     path = os.path.join(d, name)
     tmp = path + ".tmp"
     try:
-        with tarfile.open(tmp, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+        with tarfile.open(tmp, "w:gz", format=tarfile.PAX_FORMAT, dereference=True) as tar:
             for s in srcs:
                 tar.add(s, arcname=os.path.basename(s.rstrip("/")), recursive=True)
             info = tarfile.TarInfo(MANIFEST_NAME)

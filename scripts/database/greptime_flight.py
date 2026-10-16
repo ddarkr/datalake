@@ -26,11 +26,22 @@ flight_query so aggregate stays importable without the deps installed.
 """
 
 import json
+import os
 import struct
 
 GREPTIME_CATALOG = "greptime"
 FLOW_EXTENSIONS_HEADER = "x-greptime-flow-extensions"
 FLIGHT_DO_GET = "/arrow.flight.protocol.FlightService/DoGet"
+FLIGHT_DO_ACTION = "/arrow.flight.protocol.FlightService/DoAction"
+LOCAL_SST_ACTION = "datalake.local_sst_query.v1"
+
+
+def local_sst_only_enabled():
+    """Transport policy only; never part of analytical revision material."""
+    value = os.environ.get("AGG_LOCAL_SST_ONLY", "0")
+    if value not in ("0", "1"):
+        raise ValueError("AGG_LOCAL_SST_ONLY must be 0 or 1")
+    return value == "1"
 
 STALE_MARKERS = ("STALE_CURSOR", "STALE_SNAPSHOT_FENCE",
                  "FALLBACK_FULL_RECOMPUTE")
@@ -101,7 +112,8 @@ def _messages():
                             (3, "app_metadata", 12, None),
                             (1000, "data_body", 12, None)]),
             ("Metrics", [(1, "metrics", 12, None)]),
-            ("FlightMetadata", [(2, "metrics", 11, ".datalake.Metrics")])]
+            ("FlightMetadata", [(2, "metrics", 11, ".datalake.Metrics")]),
+            ("Result", [(1, "body", 12, None)])]
     for name, fields in spec:
         message = fd.message_type.add(name=name)
         for num, key, typ, ref in fields:
@@ -116,6 +128,8 @@ def _messages():
         pool.FindMessageTypeByName("datalake.FlightMetadata"))
     _descriptors["data"] = data
     _descriptors["meta"] = meta
+    _descriptors["result"] = message_factory.GetMessageClass(
+        pool.FindMessageTypeByName("datalake.Result"))
     return data, meta
 
 
@@ -148,7 +162,7 @@ def _parse_upper(app_metadata):
 
 
 def flight_query(sql, *, endpoint, db, user, password, lower=None,
-                 timeout=60, max_rows=200000):
+                 timeout=60, max_rows=200000, local_sst_only=None):
     """Run one fenced SQL query. Returns (cols, rows, upper).
 
     lower=None means an unfenced snapshot read (full data + upper
@@ -159,7 +173,15 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
 
     Timestamp columns are cast to int64 nanoseconds (never float, never
     truncated to microseconds); every other column uses to_pylist.
+
+    local_sst_only=None reads AGG_LOCAL_SST_ONLY (exact 0/1). Strict mode
+    wraps the same Ticket in datalake.local_sst_query.v1 and decodes each
+    Result.body as original FlightData. It never retries ordinary DoGet.
     """
+    if local_sst_only is None:
+        local_sst_only = local_sst_only_enabled()
+    if not isinstance(local_sst_only, bool):
+        raise ValueError("local_sst_only must be boolean")
     endpoint = (endpoint or "").strip()
     if not endpoint:
         raise FlightUnavailable("no grpc endpoint configured")
@@ -201,11 +223,24 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
         options = (("grpc.max_receive_message_length", 64 * 1024 * 1024),)
         channel = (grpc.secure_channel(host, grpc.ssl_channel_credentials(), options)
                    if secure else grpc.insecure_channel(host, options))
+        request = (_field(1, LOCAL_SST_ACTION) + _field(2, ticket)
+                   if local_sst_only else ticket)
+        if local_sst_only:
+            result_cls = _descriptors["result"]
+
+            def decode_result(raw):
+                result = result_cls.FromString(raw)
+                if not result.body:
+                    raise FlightError("local SST action returned empty FlightData")
+                return data_cls.FromString(result.body)
+        else:
+            decode_result = data_cls.FromString
         call = channel.unary_stream(
-            FLIGHT_DO_GET, request_serializer=lambda b: b,
-            response_deserializer=data_cls.FromString)
+            FLIGHT_DO_ACTION if local_sst_only else FLIGHT_DO_GET,
+            request_serializer=lambda b: b,
+            response_deserializer=decode_result)
         try:
-            frames = call(ticket, timeout=timeout,
+            frames = call(request, timeout=timeout,
                           metadata=[(FLOW_EXTENSIONS_HEADER,
                                      json.dumps(extensions))])
             total_rows = 0

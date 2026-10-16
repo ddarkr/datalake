@@ -71,7 +71,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.storage-metrics-revision: "6"
+      datalake.storage-metrics-revision: "7"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -82,7 +82,7 @@ services:
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
       S3_REGION: ${S3_REGION:-}
-      STORAGE_METRICS_INTERVAL_SEC: ${STORAGE_METRICS_INTERVAL_SEC:-3600}
+      STORAGE_METRICS_INTERVAL_SEC: ${STORAGE_METRICS_INTERVAL_SEC:-0}
       STORAGE_COST_FREE_EGRESS_MULTIPLIER: ${STORAGE_COST_FREE_EGRESS_MULTIPLIER:-3}
       STORAGE_COST_EGRESS_USD_PER_GB: ${STORAGE_COST_EGRESS_USD_PER_GB:-0.01}
       STORAGE_COST_MAX_MONTHLY_EGRESS_GIB: ${STORAGE_COST_MAX_MONTHLY_EGRESS_GIB:-2400}

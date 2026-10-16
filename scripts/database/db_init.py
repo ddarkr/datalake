@@ -48,6 +48,36 @@ _ACTIVITY_INT_ATTRS = frozenset({
 _ACTIVITY_BOOL_ATTRS = frozenset({"is_built_in", "is_async"})
 _ACTIVITY_SKIP_TRACE_ATTRS = frozenset({"service.name", "service_name"})
 
+_PERFORMANCE_TRACE_COLUMNS = (
+    ("first_content_ms", "Float64"),
+    ("coding_agent.request.duration_ms", "Float64"),
+    ("coding_agent.response.first_text_ms", "Float64"),
+    ("coding_agent.interaction.first_response_ms", "Float64"),
+    ("coding_agent.request.reasoning.budget_tokens", "Float64"),
+    ("coding_agent.ttft.kind", "STRING"),
+    ("coding_agent.duration.kind", "STRING"),
+    ("coding_agent.request.service_tier", "STRING"),
+    ("coding_agent.response.service_tier", "STRING"),
+    ("coding_agent.harness.service_tier", "STRING"),
+    ("coding_agent.request.reasoning.effort", "STRING"),
+    ("coding_agent.request.settings_source", "STRING"),
+    ("coding_agent.model.variant", "STRING"),
+    ("coding_agent.usage.source", "STRING"),
+    ("coding_agent.interaction.latency.kind", "STRING"),
+    ("coding_agent.harness.version", "STRING"),
+    ("request_id", "STRING"),
+    ("client_request_id", "STRING"),
+    ("input_tokens", "Int64"),
+    ("output_tokens", "Int64"),
+    ("event.kind", "STRING"),
+    ("input_token_count", "Int64"),
+    ("output_token_count", "Int64"),
+    ("cached_token_count", "Int64"),
+    ("cache_write_token_count", "Int64"),
+    ("reasoning_token_count", "Int64"),
+    ("tool_token_count", "Int64"),
+)
+
 
 def _activity_col_type(key):
     if key in _ACTIVITY_INT_ATTRS:
@@ -222,7 +252,12 @@ def ddl_statements(otel_ttl):
   "span_links" JSON NULL,
   PRIMARY KEY ("service_name")
 )"""
-    ddls.append(("opentelemetry_traces", traces_head + trace_activity_columns() + traces_tail + with_opts))
+    performance_columns = "".join(
+        '  "span_attributes.' + key + '" ' + coltype + ' NULL,\n'
+        for key, coltype in _PERFORMANCE_TRACE_COLUMNS
+    )
+    ddls.append(("opentelemetry_traces", traces_head + trace_activity_columns()
+                 + performance_columns + traces_tail + with_opts))
     ddls.append(("opentelemetry_logs", """CREATE TABLE IF NOT EXISTS "opentelemetry_logs" (
   "timestamp" TIMESTAMP(9) NOT NULL TIME INDEX,
   "trace_id" STRING NULL,
@@ -592,6 +627,9 @@ def alter_statements():
         'ALTER TABLE "charge_session" ADD COLUMN IF NOT EXISTS'
         ' "decode_epoch" STRING',
     ]
+    for key, coltype in _PERFORMANCE_TRACE_COLUMNS:
+        stmts.append('ALTER TABLE "opentelemetry_traces" ADD COLUMN IF NOT EXISTS'
+                     ' "span_attributes.' + key + '" ' + coltype)
     for name, coltype in (
         ("dbc_override_version", "STRING"),
         ("dbc_override_commit", "STRING"),
@@ -701,10 +739,10 @@ def main():
             sql_request(base_url, auth, db, stmt, timeout=30)
         except SqlError as e:
             fail("alter failed: " + str(e), code=3)
-    # Verify every table answers a query (works on empty tables too).
+    # Verify schema visibility without reading SST rows during every startup.
     for label, _ in ddls:
         try:
-            sql_request(base_url, auth, db, "SELECT 1 FROM " + qident(label) + " LIMIT 1")
+            sql_request(base_url, auth, db, "DESCRIBE " + qident(label))
         except SqlError as e:
             fail("verify failed for table " + label + ": " + str(e), code=3)
     sys.stdout.write("db_init: ok: database " + db + " tables=" + str(len(ddls)) + "\n")

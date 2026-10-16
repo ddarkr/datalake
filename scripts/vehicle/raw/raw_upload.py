@@ -309,9 +309,13 @@ def refresh_inventory(client, bucket):
 def inventory_loop(client, bucket, interval, stop):
     """Own cadence, separate from upload sweeps: long listings never stall
     durable upload."""
+    if interval <= 0:
+        if interval < 0:
+            raise ValueError("RAW_INVENTORY_INTERVAL_SEC must be nonnegative")
+        return
     while not stop:
         refresh_inventory(client, bucket)
-        for _ in range(max(interval, 1) * 2):
+        for _ in range(interval * 2):
             if stop:
                 break
             time.sleep(0.5)
@@ -566,6 +570,10 @@ def run_once(client, bucket, spool, vehicle, max_retries):
 
 
 def main(argv):
+    inventory_interval = ei("RAW_INVENTORY_INTERVAL_SEC", 0)
+    if inventory_interval < 0:
+        print("RAW_INVENTORY_INTERVAL_SEC must be nonnegative", file=sys.stderr)
+        return 1
     vehicle = e("VEHICLE_ID", "")
     bucket = e("RAW_BUCKET", "")
     if not vehicle or not bucket:
@@ -590,9 +598,9 @@ def main(argv):
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     client = wrap_client(make_client())
-    threading.Thread(target=lambda: inventory_loop(
-        client, bucket, ei("RAW_INVENTORY_INTERVAL_SEC", 3600), stop),
-        daemon=True).start()
+    if inventory_interval > 0:
+        threading.Thread(target=lambda: inventory_loop(
+            client, bucket, inventory_interval, stop), daemon=True).start()
     # Restart recovery is implicit: any sealed triple left behind (crash between
     # upload and delete) is re-uploaded to its deterministic key, verified,
     # then deleted. Staging *.tmp / manifest-less .mf4 are never touched here.

@@ -372,6 +372,10 @@ def test_file_mode_roundtrip_hash_match():
     tmp, src, tgt, bdir, env = fresh_layout("File")
     env["S3_BUCKET"] = ""  # File mode must not need any S3 account.
     try:
+        cached = os.path.join(src, "greptime-data", "cache-sst")
+        with open(cached, "wb") as output:
+            output.write(b"immutable mirrored SST")
+        os.link(cached, os.path.join(src, "greptime-data", "mirror-sst"))
         setenv(env)
         before = hash_tree(src)
         assert bk.cmd_backup() == 0

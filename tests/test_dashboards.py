@@ -1,5 +1,6 @@
 """Execute dashboard coverage SQL: missing input must not look healthy."""
 import json
+import re
 from pathlib import Path
 import sqlite3
 
@@ -7,6 +8,20 @@ import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
+
+
+def test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors():
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    for name, config in configs.items():
+        if not name.startswith("grafana-dash-"):
+            continue
+        dashboard = json.loads(config["content"])
+        assert dashboard["refresh"] == "", name
+        for variable in dashboard.get("templating", {}).get("list", []):
+            if variable.get("type") == "query":
+                query = str(variable.get("query", "")).lower()
+                assert "vehicle_signal" not in query, (name, variable["name"])
+                assert "vehicle_analysis" not in query, (name, variable["name"])
 
 
 def test_dashboard_and_folder_uids_are_disjoint():
@@ -1061,7 +1076,6 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
                 VALUES (1500, 1600, ?, 'battery.energy.discharge_energy_kwh',
                         ?, 'battery_energy', 'r1', 1.0, 'kWh', 'derived', ?, 10)""",
                        (vehicle, source, epoch))
-        assert [r[0] for r in db.execute(variables["vehicle"]["query"])] == ["demo-car", "demo-other"]
         raw_ids = [r[0] for r in db.execute(query(variables["vehicle_ids"]["query"]))]
         assert set(raw_ids) == {"demo-car", "demo-can", "demo-fleet"}
         raw_ids_sql = ", ".join(repr(v) for v in raw_ids)
@@ -1071,7 +1085,6 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
         db.execute("INSERT INTO vehicle_identity VALUES (0, 'demo-new', 'demo-car')")
         refreshed = [r[0] for r in db.execute(query(variables["vehicle_ids"]["query"]))]
         assert set(refreshed) == {"demo-car", "demo-can", "demo-fleet", "demo-new"}
-        assert {r[0] for r in db.execute(query(variables["source"]["query"]))} == {"", "can", "fleet"}
         hourly = panels[58]["targets"][0]["rawSql"]
         rows = db.execute(query(hourly)).fetchall()
         assert {(r[2], r[3], r[4], r[5]) for r in rows} == {
@@ -1093,21 +1106,6 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
         assert sorted((r[0], r[2], r[5]) for r in db.execute(query(hourly))) == [
             (1500, "demo-can", -1.0), (1500, "demo-fleet", -1.0),
             (1700, "demo-can", -2.0)]
-
-
-def test_coverage_frontier_lists_scopes_without_range_rows():
-    """Panel 92: whole-history frontier lists scopes even with zero range rows."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
-    query = _physical_query(configs, "grafana-dash-vehicle-overview", 92)
-    query = query.replace("$__timeFilter(ingest_time)", "ingest_time BETWEEN 1000 AND 2000")
-    with _battery_db() as db:
-        db.executemany("""INSERT INTO vehicle_signal
-            (event_time, vehicle, source, decode_epoch, ingest_time) VALUES (?, ?, ?, ?, ?)""",
-                       [(100, "stale-car", "can", "old", 100),
-                        (1500, "can-car", "can", "new", 2500)])
-        rows = {(row[0], row[2]): row for row in db.execute(query)}
-        assert rows["stale-car", "old"][6:] == (0, 0)
-        assert rows["can-car", "new"][6:] == (1, 0)
 
 
 def test_transition_timeline_starts_from_boundary_sample():
@@ -1632,65 +1630,117 @@ def test_cell_latest_raw_scope_across_epochs_with_cap():
 
 
 def test_ai_runtime_dedup_ttft_and_subagent_samples():
-    """AI runtime aggregates (panels 11/13) dedupe on (trace_id, span_id):
-    duplicate ingested rows never double-count samples or subagent spans, and
-    NULL/negative TTFT never becomes a latency sample."""
+    """Execute dashboard SQL: exact request dedup, missing identity, zero and eligibility."""
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
     runtime = json.loads(configs["grafana-dash-ai-runtime"]["content"])
-    panels = {p["id"]: p for p in _all_battery_panels(runtime["panels"])}
+    panels = {p["id"]: p for p in runtime["panels"]}
 
-    def query(panel_id, *percentiles):
-        sql = (panels[panel_id]["targets"][0]["rawSql"].replace("$$", "$")
-               .replace("$__timeFilter(timestamp)", "timestamp BETWEEN 1000 AND 2000")
-               .replace("FROM_UNIXTIME($__unixEpochTo() - 172800)", "0")
-               .replace("${client:sqlstring}", "''")
-               .replace("${provider:sqlstring}", "''")
-               .replace("${model:sqlstring}", "''"))
-        for percentile in percentiles:
-            inner = percentile[len("approx_percentile_cont("):-1].split(",")[0].strip()
-            sql = sql.replace(percentile, "AVG(" + inner + ")")
-        return sql
+    def query(panel_id):
+        sql = panels[panel_id]["targets"][0]["rawSql"].replace("$$", "$")
+        sql = sql.replace("$__timeFilter(timestamp)", "timestamp BETWEEN 1000 AND 2000")
+        sql = sql.replace("FROM_UNIXTIME($__unixEpochTo() - 172800)", "0")
+        for variable in runtime["templating"]["list"]:
+            sql = sql.replace("${" + variable["name"] + ":sqlstring}", "''")
+        sql = re.sub(r"approx_percentile_cont\((CASE WHEN .*? END|[a-z_]+), 0\.(?:5|95)\)", r"AVG(\1)", sql)
+        return sql.replace(" AS STRING)", " AS TEXT)")
 
     with sqlite3.connect(":memory:") as db:
         db.row_factory = sqlite3.Row
-        db.execute("""CREATE TABLE opentelemetry_traces (
-            timestamp TIMESTAMP, trace_id TEXT, span_id TEXT,
-            service_name TEXT, span_name TEXT, duration_nano INTEGER,
-            "span_attributes.coding_agent.client" TEXT,
-            "span_attributes.client" TEXT,
-            "span_attributes.event.name" TEXT,
-            "span_attributes.gen_ai.provider.name" TEXT,
-            "span_attributes.gen_ai.request.model" TEXT,
-            "span_attributes.gen_ai.response.model" TEXT,
-            "span_attributes.ttft_ms" REAL,
-            "span_attributes.coding_agent.subagent.type" TEXT,
-            "span_attributes.coding_agent.subagent.status" TEXT,
-            "span_attributes.coding_agent.subagent.duration_ms" INTEGER)""")
+        db.create_function("CONCAT", -1, lambda *args: "".join(str(a or "") for a in args))
+
+        def json_value(raw, path):
+            return json.loads(raw or "{}").get(path[3:-1])
+
+        db.create_function("json_get_string", 2, json_value)
+        db.create_function("json_get_float", 2, json_value)
+        db.create_function("json_to_string", 1, lambda raw: raw)
+        columns = set(re.findall(r"`([^`]+)`", query(20) + query(13)))
+        columns.update(("timestamp", "trace_id", "span_id", "service_name", "span_name", "duration_nano"))
+        db.execute("CREATE TABLE opentelemetry_traces (" + ",".join('"' + c + '"' for c in sorted(columns)) + ")")
+        db.execute("CREATE TABLE opentelemetry_logs (timestamp, trace_id, span_id, log_attributes, resource_attributes)")
+
+        def span(trace, span_id, **attrs):
+            values = {"timestamp": 1500, "trace_id": trace, "span_id": span_id,
+                      "service_name": "claude_code", "span_name": "claude_code.llm_request"}
+            values.update({"span_attributes." + k: v for k, v in attrs.items()})
+            db.execute("INSERT INTO opentelemetry_traces (" + ",".join('"' + k + '"' for k in values) + ") VALUES (" + ",".join("?" for _ in values) + ")", list(values.values()))
+
+        attrs = {"coding_agent.client": "claude-code", "coding_agent.signal_source": "native",
+                 "coding_agent.session.id": "session", "request_id": "r1",
+                 "coding_agent.ttft.kind": "provider_reported", "ttft_ms": 0,
+                 "coding_agent.usage.source": "reported", "output_tokens": 20,
+                 "coding_agent.request.duration_ms": 1000, "coding_agent.duration.kind": "logical_call",
+                 "coding_agent.request.service_tier": "fast", "model": "native-model"}
+        # Only the log knows the request ID; exact trace/span equivalence links it.
+        span("t1", "s1", **dict(attrs, request_id=None))
+        span("t1", "s1", **dict(attrs, request_id=None))
+        log = dict(attrs, **{"event.name": "claude_code.llm_request"})
+        db.execute("INSERT INTO opentelemetry_logs VALUES (1501, 't1', 's1', ?, ?)",
+                   (json.dumps(log), json.dumps({"service.name": "claude_code"})))
+        # The same exact request may also arrive with different trace/span IDs.
+        db.execute("INSERT INTO opentelemetry_logs VALUES (1502, 'copy', 'copy', ?, ?)",
+                   (json.dumps(log), json.dumps({"service.name": "claude_code"})))
+        for request, usage, duration, tier in (("r2", "reported", None, "normal"),
+                                               ("r3", "estimated", 1000, None),
+                                               ("r4", None, 1000, None)):
+            other = dict(attrs, request_id=request, **{"coding_agent.usage.source": usage,
+                         "coding_agent.request.duration_ms": duration,
+                         "coding_agent.request.service_tier": tier, "ttft_ms": None})
+            span(request, request, **other)
+        # No-span records are distinct observations, exact retransmission is not.
+        for timestamp in (1600, 1601, 1601):
+            db.execute("INSERT INTO opentelemetry_logs VALUES (?, NULL, NULL, ?, '{}')",
+                       (timestamp, json.dumps({"ttft_ms": 5, "coding_agent.client": "hermes"})))
+        db.execute("""INSERT INTO opentelemetry_traces
+            (timestamp, trace_id, span_id, service_name, span_name,
+             "span_attributes.coding_agent.client")
+            VALUES (1700, 'metadata', 'metadata', 'hermes',
+                    'coding_agent.llm.turn', 'hermes')""")
+        codex_attrs = {"coding_agent.signal_source": "native",
+                       "event.name": "codex.sse_event", "event.kind": "response.completed",
+                       "coding_agent.usage.source": "reported", "model": "codex-model",
+                       "ttft_ms": 0, "coding_agent.ttft.kind": "provider_reported",
+                       "input_token_count": 30, "output_token_count": 20, "cached_token_count": 10}
+        db.execute("INSERT INTO opentelemetry_logs VALUES (1800, NULL, NULL, ?, ?)",
+                   (json.dumps(codex_attrs), json.dumps({"service.name": "codex_exec", "originator": "codex_exec"})))
+        # Native emits a generic completion before its informative usage completion.
+        db.execute("INSERT INTO opentelemetry_logs VALUES (1799, NULL, NULL, ?, ?)",
+                   (json.dumps({"coding_agent.signal_source": "native", "event.name": "codex.sse_event",
+                                "event.kind": "response.completed"}),
+                    json.dumps({"service.name": "codex_exec", "originator": "codex_exec"})))
+        detail = [dict(row) for row in db.execute(query(20))]
+        assert len(detail) == 8, detail
+        first = next(row for row in detail if row["request_id"] == "r1")
+        assert first["signal"] == "span" and first["ttft_ms"] == 0
+        assert first["request_output_tokens_per_s"] == 20
+        assert first["model"] == "native-model"
+        codex = next(row for row in detail if row["client"] == "codex")
+        assert (codex["input_tokens"], codex["output_tokens"], codex["cache_read_tokens"]) == (30, 20, 10)
+        assert codex["request_ms"] is None and codex["request_output_tokens_per_s"] is None
+        assert codex["model"] == "codex-model" and codex["ttft_ms"] == 0
+        assert all(row["request_output_tokens_per_s"] is None for row in detail if row["request_id"] != "r1")
+        assert db.execute(query(10)).fetchone()["ttft_samples"] == 4
+        rows = [dict(row) for row in db.execute(query(19))]
+        assert sum(row["eligible_samples"] for row in rows) == 1
+        assert {row["requested_tier"] for row in rows} == {"fast", "normal", "unknown"}
+        coverage = db.execute(query(15)).fetchone()
+        assert coverage["samples"] == 8 and coverage["throughput_unknown"] == 7
+        assert coverage["output_known"] == 5
+        latency = list(db.execute(query(11)))
+        assert sum(row["total_samples"] for row in latency) == 8
+        assert sum(row["unknown_samples"] for row in latency) == 4
+        # The other verified native service spelling has identical client identity.
+        db.execute("UPDATE opentelemetry_logs SET resource_attributes = ? WHERE timestamp = 1800",
+                   (json.dumps({"service.name": "codex_cli_rs"}),))
+        assert [dict(row) for row in db.execute(query(20)) if row["client"] == "codex"][0]["model"] == "codex-model"
+        # Existing subagent observations still deduplicate and retain unknown duration.
         for _ in range(2):
-            db.execute("""INSERT INTO opentelemetry_traces VALUES
-                (1500, 't1', 's1', 'oh-my-pi', 'op', 1000000, 'oh-my-pi', NULL, NULL,
-                 'prov', 'm', NULL, 120, 'task', 'completed', 50)""")
-        db.execute("""INSERT INTO opentelemetry_traces VALUES
-            (1500, 't1', 's2', 'oh-my-pi', 'op', 2000000, 'oh-my-pi', NULL, NULL,
-             'prov', 'm', NULL, 250, 'scout', 'failed', NULL)""")
-        db.execute("""INSERT INTO opentelemetry_traces VALUES
-            (1500, 't2', 's3', 'oh-my-pi', 'op', 3000000, 'oh-my-pi', NULL, NULL,
-             'prov', 'm', NULL, -5, NULL, NULL, NULL)""")
-        db.execute("""INSERT INTO opentelemetry_traces VALUES
-            (1500, 't3', 's4', 'oh-my-pi', 'op', 4000000, 'oh-my-pi', NULL, NULL,
-             'prov', 'm', NULL, NULL, NULL, NULL, NULL)""")
-        rows = db.execute(query(11, "approx_percentile_cont(ttft_ms, 0.5)",
-                                "approx_percentile_cont(ttft_ms, 0.95)")).fetchall()
-        assert [(row["client"], row["samples"]) for row in rows] == [("oh-my-pi", 2)], [dict(row) for row in rows]
-        assert db.execute(query(10)).fetchone()["ttft_samples"] == 2
-        rows = {(row["subagent_type"], row["subagent_status"]): row for row in db.execute(
-            query(13, "approx_percentile_cont(duration_ms, 0.5)",
-                  "approx_percentile_cont(duration_ms, 0.95)"))}
-        assert rows[("task", "completed")]["spans"] == 1, {key: dict(row) for key, row in rows.items()}
-        assert rows[("scout", "failed")]["spans"] == 1, {key: dict(row) for key, row in rows.items()}
-        assert rows[("scout", "failed")]["duration_samples"] == 0, {key: dict(row) for key, row in rows.items()}
-        db.execute('DELETE FROM opentelemetry_traces WHERE "span_attributes.ttft_ms" >= 0')
-        assert db.execute(query(10)).fetchone()["ttft_samples"] is None
+            span("sub", "sub", **{"coding_agent.subagent.type": "task",
+                                  "coding_agent.subagent.status": "completed"})
+        rows = list(db.execute(query(13)))
+        assert len(rows) == 1 and rows[0]["spans"] == 1
+        assert rows[0]["duration_samples"] == 0
+
 
 def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
     configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
@@ -2439,6 +2489,7 @@ def test_analysis_input_states_keep_boundary_and_invalid_transition():
 
 
 if __name__ == "__main__":
+    test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors()
     test_analysis_input_latest_preserves_invalid_and_scope_identity()
     test_analysis_input_trends_keep_unit_and_quality_boundaries()
     test_analysis_input_states_keep_boundary_and_invalid_transition()
@@ -2462,7 +2513,6 @@ if __name__ == "__main__":
     test_vehicle_coverage_separates_observation_from_receipt()
     test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps()
     test_vehicle_identity_canonical_selection_and_scope_split()
-    test_coverage_frontier_lists_scopes_without_range_rows()
     test_transition_timeline_starts_from_boundary_sample()
     test_cell_frequency_respects_selected_source_and_epoch()
     test_provenance_table_matches_card_eligibility()

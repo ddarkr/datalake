@@ -288,6 +288,15 @@ class FakeS3:
         return {"Contents": []}
 
 
+class InventorySchedulingTest(unittest.TestCase):
+    def test_negative_interval_fails_before_opening_server(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {"STORAGE_METRICS_INTERVAL_SEC": "-1"}):
+            with patch.object(sm.threading, "Thread", side_effect=AssertionError("unexpected listener")):
+                with self.assertRaisesRegex(SystemExit, "STORAGE_METRICS_INTERVAL_SEC must be >= 0"):
+                    sm.main([])
+
+
 class CountingS3Test(unittest.TestCase):
     def test_get_counts_partial_reads_lines_readinto_and_iteration_once(self):
         from scripts.storage.s3_cost import CountingS3

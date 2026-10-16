@@ -725,7 +725,8 @@ def owned_cache_scope(tmp, project, env):
     if not re.fullmatch(r"gbench-gbench[0-9]+", project):
         raise RuntimeError("cache reset requires an owned synthetic project")
     with open(os.path.join(tmp, "greptimedb.toml"), encoding="utf-8") as source:
-        layout = cache_config(source.read())
+        config_text = source.read()
+    layout = cache_config(config_text)
     containers, volumes, identities, running = {}, {}, {}, {}
     for service in ("greptimedb", "minio", "s3meter"):
         rc, out, _ = compose_run(tmp, project, env, "ps", "--all", "--quiet", service)
@@ -755,10 +756,18 @@ def owned_cache_scope(tmp, project, env):
                         "/etc/greptime/auth": os.path.join(tmp, "preflight", "auth")}
             for destination, source in expected.items():
                 matched = [m for m in mounts if m["Destination"] == destination]
-                if (len(matched) != 1 or matched[0]["Type"] != "bind"
-                        or matched[0]["RW"]
-                        or os.path.realpath(matched[0]["Source"]) != os.path.realpath(source)):
+                if len(matched) != 1 or matched[0]["Type"] != "bind" or matched[0]["RW"]:
                     raise RuntimeError("cache reset config/auth mount mismatch")
+                mounted = os.path.realpath(matched[0]["Source"])
+                if mounted != os.path.realpath(source):
+                    if (destination != "/etc/greptime/greptimedb.toml"
+                            or os.path.dirname(mounted) != os.path.realpath(tmp)
+                            or not re.fullmatch(r"greptimedb-config-[a-z0-9_]+\.toml", os.path.basename(mounted))
+                            or os.path.islink(matched[0]["Source"])):
+                        raise RuntimeError("cache reset config/auth mount mismatch")
+                    with open(mounted, encoding="utf-8") as immutable:
+                        if immutable.read() != config_text:
+                            raise RuntimeError("cache reset mounted configuration differs")
         name = data[0]["Name"]
         rc, out, _ = sh(["docker", "volume", "inspect", name])
         if rc:

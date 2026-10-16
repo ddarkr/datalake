@@ -24,6 +24,8 @@ Env (exact names, coordinated with BatteryIntegrationPackaging):
   GREPTIME_HTTP_URL / GREPTIME_DB / GREPTIME_USER / GREPTIME_PASSWORD
     (shared connection).
   AGG_INTERVAL_SECONDS is the only schedule; battery rides it.
+  AGG_LOCAL_SST_ONLY default 0, exact 0/1: every SQL statement uses the
+    strict /v1/local-sql endpoint when enabled, without remote fallback.
 
 Config JSON shape (plain JSON object, no secrets):
   {"conditions": {}, "energy": {}, "electrical": {}, "rul": {},
@@ -135,6 +137,7 @@ import urllib.parse
 import urllib.request
 
 from scripts.analytics.battery import battery_common as bc
+from scripts.database.greptime_flight import local_sst_only_enabled
 
 RUNTIME_VERSION = "1.0.6"
 BATTERY_SCOPE_WINDOWS_SUPPORTED = True
@@ -162,6 +165,10 @@ EPOCH = dt.datetime(1970, 1, 1)
 
 class BatteryError(Exception):
     pass
+
+
+class LocalSstTransportError(BatteryError):
+    """Strict endpoint failure, never a missing analytical source table."""
 
 
 class BatteryConfigError(BatteryError):
@@ -266,8 +273,12 @@ def request_sql(base_url, auth, db, stmt, timeout=60):
 
 
 def _request_sql(base_url, auth, db, stmt, timeout=60):
-    url = base_url.rstrip("/") + "/v1/sql?db=" + urllib.parse.quote(db,
-                                                                   safe="")
+    try:
+        strict = local_sst_only_enabled()
+    except ValueError as exc:
+        raise BatteryError(str(exc)) from exc
+    path = "/v1/local-sql" if strict else "/v1/sql"
+    url = base_url.rstrip("/") + path + "?db=" + urllib.parse.quote(db, safe="")
     body = urllib.parse.urlencode({"sql": stmt}).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -277,6 +288,10 @@ def _request_sql(base_url, auth, db, stmt, timeout=60):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as exc:
+        if strict and exc.code in (404, 405, 501):
+            exc.close()
+            raise LocalSstTransportError(
+                "local SST SQL http " + str(exc.code)) from exc
         try:
             raw = exc.read().decode("utf-8", "replace")
         except Exception:
@@ -300,6 +315,8 @@ def _request_sql(base_url, auth, db, stmt, timeout=60):
 
 
 def is_missing_table(err):
+    if isinstance(err, LocalSstTransportError):
+        return False
     return any(h in str(err).lower() for h in MISSING_TABLE_HINTS)
 
 

@@ -8,6 +8,8 @@ Stdlib only. Reads GREPTIME_* connection env plus:
     and the SQL-pushdownagg windows (vehicle 1m/1h, home 5m/1h/1d).
   AGG_MAX_ROWS (default 200000): per-section raw-row cap. A section over the
   cap fails closed (error, no partial writes) instead of OOMing.
+  AGG_LOCAL_SST_ONLY (default 0): exact 0/1; select strict local-SST HTTP
+    and Flight transports for every SQL statement, without remote fallback.
   BATTERY_ANALYSIS_CONFIG (default /app/battery-analysis.json): plain JSON
   config for the battery section (explicit missing path is an error); plus
   BATTERY_LOOKBACK_HOURS/BATTERY_MAX_ROWS (empty = fall back to the AGG
@@ -69,6 +71,7 @@ import urllib.parse
 import urllib.request
 from bisect import bisect_right
 
+from scripts.database.greptime_flight import local_sst_only_enabled
 from scripts.telemetry.activity import (ACTIVITY_COUNT_FIELDS, ACTIVITY_VALUE_FIELDS,
                       ACTIVITY_TRACE_ATTRIBUTES, summarize_activity)
 
@@ -454,6 +457,10 @@ class SqlError(Exception):
     pass
 
 
+class LocalSstTransportError(SqlError):
+    """Strict endpoint failure, never a missing analytical source table."""
+
+
 def request_sql(base_url, auth, db, stmt, timeout=60):
     started = time.monotonic()
     failed = True
@@ -507,7 +514,12 @@ def request_sql(base_url, auth, db, stmt, timeout=60):
 
 
 def _request_sql(base_url, auth, db, stmt, timeout):
-    url = base_url.rstrip("/") + "/v1/sql?db=" + urllib.parse.quote(db, safe="")
+    try:
+        strict = local_sst_only_enabled()
+    except ValueError as exc:
+        raise SqlError(str(exc)) from exc
+    path = "/v1/local-sql" if strict else "/v1/sql"
+    url = base_url.rstrip("/") + path + "?db=" + urllib.parse.quote(db, safe="")
     body = urllib.parse.urlencode({"sql": stmt}).encode("utf-8")
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
@@ -517,6 +529,9 @@ def _request_sql(base_url, auth, db, stmt, timeout):
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8", "replace")
     except urllib.error.HTTPError as e:
+        if strict and e.code in (404, 405, 501):
+            e.close()
+            raise LocalSstTransportError("local SST SQL http " + str(e.code)) from e
         try:
             raw = e.read().decode("utf-8", "replace")
         except Exception:
@@ -619,6 +634,8 @@ def fetch_rows(base_url, auth, db, stmt):
 
 
 def is_missing_table(err):
+    if isinstance(err, LocalSstTransportError):
+        return False
     low = str(err).lower()
     return any(h in low for h in MISSING_TABLE_HINTS)
 
@@ -1909,6 +1926,10 @@ def _apply_plans(base_url, auth, db, table, pk_col, columns, key,
 
 
 def load_cfg():
+    try:
+        local_sst_only_enabled()
+    except ValueError as exc:
+        raise SqlError(str(exc)) from exc
     try:
         lookback_h = int(env("AGG_LOOKBACK_HOURS", "30"))
         interval_s = int(env("AGG_INTERVAL_SECONDS", "300"))

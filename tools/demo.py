@@ -19,6 +19,8 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 DEFAULT_STATE = Path(tempfile.gettempdir()) / f"doda-datalake-demo-{os.getuid()}"
 MARKER = "private_content_smoke_do_not_store"
 TABLES = ("opentelemetry_traces", "opentelemetry_logs", "vehicle_signal",
@@ -68,7 +70,8 @@ def compose(state, *args, restore=False, capture=False):
     result = subprocess.run(["docker", "compose", "--project-directory", str(directory),
                              "--env-file", str(envfile), "-p", project,
                              "-f", str(ROOT / "compose.yaml"), "-f", str(directory / "override.yaml"),
-                             "--profile", "server", *args],
+                             * (["-f", str(directory / "restore-s3.yaml")] if restore and state.get("storage") == "S3" else []),
+                             "--profile", "*" if args and args[0] == "down" else "server", *args],
                             env=clean_env(), check=True, text=True,
                             stdout=subprocess.PIPE if capture else None)
     return result.stdout if capture else None
@@ -182,13 +185,13 @@ def summaries_ready(state, queued=False):
     return rows
 
 
-def start(directory):
+def start(directory, storage="File"):
     directory.mkdir(mode=0o700, parents=True, exist_ok=False)
     state = {"project": "datalake-demo-" + secrets.token_hex(8), "directory": str(directory.resolve()),
              "timestamp_ns": time.time_ns() - 60_000_000_000, "db_user": "demo",
              "db_password": secrets.token_hex(24), "otlp_user": "demo",
              "otlp_password": secrets.token_hex(24), "grafana_user": "demo",
-             "grafana_password": secrets.token_hex(24)}
+             "grafana_password": secrets.token_hex(24), "storage": storage}
     save_state(state)  # failed start remains stoppable
     calibration = {field: {"vehicle": "demo-car", "source": "fleet", "decode_epoch": "fleet-v1",
                            "declared_domain": "synthetic-demo", "version": "demo-1", "unit": unit,
@@ -204,6 +207,9 @@ def start(directory):
            "STORAGE_METRICS_INTERVAL_SEC": "10", "INFRA_SCRAPE_INTERVAL": "15s",
            "BATTERY_ANALYSIS_CONFIG_JSON": json.dumps({"energy": {"current_sign": "positive_charge",
                                                                    "field_calibration": calibration}})}
+    if storage == "S3":
+        from tools import benchmark_background_services as background
+        background.configure(state, env)
     # Honor the existing image overrides without importing operator credentials.
     for key in ("PYTHON_IMAGE", "BACKUP_IMAGE", "GREPTIME_IMAGE", "GRAFANA_IMAGE", "ALLOY_IMAGE"):
         if key in os.environ:
@@ -232,7 +238,11 @@ def start(directory):
                  "    external: false\n")
     # Override even private bundles that inline their operator calibration.
     override += "configs:\n  battery_analysis_json:\n    content: " + json.dumps(env["BATTERY_ANALYSIS_CONFIG_JSON"]) + "\n"
+    if storage == "S3":
+        override = background.extend_override(state, env, override)
     private_write(directory / "override.yaml", override)
+    if storage == "S3":
+        background.start_storage(state)
     compose(state, "up", "-d")
     discover(state)
     wait_for(lambda: sql(state, "SELECT 1"), "database schema")
@@ -323,7 +333,11 @@ def restore_check(state):
     compose(state, "stop", "aggregate")
     expected = snapshot(state)
     private_write(Path(state["directory"]) / "expected.json", json.dumps(expected, sort_keys=True))
-    compose(state, "stop")
+    if state.get("storage") == "S3":
+        services = compose(state, "ps", "--services", "--status", "running", capture=True).splitlines()
+        compose(state, "stop", *(service for service in services if service not in ("minio", "s3meter", "rawmeter")))
+    else:
+        compose(state, "stop")
     compose(state, "run", "--rm", "-e", "BACKUP_OFFLINE_CONFIRMED=1", "backup", "backup")
     directory = Path(state["directory"])
     private_write(directory / "restore.env", (directory / "demo.env").read_text() +
@@ -360,6 +374,9 @@ def calibrated_battery(state):
 
 
 def check(state):
+    if state.get("storage") == "S3" and not state.get("_service_oracles"):
+        from tools import benchmark_background_services as background
+        return background.check(state)
     discover(state)
     if not state.get("queued_verified"):
         compose(state, "stop", "greptimedb")
@@ -493,10 +510,43 @@ def regressions():
             raise SystemExit(f"mandatory CAN/RAW regression failed or skipped: {result.skipped}")
 
 
+def cleanup_owned(state):
+    """Remove exact project-labelled resources, including inactive profiles."""
+    project = state["project"]
+    if not re.fullmatch(r"datalake-demo-[0-9a-f]{16}", project):
+        raise ValueError("refusing cleanup of an unowned project")
+    def docker(*args):
+        return subprocess.run(["docker", *args], env=clean_env(), check=True, text=True,
+                              stdout=subprocess.PIPE).stdout.strip().splitlines()
+    resources = (("container", ["ps", "-aq"], ["rm", "-f"]),
+                 ("volume", ["volume", "ls", "-q"], ["volume", "rm"]),
+                 ("network", ["network", "ls", "-q"], ["network", "rm"]))
+    # Restore first releases the externally shared backup volume/network.
+    for owner in (project + "-restore", project):
+        for kind, listing, removal in resources:
+            selected = docker(*listing, "--filter", "label=com.docker.compose.project=" + owner)
+            for resource in selected:
+                labels = docker(kind, "inspect", "--format", '{{json .Labels}}' if kind != "container"
+                                else '{{json .Config.Labels}}', resource)
+                if json.loads(labels[0] or "{}").get("com.docker.compose.project") != owner:
+                    raise ValueError("resource ownership changed during cleanup")
+                if kind == "container":
+                    docker("stop", "--time", "60", resource)
+                docker(*removal, resource)
+    residuals = {owner: {kind: docker(*listing, "--filter", "label=com.docker.compose.project=" + owner)
+                         for kind, listing, _ in resources}
+                 for owner in (project, project + "-restore")}
+    if any(items for kinds in residuals.values() for items in kinds.values()):
+        raise RuntimeError("owned demo resources remain; recovery files retained")
+    return residuals
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("start", "status", "check", "stop", "regressions", "_wire", "_privacy", "_queue", "_fleet"))
     parser.add_argument("--state", type=Path, default=DEFAULT_STATE)
+    parser.add_argument("--storage", choices=("File", "S3"), default="File",
+                        help="S3 runs isolated MinIO plus complete response-byte meters; never uses operator S3")
     args = parser.parse_args()
     if args.command == "regressions":
         regressions()
@@ -507,22 +557,37 @@ def main():
     directory = args.state.expanduser().resolve()
     require_local_docker()
     if args.command == "start":
-        state = start(directory)
+        state = start(directory, args.storage)
     else:
         state = load_state(directory)
         if args.command == "check":
             check(state)
         elif args.command == "stop":
-            if (directory / "restore.env").exists():
-                compose(state, "down", "--volumes", "--remove-orphans", restore=True)
-            compose(state, "down", "--volumes", "--remove-orphans")
-            for name in ("demo.env", "restore.env", "override.yaml", "expected.json", "state.json"):
+            if state.get("storage") == "S3" and state.get("meter_urls"):
+                from tools import benchmark_background_services as background
+                try:
+                    background.stop(state)
+                except Exception as error:
+                    state.setdefault("s3_proof", {}).update(shutdown_accounting_error=type(error).__name__,
+                                                            shutdown_cost_unavailable=True)
+                    private_write(directory / "proof.json", json.dumps(state["s3_proof"], indent=2) + "\n")
+                    print(json.dumps({"shutdown_accounting_error": type(error).__name__,
+                                      "shutdown_cost_unavailable": True}), file=sys.stderr)
+            # Exact labels cover optional S3 services and inactive profiles.
+            # Any removal/absence-check failure exits before deleting recovery material.
+            residuals = cleanup_owned(state)
+            if (directory / "proof.json").exists():
+                proof = json.loads((directory / "proof.json").read_text())
+                proof["cleanup"] = {"owned_resource_residuals": residuals, "complete": True}
+                private_write(directory / "proof.json", json.dumps(proof, indent=2) + "\n")
+            for name in ("demo.env", "restore.env", "override.yaml", "restore-s3.yaml", "expected.json",
+                         "minio-bin"):
                 (directory / name).unlink(missing_ok=True)
-            try:
-                directory.rmdir()
-            except OSError:
-                print("Unrecognized files retained in demo state directory", file=sys.stderr)
-            print(json.dumps({"project": state["project"], "stopped": True, "owned_volumes_removed": True}))
+            stopped = {"project": state["project"], "directory": state["directory"],
+                       "storage": state.get("storage", "File"), "stopped": True}
+            save_state(stopped)  # credential-free marker makes stop idempotent
+            print(json.dumps({"project": state["project"], "stopped": True, "owned_volumes_removed": True,
+                              "proof_file": str(directory / "proof.json") if (directory / "proof.json").exists() else None}))
             return
     status(state)
 

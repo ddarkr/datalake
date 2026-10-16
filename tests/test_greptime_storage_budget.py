@@ -19,6 +19,7 @@ import tempfile
 import threading
 import tracemalloc
 import unittest
+from unittest.mock import patch
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
@@ -280,14 +281,14 @@ class MeterBehaviorTest(unittest.TestCase):
 
     def test_metadata_errors_and_empty_bodies_cannot_prove_cold(self):
         cases = (
-            ("GET", "/bucket/manifest.json", 200, "control", True),
-            ("GET", "/bucket/manifest.json?key=object.parquet", 200, "control", True),
+            ("GET", "/bucket/manifest.json", 200, "unknown", True),
+            ("GET", "/bucket/manifest.json?key=object.parquet", 200, "unknown", True),
             ("GET", "/missing.parquet", 404, "sst", False),
             ("GET", "/boom.parquet", 500, "sst", False),
             ("HEAD", "/bucket/object.parquet", 200, "sst", True),
             ("PUT", "/bucket/object.parquet", 200, "sst", True),
             ("GET", "/empty.parquet", 200, "sst", True),
-            ("GET", "/bucket/object.parquet?list-type=2", 200, "sst", True),
+            ("GET", "/bucket/object.parquet?list-type=2", 200, "control", True),
         )
         for method, selector, expected_status, kind, success in cases:
             with self.subTest(method=method, selector=selector):
@@ -303,6 +304,87 @@ class MeterBehaviorTest(unittest.TestCase):
                 self.assertEqual(snap["counters"]["sst_read_bytes"], 0)
         self.assertEqual(snap["counters"]["read_bytes"], sum(
             r["resp_bytes"] for r in snap["requests"] if r["op"] == "GET"))
+
+    def test_complete_attribution_survives_request_log_rotation(self):
+        cases = (
+            ("/bucket/greptime-backup-20261015T010203.123456789Z-abcdef/"
+             "greptime-backup-20261015T010203.123456789Z-abcdef.tar.gz",
+             "backup_payload", "payload_read_bytes"),
+            ("/bucket/greptime-backup-20261015T010203.123456789Z-abcdef/COMPLETE",
+             "metadata", "metadata_read_bytes"),
+            ("/bucket/greptime-backup-20261015T010203.123456789Z-abcdef/manifest.json",
+             "metadata", "metadata_read_bytes"),
+            ("/private_region/data.parquet", "sst", "payload_read_bytes"),
+            ("/private_region/index.puffin", "index", "payload_read_bytes"),
+            ("/bucket/_sst/" + "a" * 64, "backup_payload", "payload_read_bytes"),
+            ("/bucket/_sst/not-a-digest", "unknown", "unknown_read_bytes"),
+            ("/private_region/manifest/00000000000000000001.json",
+             "metadata", "metadata_read_bytes"),
+            ("/private_region/manifest/00000000000000000001.checkpoint.gz",
+             "metadata", "metadata_read_bytes"),
+            ("/private_region/manifest/_last_checkpoint",
+             "manifest_checkpoint_discovery", "metadata_read_bytes"),
+            ("/private_region/arbitrary.json", "unknown", "unknown_read_bytes"),
+            ("/private_region/manifest/arbitrary.json", "unknown", "unknown_read_bytes"),
+            ("/bucket?list-type=2&X-Amz-Signature=private_signature",
+             "control", None),
+        )
+        expected_classes = {}
+        expected_reads = dict.fromkeys(
+            ("payload_read_bytes", "metadata_read_bytes", "unknown_read_bytes"), 0)
+        with patch("tools.s3_meter._REQUEST_LOG_LIMIT", 3), patch(
+                "tools.s3_meter._REQUEST_LOG_TRIM", 2):
+            for selector, kind, read_counter in cases:
+                _, body = self._req("GET", selector)
+                snap = self.meter.snapshot()
+                self.assertEqual(snap["requests"][-1]["object_kind"], kind)
+                expected_classes[kind] = expected_classes.get(kind, 0) + len(body)
+                if read_counter:
+                    expected_reads[read_counter] += len(body)
+        counters = snap["counters"]
+        self.assertEqual(snap["response_bytes_by_object"], expected_classes)
+        self.assertEqual(counters["response_bytes"], sum(expected_classes.values()))
+        for name, size in expected_reads.items():
+            self.assertEqual(counters[name], size)
+        self.assertEqual(counters["read_bytes"], sum(expected_reads.values()))
+        self.assertEqual(snap["op_requests"], {"GET": len(cases) - 1, "LIST": 1})
+        self.assertEqual(self.meter.op_counters(), snap["op_requests"])
+        self.assertGreater(snap["truncated_requests"], 0)
+        self.assertLess(len(snap["requests"]), len(cases))
+        encoded = json.dumps(snap)
+        for secret in ("private_region", "private_signature", "arbitrary.json", "a" * 64):
+            self.assertNotIn(secret, encoded)
+
+    def test_payload_and_unknown_errors_partial_and_retries_are_cumulative(self):
+        cases = (
+            ("/short.puffin", "index", "payload_read_bytes", 200, 10),
+            ("/boom.puffin", "index", "payload_read_bytes", 500, 3),
+            ("/missing/_sst/" + "b" * 64,
+             "backup_payload", "payload_read_bytes", 404, 4),
+            ("/short-unknown", "unknown", "unknown_read_bytes", 200, 10),
+            ("/boom/arbitrary.json", "unknown", "unknown_read_bytes", 500, 3),
+        )
+        expected = {"payload_read_bytes": 0, "unknown_read_bytes": 0}
+        total = 0
+        for selector, kind, counter, status, size in cases:
+            for attempt in (1, 2):
+                actual, body = self._req("GET", selector, headers={
+                    "amz-sdk-request": "attempt=%d; max=2" % attempt})
+                self.assertEqual((actual, len(body)), (status, size))
+                entry = self.meter.snapshot()["requests"][-1]
+                self.assertEqual(entry["object_kind"], kind)
+                self.assertFalse(entry["success"])
+                expected[counter] += size
+                total += size
+        snap = self.meter.snapshot()
+        for counter, size in expected.items():
+            self.assertEqual(snap["counters"][counter], size)
+        self.assertEqual(snap["counters"]["response_bytes"], total)
+        self.assertEqual(snap["counters"]["read_bytes"], total)
+        self.assertEqual(sum(snap["response_bytes_by_object"].values()), total)
+        self.assertEqual(snap["counters"]["metadata_read_bytes"], 0)
+        self.assertEqual(snap["counters"]["retries"], len(cases))
+        self.assertEqual(snap["counters"]["sst_read_bytes"], 0)
 
     def test_optional_checkpoint_nosuchkey_is_counted_and_private(self):
         selector = "/probe/private_region/manifest/_last_checkpoint"

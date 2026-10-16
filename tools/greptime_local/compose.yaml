@@ -1,0 +1,19 @@
+# Use after the generated root compose.yaml; never silently substitutes stock Greptime.
+services:
+  greptimedb:
+    image: ${GREPTIME_LOCAL_IMAGE:?Set the locally built pinned Greptime image}
+    command:
+      - standalone
+      - start
+      - --config-file
+      - /etc/greptime/greptimedb.toml
+      - --require-local-sst-mirror-v1
+  db-init:
+    environment:
+      GREPTIME_LOCAL_SST_MIRROR: "1"
+      GREPTIME_MIN_COMPACTION_INTERVAL: "0m"
+      GREPTIME_SST_MIRROR_CAPACITY: ${GREPTIME_SST_MIRROR_CAPACITY:?Set retained SST and output capacity}
+      GREPTIME_SST_MIRROR_OUTPUT_RESERVE: ${GREPTIME_SST_MIRROR_OUTPUT_RESERVE:?Set per-maintenance output budget}
+  aggregate:
+    environment:
+      AGG_LOCAL_SST_ONLY: "1"

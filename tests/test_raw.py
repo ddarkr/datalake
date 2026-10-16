@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 from scripts.vehicle.raw import raw_recorder as rec
 from scripts.vehicle.raw import raw_upload as upl
@@ -475,6 +476,67 @@ class FakeS3:
 
 
 class UploadTest(unittest.TestCase):
+    def test_inventory_disabled_upload_and_replay_remain_verified(self):
+        with tempfile.TemporaryDirectory() as spool:
+            paths = self._triple(spool)
+            cli = FakeS3()
+            with mock.patch.object(upl, "_bucket_inventory") as inventory:
+                upl.inventory_loop(cli, "b", 0, [])
+                # Simulate a crash after remote ACK but before local GC.
+                with mock.patch.object(upl.os, "unlink"):
+                    self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
+                self.assertEqual(cli.puts, 3)
+                env = {"VEHICLE_ID": "m3", "RAW_BUCKET": "b",
+                       "RAW_SPOOL_DIR": spool,
+                       "RAW_S3_ENDPOINT_URL": "https://s3.example.test",
+                       "RAW_S3_ACCESS_KEY_ID": "test",
+                       "RAW_S3_SECRET_ACCESS_KEY": "test"}
+                callbacks = []
+                run_once = upl.run_once
+
+                def sweep(*args):
+                    result = run_once(*args)
+                    callbacks[0]()
+                    return result
+
+                with mock.patch.dict(os.environ, env, clear=True), \
+                        mock.patch.object(upl.threading, "Thread") as thread, \
+                        mock.patch.object(upl.signal, "signal",
+                                          side_effect=lambda _, cb: callbacks.append(cb)), \
+                        mock.patch.object(upl, "make_client", return_value=cli) as make, \
+                        mock.patch.object(upl, "wrap_client", side_effect=lambda c: c), \
+                        mock.patch.object(upl, "run_once", side_effect=sweep):
+                    self.assertEqual(upl.main([]), 0)
+                make.assert_called_once_with()
+                self.assertEqual(thread.call_count, 1)  # metrics only
+                inventory.assert_not_called()
+                self.assertEqual(cli.puts, 3)  # replay reuses verified HEADs
+                self.assertEqual(cli.gets, 0)
+                for path in paths:
+                    self.assertFalse(os.path.exists(path))
+
+    def test_inventory_positive_cadence_and_negative_startup(self):
+        stop, sleeps = [], []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 4:
+                stop.append(1)
+
+        with mock.patch.object(upl, "refresh_inventory") as refresh, \
+                mock.patch.object(upl.time, "sleep", side_effect=sleep):
+            upl.inventory_loop(object(), "b", 1, stop)
+        self.assertEqual(refresh.call_count, 2)
+        self.assertEqual(sleeps, [0.5] * 4)
+        with mock.patch.dict(os.environ, {"RAW_INVENTORY_INTERVAL_SEC": "-1"}), \
+                mock.patch.object(upl.threading, "Thread") as thread, \
+                mock.patch.object(upl, "make_client") as make, \
+                mock.patch.object(upl.os, "makedirs") as mkdir:
+            self.assertEqual(upl.main([]), 1)
+        thread.assert_not_called()
+        make.assert_not_called()
+        mkdir.assert_not_called()
+
     def _triple(self, spool, name="m3_20260921T140000Z_deadbeef_001",
                 tweak=None):
         try:

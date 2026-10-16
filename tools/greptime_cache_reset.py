@@ -34,13 +34,16 @@ def cache_config(text):
     path = mito.get("write_cache_path", "")
     if not isinstance(path, str) or (path.strip() and path != "/data"):
         raise RuntimeError("unknown benchmark write_cache_path")
+    mirror = mito.get("sst_mirror_path", "")
+    if mirror not in ("", "/data/sst-mirror-v1"):
+        raise RuntimeError("unknown benchmark mirror layout")
     return {"data_home": "/data", "s3_root": "greptime",
             "configured_write_cache_path": path,
             "effective_write_cache_path": "/data",
             "configured_enable_write_cache": mito.get("enable_write_cache", False),
             "runtime_enable_write_cache": True,
             "runtime_reason": "Greptime 1.2.1 forces object-storage write cache on",
-            "cache_dirs": list(CACHE_DIRS)}
+            "cache_dirs": list(CACHE_DIRS), "sst_mirror_path": mirror}
 
 
 def _directory(path):
@@ -55,13 +58,26 @@ def _walk_error(error):
 
 def reset_cache(root, text):
     """The CLI fixes root=/data; tests use a real temporary volume directory."""
-    cache_config(text)
+    layout = cache_config(text)
     root = Path(root)
     if not root.is_absolute() or root == Path("/") or ".." in root.parts:
         raise RuntimeError("cache reset refuses unsafe volume root")
     # Never resolve a symlink to a different volume, including an ancestor.
     for path in reversed((root, *root.parents)):
         _directory(path)
+    mirror_inodes = set()
+    if layout["sst_mirror_path"]:
+        mirror = root / "sst-mirror-v1"
+        _directory(mirror)
+        _directory(mirror / "objects")
+        for current, dirs, names in os.walk(mirror / "objects", followlinks=False, onerror=_walk_error):
+            for name in dirs:
+                _directory(Path(current) / name)
+            for name in names:
+                info = (Path(current) / name).lstat()
+                if not stat.S_ISREG(info.st_mode):
+                    raise RuntimeError("cache reset refuses non-regular mirror file")
+                mirror_inodes.add((info.st_dev, info.st_ino))
     targets, records = [], []
     for relative in CACHE_DIRS:
         target = root / relative
@@ -81,7 +97,9 @@ def reset_cache(root, text):
                     _directory(Path(current) / name)
                 for name in names:
                     info = (Path(current) / name).lstat()
-                    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    mirror_link = (info.st_nlink == 2 and
+                                   (info.st_dev, info.st_ino) in mirror_inodes)
+                    if not stat.S_ISREG(info.st_mode) or (info.st_nlink != 1 and not mirror_link):
                         raise RuntimeError("cache reset refuses symlink/special/linked file")
                     files += 1
                     size += info.st_size
@@ -97,7 +115,9 @@ def reset_cache(root, text):
     return {"cache_dirs": records,
             "deleted_files": sum(r["deleted_files"] for r in records),
             "deleted_bytes": sum(r["deleted_bytes"] for r in records),
-            "preserved_primary": ["wal", "data", "metadata", "auth", "s3_objects"]}
+            "deleted_bytes_scope": "logical cache entries; hardlinked mirror payload is not freed",
+            "preserved_primary": ["wal", "data", "metadata", "auth", "s3_objects"]
+                                 + (["sst-mirror-v1"] if layout["sst_mirror_path"] else [])}
 
 
 def main():

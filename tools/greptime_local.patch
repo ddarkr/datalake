@@ -1,0 +1,2728 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 30566e1..69df75b 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -8684,6 +8684,7 @@ dependencies = [
+  "derive_more",
+  "dotenv",
+  "either",
++ "fs2",
+  "futures",
+  "greptime-proto",
+  "humantime",
+diff --git a/src/catalog/src/table_source.rs b/src/catalog/src/table_source.rs
+index fd78cc2..4399493 100644
+--- a/src/catalog/src/table_source.rs
++++ b/src/catalog/src/table_source.rs
+@@ -121,7 +121,9 @@ impl DfTableSourceProvider {
+         let provider: Arc<dyn TableProvider> = if table.table_info().table_type == TableType::View {
+             self.create_view_provider(&table).await?
+         } else {
+-            Arc::new(DfTableProviderAdapter::new(table))
++            let provider = DfTableProviderAdapter::new(table)
++                .with_local_sst_only(self.query_ctx.local_sst_only());
++            Arc::new(provider)
+         };
+ 
+         let source = provider_as_source(provider);
+@@ -147,7 +149,9 @@ impl DfTableSourceProvider {
+             })?;
+ 
+         // Build the catalog list provider for deserialization.
+-        let catalog_list = Arc::new(DummyCatalogList::new(self.catalog_manager.clone()));
++        let catalog_list = Arc::new(DummyCatalogList::new_with_query_ctx(
++            self.catalog_manager.clone(), self.query_ctx.clone(),
++        ));
+         let logical_plan = self
+             .plan_decoder
+             .decode(view_info.view_info.clone().into(), catalog_list, false)
+diff --git a/src/catalog/src/table_source/dummy_catalog.rs b/src/catalog/src/table_source/dummy_catalog.rs
+index 20637c3..2cf54fc 100644
+--- a/src/catalog/src/table_source/dummy_catalog.rs
++++ b/src/catalog/src/table_source/dummy_catalog.rs
+@@ -157,7 +157,9 @@ impl SchemaProvider for DummySchemaProvider {
+                 table: format_full_table_name(&self.catalog_name, &self.schema_name, name),
+             })?;
+ 
+-        let table_provider: Arc<dyn TableProvider> = Arc::new(DfTableProviderAdapter::new(table));
++        let provider = DfTableProviderAdapter::new(table)
++            .with_local_sst_only(self.query_ctx.as_ref().is_some_and(|ctx| ctx.local_sst_only()));
++        let table_provider: Arc<dyn TableProvider> = Arc::new(provider);
+ 
+         Ok(Some(table_provider))
+     }
+diff --git a/src/cmd/src/standalone.rs b/src/cmd/src/standalone.rs
+index aec3736..70fa766 100644
+--- a/src/cmd/src/standalone.rs
++++ b/src/cmd/src/standalone.rs
+@@ -52,7 +52,7 @@ use common_telemetry::info;
+ use common_telemetry::logging::{DEFAULT_LOGGING_DIR, TracingOptions};
+ use common_time::timezone::set_default_timezone;
+ use common_version::{short_version, verbose_version};
+-use datanode::config::{DatanodeOptions, StorageConfig};
++use datanode::config::{DatanodeOptions, RegionEngineConfig, StorageConfig};
+ use datanode::datanode::{Datanode, DatanodeBuilder};
+ use datanode::region_server::RegionServer;
+ use flow::{
+@@ -289,6 +289,9 @@ pub struct StartCommand {
+     /// The working home directory of this standalone instance.
+     #[clap(long)]
+     data_home: Option<String>,
++    /// Require this fork's persistent local SST mirror before any services start.
++    #[clap(long)]
++    require_local_sst_mirror_v1: bool,
+ }
+ 
+ impl StartCommand {
+@@ -305,6 +308,20 @@ impl StartCommand {
+ 
+         self.merge_with_cli_options(global_options, &mut opts.component)?;
+         opts.component.sanitize();
++        if self.require_local_sst_mirror_v1
++            && !opts.component.region_engine.iter().any(|engine| {
++                matches!(engine, RegionEngineConfig::Mito(config)
++                    if config.sst_mirror_path.as_ref().is_some_and(|path| !path.trim().is_empty())
++                        && config.sst_mirror_capacity.0 > 0
++                        && config.sst_mirror_output_reserve.0 > 0
++                        && config.sst_mirror_output_reserve.0 <= config.sst_mirror_capacity.0)
++            })
++        {
++            return error::IllegalConfigSnafu {
++                msg: "--require-local-sst-mirror-v1 requires an enabled Mito SST mirror with positive capacity and output reservation".to_string(),
++            }
++            .fail();
++        }
+ 
+         Ok(opts)
+     }
+@@ -1335,6 +1352,19 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_require_local_sst_mirror_rejects_disabled_config() {
++        let command = StartCommand::try_parse_from([
++            "standalone",
++            "--require-local-sst-mirror-v1",
++            "--env-prefix",
++            "GREPTIMEDB_TEST_LOCAL_SST_GUARD",
++        ])
++        .unwrap();
++        let error = command.load_options(&GlobalOptions::default()).unwrap_err();
++        assert!(error.to_string().contains("requires an enabled Mito SST mirror"));
++    }
++
+     #[test]
+     fn test_parse_grpc_bind_addr_aliases() {
+         let command =
+diff --git a/src/common/meta/src/node_manager.rs b/src/common/meta/src/node_manager.rs
+index 6cc6c3e..0b1ac75 100644
+--- a/src/common/meta/src/node_manager.rs
++++ b/src/common/meta/src/node_manager.rs
+@@ -52,6 +52,9 @@ pub type FlownodeRef = Arc<dyn Flownode>;
+ /// Datanode manager
+ #[async_trait::async_trait]
+ pub trait DatanodeManager: Send + Sync {
++    fn supports_local_sst_reads(&self) -> bool {
++        false
++    }
+     async fn datanode(&self, node: &Peer) -> DatanodeRef;
+ }
+ 
+diff --git a/src/frontend/src/instance.rs b/src/frontend/src/instance.rs
+index 2319f1e..80bc8de 100644
+--- a/src/frontend/src/instance.rs
++++ b/src/frontend/src/instance.rs
+@@ -146,6 +146,10 @@ pub struct Instance {
+ }
+ 
+ impl Instance {
++    pub fn supports_local_sst_reads(&self) -> bool {
++        self.node_manager().supports_local_sst_reads()
++    }
++
+     pub fn frontend_peer_addr(&self) -> &str {
+         &self.frontend_peer_addr
+     }
+@@ -282,6 +286,13 @@ impl Instance {
+     }
+ 
+     async fn query_statement(&self, stmt: Statement, query_ctx: QueryContextRef) -> Result<Output> {
++        if query_ctx.local_sst_only() {
++            ensure!(self.supports_local_sst_reads(), InvalidSqlSnafu {
++                err_msg: "local SST queries require standalone dispatch",
++            });
++            validate_local_sst_statement(&stmt)?;
++            self.check_local_sst_tables(&stmt, &query_ctx).await?;
++        }
+         check_permission(self.plugins.clone(), &stmt, &query_ctx)?;
+ 
+         let query_interceptor = self.plugins.get::<SqlQueryInterceptorRef<Error>>();
+@@ -651,8 +662,99 @@ fn attach_timeout(
+ 
+     Ok(output)
+ }
++fn validate_local_sst_statement(stmt: &Statement) -> Result<()> {
++    use sqlparser::ast::{Visit, Visitor, TableFactor};
++    struct LocalRelations;
++    impl Visitor for LocalRelations {
++        type Break = ();
++        fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> std::ops::ControlFlow<()> {
++            match factor {
++                TableFactor::Table { args: None, .. }
++                | TableFactor::Derived { .. }
++                | TableFactor::NestedJoin { .. } => std::ops::ControlFlow::Continue(()),
++                _ => std::ops::ControlFlow::Break(()),
++            }
++        }
++    }
++    ensure!(!matches!(stmt.visit(&mut LocalRelations), std::ops::ControlFlow::Break(())),
++        InvalidSqlSnafu { err_msg: "table functions are unsupported in local SST queries" });
++    use sql::statements::alter::AlterTableOperation;
++    let supported = match stmt {
++        Statement::Query(_) | Statement::Insert(_) | Statement::Delete(_)
++        | Statement::DescribeTable(_) | Statement::ShowDatabases(_)
++        | Statement::ShowTables(_) | Statement::ShowColumns(_)
++        | Statement::ShowCreateTable(_) | Statement::ShowSearchPath(_)
++        | Statement::ShowVariables(_) => true,
++        Statement::CreateTable(table) => table.engine.eq_ignore_ascii_case("mito"),
++        Statement::AlterTable(table) => matches!(
++            table.alter_operation,
++            AlterTableOperation::AddColumns { .. }
++                | AlterTableOperation::DropColumn { .. }
++                | AlterTableOperation::ModifyColumnType { .. }
++                | AlterTableOperation::RenameTable { .. }
++                | AlterTableOperation::DropDefaults { .. }
++                | AlterTableOperation::SetDefaults { .. }
++        ),
++        _ => false,
++    };
++    ensure!(supported, InvalidSqlSnafu {
++        err_msg: "statement is not supported by local SST query policy",
++    });
++    Ok(())
++}
++
+ 
+ impl Instance {
++    async fn check_local_sst_tables(&self, stmt: &Statement, ctx: &QueryContextRef) -> Result<()> {
++        let Some(names) = extract_tables_from_statement_checked(stmt) else {
++            return InvalidSqlSnafu { err_msg: "unresolved local SST query tables" }.fail();
++        };
++        let mut pending = names.map(|name| table_idents_to_full_name(&name, ctx))
++            .collect::<std::result::Result<Vec<_>, _>>()
++            .map_err(BoxedError::new).context(ExternalSnafu)?;
++        let mut visited = std::collections::HashSet::new();
++        while let Some((catalog, schema, table)) = pending.pop() {
++            if !visited.insert((catalog.clone(), schema.clone(), table.clone())) {
++                continue;
++            }
++            if let Some(table) = self.catalog_manager.table(&catalog, &schema, &table, Some(ctx))
++                .await.map_err(BoxedError::new).context(ExternalSnafu)?
++            {
++                let info = table.table_info();
++                if info.table_type == table::metadata::TableType::View {
++                    let manager = self.catalog_manager.as_any()
++                        .downcast_ref::<catalog::kvbackend::KvBackendCatalogManager>()
++                        .ok_or_else(|| InvalidSqlSnafu {
++                            err_msg: "unsupported local SST view catalog",
++                        }.build())?;
++                    let view = manager.view_info_cache()
++                        .map_err(BoxedError::new).context(ExternalSnafu)?
++                        .get(info.ident.table_id).await
++                        .map_err(BoxedError::new).context(ExternalSnafu)?
++                        .ok_or_else(|| InvalidSqlSnafu { err_msg: "missing local SST view metadata" }.build())?;
++                    for definition in parse_stmt(&view.definition, ctx.sql_dialect())? {
++                        match definition {
++                            Statement::CreateView(definition) => validate_local_sst_statement(&definition.query)?,
++                            definition => validate_local_sst_statement(&definition)?,
++                        }
++                    }
++                    pending.extend(view.table_names.iter().map(|name| (
++                        name.catalog_name.clone(), name.schema_name.clone(), name.table_name.clone(),
++                    )));
++                }
++                ensure!(
++                    matches!(info.meta.engine.as_str(), "mito" | "metric")
++                        || info.table_type == table::metadata::TableType::View
++                        || (info.table_type == table::metadata::TableType::Temporary
++                            && matches!(schema.as_str(), "information_schema" | "pg_catalog")
++                            && !matches!(info.name.as_str(), "ssts_storage" | "ssts_index_meta")),
++                    InvalidSqlSnafu { err_msg: "table is not supported by local SST query policy" }
++                );
++            }
++        }
++        Ok(())
++    }
++
+     async fn check_sql_permission(
+         &self,
+         stmt: &Statement,
+@@ -763,6 +865,21 @@ impl Instance {
+             .and_then(|stmts| query_interceptor.post_parsing(stmts, query_ctx.clone()))
+         {
+             Ok(stmts) => {
++                if query_ctx.local_sst_only() {
++                    if !self.supports_local_sst_reads() {
++                        return vec![InvalidSqlSnafu {
++                            err_msg: "local SST queries require standalone dispatch",
++                        }.fail()];
++                    }
++                    if let Err(error) = stmts.iter().try_for_each(validate_local_sst_statement) {
++                        return vec![Err(error)];
++                    }
++                    for stmt in &stmts {
++                        if let Err(error) = self.check_local_sst_tables(stmt, &query_ctx).await {
++                            return vec![Err(error)];
++                        }
++                    }
++                }
+                 if stmts.is_empty() {
+                     return vec![
+                         InvalidSqlSnafu {
+@@ -3720,6 +3837,35 @@ mod tests {
+             .unwrap()
+     }
+ 
++    #[test]
++    fn test_local_sst_statement_policy() {
++        for sql in [
++            "SELECT * FROM readings",
++            "INSERT INTO readings SELECT * FROM source",
++            "DELETE FROM readings WHERE ts < '2026-01-01'",
++            "CREATE TABLE state (ts TIMESTAMP TIME INDEX, val STRING) ENGINE=mito",
++            "ALTER TABLE state ADD COLUMN val STRING",
++            "DESCRIBE state",
++        ] {
++            let statements = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
++            assert!(statements.iter().all(|stmt| validate_local_sst_statement(stmt).is_ok()), "{sql}");
++        }
++        for sql in [
++            "COPY readings TO 's3://bucket/path'",
++            "ADMIN COMPACT_TABLE('readings')",
++            "CREATE TABLE unsafe (ts TIMESTAMP TIME INDEX) ENGINE=metric",
++            "SELECT * FROM read_parquet('s3://bucket/path')",
++        ] {
++            let statements = parse_stmt(sql, &GreptimeDbDialect {}).unwrap();
++            assert!(statements.iter().any(|stmt| validate_local_sst_statement(stmt).is_err()), "{sql}");
++        }
++        let statements = parse_stmt(
++            "INSERT INTO readings VALUES (1); COPY readings TO 's3://bucket/path'",
++            &GreptimeDbDialect {},
++        ).unwrap();
++        assert!(statements.iter().try_for_each(validate_local_sst_statement).is_err());
++    }
++
+     #[test]
+     fn test_exec_validation() {
+         let query_ctx = QueryContext::arc();
+diff --git a/src/frontend/src/instance/region_query.rs b/src/frontend/src/instance/region_query.rs
+index 1523e52..5c5e75b 100644
+--- a/src/frontend/src/instance/region_query.rs
++++ b/src/frontend/src/instance/region_query.rs
+@@ -93,6 +93,14 @@ impl FrontendRegionQueryHandler {
+         read_preference: ReadPreference,
+         request: QueryRequest,
+     ) -> Result<SendableRecordBatchStream> {
++        let local_sst_only = request.header.as_ref()
++            .and_then(|header| header.query_context.as_ref())
++            .is_some_and(|ctx| ctx.extensions.contains_key("datalake.internal.local_sst_only"));
++        if local_sst_only && !self.node_manager.supports_local_sst_reads() {
++            return crate::error::InvalidSqlSnafu {
++                err_msg: "local SST reads require standalone dispatch",
++            }.fail();
++        }
+         let region_id = request.region_id;
+ 
+         let peer = &self
+diff --git a/src/frontend/src/instance/standalone.rs b/src/frontend/src/instance/standalone.rs
+index d349229..d2ff61f 100644
+--- a/src/frontend/src/instance/standalone.rs
++++ b/src/frontend/src/instance/standalone.rs
+@@ -41,6 +41,9 @@ pub struct StandaloneDatanodeManager {
+ 
+ #[async_trait]
+ impl DatanodeManager for StandaloneDatanodeManager {
++    fn supports_local_sst_reads(&self) -> bool {
++        true
++    }
+     async fn datanode(&self, _datanode: &Peer) -> DatanodeRef {
+         RegionInvoker::arc(self.region_server.clone())
+     }
+diff --git a/src/frontend/src/server.rs b/src/frontend/src/server.rs
+index f529585..3412b8f 100644
+--- a/src/frontend/src/server.rs
++++ b/src/frontend/src/server.rs
+@@ -246,7 +246,8 @@ where
+             user_provider.clone(),
+             runtime,
+             grpc.flight_compression,
+-        );
++        )
++        .with_local_sst_queries(external && self.instance.supports_local_sst_reads());
+ 
+         let default_flight_handler = Arc::new(greptime_request_handler.clone()) as FlightCraftRef;
+         let flight_handler = if external {
+@@ -297,11 +298,14 @@ where
+         toml: String,
+         request_memory_limiter: ServerMemoryLimiter,
+     ) -> Result<(HttpServer, Option<HttpServer>)> {
+-        let builder = if let Some(builder) = self.http_server_builder.take() {
++        let mut builder = if let Some(builder) = self.http_server_builder.take() {
+             builder
+         } else {
+             self.http_server_builder(opts, request_memory_limiter)
+         };
++        if self.instance.supports_local_sst_reads() {
++            builder = builder.with_local_sql_handler(self.instance.clone());
++        }
+ 
+         // The API server is configured entirely under `[http]` (`enable_api_server`,
+         // `api_server_host`, `api_server_port`) and shares every other `[http]`
+@@ -499,6 +503,13 @@ mod tests {
+             self.do_put_calls.fetch_add(1, Ordering::SeqCst);
+             self.inner.do_put(request).await
+         }
++
++        async fn do_action(
++            &self,
++            request: Request<arrow_flight::Action>,
++        ) -> std::result::Result<Response<TonicStream<arrow_flight::Result>>, Status> {
++            self.inner.do_action(request).await
++        }
+     }
+ 
+     #[test]
+diff --git a/src/metric-engine/src/engine.rs b/src/metric-engine/src/engine.rs
+index 6d5dace..19a885b 100644
+--- a/src/metric-engine/src/engine.rs
++++ b/src/metric-engine/src/engine.rs
+@@ -351,6 +351,13 @@ impl RegionEngine for MetricEngine {
+             .map_err(BoxedError::new)
+     }
+ 
++    async fn get_metadata_for_query(
++        &self, region_id: RegionId, local_sst_only: bool,
++    ) -> Result<RegionMetadataRef, BoxedError> {
++        self.inner.load_region_metadata_with_policy(region_id, local_sst_only)
++            .await.map_err(BoxedError::new)
++    }
++
+     /// Retrieves region's disk usage.
+     ///
+     /// Note: Returns `None` if it's a logical region.
+diff --git a/src/metric-engine/src/engine/read.rs b/src/metric-engine/src/engine/read.rs
+index 53dd086..2e51e2c 100644
+--- a/src/metric-engine/src/engine/read.rs
++++ b/src/metric-engine/src/engine/read.rs
+@@ -105,8 +105,13 @@ impl MetricEngineInner {
+     }
+ 
+     pub async fn load_region_metadata(&self, region_id: RegionId) -> Result<RegionMetadataRef> {
+-        let is_reading_physical_region =
+-            self.state.read().unwrap().exist_physical_region(region_id);
++        self.load_region_metadata_with_policy(region_id, false).await
++    }
++
++    pub async fn load_region_metadata_with_policy(
++        &self, region_id: RegionId, local_sst_only: bool,
++    ) -> Result<RegionMetadataRef> {
++        let is_reading_physical_region = self.is_physical_region(region_id);
+ 
+         if is_reading_physical_region {
+             self.mito
+@@ -115,7 +120,7 @@ impl MetricEngineInner {
+                 .context(MitoReadOperationSnafu)
+         } else {
+             let physical_region_id = self.get_physical_region_id(region_id).await?;
+-            self.logical_region_metadata(physical_region_id, region_id)
++            self.logical_region_metadata_with_policy(physical_region_id, region_id, local_sst_only)
+                 .await
+         }
+     }
+@@ -147,12 +152,14 @@ impl MetricEngineInner {
+         // transform projection
+         let physical_projection = match request.projection.as_ref() {
+             Some(projection) => {
+-                self.transform_projection(physical_region_id, logical_region_id, projection)
+-                    .await?
++                self.transform_projection_with_policy(
++                    physical_region_id, logical_region_id, projection, request.local_sst_only,
++                ).await?
+             }
+             None => {
+-                self.default_projection(physical_region_id, logical_region_id)
+-                    .await?
++                self.default_projection_with_policy(
++                    physical_region_id, logical_region_id, request.local_sst_only,
++                ).await?
+             }
+         };
+ 
+@@ -176,28 +183,14 @@ impl MetricEngineInner {
+     /// Transform the projection from logical region to physical region.
+     ///
+     /// This method will not preserve internal columns.
+-    pub async fn transform_projection(
+-        &self,
+-        physical_region_id: RegionId,
+-        logical_region_id: RegionId,
+-        origin_projection: &[usize],
++    async fn transform_projection_with_policy(
++        &self, physical_region_id: RegionId, logical_region_id: RegionId,
++        origin_projection: &[usize], local_sst_only: bool,
+     ) -> Result<Vec<usize>> {
+         // project on logical columns
+         let all_logical_columns = self
+-            .load_logical_column_names(physical_region_id, logical_region_id)
++            .load_logical_columns_with_policy(physical_region_id, logical_region_id, local_sst_only)
+             .await?;
+-        let projected_logical_names = origin_projection
+-            .iter()
+-            .map(|&index| {
+-                all_logical_columns
+-                    .get(index)
+-                    .map(String::as_str)
+-                    .with_context(|| InvalidRequestSnafu {
+-                        region_id: logical_region_id,
+-                        reason: format!("projection index {index} is out of bounds"),
+-                    })
+-            })
+-            .collect::<Result<Vec<_>>>()?;
+ 
+         // generate physical projection
+         let mut physical_projection = Vec::with_capacity(origin_projection.len());
+@@ -208,22 +201,24 @@ impl MetricEngineInner {
+             .await
+             .context(MitoReadOperationSnafu)?;
+ 
+-        for name in projected_logical_names {
+-            // Safety: logical columns is a strict subset of physical columns
+-            physical_projection.push(physical_metadata.column_index_by_name(name).unwrap());
++        for &index in origin_projection {
++            let column = all_logical_columns.get(index).with_context(|| InvalidRequestSnafu {
++                region_id: logical_region_id,
++                reason: format!("projection index {index} is out of bounds"),
++            })?;
++            // Safety: logical columns is a strict subset of physical columns.
++            physical_projection.push(physical_metadata.column_index_by_name(&column.column_schema.name).unwrap());
+         }
+ 
+         Ok(physical_projection)
+     }
+ 
+     /// Default projection for a logical region. Includes non-internal columns
+-    pub async fn default_projection(
+-        &self,
+-        physical_region_id: RegionId,
+-        logical_region_id: RegionId,
++    async fn default_projection_with_policy(
++        &self, physical_region_id: RegionId, logical_region_id: RegionId, local_sst_only: bool,
+     ) -> Result<Vec<usize>> {
+         let logical_columns = self
+-            .load_logical_column_names(physical_region_id, logical_region_id)
++            .load_logical_columns_with_policy(physical_region_id, logical_region_id, local_sst_only)
+             .await?;
+         let mut projection = Vec::with_capacity(logical_columns.len());
+         let data_region_id = utils::to_data_region_id(physical_region_id);
+@@ -234,7 +229,7 @@ impl MetricEngineInner {
+             .context(MitoReadOperationSnafu)?;
+         for name in logical_columns {
+             // Safety: logical columns is a strict subset of physical columns
+-            projection.push(physical_metadata.column_index_by_name(&name).unwrap());
++            projection.push(physical_metadata.column_index_by_name(&name.column_schema.name).unwrap());
+         }
+ 
+         Ok(projection)
+@@ -244,9 +239,15 @@ impl MetricEngineInner {
+         &self,
+         physical_region_id: RegionId,
+         logical_region_id: RegionId,
++    ) -> Result<RegionMetadataRef> {
++        self.logical_region_metadata_with_policy(physical_region_id, logical_region_id, false).await
++    }
++
++    async fn logical_region_metadata_with_policy(
++        &self, physical_region_id: RegionId, logical_region_id: RegionId, local_sst_only: bool,
+     ) -> Result<RegionMetadataRef> {
+         let logical_columns = self
+-            .load_logical_columns(physical_region_id, logical_region_id)
++            .load_logical_columns_with_policy(physical_region_id, logical_region_id, local_sst_only)
+             .await?;
+ 
+         let primary_keys = logical_columns
+@@ -315,6 +316,22 @@ mod test {
+         TestEnv, alter_logical_region_add_tag_columns, create_logical_region_request,
+     };
+ 
++    #[tokio::test]
++    async fn test_strict_metric_scan_reaches_mito_policy() {
++        let env = TestEnv::new().await;
++        env.init_metric_region().await;
++        let region_id = env.default_logical_region_id();
++        let request = ScanRequest {
++            local_sst_only: true,
++            ..Default::default()
++        };
++        let error = match RegionEngine::handle_query(&env.metric(), region_id, request).await {
++            Ok(_) => panic!("strict Metric scan without a mirror unexpectedly succeeded"),
++            Err(error) => error,
++        };
++        assert!(error.to_string().contains("SST_MIRROR_MISS"), "{error}");
++    }
++
+     #[tokio::test]
+     async fn test_invalid_logical_projection() {
+         let env = TestEnv::new().await;
+diff --git a/src/metric-engine/src/engine/region_metadata.rs b/src/metric-engine/src/engine/region_metadata.rs
+index f8e0dd8..8acbd66 100644
+--- a/src/metric-engine/src/engine/region_metadata.rs
++++ b/src/metric-engine/src/engine/region_metadata.rs
+@@ -30,6 +30,16 @@ impl MetricEngineInner {
+         &self,
+         physical_region_id: RegionId,
+         logical_region_id: RegionId,
++    ) -> Result<Vec<ColumnMetadata>> {
++        self.load_logical_columns_with_policy(
++            physical_region_id,
++            logical_region_id,
++            self.mito.mito_config().sst_mirror_path.is_some(),
++        ).await
++    }
++
++    pub async fn load_logical_columns_with_policy(
++        &self, physical_region_id: RegionId, logical_region_id: RegionId, local_sst_only: bool,
+     ) -> Result<Vec<ColumnMetadata>> {
+         // First try to load from state cache
+         if let Some(columns) = self
+@@ -50,7 +60,7 @@ impl MetricEngineInner {
+         // Load logical and physical columns, and intersect them to get logical column metadata.
+         let logical_column_metadata = self
+             .metadata_region
+-            .logical_columns(physical_region_id, logical_region_id)
++            .logical_columns_with_policy(physical_region_id, logical_region_id, local_sst_only)
+             .await?
+             .into_iter()
+             .map(|(_, column_metadata)| column_metadata)
+@@ -80,36 +90,4 @@ impl MetricEngineInner {
+         Ok(dedup_columns)
+     }
+ 
+-    /// Load logical column names of a logical region.
+-    ///
+-    /// The return value is ordered on column name alphabetically.
+-    pub async fn load_logical_column_names(
+-        &self,
+-        physical_region_id: RegionId,
+-        logical_region_id: RegionId,
+-    ) -> Result<Vec<String>> {
+-        // First try to load from state cache
+-        if let Some(columns) = self
+-            .state
+-            .read()
+-            .unwrap()
+-            .logical_columns()
+-            .get(&logical_region_id)
+-        {
+-            return Ok(columns
+-                .iter()
+-                .map(|c| c.column_schema.name.clone())
+-                .collect());
+-        }
+-
+-        // Else load from metadata region
+-        let columns = self
+-            .load_logical_columns(physical_region_id, logical_region_id)
+-            .await?
+-            .into_iter()
+-            .map(|c| c.column_schema.name)
+-            .collect::<Vec<_>>();
+-
+-        Ok(columns)
+-    }
+ }
+diff --git a/src/metric-engine/src/metadata_region.rs b/src/metric-engine/src/metadata_region.rs
+index ec67ac7..8c82f6c 100644
+--- a/src/metric-engine/src/metadata_region.rs
++++ b/src/metric-engine/src/metadata_region.rs
+@@ -270,13 +270,23 @@ impl MetadataRegion {
+         &self,
+         physical_region_id: RegionId,
+         logical_region_id: RegionId,
++    ) -> Result<Vec<(String, ColumnMetadata)>> {
++        self.logical_columns_with_policy(
++            physical_region_id,
++            logical_region_id,
++            self.mito.mito_config().sst_mirror_path.is_some(),
++        ).await
++    }
++
++    pub async fn logical_columns_with_policy(
++        &self, physical_region_id: RegionId, logical_region_id: RegionId, local_sst_only: bool,
+     ) -> Result<Vec<(String, ColumnMetadata)>> {
+         let metadata_region_id = utils::to_metadata_region_id(physical_region_id);
+         let region_column_prefix = Self::concat_column_key_prefix(logical_region_id);
+ 
+         let mut columns = vec![];
+         for (k, v) in self
+-            .get_all_with_prefix(metadata_region_id, &region_column_prefix)
++            .get_all_with_prefix_policy(metadata_region_id, &region_column_prefix, local_sst_only)
+             .await?
+         {
+             if !k.starts_with(&region_column_prefix) {
+@@ -438,7 +448,17 @@ impl MetadataRegion {
+     }
+ 
+     async fn load_all(&self, metadata_region_id: RegionId) -> Result<RegionMetadataCacheEntry> {
+-        let scan_req = MetadataRegion::build_read_request();
++        self.load_all_with_policy(
++            metadata_region_id,
++            self.mito.mito_config().sst_mirror_path.is_some(),
++        ).await
++    }
++
++    async fn load_all_with_policy(
++        &self, metadata_region_id: RegionId, local_sst_only: bool,
++    ) -> Result<RegionMetadataCacheEntry> {
++        let mut scan_req = Self::build_read_request();
++        scan_req.local_sst_only = local_sst_only;
+         let record_batch_stream = self
+             .mito
+             .scan_to_stream(metadata_region_id, scan_req)
+@@ -484,18 +504,20 @@ impl MetadataRegion {
+         }
+     }
+ 
+-    async fn get_all_with_prefix(
+-        &self,
+-        metadata_region_id: RegionId,
+-        prefix: &str,
++    async fn get_all_with_prefix_policy(
++        &self, metadata_region_id: RegionId, prefix: &str, local_sst_only: bool,
+     ) -> Result<HashMap<String, String>> {
+         let cache_access_lock = self.cache_access_lock(metadata_region_id);
+         let _cache_guard = cache_access_lock.read().await;
+-        let region_metadata = self
+-            .cache
+-            .try_get_with(metadata_region_id, self.load_all(metadata_region_id))
+-            .await
+-            .context(CacheGetSnafu)?;
++        let region_metadata = if local_sst_only {
++            // Never join an ordinary cache fill whose reader may use remote SSTs.
++            self.load_all_with_policy(metadata_region_id, true).await?
++        } else {
++            self.cache
++                .try_get_with(metadata_region_id, self.load_all_with_policy(metadata_region_id, false))
++                .await
++                .context(CacheGetSnafu)?
++        };
+ 
+         let mut result = HashMap::new();
+         get_all_with_prefix(&region_metadata, prefix, |k, v| {
+@@ -510,7 +532,10 @@ impl MetadataRegion {
+         region_id: RegionId,
+         prefix: &str,
+     ) -> Result<Vec<String>> {
+-        let scan_req = MetadataRegion::build_prefix_read_request(prefix, true);
++        let mut scan_req = MetadataRegion::build_prefix_read_request(prefix, true);
++        // Recovery and metadata mutation are maintenance, not ordinary user reads.
++        // Missing mirror input must fail the operation rather than fetch remotely.
++        scan_req.local_sst_only = self.mito.mito_config().sst_mirror_path.is_some();
+         let record_batch_stream = self
+             .mito
+             .scan_to_stream(region_id, scan_req)
+@@ -939,6 +964,58 @@ mod test {
+             .await
+     }
+ 
++    #[tokio::test]
++    async fn test_recovery_metadata_requires_mirror_but_user_reads_do_not() {
++        use common_base::readable_size::ReadableSize;
++        use common_test_util::temp_dir::create_temp_dir;
++        use mito2::config::MitoConfig;
++        use store_api::region_engine::RegionEngine;
++        use store_api::region_request::RegionFlushRequest;
++
++        let dir = create_temp_dir("metric-recovery-mirror");
++        let mirror_path = dir.path().join("mirror");
++        let env = TestEnv::with_mito_config(
++            "metric-recovery-mirror",
++            MitoConfig {
++                sst_mirror_path: Some(mirror_path.to_str().unwrap().to_string()),
++                sst_mirror_capacity: ReadableSize::mb(64),
++                sst_mirror_output_reserve: ReadableSize::mb(16),
++                ..Default::default()
++            },
++            Default::default(),
++        ).await;
++        env.init_metric_region().await;
++        let metadata_region = env.metadata_region();
++        let physical_region_id = env.default_physical_region_id();
++        let metadata_region_id = to_metadata_region_id(physical_region_id);
++        let logical_region_id = env.default_logical_region_id();
++        env.mito().handle_request(
++            metadata_region_id,
++            RegionRequest::Flush(RegionFlushRequest::default()),
++        ).await.unwrap();
++
++        // This registry scan is shared by single and batch region recovery.
++        assert!(metadata_region.logical_regions(physical_region_id).await.unwrap()
++            .contains(&logical_region_id));
++        assert!(!metadata_region.load_all(metadata_region_id).await.unwrap().key_values.is_empty());
++
++        // Canonical storage and write cache remain intact. Only local maintenance
++        // inputs disappear: recovery must not silently read either fallback.
++        std::fs::remove_dir_all(mirror_path.join("objects")).unwrap();
++        assert!(metadata_region.logical_regions(physical_region_id).await.is_err());
++        assert!(metadata_region.load_all(metadata_region_id).await.is_err());
++        assert!(metadata_region.logical_columns(physical_region_id, logical_region_id).await.is_err());
++
++        // Explicit ordinary reads still work and may fill the ordinary cache.
++        assert!(!metadata_region.logical_columns_with_policy(
++            physical_region_id, logical_region_id, false,
++        ).await.unwrap().is_empty());
++        // A warm ordinary cache must not bypass the strict mirror guard.
++        assert!(metadata_region.logical_columns_with_policy(
++            physical_region_id, logical_region_id, true,
++        ).await.is_err());
++    }
++
+     #[tokio::test]
+     async fn add_logical_regions_to_meta_region() {
+         let env = TestEnv::new().await;
+diff --git a/src/mito2/Cargo.toml b/src/mito2/Cargo.toml
+index bf8e1cd..6f0bc2e 100644
+--- a/src/mito2/Cargo.toml
++++ b/src/mito2/Cargo.toml
+@@ -54,6 +54,7 @@ dashmap.workspace = true
+ derive_more.workspace = true
+ dotenv.workspace = true
+ either.workspace = true
++fs2.workspace = true
+ futures.workspace = true
+ humantime.workspace = true
+ humantime-serde.workspace = true
+diff --git a/src/mito2/src/access_layer.rs b/src/mito2/src/access_layer.rs
+index 05595bb..1edaf60 100644
+--- a/src/mito2/src/access_layer.rs
++++ b/src/mito2/src/access_layer.rs
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ use std::sync::Arc;
++use crate::cache::sst_mirror::SstMirror;
+ use std::time::{Duration, Instant};
+ 
+ use async_stream::try_stream;
+@@ -24,7 +25,7 @@ use object_store::util::{join_dir, with_instrument_layers};
+ use object_store::{ATOMIC_WRITE_DIR, ErrorKind, OLD_ATOMIC_WRITE_DIR, ObjectStore};
+ use parquet::file::metadata::PageIndexPolicy;
+ use smallvec::SmallVec;
+-use snafu::ResultExt;
++use snafu::{IntoError, ResultExt};
+ use store_api::metadata::RegionMetadataRef;
+ use store_api::region_request::PathType;
+ use store_api::sst_entry::StorageSstEntry;
+@@ -144,6 +145,7 @@ impl Metrics {
+ }
+ 
+ /// A layer to access SST files under the same directory.
++#[derive(Clone)]
+ pub struct AccessLayer {
+     table_dir: String,
+     /// Path type for generating file paths.
+@@ -154,6 +156,8 @@ pub struct AccessLayer {
+     puffin_manager_factory: PuffinManagerFactory,
+     /// Intermediate manager for inverted index.
+     intermediate_manager: IntermediateManager,
++    mirror: Option<Arc<SstMirror>>,
++    local_only: bool,
+ }
+ 
+ impl std::fmt::Debug for AccessLayer {
+@@ -179,9 +183,58 @@ impl AccessLayer {
+             object_store,
+             puffin_manager_factory,
+             intermediate_manager,
++            mirror: None,
++            local_only: false,
+         }
+     }
+ 
++    pub(crate) fn with_mirror(mut self, mirror: Arc<SstMirror>) -> Self {
++        self.mirror = Some(mirror);
++        self
++    }
++
++    pub(crate) fn mirror(&self) -> Option<&Arc<SstMirror>> {
++        self.mirror.as_ref()
++    }
++
++    /// No remote operator survives in this layer, including its Puffin manager.
++    pub(crate) fn local_input_layer(&self) -> Result<AccessLayerRef> {
++        let mirror = self.mirror.as_ref().ok_or_else(|| {
++            OpenDalSnafu.into_error(object_store::Error::new(
++                object_store::ErrorKind::Unexpected, "SST_MIRROR_MISS: local mirror is disabled"))
++        })?;
++        let mut layer = self.clone();
++        layer.object_store = mirror.store();
++        layer.local_only = true;
++        Ok(Arc::new(layer))
++    }
++    /// Validate selected local inputs before index errors can fall back to a scan.
++    pub(crate) async fn validate_local_input(&self, file: &FileHandle) -> Result<()> {
++        if !self.local_only {
++            return Ok(());
++        }
++        let mut paths = vec![file.file_path(&self.table_dir, self.path_type)];
++        if file.index_size() > 0 {
++            paths.push(location::index_file_path(
++                &self.table_dir, file.index_id(), self.path_type,
++            ));
++        }
++        self.mirror.as_ref().expect("local layer has mirror").validate_paths(&paths).await
++    }
++
++
++    fn validate_output_cache(&self, cache: &CacheManagerRef) -> Result<()> {
++        if self.local_only || self.mirror.as_ref().is_some_and(|mirror| {
++            !cache.write_cache().and_then(|c| c.mirror())
++                .is_some_and(|other| Arc::ptr_eq(mirror, other))
++        }) {
++            return Err(OpenDalSnafu.into_error(object_store::Error::new(
++                object_store::ErrorKind::Unexpected,
++                "SST_MIRROR_IO: outputs require the canonical layer and its mirrored write cache")));
++        }
++        Ok(())
++    }
++
+     /// Returns the directory of the table.
+     pub fn table_dir(&self) -> &str {
+         &self.table_dir
+@@ -230,6 +283,9 @@ impl AccessLayer {
+             .context(DeleteIndexSnafu {
+                 file_id: index_file_id.file_id(),
+             })?;
++        if let Some(mirror) = &self.mirror {
++            mirror.delete(&path).await?;
++        }
+         Ok(())
+     }
+ 
+@@ -273,6 +329,9 @@ impl AccessLayer {
+             region_id,
+             file_ids: attempted_files,
+         })?;
++        if let Some(mirror) = &self.mirror {
++            for path in &paths { mirror.delete(path).await?; }
++        }
+ 
+         Ok(())
+     }
+@@ -311,6 +370,9 @@ impl AccessLayer {
+             .close()
+             .await
+             .context(DeleteIndexesSnafu { file_ids })?;
++        if let Some(mirror) = &self.mirror {
++            for path in &paths { mirror.delete(path).await?; }
++        }
+ 
+         Ok(())
+     }
+@@ -342,6 +404,7 @@ impl AccessLayer {
+         let region_id = request.metadata.region_id;
+         let region_metadata = request.metadata.clone();
+         let cache_manager = request.cache_manager.clone();
++        self.validate_output_cache(&cache_manager)?;
+ 
+         let sst_info = if let Some(write_cache) = cache_manager.write_cache() {
+             // Write to the write cache.
+@@ -466,6 +529,7 @@ impl AccessLayer {
+         sst_info: &SstInfo,
+         cache_manager: &CacheManagerRef,
+     ) -> Result<Metrics> {
++        self.validate_output_cache(cache_manager)?;
+         if let Some(write_cache) = cache_manager.write_cache() {
+             // Write to cache and upload to remote store
+             let upload_request = SstUploadRequest {
+diff --git a/src/mito2/src/cache.rs b/src/mito2/src/cache.rs
+index 7935b3a..07a3ba2 100644
+--- a/src/mito2/src/cache.rs
++++ b/src/mito2/src/cache.rs
+@@ -22,6 +22,7 @@ pub(crate) mod manifest_cache;
+ #[cfg(test)]
+ pub(crate) mod test_util;
+ pub(crate) mod write_cache;
++pub(crate) mod sst_mirror;
+ 
+ use std::collections::{BTreeMap, HashMap};
+ use std::mem;
+diff --git a/src/mito2/src/cache/write_cache.rs b/src/mito2/src/cache/write_cache.rs
+index a85e3eb..918dda8 100644
+--- a/src/mito2/src/cache/write_cache.rs
++++ b/src/mito2/src/cache/write_cache.rs
+@@ -15,13 +15,14 @@
+ //! A write-through cache for remote object stores.
+ 
+ use std::sync::Arc;
++use crate::cache::sst_mirror::SstMirror;
+ use std::time::{Duration, Instant};
+ 
+ use common_base::readable_size::ReadableSize;
+ use common_telemetry::{debug, info};
+ use futures::AsyncWriteExt;
+ use object_store::ObjectStore;
+-use snafu::ResultExt;
++use snafu::{IntoError, ResultExt};
+ use store_api::storage::RegionId;
+ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+ 
+@@ -56,6 +57,7 @@ pub struct WriteCache {
+     task_sender: UnboundedSender<RegionLoadCacheTask>,
+     /// Optional cache for manifest files.
+     manifest_cache: Option<ManifestCache>,
++    mirror: Option<Arc<SstMirror>>,
+ }
+ 
+ pub type WriteCacheRef = Arc<WriteCache>;
+@@ -91,6 +93,7 @@ impl WriteCache {
+             intermediate_manager,
+             task_sender,
+             manifest_cache,
++            mirror: None,
+         })
+     }
+ 
+@@ -130,6 +133,16 @@ impl WriteCache {
+         .await
+     }
+ 
++    pub(crate) fn set_mirror(&mut self, mirror: Arc<SstMirror>) -> Result<()> {
++        mirror.validate_cache_store(&self.file_cache.local_store())?;
++        self.mirror = Some(mirror);
++        Ok(())
++    }
++
++    pub(crate) fn mirror(&self) -> Option<&Arc<SstMirror>> {
++        self.mirror.as_ref()
++    }
++
+     /// Returns the file cache of the write cache.
+     pub(crate) fn file_cache(&self) -> FileCacheRef {
+         self.file_cache.clone()
+@@ -298,6 +311,13 @@ impl WriteCache {
+ 
+         if let Some(err) = err {
+             // Cleans files on failure.
++            if let Some(mirror) = &self.mirror {
++                for path in &upload_tracker.files_uploaded {
++                    if let Err(error) = mirror.delete(path).await {
++                        common_telemetry::error!(error; "Failed to clean uncommitted mirror output");
++                    }
++                }
++            }
+             upload_tracker
+                 .clean(&sst_info, &self.file_cache, remote_store)
+                 .await;
+@@ -321,6 +341,11 @@ impl WriteCache {
+         remote_store: &ObjectStore,
+         file_size: u64,
+     ) -> Result<()> {
++        if self.mirror.is_some() {
++            return Err(error::OpenDalSnafu.into_error(object_store::Error::new(
++                object_store::ErrorKind::Unexpected,
++                "SST_MIRROR_MISS: automatic remote cache download disabled")));
++        }
+         self.file_cache
+             .download(index_key, remote_path, remote_store, file_size)
+             .await
+@@ -350,12 +375,32 @@ impl WriteCache {
+         Ok(true)
+     }
+ 
+-    /// Uploads a Parquet file or a Puffin file to the remote object store.
+     pub(crate) async fn upload(
+         &self,
+         index_key: IndexKey,
+         upload_path: &str,
+         remote_store: &ObjectStore,
++    ) -> Result<()> {
++        if let Some(mirror) = &self.mirror {
++            let source = std::path::PathBuf::from(self.file_cache.local_store().info().root())
++                .join(self.file_cache.cache_file_path(index_key));
++            mirror.publish(&source, upload_path).await?;
++        }
++        let result = self.upload_inner(index_key, upload_path, remote_store).await;
++        if result.is_err() {
++            if let Some(mirror) = &self.mirror {
++                mirror.delete(upload_path).await?;
++            }
++        }
++        result
++    }
++
++    /// Uploads a Parquet file or a Puffin file to the remote object store.
++    async fn upload_inner(
++        &self,
++        index_key: IndexKey,
++        upload_path: &str,
++        remote_store: &ObjectStore,
+     ) -> Result<()> {
+         let region_id = index_key.region_id;
+         let file_id = index_key.file_id;
+diff --git a/src/mito2/src/compaction/compactor.rs b/src/mito2/src/compaction/compactor.rs
+index 65c57ba..032eb18 100644
+--- a/src/mito2/src/compaction/compactor.rs
++++ b/src/mito2/src/compaction/compactor.rs
+@@ -134,6 +134,12 @@ pub async fn open_compaction_region(
+     object_store_manager: ObjectStoreManagerRef,
+     ttl_provider: Either<TimeToLive, SchemaMetadataManagerRef>,
+ ) -> Result<CompactionRegion> {
++    if mito_config.sst_mirror_path.is_some() {
++        return error::InvalidMetaSnafu {
++            reason: "remote compaction cannot use the standalone SST mirror".to_string(),
++        }
++        .fail();
++    }
+     let object_store = {
+         let name = &req.region_options.storage;
+         if let Some(name) = name {
+@@ -447,7 +453,11 @@ impl SstMerger for DefaultSstMerger {
+             .flatten();
+         let builder = CompactionSstReaderBuilder {
+             metadata: compaction_region.region_metadata.clone(),
+-            sst_layer: compaction_region.access_layer.clone(),
++            sst_layer: if compaction_region.access_layer.mirror().is_some() {
++                compaction_region.access_layer.local_input_layer()?
++            } else {
++                compaction_region.access_layer.clone()
++            },
+             cache: compaction_region.cache_manager.clone(),
+             inputs: &output.inputs,
+             append_mode,
+@@ -459,6 +469,16 @@ impl SstMerger for DefaultSstMerger {
+ 
+         let mut metrics = Metrics::new(WriteType::Compaction);
+         let region_metadata = compaction_region.region_metadata.clone();
++        // Convert partition expression once outside the map
++        let partition_expr = match &region_metadata.partition_expr {
++            None => None,
++            Some(json_str) if json_str.is_empty() => None,
++            Some(json_str) => PartitionExpr::from_json_str(json_str).with_context(|_| {
++                InvalidPartitionExprSnafu {
++                    expr: json_str.clone(),
++                }
++            })?,
++        };
+         let sst_infos = compaction_region
+             .access_layer
+             .write_sst(
+@@ -486,16 +506,6 @@ impl SstMerger for DefaultSstMerger {
+                 &mut metrics,
+             )
+             .await?;
+-        // Convert partition expression once outside the map
+-        let partition_expr = match &region_metadata.partition_expr {
+-            None => None,
+-            Some(json_str) if json_str.is_empty() => None,
+-            Some(json_str) => PartitionExpr::from_json_str(json_str).with_context(|_| {
+-                InvalidPartitionExprSnafu {
+-                    expr: json_str.clone(),
+-                }
+-            })?,
+-        };
+ 
+         let output_files = sst_infos
+             .iter()
+@@ -600,6 +610,51 @@ where
+         let internal_parallelism = compaction_region.max_parallelism.max(1);
+         let compaction_time_window = picker_output.time_window_size;
+         let region_id = compaction_region.region_id;
++        let strict = compaction_region.access_layer.mirror().is_some();
++        if compaction_region.engine_config.sst_mirror_path.is_some() && !strict {
++            return error::InvalidMetaSnafu {
++                reason: "strict compaction requires an attached SST mirror".to_string(),
++            }
++            .fail();
++        }
++        // Pin every selected input before any output or manifest operation.
++        // FileHandles retained by the picker also protect inputs through commit.
++        let (_input_lease, _output_reservation) =
++            if let Some(mirror) = compaction_region.access_layer.mirror() {
++                let mut paths = Vec::new();
++                for output in &picker_output.outputs {
++                    for file in &output.inputs {
++                        paths.push(file.file_path(
++                            compaction_region.access_layer.table_dir(),
++                            compaction_region.access_layer.path_type(),
++                        ));
++                        if file.index_size() > 0 {
++                            paths.push(crate::sst::location::index_file_path(
++                                compaction_region.access_layer.table_dir(),
++                                file.index_id(),
++                                compaction_region.access_layer.path_type(),
++                            ));
++                        }
++                    }
++                }
++                let lease = mirror.lease_paths(&paths).await?;
++                let reservation = if picker_output.outputs.is_empty() {
++                    None
++                } else {
++                    Some(mirror.reserve_output().await?)
++                };
++                (Some(lease), reservation)
++            } else {
++                (None, None)
++            };
++        let mut merge_error = None;
++        let uncommitted = self.uncommitted.clone().or_else(|| {
++            strict.then(|| UncommittedSsts::new(
++                region_id,
++                compaction_region.access_layer.clone(),
++                Some(compaction_region.cache_manager.clone()),
++            ))
++        });
+ 
+         // Build tasks along with their input file metas so we can track which
+         // inputs correspond to each task.
+@@ -615,7 +670,7 @@ where
+             };
+             let merger = self.merger.clone();
+             let compaction_region = compaction_region.clone();
+-            let uncommitted = self.uncommitted.clone();
++            let uncommitted = uncommitted.clone();
+             let fut = async move {
+                 let result = merger
+                     .merge_single_output(compaction_region, output, write_opts)
+@@ -667,6 +722,9 @@ where
+                             region_id,
+                             inputs.iter().map(|f| f.file_id.to_string()).join(",")
+                         );
++                        if strict {
++                            merge_error.get_or_insert(e);
++                        }
+                     }
+                     Ok(Err(e)) => {
+                         warn!(
+@@ -675,15 +733,12 @@ where
+                             inputs.iter().map(|f| f.file_id.to_string()).join(","),
+                             e
+                         );
+-                        // If the cancel handle is cancelled,
+-                        // cancel the remaining tasks before returns the error.
+-                        if self.cancel_handle.is_cancelled() {
+-                            abort_handle.abort();
+-                            for (_, handle) in &spawned {
+-                                handle.abort();
+-                            }
+-                            for (_, handle) in spawned {
+-                                let _ = handle.await;
++                        for (_, handle) in spawned {
++                            let _ = handle.await;
++                        }
++                        if strict {
++                            if let Some(uncommitted) = &uncommitted {
++                                uncommitted.cleanup().await;
+                             }
+                         }
+                         return Err(e).context(error::JoinSnafu);
+@@ -706,14 +761,32 @@ where
+                     }
+                 }
+             }
++            // Drain all already-started work before returning failure: each
++            // finalized output must be tracked before uncommitted cleanup.
++            if let Some(error) = merge_error.take() {
++                if let Some(uncommitted) = &uncommitted {
++                    uncommitted.cleanup().await;
++                }
++                return Err(error);
++            }
+ 
+             if self.cancel_handle.is_cancelled() {
+                 info!("Compaction merge cancelled for region: {}", region_id);
++                if strict {
++                    if let Some(uncommitted) = &uncommitted {
++                        uncommitted.cleanup().await;
++                    }
++                    return error::InvalidMetaSnafu {
++                        reason: "strict compaction cancelled before publication".to_string(),
++                    }
++                    .fail();
++                }
+                 break;
+             }
+         }
+ 
+-        // Include expired SSTs in removals — these don't depend on merge success.
++        // Strict jobs reach here only after every merge succeeds; expiry-only
++        // jobs remain metadata-only and do not reserve output capacity.
+         compacted_inputs.extend(
+             picker_output
+                 .expired_ssts
+@@ -856,6 +929,105 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn test_strict_merge_failure_never_returns_partial_edit() {
++        use common_test_util::temp_dir::create_temp_dir;
++        use crate::cache::sst_mirror::SstMirror;
++
++        for format in [FormatType::Flat, FormatType::PrimaryKey] {
++            let dir = create_temp_dir("");
++            let mirror = SstMirror::new(dir.path().to_str().unwrap(), 4096, 1024).await.unwrap();
++            let mut region = new_test_compaction_region().await;
++            region.region_options.sst_format = Some(format);
++            region.max_parallelism = 2;
++            let layer = &region.access_layer;
++            region.access_layer = Arc::new(AccessLayer::new(
++                "strict-test-region",
++                layer.path_type(),
++                layer.object_store().clone(),
++                layer.puffin_manager_factory().clone(),
++                layer.intermediate_manager().clone(),
++            ).with_mirror(mirror.clone()));
++            let first = new_file_handle(dummy_file_meta());
++            let second = new_file_handle(dummy_file_meta());
++            let expired = new_file_handle(dummy_file_meta());
++            let outputs = vec![first.clone(), second.clone()].into_iter().map(|file| {
++                CompactionOutput {
++                    output_level: 1,
++                    inputs: vec![file],
++                    filter_deleted: false,
++                    output_time_range: None,
++                }
++            }).collect();
++            let picker = PickerOutput {
++                outputs,
++                expired_ssts: vec![expired.clone()],
++                time_window_size: 3600,
++                max_file_size: None,
++            };
++            let merger = MockMerger::new(vec![
++                Ok(vec![dummy_file_meta()]),
++                Err(error::InvalidMetaSnafu { reason: "failed sibling".to_string() }.build()),
++            ]);
++            let calls = merger.call_idx.clone();
++            let compactor = DefaultCompactor::with_merger(merger);
++            let before = region.manifest_ctx.manifest().await.files.len();
++            assert!(compactor.merge_ssts(&region, picker.clone()).await.is_err());
++            assert_eq!(calls.load(Ordering::SeqCst), 0);
++            let source = dir.path().join("source");
++            std::fs::write(&source, b"local immutable input").unwrap();
++            for file in [&first, &second] {
++                mirror.publish(&source, &file.file_path(
++                    region.access_layer.table_dir(), region.access_layer.path_type()
++                )).await.unwrap();
++            }
++            let reservation = mirror.reserve_output().await.unwrap();
++            assert!(tokio::time::timeout(
++                std::time::Duration::from_millis(1), compactor.merge_ssts(&region, picker.clone()),
++            ).await.is_err());
++            assert_eq!(calls.load(Ordering::SeqCst), 0);
++            drop(reservation);
++            // Finish both siblings, but never expose a partial source retirement
++            // or expiry edit when either sibling fails.
++            assert!(compactor.merge_ssts(&region, picker).await.is_err());
++            assert_eq!(calls.load(Ordering::SeqCst), 2);
++            assert!(!first.is_deleted());
++            assert!(!second.is_deleted());
++            assert!(!expired.is_deleted());
++            assert_eq!(before, region.manifest_ctx.manifest().await.files.len());
++        }
++    }
++
++    #[tokio::test]
++    async fn test_strict_compaction_without_mirror_preserves_inputs() {
++        let mut region = new_test_compaction_region().await;
++        let mut config = MitoConfig::default();
++        config.sst_mirror_path = Some("missing-mirror".to_string());
++        region.engine_config = Arc::new(config);
++        let live = new_file_handle(dummy_file_meta());
++        let expired = new_file_handle(dummy_file_meta());
++        let merger = MockMerger::new(vec![Ok(vec![dummy_file_meta()])]);
++        let calls = merger.call_idx.clone();
++        let compactor = DefaultCompactor::with_merger(merger);
++        let before = region.manifest_ctx.manifest().await.files.len();
++        let result = compactor.merge_ssts(&region, PickerOutput {
++            outputs: vec![CompactionOutput {
++                output_level: 1,
++                inputs: vec![live.clone()],
++                filter_deleted: false,
++                output_time_range: None,
++            }],
++            expired_ssts: vec![expired.clone()],
++            time_window_size: 3600,
++            max_file_size: None,
++        }).await;
++        assert!(result.is_err());
++        assert_eq!(calls.load(Ordering::SeqCst), 0);
++        assert!(!live.is_deleted());
++        assert!(!expired.is_deleted());
++        assert_eq!(before, region.manifest_ctx.manifest().await.files.len());
++    }
++
+     #[tokio::test]
+     async fn test_partial_merge_failure_collects_only_successful_outputs() {
+         common_telemetry::init_default_ut_logging();
+diff --git a/src/mito2/src/compaction/reader.rs b/src/mito2/src/compaction/reader.rs
+index 2f60479..f9d7a5f 100644
+--- a/src/mito2/src/compaction/reader.rs
++++ b/src/mito2/src/compaction/reader.rs
+@@ -127,6 +127,7 @@ impl CompactionSstReaderBuilder<'_> {
+             &targets,
+         )?;
+ 
++        let strict = self.sst_layer.mirror().is_some();
+         let mut scan_input = ScanInput::new(self.sst_layer, mapper)
+             .with_json2_rewrite_targets(targets)
+             .with_files(self.inputs.to_vec())
+@@ -136,8 +137,7 @@ impl CompactionSstReaderBuilder<'_> {
+             // We use special cache strategy for compaction.
+             .with_cache(CacheStrategy::Compaction(self.cache))
+             .with_filter_deleted(self.filter_deleted)
+-            // We ignore file not found error during compaction.
+-            .with_ignore_file_not_found(true)
++            .with_ignore_file_not_found(!strict)
+             .with_merge_mode(self.merge_mode);
+ 
+         // This serves as a workaround of https://github.com/GreptimeTeam/greptimedb/issues/3944
+@@ -171,7 +171,7 @@ impl CompactionSstReaderBuilder<'_> {
+                 .map(|x| x.0.parquet_metadata())
+             {
+                 Ok(x) => x,
+-                Err(e) if e.is_object_not_found() => continue,
++                Err(e) if e.is_object_not_found() && self.sst_layer.mirror().is_none() => continue,
+                 Err(e) => return Err(e),
+             };
+             metadata.push(parquet_metadata);
+diff --git a/src/mito2/src/compaction/task.rs b/src/mito2/src/compaction/task.rs
+index 6f87c37..ef4dd9a 100644
+--- a/src/mito2/src/compaction/task.rs
++++ b/src/mito2/src/compaction/task.rs
+@@ -333,7 +333,13 @@ impl CompactionTask for CompactionTaskImpl {
+             }
+         };
+ 
+-        self.handle_expiration().await;
++        // Strict maintenance co-commits expiry with a successful merge. A missing
++        // live input must not mutate the manifest through eager expiration.
++        if self.compaction_region.access_layer.mirror().is_none()
++            && self.compaction_region.engine_config.sst_mirror_path.is_none()
++        {
++            self.handle_expiration().await;
++        }
+ 
+         // The local compactor owns cancellation of its spawned merge tasks. Waiting for it to
+         // return ensures all finalized outputs are tracked before cleanup starts.
+diff --git a/src/mito2/src/config.rs b/src/mito2/src/config.rs
+index f748970..86f7fae 100644
+--- a/src/mito2/src/config.rs
++++ b/src/mito2/src/config.rs
+@@ -133,6 +133,12 @@ pub struct MitoConfig {
+     pub write_cache_path: String,
+     /// Capacity for write cache.
+     pub write_cache_size: ReadableSize,
++    /// Persistent immutable active-SST mirror. None keeps the ordinary remote policy.
++    pub sst_mirror_path: Option<String>,
++    /// Hard logical payload quota, independent of the evicting write cache.
++    pub sst_mirror_capacity: ReadableSize,
++    /// Fixed maximum output bytes admitted in one maintenance window.
++    pub sst_mirror_output_reserve: ReadableSize,
+     /// TTL for write cache.
+     #[serde(with = "humantime_serde")]
+     pub write_cache_ttl: Option<Duration>,
+@@ -220,6 +226,9 @@ impl Default for MitoConfig {
+             enable_write_cache: false,
+             write_cache_path: String::new(),
+             write_cache_size: ReadableSize::gb(5),
++            sst_mirror_path: None,
++            sst_mirror_capacity: ReadableSize(0),
++            sst_mirror_output_reserve: ReadableSize(0),
+             write_cache_ttl: None,
+             preload_index_cache: true,
+             index_cache_percent: DEFAULT_INDEX_CACHE_PERCENT,
+@@ -307,6 +316,11 @@ impl MitoConfig {
+         if self.write_cache_path.trim().is_empty() {
+             self.write_cache_path = data_home.to_string();
+         }
++        if self.sst_mirror_path.is_some() {
++            self.enable_write_cache = true;
++            self.preload_index_cache = false;
++            self.enable_refill_cache_on_read = false;
++        }
+ 
+         // Validate index_cache_percent is within valid range (0, 100)
+         if self.index_cache_percent == 0 || self.index_cache_percent >= 100 {
+diff --git a/src/mito2/src/engine.rs b/src/mito2/src/engine.rs
+index a128531..fdb3944 100644
+--- a/src/mito2/src/engine.rs
++++ b/src/mito2/src/engine.rs
+@@ -1088,12 +1088,17 @@ impl EngineInner {
+ 
+         // Get cache.
+         let cache_manager = self.workers.cache_manager();
++        let (access_layer, cache_strategy) = if request.local_sst_only {
++            (region.access_layer.local_input_layer()?, CacheStrategy::Disabled)
++        } else {
++            (region.access_layer.clone(), CacheStrategy::EnableAll(cache_manager))
++        };
+ 
+         let scan_region = ScanRegion::new(
+             version,
+-            region.access_layer.clone(),
++            access_layer,
+             request,
+-            CacheStrategy::EnableAll(cache_manager),
++            cache_strategy,
+         )
+         .with_query_stat_counters(region.region_stats.query_stat_counters())
+         .with_max_concurrent_scan_files(self.config.max_concurrent_scan_files)
+diff --git a/src/mito2/src/gc.rs b/src/mito2/src/gc.rs
+index a547409..9db00f4 100644
+--- a/src/mito2/src/gc.rs
++++ b/src/mito2/src/gc.rs
+@@ -793,6 +793,34 @@ impl LocalGcWorker {
+             })?;
+         let index_cnt = index_entries.len();
+         all_entries.extend(index_entries);
++        // Local outputs can survive a crash before remote upload. Include them
++        // in the same manifest/ref/age filtering as remote orphans; never warm
++        // missing historical mirror entries during recovery.
++        if let Some(mirror) = self.access_layer.mirror() {
++            let store = mirror.store();
++            let region_dir = self.access_layer.build_region_dir(region_id);
++            let index_dir = object_store::util::join_dir(&region_dir, "index");
++            let mut seen = all_entries
++                .iter()
++                .map(|entry| entry.path().to_string())
++                .collect::<HashSet<_>>();
++            for dir in [&region_dir, &index_dir] {
++                let mut lister = match store.lister_with(dir).await {
++                    Ok(lister) => lister,
++                    Err(error) if error.kind() == ErrorKind::NotFound => continue,
++                    Err(error) => return Err(error).context(OpenDalSnafu),
++                };
++                while let Some(entry) = lister.next().await {
++                    let entry = entry.context(OpenDalSnafu)?;
++                    if entry.metadata().is_file()
++                        && (entry.name().ends_with(".parquet") || entry.name().ends_with(".puffin"))
++                        && seen.insert(entry.path().to_string())
++                    {
++                        all_entries.push(entry);
++                    }
++                }
++            }
++        }
+         info!(
+             "gc: full listing mode cost {} secs using {lister_cnt} lister for root={root_cnt} index={index_cnt} files in region {}.",
+             start.elapsed().as_secs_f64(),
+diff --git a/src/mito2/src/read/scan_region.rs b/src/mito2/src/read/scan_region.rs
+index 7427584..09f5c82 100644
+--- a/src/mito2/src/read/scan_region.rs
++++ b/src/mito2/src/read/scan_region.rs
+@@ -1290,6 +1290,7 @@ impl ScanInput {
+         predicate: Option<Predicate>,
+         reader_metrics: &mut ReaderMetrics,
+     ) -> Result<FileRangeBuilder> {
++        self.access_layer.validate_local_input(file).await?;
+         let may_build_selective_row_selection = predicate.is_some();
+         let decode_pk_values = !self.compaction
+             && self
+diff --git a/src/mito2/src/region.rs b/src/mito2/src/region.rs
+index 76204da..b6052f6 100644
+--- a/src/mito2/src/region.rs
++++ b/src/mito2/src/region.rs
+@@ -23,7 +23,7 @@ pub(crate) mod version;
+ use std::collections::hash_map::Entry;
+ use std::collections::{HashMap, HashSet};
+ use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+-use std::sync::{Arc, Mutex, RwLock};
++use std::sync::{Arc, Mutex, OnceLock, RwLock};
+ 
+ use common_base::hash::partition_expr_version;
+ use common_recordbatch::adapter::RegionQueryStatCounters;
+@@ -58,7 +58,7 @@ use crate::manifest::action::{
+ use crate::manifest::manager::RegionManifestManager;
+ use crate::region::version::{VersionControlRef, VersionRef};
+ use crate::request::{OnFailure, OptionOutputTx};
+-use crate::sst::file::FileMeta;
++use crate::sst::file::{FileMeta, RegionFileId, RegionIndexId};
+ use crate::sst::file_purger::FilePurgerRef;
+ use crate::sst::location::{index_file_path, sst_file_path};
+ use crate::time_provider::TimeProviderRef;
+@@ -1133,6 +1133,8 @@ pub(crate) struct ManifestContext {
+     staging_partition_info: Mutex<Option<StagingPartitionInfo>>,
+     /// Optional region hook for observing manifest mutations.
+     hook: Option<RegionHookRef>,
++    /// Output publication fence; deliberately not used when opening cold history.
++    access_layer: OnceLock<AccessLayerRef>,
+ }
+ 
+ impl ManifestContext {
+@@ -1146,9 +1148,16 @@ impl ManifestContext {
+             state: AtomicCell::new(state),
+             staging_partition_info: Mutex::new(None),
+             hook,
++            access_layer: OnceLock::new(),
+         }
+     }
+ 
++    pub(crate) fn set_access_layer(&self, access_layer: AccessLayerRef) {
++        self.access_layer
++            .set(access_layer)
++            .expect("manifest access layer initialized once");
++    }
++
+     /// Returns the region hook if one is registered.
+     pub(crate) fn hook(&self) -> Option<RegionHookRef> {
+         self.hook.clone()
+@@ -1381,6 +1390,47 @@ impl ManifestContext {
+         is_staging: bool,
+     ) -> Result<PendingManifestHook> {
+         let region_id = manager.manifest().metadata.region_id;
++        let _publication_lease = if let Some(layer) = self.access_layer.get()
++            && let Some(mirror) = layer.mirror()
++        {
++            let manifest = manager.manifest();
++            let mut paths = Vec::new();
++            for action in &action_list.actions {
++                let RegionMetaAction::Edit(edit) = action else {
++                    continue;
++                };
++                for file in &edit.files_to_add {
++                    let previous = manifest.files.get(&file.file_id);
++                    let file_id = RegionFileId::new(file.region_id, file.file_id);
++                    // Metadata-only edits of historical cold files are legal.
++                    // Every newly referenced payload, however, must already be
++                    // durable locally before its manifest reference is visible.
++                    if previous.is_none_or(|old| {
++                        old.region_id != file.region_id || old.file_size != file.file_size
++                    }) {
++                        paths.push(sst_file_path(layer.table_dir(), file_id, layer.path_type()));
++                    }
++                    if file.index_file_size > 0
++                        && previous.is_none_or(|old| {
++                            old.region_id != file.region_id
++                                || old.index_file_size != file.index_file_size
++                                || old.index_version != file.index_version
++                        })
++                    {
++                        paths.push(index_file_path(
++                            layer.table_dir(),
++                            RegionIndexId::new(file_id, file.index_version),
++                            layer.path_type(),
++                        ));
++                    }
++                }
++            }
++            let lease = mirror.lease_paths(&paths).await?;
++            mirror.validate_paths(&paths).await?;
++            Some(lease)
++        } else {
++            None
++        };
+         // Clone before `action_list` is moved into `update` so the hook still
+         // sees what was written.
+         let action_list_for_hook = self.hook.as_ref().map(|_| action_list.clone());
+@@ -2051,6 +2101,62 @@ mod tests {
+         }
+     }
+ 
++    #[tokio::test]
++    async fn test_mirror_publication_fences_new_payload_not_cold_history() {
++        let env = SchedulerEnv::new().await;
++        let region = build_test_region(&env).await;
++        let source = crate::sst::file::FileMeta {
++            region_id: region.region_id,
++            file_id: FileId::random(),
++            file_size: 100,
++            ..Default::default()
++        };
++        let mut edit = empty_edit();
++        edit.files_to_add.push(source.clone());
++        region.manifest_ctx.update_manifest(
++            RegionLeaderState::Writable,
++            RegionMetaActionList::with_action(RegionMetaAction::Edit(edit)),
++            false,
++        ).await.unwrap();
++
++        let dir = common_test_util::temp_dir::create_temp_dir("manifest-mirror");
++        let mirror = crate::cache::sst_mirror::SstMirror::new(
++            dir.path().to_str().unwrap(), 1024 * 1024, 1024,
++        ).await.unwrap();
++        region.manifest_ctx.set_access_layer(Arc::new(
++            env.access_layer.as_ref().clone().with_mirror(mirror),
++        ));
++        // A metadata-only update must not require historical payload recovery.
++        let mut edit = empty_edit();
++        edit.files_to_add.push(source.clone());
++        region.manifest_ctx.update_manifest(
++            RegionLeaderState::Writable,
++            RegionMetaActionList::with_action(RegionMetaAction::Edit(edit)),
++            false,
++        ).await.unwrap();
++        let mut updated = source.clone();
++        updated.index_file_size = 10;
++        updated.index_version = 1;
++        let mut edit = empty_edit();
++        edit.files_to_add.push(updated);
++        assert!(region.manifest_ctx.update_manifest(
++            RegionLeaderState::Writable,
++            RegionMetaActionList::with_action(RegionMetaAction::Edit(edit)),
++            false,
++        ).await.is_err());
++        assert_eq!(region.manifest_ctx.manifest().await.files[&source.file_id], source);
++        let mut fresh = source.clone();
++        fresh.file_id = FileId::random();
++        let mut edit = empty_edit();
++        edit.files_to_add.push(fresh.clone());
++        assert!(region.manifest_ctx.update_manifest(
++            RegionLeaderState::Writable,
++            RegionMetaActionList::with_action(RegionMetaAction::Edit(edit)),
++            false,
++        ).await.is_err());
++        assert!(!region.manifest_ctx.manifest().await.files.contains_key(&fresh.file_id));
++    }
++
+     fn empty_edit() -> RegionEdit {
+         RegionEdit {
+             files_to_add: Vec::new(),
+diff --git a/src/mito2/src/region/opener.rs b/src/mito2/src/region/opener.rs
+index 0565e1b..91038bc 100644
+--- a/src/mito2/src/region/opener.rs
++++ b/src/mito2/src/region/opener.rs
+@@ -408,13 +408,24 @@ impl RegionOpener {
+             .flushed_entry_id(flushed_entry_id)
+             .build();
+         let version_control = Arc::new(VersionControl::new(version));
+-        let access_layer = Arc::new(AccessLayer::new(
++        let mut layer = AccessLayer::new(
+             self.table_dir.clone(),
+             self.path_type,
+             object_store,
+             self.puffin_manager_factory,
+             self.intermediate_manager,
++        );
++        if let Some(mirror) = self.cache_manager.as_ref().and_then(|c| c.write_cache())
++            .and_then(|c| c.mirror().cloned()) {
++            layer = layer.with_mirror(mirror);
++        }
++        let access_layer = Arc::new(layer);
++        let manifest_ctx = Arc::new(ManifestContext::new(
++            manifest_manager,
++            RegionRoleState::Leader(RegionLeaderState::Writable),
++            self.hook.clone(),
+         ));
++        manifest_ctx.set_access_layer(access_layer.clone());
+         let now = self.time_provider.current_time_millis();
+ 
+         Ok(Arc::new(MitoRegion {
+@@ -422,11 +433,7 @@ impl RegionOpener {
+             version_control,
+             access_layer: access_layer.clone(),
+             // Region is writable after it is created.
+-            manifest_ctx: Arc::new(ManifestContext::new(
+-                manifest_manager,
+-                RegionRoleState::Leader(RegionLeaderState::Writable),
+-                self.hook.clone(),
+-            )),
++            manifest_ctx,
+             file_purger: create_file_purger(
+                 config.gc.enable,
+                 self.path_type,
+@@ -535,13 +542,18 @@ impl RegionOpener {
+             region_id, self.table_dir, self.options
+         );
+ 
+-        let access_layer = Arc::new(AccessLayer::new(
++        let mut layer = AccessLayer::new(
+             self.table_dir.clone(),
+             self.path_type,
+             object_store,
+             self.puffin_manager_factory.clone(),
+             self.intermediate_manager.clone(),
+-        ));
++        );
++        if let Some(mirror) = self.cache_manager.as_ref().and_then(|c| c.write_cache())
++            .and_then(|c| c.mirror().cloned()) {
++            layer = layer.with_mirror(mirror);
++        }
++        let access_layer = Arc::new(layer);
+         let file_purger = create_file_purger(
+             config.gc.enable,
+             self.path_type,
+@@ -646,17 +658,19 @@ impl RegionOpener {
+         }
+ 
+         let now = self.time_provider.current_time_millis();
++        let manifest_ctx = Arc::new(ManifestContext::new(
++            manifest_manager,
++            RegionRoleState::Follower,
++            self.hook.clone(),
++        ));
++        manifest_ctx.set_access_layer(access_layer.clone());
+ 
+         let region = MitoRegion {
+             region_id: self.region_id,
+             version_control: version_control.clone(),
+             access_layer: access_layer.clone(),
+             // Region is always opened in read only mode.
+-            manifest_ctx: Arc::new(ManifestContext::new(
+-                manifest_manager,
+-                RegionRoleState::Follower,
+-                self.hook.clone(),
+-            )),
++            manifest_ctx,
+             file_purger,
+             provider: provider.clone(),
+             last_flush_millis: AtomicI64::new(now),
+@@ -1114,7 +1128,7 @@ fn maybe_load_cache(
+         return;
+     };
+ 
+-    let preload_enabled = config.preload_index_cache;
++    let preload_enabled = config.preload_index_cache && config.sst_mirror_path.is_none();
+     if !preload_enabled {
+         return;
+     }
+@@ -1286,7 +1300,7 @@ fn maybe_preload_parquet_meta_cache(
+     if config.sst_meta_cache_size.as_bytes() == 0 {
+         return;
+     }
+-    if !config.preload_index_cache {
++    if !config.preload_index_cache || config.sst_mirror_path.is_some() {
+         return;
+     }
+ 
+diff --git a/src/mito2/src/sst/index.rs b/src/mito2/src/sst/index.rs
+index 7954af2..ac87020 100644
+--- a/src/mito2/src/sst/index.rs
++++ b/src/mito2/src/sst/index.rs
+@@ -850,10 +850,26 @@ impl IndexBuildTask {
+                 self.region_id, self.source.file_meta.file_id
+             )));
+         }
++        // The native FileHandle pins the source version. A mirror lease also
++        // protects its local inode against GC until index publication completes.
++        let _mirror_lease = if let Some(mirror) = self.access_layer.mirror() {
++            let source_path = self.file.file_path(
++                self.access_layer.table_dir(),
++                self.access_layer.path_type(),
++            );
++            Some(mirror.lease_paths(&[source_path]).await?)
++        } else {
++            None
++        };
++        let _output_reservation = if let Some(mirror) = self.access_layer.mirror() {
++            Some(mirror.reserve_output().await?)
++        } else {
++            None
++        };
++        let input_layer = self.access_layer.local_input_layer()?;
+ 
+-        let mut parquet_reader = self
+-            .access_layer
+-            .read_sst(self.file.clone()) // use the latest file handle instead of creating a new one
++        let mut parquet_reader = input_layer
++            .read_sst(self.file.clone())
+             .expected_metadata(Some(self.target_region_metadata.clone()))
+             .build()
+             .await?;
+diff --git a/src/mito2/src/worker.rs b/src/mito2/src/worker.rs
+index 63706ca..cc5b1b8 100644
+--- a/src/mito2/src/worker.rs
++++ b/src/mito2/src/worker.rs
+@@ -502,7 +502,7 @@ pub async fn write_cache_from_config(
+     puffin_manager_factory: PuffinManagerFactory,
+     intermediate_manager: IntermediateManager,
+ ) -> Result<Option<WriteCacheRef>> {
+-    if !config.enable_write_cache {
++    if !config.enable_write_cache && config.sst_mirror_path.is_none() {
+         return Ok(None);
+     }
+ 
+@@ -512,17 +512,26 @@ pub async fn write_cache_from_config(
+             dir: &config.write_cache_path,
+         })?;
+ 
+-    let cache = WriteCache::new_fs(
++    let mut cache = WriteCache::new_fs(
+         &config.write_cache_path,
+         config.write_cache_size,
+         config.write_cache_ttl,
+         Some(config.index_cache_percent),
+-        config.enable_refill_cache_on_read,
++        config.enable_refill_cache_on_read && config.sst_mirror_path.is_none(),
+         puffin_manager_factory,
+         intermediate_manager,
+         config.manifest_cache_size,
+     )
+     .await?;
++    if let Some(path) = &config.sst_mirror_path {
++        let mirror = crate::cache::sst_mirror::SstMirror::new(
++            path,
++            config.sst_mirror_capacity.as_bytes(),
++            config.sst_mirror_output_reserve.as_bytes(),
++        )
++        .await?;
++        cache.set_mirror(mirror)?;
++    }
+     Ok(Some(Arc::new(cache)))
+ }
+ 
+diff --git a/src/query/src/datafusion/planner.rs b/src/query/src/datafusion/planner.rs
+index 856f218..ba35f1f 100644
+--- a/src/query/src/datafusion/planner.rs
++++ b/src/query/src/datafusion/planner.rs
+@@ -228,6 +228,11 @@ impl ContextProvider for DfContextProviderAdapter {
+         name: &str,
+         args: Vec<datafusion_expr::Expr>,
+     ) -> DfResult<Arc<dyn TableSource>> {
++        if self.query_ctx.local_sst_only() {
++            return Err(DataFusionError::Plan(
++                "table functions are unsupported in local SST queries".into(),
++            ));
++        }
+         if let Some(tbl_func) = self.engine_state.table_function(name) {
+             let provider = tbl_func.create_table_provider(&args)?;
+             Ok(provider_as_source(provider))
+diff --git a/src/query/src/dummy_catalog.rs b/src/query/src/dummy_catalog.rs
+index e38813b..7d99419 100644
+--- a/src/query/src/dummy_catalog.rs
++++ b/src/query/src/dummy_catalog.rs
+@@ -318,9 +318,18 @@ impl DummyTableProviderFactory {
+         engine: RegionEngineRef,
+         query_ctx: Option<QueryContextRef>,
+     ) -> Result<DummyTableProvider> {
++        if query_ctx.as_ref().is_some_and(|ctx| ctx.local_sst_only())
++            && !matches!(engine.name(), "mito" | "metric")
++        {
++            return crate::error::InvalidQueryContextExtensionSnafu {
++                reason: format!("local SST reads unsupported for engine {}", engine.name()),
++            }.fail();
++        }
+         let metadata =
+             engine
+-                .get_metadata(region_id)
++                .get_metadata_for_query(
++                    region_id, query_ctx.as_ref().is_some_and(|ctx| ctx.local_sst_only()),
++                )
+                 .await
+                 .with_context(|_| GetRegionMetadataSnafu {
+                     engine: engine.name(),
+@@ -449,6 +458,7 @@ fn build_scan_request(
+     // time. A later scan may still refresh `memtable_max_sequence` if another source scan
+     // has bound a snapshot into `query_ctx` after this provider was created.
+     ScanRequest {
++        local_sst_only: query_ctx.local_sst_only(),
+         sst_min_sequence: (!decision.is_sink_scan)
+             .then(|| query_ctx.sst_min_sequence(region_id.as_u64()))
+             .flatten(),
+@@ -747,6 +757,7 @@ mod tests {
+     fn test_scan_request_from_query_context_keeps_snapshot_fields() {
+         let region_id = test_region_id();
+         let query_ctx = QueryContextBuilder::default()
++            .local_sst_only(true)
+             .snapshot_seqs(Arc::new(RwLock::new(HashMap::from([(
+                 region_id.as_u64(),
+                 100,
+@@ -758,6 +769,7 @@ mod tests {
+             .build();
+ 
+         let request = scan_request_from_query_context(region_id, &query_ctx).unwrap();
++        assert!(request.local_sst_only);
+         assert_eq!(request.memtable_max_sequence, Some(100));
+         assert_eq!(request.sst_min_sequence, Some(90));
+         assert_eq!(request.memtable_min_sequence, None);
+diff --git a/src/servers/src/grpc/flight.rs b/src/servers/src/grpc/flight.rs
+index e6f35e1..362af23 100644
+--- a/src/servers/src/grpc/flight.rs
++++ b/src/servers/src/grpc/flight.rs
+@@ -72,6 +72,14 @@ pub trait FlightCraft: Send + Sync + 'static {
+         request: Request<Ticket>,
+     ) -> TonicResult<Response<TonicStream<FlightData>>>;
+ 
++    async fn do_action(
++        &self,
++        request: Request<Action>,
++    ) -> TonicResult<Response<TonicStream<arrow_flight::Result>>> {
++        let _ = request;
++        Err(Status::unimplemented("Unknown Flight action"))
++    }
++
+     async fn do_put(
+         &self,
+         request: Request<Streaming<FlightData>>,
+@@ -100,6 +108,13 @@ impl FlightCraft for FlightCraftRef {
+         (**self).do_get(request).await
+     }
+ 
++    async fn do_action(
++        &self,
++        request: Request<Action>,
++    ) -> TonicResult<Response<TonicStream<arrow_flight::Result>>> {
++        (**self).do_action(request).await
++    }
++
+     async fn do_put(
+         &self,
+         request: Request<Streaming<FlightData>>,
+@@ -175,8 +190,8 @@ impl<T: FlightCraft> FlightService for FlightCraftWrapper<T> {
+ 
+     type DoActionStream = TonicStream<arrow_flight::Result>;
+ 
+-    async fn do_action(&self, _: Request<Action>) -> TonicResult<Response<Self::DoActionStream>> {
+-        Err(Status::unimplemented("Not yet implemented"))
++    async fn do_action(&self, request: Request<Action>) -> TonicResult<Response<Self::DoActionStream>> {
++        self.0.do_action(request).await
+     }
+ 
+     type ListActionsStream = TonicStream<ActionType>;
+@@ -189,11 +204,13 @@ impl<T: FlightCraft> FlightService for FlightCraftWrapper<T> {
+     }
+ }
+ 
+-#[async_trait]
+-impl FlightCraft for GreptimeRequestHandler {
+-    async fn do_get(
++pub const LOCAL_SST_QUERY_ACTION: &str = "datalake.local_sst_query.v1";
++
++impl GreptimeRequestHandler {
++    async fn flight_query(
+         &self,
+         request: Request<Ticket>,
++        local_sst_only: bool,
+     ) -> TonicResult<Response<TonicStream<FlightData>>> {
+         let mut hints = hint_headers::extract_hints(request.metadata());
+         hints.extend(extract_flow_extensions(request.metadata())?);
+@@ -202,8 +219,23 @@ impl FlightCraft for GreptimeRequestHandler {
+         let ticket = request.into_inner().ticket;
+         let request =
+             GreptimeRequest::decode(ticket.as_ref()).context(error::InvalidFlightTicketSnafu)?;
++        if local_sst_only
++            && !matches!(
++                &request.request,
++                Some(api::v1::greptime_request::Request::Query(api::v1::QueryRequest {
++                    query: Some(api::v1::query_request::Query::Sql(_)),
++                }))
++            )
++        {
++            return Err(Status::invalid_argument("Local SST action requires a SQL query"));
++        }
+         let query_ctx =
+             create_query_context(Channel::Grpc, request.header.as_ref(), hints, snapshot_seqs)?;
++        let query_ctx = if local_sst_only {
++            Arc::new((*query_ctx).clone().into_local_sst_only())
++        } else {
++            query_ctx
++        };
+         // Validate flow hint syntax at the transport boundary before dispatching the request.
+         // This does not authorize or execute anything; `handle_request()` below still performs
+         // the normal frontend handling and auth checks before query execution.
+@@ -236,6 +268,38 @@ impl FlightCraft for GreptimeRequestHandler {
+         .trace(span)
+         .await
+     }
++}
++
++#[async_trait]
++impl FlightCraft for GreptimeRequestHandler {
++    async fn do_get(
++        &self,
++        request: Request<Ticket>,
++    ) -> TonicResult<Response<TonicStream<FlightData>>> {
++        self.flight_query(request, false).await
++    }
++
++    async fn do_action(
++        &self,
++        request: Request<Action>,
++    ) -> TonicResult<Response<TonicStream<arrow_flight::Result>>> {
++        if !self.local_sst_queries || request.get_ref().r#type != LOCAL_SST_QUERY_ACTION {
++            return Err(Status::unimplemented("Unknown Flight action"));
++        }
++        let (metadata, extensions, action) = request.into_parts();
++        let ticket = Ticket::decode(action.body)
++            .map_err(|e| Status::invalid_argument(format!("Invalid Flight Ticket: {e}")))?;
++        let response = self
++            .flight_query(Request::from_parts(metadata, extensions, ticket), true)
++            .await?;
++        let (metadata, stream, extensions) = response.into_parts();
++        let stream: TonicStream<arrow_flight::Result> = stream
++            .map_ok(|data| arrow_flight::Result {
++                body: data.encode_to_vec().into(),
++            })
++            .boxed();
++        Ok(Response::from_parts(metadata, stream, extensions))
++    }
+ 
+     async fn do_put(
+         &self,
+@@ -632,6 +696,67 @@ mod tests {
+ 
+     use super::*;
+ 
++    struct PolicyHandler;
++
++    #[async_trait]
++    impl crate::query_handler::grpc::GrpcQueryHandler for PolicyHandler {
++        async fn do_query(
++            &self,
++            _: api::v1::greptime_request::Request,
++            ctx: QueryContextRef,
++        ) -> Result<Output> {
++            Ok(Output::new_with_affected_rows(usize::from(ctx.local_sst_only())))
++        }
++
++        fn handle_put_record_batch_stream(
++            &self,
++            _: PutRecordBatchRequestStream,
++            _: QueryContextRef,
++        ) -> Pin<Box<dyn Stream<Item = Result<DoPutResponse>> + Send>> {
++            Box::pin(futures::stream::empty())
++        }
++    }
++
++    #[tokio::test]
++    async fn test_local_action_is_opt_in_and_preserves_flight_encoding() {
++        let handler = GreptimeRequestHandler::new(
++            Arc::new(PolicyHandler), None, None, FlightCompression::default(),
++        );
++        let ticket = Ticket {
++            ticket: GreptimeRequest {
++                header: None,
++                request: Some(api::v1::greptime_request::Request::Query(api::v1::QueryRequest {
++                    query: Some(api::v1::query_request::Query::Sql("SELECT 1".into())),
++                })),
++            }.encode_to_vec().into(),
++        };
++        let action = Action {
++            r#type: LOCAL_SST_QUERY_ACTION.into(),
++            body: ticket.encode_to_vec().into(),
++        };
++        let err = FlightCraft::do_action(&handler, Request::new(action.clone()))
++            .await.err().unwrap();
++        assert_eq!(err.code(), tonic::Code::Unimplemented);
++        let handler = handler.with_local_sst_queries(true);
++        let wrapper = FlightCraftWrapper(Arc::new(handler.clone()) as FlightCraftRef);
++        let strict = FlightService::do_action(&wrapper, Request::new(action))
++            .await.unwrap().into_inner().try_collect::<Vec<_>>().await.unwrap();
++        let ordinary = FlightCraft::do_get(&handler, Request::new(ticket))
++            .await.unwrap().into_inner().try_collect::<Vec<_>>().await.unwrap();
++        assert_eq!(strict.len(), ordinary.len());
++        assert!(!strict.is_empty());
++        let strict = FlightData::decode(strict[0].body.clone()).unwrap();
++        assert_ne!(strict, ordinary[0]);
++        let err = FlightCraft::do_action(&handler, Request::new(Action {
++            r#type: "unknown".into(), body: Bytes::new(),
++        })).await.err().unwrap();
++        assert_eq!(err.code(), tonic::Code::Unimplemented);
++        let err = FlightCraft::do_action(&handler, Request::new(Action {
++            r#type: LOCAL_SST_QUERY_ACTION.into(), body: Bytes::from_static(b"\xff"),
++        })).await.err().unwrap();
++        assert_eq!(err.code(), tonic::Code::InvalidArgument);
++    }
++
+     #[test]
+     fn test_extract_flow_extensions_preserves_comma_bearing_values() {
+         let mut metadata = MetadataMap::new();
+diff --git a/src/servers/src/grpc/greptime_handler.rs b/src/servers/src/grpc/greptime_handler.rs
+index ad77794..4736f7b 100644
+--- a/src/servers/src/grpc/greptime_handler.rs
++++ b/src/servers/src/grpc/greptime_handler.rs
+@@ -54,6 +54,7 @@ pub struct GreptimeRequestHandler {
+     pub(crate) user_provider: Option<UserProviderRef>,
+     runtime: Option<Runtime>,
+     pub(crate) flight_compression: FlightCompression,
++    pub(crate) local_sst_queries: bool,
+ }
+ 
+ impl GreptimeRequestHandler {
+@@ -68,9 +69,15 @@ impl GreptimeRequestHandler {
+             user_provider,
+             runtime,
+             flight_compression,
++            local_sst_queries: false,
+         }
+     }
+ 
++    pub fn with_local_sst_queries(mut self, enabled: bool) -> Self {
++        self.local_sst_queries = enabled;
++        self
++    }
++
+     #[tracing::instrument(skip_all, fields(protocol = "grpc", request_type = get_request_type(&request)))]
+     pub(crate) async fn handle_request(
+         &self,
+diff --git a/src/servers/src/http.rs b/src/servers/src/http.rs
+index 2df095a..0f1d5df 100644
+--- a/src/servers/src/http.rs
++++ b/src/servers/src/http.rs
+@@ -660,6 +660,23 @@ impl HttpServerBuilder {
+         }
+     }
+ 
++    /// Register the strict SQL transport only for a standalone instance.
++    pub fn with_local_sql_handler(self, sql_handler: ServerSqlQueryHandlerRef) -> Self {
++        let state = ApiState {
++            sql_handler,
++            experimental_enable_explain_analyze_stream: false,
++        };
++        Self {
++            router: self.router.nest(
++                &format!("/{HTTP_API_VERSION}"),
++                Router::new()
++                    .route("/local-sql", routing::post(handler::local_sql))
++                    .with_state(state),
++            ),
++            ..self
++        }
++    }
++
+     pub fn with_logs_handler(self, logs_handler: LogQueryHandlerRef) -> Self {
+         let logs_router = HttpServer::route_logs(logs_handler);
+ 
+@@ -1640,6 +1657,32 @@ mod test {
+         server.build(app).unwrap()
+     }
+ 
++    #[tokio::test]
++    async fn test_local_sql_route_requires_explicit_registration_and_post() {
++        let (tx, _rx) = mpsc::channel(100);
++        let client = TestClient::new(make_test_app(tx)).await;
++        assert_eq!(
++            client.post("/v1/local-sql").send().await.status(),
++            StatusCode::NOT_FOUND
++        );
++        let (tx, _rx) = mpsc::channel(100);
++        let instance = Arc::new(DummyInstance { _tx: tx });
++        let server = HttpServerBuilder::new(HttpOptions::default())
++            .with_sql_handler(instance.clone())
++            .with_local_sql_handler(instance)
++            .build();
++        let app = server.build(server.make_app()).unwrap();
++        let client = TestClient::new(app).await;
++        assert_eq!(
++            client.get("/v1/local-sql").send().await.status(),
++            StatusCode::METHOD_NOT_ALLOWED
++        );
++        assert_ne!(
++            client.post("/v1/local-sql").send().await.status(),
++            StatusCode::NOT_FOUND
++        );
++    }
++
+     #[tokio::test]
+     pub async fn test_analyze_stream_route_config_gate() {
+         let (tx, _rx) = mpsc::channel(100);
+diff --git a/src/servers/src/http/handler.rs b/src/servers/src/http/handler.rs
+index f92f241..c002c0f 100644
+--- a/src/servers/src/http/handler.rs
++++ b/src/servers/src/http/handler.rs
+@@ -112,6 +112,16 @@ struct AnalyzeStreamState {
+     done: bool,
+ }
+ 
++/// Execute through the ordinary authenticated SQL path with a fresh strict context.
++pub async fn local_sql(
++    state: State<ApiState>,
++    query: Query<SqlQuery>,
++    Extension(query_ctx): Extension<QueryContext>,
++    form: Form<SqlQuery>,
++) -> HttpResponse {
++    sql(state, query, Extension(query_ctx.into_local_sst_only()), form).await
++}
++
+ /// Handler to execute sql
+ #[axum_macros::debug_handler]
+ #[tracing::instrument(skip_all, fields(protocol = "http", request_type = "sql"))]
+diff --git a/src/session/src/context.rs b/src/session/src/context.rs
+index d383aef..10b1e7b 100644
+--- a/src/session/src/context.rs
++++ b/src/session/src/context.rs
+@@ -61,6 +61,8 @@ pub fn generate_remote_query_id_value() -> QueryId {
+ #[builder(pattern = "owned")]
+ #[builder(build_fn(skip))]
+ pub struct QueryContext {
++    #[builder(default)]
++    local_sst_only: bool,
+     current_catalog: String,
+     /// mapping of RegionId to SequenceNumber, for snapshot read, meaning that the read should only
+     /// container data that was committed before(and include) the given sequence number
+@@ -179,9 +181,11 @@ impl From<&RegionRequestHeader> for QueryContext {
+ }
+ 
+ impl From<api::v1::QueryContext> for QueryContext {
+-    fn from(ctx: api::v1::QueryContext) -> Self {
++    fn from(mut ctx: api::v1::QueryContext) -> Self {
++        let local_sst_only = ctx.extensions.remove("datalake.internal.local_sst_only").is_some();
+         let sequences = ctx.snapshot_seqs.as_ref();
+         QueryContextBuilder::default()
++            .local_sst_only(local_sst_only)
+             .current_catalog(ctx.current_catalog)
+             .current_schema(ctx.current_schema)
+             .timezone(parse_timezone(Some(&ctx.timezone)))
+@@ -207,7 +211,8 @@ impl From<QueryContext> for api::v1::QueryContext {
+         QueryContext {
+             current_catalog,
+             mutable_session_data: mutable_inner,
+-            extensions,
++            mut extensions,
++            local_sst_only,
+             channel,
+             snapshot_seqs,
+             sst_min_sequences,
+@@ -217,6 +222,10 @@ impl From<QueryContext> for api::v1::QueryContext {
+     ) -> Self {
+         let explain = mutable_query_context_data.read().unwrap().explain_options;
+         let mutable_inner = mutable_inner.read().unwrap();
++        extensions.remove("datalake.internal.local_sst_only");
++        if local_sst_only {
++            extensions.insert("datalake.internal.local_sst_only".into(), "true".into());
++        }
+         api::v1::QueryContext {
+             current_catalog,
+             current_schema: mutable_inner.schema.clone(),
+@@ -239,6 +248,15 @@ impl From<&QueryContext> for api::v1::QueryContext {
+ }
+ 
+ impl QueryContext {
++    pub fn local_sst_only(&self) -> bool {
++        self.local_sst_only
++    }
++
++    pub fn into_local_sst_only(mut self) -> Self {
++        self.local_sst_only = true;
++        self
++    }
++
+     /// Forks this context with an independent snapshot of mutable session data.
+     ///
+     /// Unlike [`Clone`], changes to the schema, user, timezone, and other fields
+@@ -561,6 +579,7 @@ impl QueryContextBuilder {
+             .entry(REMOTE_QUERY_ID_EXTENSION_KEY.to_string())
+             .or_insert_with(generate_remote_query_id);
+         QueryContext {
++            local_sst_only: self.local_sst_only.unwrap_or_default(),
+             current_catalog: self
+                 .current_catalog
+                 .unwrap_or_else(|| DEFAULT_CATALOG_NAME.to_string()),
+@@ -719,6 +738,28 @@ mod test {
+         assert!(query_ctx.remote_query_id().is_some());
+     }
+ 
++    #[test]
++    fn test_local_sst_policy_proto_carrier() {
++        let context = QueryContextBuilder::default()
++            .local_sst_only(true)
++            .set_extension("flow.return_region_seq".into(), "true".into())
++            .build();
++        let proto: api::v1::QueryContext = context.into();
++        assert_eq!(proto.extensions["datalake.internal.local_sst_only"], "true");
++        let decoded = QueryContext::from(proto);
++        assert!(decoded.local_sst_only());
++        assert!(decoded.extension("datalake.internal.local_sst_only").is_none());
++        assert_eq!(decoded.extension("flow.return_region_seq"), Some("true"));
++
++        let spoofed = QueryContextBuilder::default()
++            .set_extension("datalake.internal.local_sst_only".into(), "false".into())
++            .build();
++        let mut proto: api::v1::QueryContext = spoofed.into();
++        assert!(!proto.extensions.contains_key("datalake.internal.local_sst_only"));
++        proto.extensions.insert("datalake.internal.local_sst_only".into(), "malformed".into());
++        assert!(QueryContext::from(proto).local_sst_only());
++    }
++
+     #[test]
+     fn test_context_db_string() {
+         let context = QueryContext::with("a0b1c2d3", "test");
+diff --git a/src/session/src/hints.rs b/src/session/src/hints.rs
+index e656b34..9995c1e 100644
+--- a/src/session/src/hints.rs
++++ b/src/session/src/hints.rs
+@@ -24,7 +24,8 @@ pub const SUPPORT_FLIGHT_METRICS_BEFORE_BATCH_EXTENSION_KEY: &str =
+ pub const LIVE_ANALYZE_METRICS_EXTENSION_KEY: &str = "query.live_analyze_metrics";
+ 
+ pub const READ_PREFERENCE_HINT: &str = "read_preference";
+-pub const RESERVED_EXTENSION_KEYS: [&str; 4] = [
++pub const RESERVED_EXTENSION_KEYS: [&str; 5] = [
++    "datalake.internal.local_sst_only",
+     REMOTE_QUERY_ID_EXTENSION_KEY,
+     INITIAL_REMOTE_DYN_FILTER_REGISTRATIONS_EXTENSION_KEY,
+     SUPPORT_FLIGHT_METRICS_BEFORE_BATCH_EXTENSION_KEY,
+diff --git a/src/store-api/src/region_engine.rs b/src/store-api/src/region_engine.rs
+index 7dc8f68..e07d313 100644
+--- a/src/store-api/src/region_engine.rs
++++ b/src/store-api/src/region_engine.rs
+@@ -1001,6 +1001,13 @@ pub trait RegionEngine: Send + Sync {
+     /// Retrieves region's metadata.
+     async fn get_metadata(&self, region_id: RegionId) -> Result<RegionMetadataRef, BoxedError>;
+ 
++    /// Retrieves query metadata without dropping the query's input policy.
++    async fn get_metadata_for_query(
++        &self, region_id: RegionId, _local_sst_only: bool,
++    ) -> Result<RegionMetadataRef, BoxedError> {
++        self.get_metadata(region_id).await
++    }
++
+     /// Retrieves region's statistic.
+     fn region_statistic(&self, region_id: RegionId) -> Option<RegionStatistic>;
+ 
+diff --git a/src/store-api/src/storage/requests.rs b/src/store-api/src/storage/requests.rs
+index 7ae1bc5..11ebc05 100644
+--- a/src/store-api/src/storage/requests.rs
++++ b/src/store-api/src/storage/requests.rs
+@@ -98,6 +98,8 @@ pub enum TimeSeriesDistribution {
+ 
+ #[derive(Default, Clone, Debug, PartialEq)]
+ pub struct ScanRequest {
++    /// Forbid remote SST and index reads; missing local inputs are errors.
++    pub local_sst_only: bool,
+     /// Optional projection information for the scan. `None` reads all root
+     /// columns.
+     pub projection: Option<Vec<usize>>,
+diff --git a/src/table/src/table/adapter.rs b/src/table/src/table/adapter.rs
+index a8ec6ee..e47c0cc 100644
+--- a/src/table/src/table/adapter.rs
++++ b/src/table/src/table/adapter.rs
+@@ -38,6 +38,7 @@ use crate::table::{TableRef, TableType};
+ /// Adapt greptime's [TableRef] to DataFusion's [TableProvider].
+ pub struct DfTableProviderAdapter {
+     table: TableRef,
++    local_sst_only: bool,
+     scan_req: Arc<Mutex<ScanRequest>>,
+ }
+ 
+@@ -47,6 +48,7 @@ impl DfTableProviderAdapter {
+             supports_pk_dictionary_encoding(&table.table_info().meta.engine);
+         Self {
+             table,
++            local_sst_only: false,
+             scan_req: Arc::new(Mutex::new(ScanRequest {
+                 preserve_pk_dictionary_encoding,
+                 ..Default::default()
+@@ -58,6 +60,11 @@ impl DfTableProviderAdapter {
+         self.table.clone()
+     }
+ 
++    pub fn with_local_sst_only(mut self, enabled: bool) -> Self {
++        self.local_sst_only = enabled;
++        self
++    }
++
+     pub fn with_ordering_hint(&self, order_opts: &[OrderOption]) {
+         self.scan_req.lock().unwrap().output_ordering = Some(order_opts.to_vec());
+     }
+@@ -159,13 +166,26 @@ impl TableProvider for DfTableProviderAdapter {
+         limit: Option<usize>,
+     ) -> DfResult<Arc<dyn ExecutionPlan>> {
+         let filters: Vec<Expr> = filters.iter().map(Clone::clone).collect();
+-        let request = {
++        let mut request = {
+             let mut request = self.scan_req.lock().unwrap();
+             request.filters = filters;
+             request.projection = projection.cloned();
+             request.limit = limit;
+             request.clone()
+         };
++        request.local_sst_only = self.local_sst_only;
++        if request.local_sst_only {
++            let info = self.table.table_info();
++            if !matches!(info.meta.engine.as_str(), "mito" | "metric")
++                && !(info.table_type == crate::metadata::TableType::Temporary
++                    && matches!(info.schema_name.as_str(), "information_schema" | "pg_catalog")
++                    && !matches!(info.name.as_str(), "ssts_storage" | "ssts_index_meta"))
++            {
++                return Err(datafusion::error::DataFusionError::Plan(
++                    format!("local SST reads unsupported for engine {}", info.meta.engine),
++                ));
++            }
++        }
+ 
+         if let Some(plan) = self.table.scan_to_plan(request.clone())? {
+             return Ok(plan);
+diff --git a/src/mito2/src/cache/sst_mirror.rs b/src/mito2/src/cache/sst_mirror.rs
+new file mode 100644
+index 0000000..132d568
+--- /dev/null
++++ b/src/mito2/src/cache/sst_mirror.rs
+@@ -0,0 +1,276 @@
++// Copyright 2026 Greptime Team
++// Licensed under the Apache License, Version 2.0.
++
++//! Non-evicting immutable local inputs. S3 remains the canonical output store.
++//! Quota counts payload bytes once, including uncommitted published outputs.
++//! One maintenance reservation admits a fixed aggregate output budget; concurrent
++//! flushes also consume that budget. Free-space checks are admission, not physical
++//! preallocation: link/fsync errors still abort publication before remote upload.
++
++use std::collections::HashMap;
++use std::fs::{self, File};
++use std::path::{Component, Path, PathBuf};
++use std::sync::{Arc, Mutex};
++
++use object_store::{ErrorKind, ObjectStore};
++use snafu::IntoError;
++
++use crate::access_layer::new_fs_cache_store;
++use crate::error::{OpenDalSnafu, Result};
++
++fn failure(marker: &str, detail: impl std::fmt::Display) -> crate::error::Error {
++    OpenDalSnafu.into_error(object_store::Error::new(ErrorKind::Unexpected, format!("{marker}: {detail}")))
++}
++fn io<T>(value: std::io::Result<T>) -> Result<T> {
++    value.map_err(|e| failure("SST_MIRROR_IO", e))
++}
++
++#[derive(Debug)]
++struct Entry { size: u64, pins: usize, deleting: bool }
++#[derive(Default, Debug)]
++struct State {
++    entries: HashMap<String, Entry>,
++    used: u64,
++    remaining_output: Option<u64>,
++}
++
++#[derive(Debug)]
++pub(crate) struct SstMirror {
++    root: PathBuf,
++    store: ObjectStore,
++    capacity: u64,
++    output_reserve: u64,
++    // ponytail: one maintenance output budget; queue concurrent jobs instead of rejecting them.
++    maintenance: Arc<tokio::sync::Semaphore>,
++    // ponytail: serialize filesystem publication/deletion; shard only if measured contention warrants it.
++    state: Mutex<State>,
++    _lock: File,
++}
++
++impl SstMirror {
++    pub(crate) async fn new(path: &str, capacity: u64, output_reserve: u64) -> Result<Arc<Self>> {
++        if path.trim().is_empty() || capacity == 0 || output_reserve == 0 || output_reserve > capacity {
++            return Err(failure("SST_MIRROR_CAPACITY", "nonempty path and 0 < output reserve <= capacity required"));
++        }
++        let root = Path::new(path).join("objects");
++        io(fs::create_dir_all(&root))?;
++        let root = io(fs::canonicalize(root))?;
++        let lock = io(fs::OpenOptions::new().read(true).write(true).create(true)
++            .truncate(false).open(root.parent().unwrap().join("mirror.lock")))?;
++        io(fs2::FileExt::try_lock_exclusive(&lock))?;
++        let store = new_fs_cache_store(root.to_str().ok_or_else(|| failure("SST_MIRROR_IO", "non UTF-8 path"))?).await?;
++        let mut state = State::default();
++        fn scan(root: &Path, dir: &Path, state: &mut State) -> Result<()> {
++            for entry in io(fs::read_dir(dir))? {
++                let entry = io(entry)?;
++                let kind = io(entry.file_type())?;
++                if kind.is_symlink() { return Err(failure("SST_MIRROR_IO", "symlink in mirror namespace")); }
++                if kind.is_dir() { scan(root, &entry.path(), state)?; }
++                else if kind.is_file() {
++                    let path = entry.path();
++                    let key = path.strip_prefix(root).unwrap().to_string_lossy().into_owned();
++                    let size = io(entry.metadata())?.len();
++                    state.used = state.used.checked_add(size).ok_or_else(|| failure("SST_MIRROR_CAPACITY", "size overflow"))?;
++                    state.entries.insert(key, Entry { size, pins: 0, deleting: false });
++                }
++            }
++            Ok(())
++        }
++        scan(&root, &root, &mut state)?;
++        if state.used > capacity { return Err(failure("SST_MIRROR_CAPACITY", "existing mirror exceeds quota")); }
++        // Probe actual writable/durable setup; no mirrorless fallback.
++        let probe = root.join(".startup-probe");
++        io(File::create(&probe))?.sync_all().map_err(|e| failure("SST_MIRROR_IO", e))?;
++        io(fs::remove_file(probe))?;
++        io(File::open(&root))?.sync_all().map_err(|e| failure("SST_MIRROR_IO", e))?;
++        Ok(Arc::new(Self { root, store, capacity, output_reserve,
++            maintenance: Arc::new(tokio::sync::Semaphore::new(1)),
++            state: Mutex::new(state), _lock: lock }))
++    }
++
++    pub(crate) fn validate_cache_store(&self, cache: &ObjectStore) -> Result<()> {
++        if cache.info().scheme() != "fs" {
++            return Err(failure("SST_MIRROR_IO", "mirror requires filesystem write cache"));
++        }
++        let cache_root = io(fs::canonicalize(cache.info().root()))?;
++        let evicting_namespace = cache_root.join("cache");
++        let atomic_namespace = cache_root.join(object_store::ATOMIC_WRITE_DIR);
++        if self.root.starts_with(&evicting_namespace) || evicting_namespace.starts_with(&self.root)
++            || self.root.starts_with(&atomic_namespace) || atomic_namespace.starts_with(&self.root) {
++            return Err(failure("SST_MIRROR_IO", "mirror must have a separate persistent namespace"));
++        }
++        let probe = self.root.join(".link-probe");
++        let source = cache_root.join(".mirror-link-probe");
++        let file = io(fs::OpenOptions::new().write(true).create_new(true).open(&source))?;
++        let result = fs::hard_link(&source, &probe);
++        drop(file);
++        let _ = fs::remove_file(&source);
++        if result.is_ok() { io(fs::remove_file(&probe))?; }
++        io(result)
++    }
++
++    pub(crate) fn store(&self) -> ObjectStore { self.store.clone() }
++
++    fn path(&self, key: &str) -> Result<PathBuf> {
++        if key.is_empty() || Path::new(key).components().any(|c| !matches!(c, Component::Normal(_))) {
++            return Err(failure("SST_MIRROR_IO", "invalid object key"));
++        }
++        Ok(self.root.join(key))
++    }
++
++    fn sync_path(&self, key: &str) -> Result<()> {
++        let path = self.path(key)?;
++        io(File::open(&path)).map_err(|_| failure("SST_MIRROR_MISS", key))?.sync_all().map_err(|e| failure("SST_MIRROR_IO", e))?;
++        let mut parent = path.parent();
++        while let Some(dir) = parent {
++            io(File::open(dir))?.sync_all().map_err(|e| failure("SST_MIRROR_IO", e))?;
++            if dir == self.root { break; }
++            parent = dir.parent();
++        }
++        Ok(())
++    }
++
++    pub(crate) async fn validate_paths(&self, paths: &[String]) -> Result<()> {
++        let state = self.state.lock().unwrap();
++        for key in paths {
++            let entry = state.entries.get(key).filter(|e| !e.deleting).ok_or_else(|| failure("SST_MIRROR_MISS", key))?;
++            if io(fs::metadata(self.path(key)?))?.len() != entry.size { return Err(failure("SST_MIRROR_MISS", key)); }
++            self.sync_path(key)?;
++        }
++        Ok(())
++    }
++
++    pub(crate) async fn lease_paths(self: &Arc<Self>, paths: &[String]) -> Result<MirrorLease> {
++        self.validate_paths(paths).await?;
++        let mut state = self.state.lock().unwrap();
++        // Validate again under the same lock as deletion, before pinning anything.
++        for key in paths {
++            if !state.entries.get(key).is_some_and(|e| !e.deleting) { return Err(failure("SST_MIRROR_MISS", key)); }
++        }
++        for key in paths { state.entries.get_mut(key).unwrap().pins += 1; }
++        Ok(MirrorLease { mirror: self.clone(), paths: paths.to_vec() })
++    }
++
++    pub(crate) async fn reserve_output(self: &Arc<Self>) -> Result<MirrorReservation> {
++        let permit = self.maintenance.clone().acquire_owned().await
++            .map_err(|error| failure("SST_MIRROR_RESERVATION", error))?;
++        let mut state = self.state.lock().unwrap();
++        if self.capacity - state.used < self.output_reserve || io(fs2::available_space(&self.root))? < self.output_reserve {
++            return Err(failure("SST_MIRROR_CAPACITY", "insufficient quota or filesystem headroom"));
++        }
++        state.remaining_output = Some(self.output_reserve);
++        Ok(MirrorReservation { mirror: self.clone(), _permit: permit })
++    }
++
++    /// Only accepts already-complete immutable local files; never reads S3.
++    /// A hardlink survives cache eviction (unlink), without duplicate payload blocks.
++    pub(crate) async fn publish(&self, source: &Path, key: &str) -> Result<()> {
++        let dest = self.path(key)?;
++        let size = io(fs::metadata(source))?.len();
++        let mut state = self.state.lock().unwrap();
++        if state.entries.contains_key(key) {
++            return Err(failure("SST_MIRROR_IO", "immutable object key already published"));
++        }
++        if size > self.capacity - state.used || state.remaining_output.is_some_and(|remaining| size > remaining) {
++            return Err(failure("SST_MIRROR_CAPACITY", "output exceeds hard quota or reserved output budget"));
++        }
++        // Hardlinking allocates metadata only, but still require output-sized free
++        // headroom so a full filesystem cannot pass maintenance publication.
++        if io(fs2::available_space(&self.root))? < size { return Err(failure("SST_MIRROR_CAPACITY", "filesystem headroom exhausted")); }
++        io(fs::create_dir_all(dest.parent().unwrap()))?;
++        io(File::open(source))?.sync_all().map_err(|e| failure("SST_MIRROR_IO", e))?;
++        io(fs::hard_link(source, &dest))?;
++        if let Err(error) = self.sync_path(key) {
++            let _ = fs::remove_file(&dest);
++            return Err(error);
++        }
++        state.used += size;
++        if let Some(remaining) = &mut state.remaining_output { *remaining -= size; }
++        state.entries.insert(key.to_string(), Entry { size, pins: 0, deleting: false });
++        Ok(())
++    }
++
++    pub(crate) async fn delete(&self, key: &str) -> Result<()> {
++        let mut state = self.state.lock().unwrap();
++        if let Some(entry) = state.entries.get_mut(key) {
++            entry.deleting = true;
++            if entry.pins != 0 { return Ok(()); }
++            self.remove_locked(key, &mut state)?;
++        }
++        Ok(())
++    }
++
++    fn remove_locked(&self, key: &str, state: &mut State) -> Result<()> {
++        match fs::remove_file(self.path(key)?) {
++            Ok(()) => (),
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
++            Err(e) => return Err(failure("SST_MIRROR_IO", e)),
++        }
++        if let Some(entry) = state.entries.remove(key) { state.used -= entry.size; }
++        Ok(())
++    }
++}
++
++pub(crate) struct MirrorReservation {
++    mirror: Arc<SstMirror>,
++    _permit: tokio::sync::OwnedSemaphorePermit,
++}
++impl Drop for MirrorReservation {
++    fn drop(&mut self) { self.mirror.state.lock().unwrap().remaining_output = None; }
++}
++pub(crate) struct MirrorLease { mirror: Arc<SstMirror>, paths: Vec<String> }
++impl Drop for MirrorLease {
++    fn drop(&mut self) {
++        let mut state = self.mirror.state.lock().unwrap();
++        for key in &self.paths {
++            if let Some(entry) = state.entries.get_mut(key) {
++                entry.pins -= 1;
++                if entry.pins == 0 && entry.deleting {
++                    // Failed cleanup stays charged and can be retried, never frees quota early.
++                    let _ = self.mirror.remove_locked(key, &mut state);
++                }
++            }
++        }
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    #[tokio::test]
++    async fn retention_leases_quota_and_local_miss() {
++        let dir = common_test_util::temp_dir::create_temp_dir("sst-mirror");
++        let root = dir.path().join("mirror");
++        let mirror = SstMirror::new(root.to_str().unwrap(), 32, 8).await.unwrap();
++        let source = dir.path().join("cache-file");
++        fs::write(&source, [1u8; 8]).unwrap();
++        mirror.publish(&source, "table/a.parquet").await.unwrap();
++        fs::remove_file(&source).unwrap(); // LRU eviction only unlinks its own name.
++        let key = "table/a.parquet".to_string();
++        let lease = mirror.lease_paths(std::slice::from_ref(&key)).await.unwrap();
++        assert_eq!(fs::read(root.join("objects").join(&key)).unwrap(), [1u8; 8]);
++        let reserve = mirror.reserve_output().await.unwrap();
++        assert!(tokio::time::timeout(
++            std::time::Duration::from_millis(1), mirror.reserve_output(),
++        ).await.is_err());
++        fs::write(&source, [2u8; 8]).unwrap();
++        mirror.publish(&source, "table/b.123.puffin").await.unwrap();
++        fs::remove_file(&source).unwrap();
++        fs::write(&source, [3u8; 1]).unwrap();
++        assert!(mirror.publish(&source, "table/c.parquet").await.is_err());
++        assert!(mirror.publish(&source, &key).await.is_err());
++        assert_eq!(fs::read(root.join("objects").join(&key)).unwrap(), [1u8; 8]);
++        assert!(mirror.lease_paths(&["missing.parquet".to_string()]).await.is_err());
++        mirror.delete(&key).await.unwrap();
++        assert!(root.join("objects").join(&key).exists());
++        drop(lease);
++        assert!(!root.join("objects").join(&key).exists());
++        assert!(mirror.store().read("absent.parquet").await.is_err());
++        drop(reserve);
++        assert!(mirror.reserve_output().await.is_ok());
++        assert!(SstMirror::new(root.to_str().unwrap(), 32, 8).await.is_err());
++        drop(mirror);
++        let reopened = SstMirror::new(root.to_str().unwrap(), 32, 8).await.unwrap();
++        reopened.validate_paths(&["table/b.123.puffin".to_string()]).await.unwrap();
++    }
++}

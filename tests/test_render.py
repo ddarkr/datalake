@@ -118,6 +118,21 @@ def test_preflight_rejects_invalid_compaction_interval(tmp_path):
     assert "GREPTIME_MIN_COMPACTION_INTERVAL" in result.stderr
     assert not list(tmp_path.iterdir())
 
+def test_preflight_mirror_requires_s3_and_positive_budget(tmp_path):
+    for storage, capacity, reserve, error in (
+        ("File", "256MiB", "32MiB", "requires S3"),
+        ("S3", "0B", "32MiB", "GREPTIME_SST_MIRROR_CAPACITY"),
+        ("S3", "256MiB", "", "GREPTIME_SST_MIRROR_OUTPUT_RESERVE"),
+    ):
+        env = dict(base_env(tmp_path), GREPTIME_LOCAL_SST_MIRROR="1",
+                   GREPTIME_STORAGE_TYPE=storage, GREPTIME_SST_MIRROR_CAPACITY=capacity,
+                   GREPTIME_SST_MIRROR_OUTPUT_RESERVE=reserve)
+        result = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"],
+                                capture_output=True, text=True, env=env, cwd=ROOT)
+        assert result.returncode != 0 and error in result.stderr
+        assert not list(tmp_path.iterdir())
+
+
 
 def test_preflight_rejects_hostless_endpoint_without_echo(tmp_path):
     env = dict(base_env(tmp_path), GREPTIME_STORAGE_TYPE="S3",
@@ -209,10 +224,11 @@ if __name__ == "__main__":
         test_preflight_fails_fast_without_otlp,
         test_preflight_rejects_bad_size,
         test_preflight_rejects_invalid_compaction_interval,
+        test_preflight_mirror_requires_s3_and_positive_budget,
         test_preflight_rejects_hostless_endpoint_without_echo,
         test_preflight_file_mode_writes_exact_config,
         test_preflight_identity_change_fails_closed,
     ):
         with tempfile.TemporaryDirectory() as directory:
             check(Path(directory))
-    print("test_render: ok (13 checks)")
+    print("test_render: ok (14 checks)")

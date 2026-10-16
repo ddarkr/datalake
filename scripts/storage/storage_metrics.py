@@ -42,8 +42,9 @@ reports known=0/success=0 with no value metrics; malformed required counter
 data is unknown (never silently skipped while known=1). Legacy archives
 without archive_meta omit raw totals/counters; unknown freshness and absent
 reserve stay omitted, never zeroed.
-File mode serves the disabled state without contacting S3 (boto3 is never
-even imported). Errors never carry bucket/key/credential text: type name only.
+File mode or STORAGE_METRICS_INTERVAL_SEC=0 serves the disabled inventory
+state without contacting S3 (boto3 is never imported). Errors never carry
+bucket/key/credential text: type name only.
 """
 
 import os
@@ -597,15 +598,17 @@ class _H(BaseHTTPRequestHandler):
 
 
 def main(argv):
-    interval = max(ei("STORAGE_METRICS_INTERVAL_SEC", 3600), 1)
+    interval = ei("STORAGE_METRICS_INTERVAL_SEC", 0)
+    if interval < 0:
+        raise SystemExit("STORAGE_METRICS_INTERVAL_SEC must be >= 0")
     # Listen inside the container; Compose exposes no host port (internal only).
     threading.Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", 9105), _H).serve_forever(),
                      daemon=True).start()
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     signal.signal(signal.SIGINT, lambda *a: stop.append(1))
-    client = resolve_client()
-    if client is None:  # File mode / S3 absent: disabled state, never touch S3
+    client = resolve_client() if interval else None
+    if client is None:  # Disabled inventory; keep local metrics available.
         while not stop:
             time.sleep(0.5)
         return 0

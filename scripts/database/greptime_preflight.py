@@ -96,6 +96,9 @@ def main():
     write_buf = os.environ.get("GREPTIME_WRITE_BUFFER_SIZE", "128MB")
     flush_interval = os.environ.get("GREPTIME_AUTO_FLUSH_INTERVAL", "10m")
     min_compaction_interval = os.environ.get("GREPTIME_MIN_COMPACTION_INTERVAL", "0m")
+    mirror = os.environ.get("GREPTIME_LOCAL_SST_MIRROR", "0")
+    mirror_capacity = os.environ.get("GREPTIME_SST_MIRROR_CAPACITY", "")
+    mirror_reserve = os.environ.get("GREPTIME_SST_MIRROR_OUTPUT_RESERVE", "")
     out_dir = os.environ.get("OUT_DIR", "/out")
 
     for name, value in (("GREPTIME_DB", db), ("GREPTIME_USER", user)):
@@ -127,6 +130,16 @@ def main():
         fail("GREPTIME_AUTO_FLUSH_INTERVAL must be a duration like 10m")
     if not DURATION_RE.match(min_compaction_interval):
         fail("GREPTIME_MIN_COMPACTION_INTERVAL must be a duration like 0m")
+    if mirror not in ("0", "1"):
+        fail("GREPTIME_LOCAL_SST_MIRROR must be 0 or 1")
+    if mirror == "1":
+        if storage != "S3":
+            fail("local SST mirror requires S3 primary storage")
+        for name, value in (("GREPTIME_SST_MIRROR_CAPACITY", mirror_capacity),
+                            ("GREPTIME_SST_MIRROR_OUTPUT_RESERVE", mirror_reserve)):
+            match = SIZE_RE.fullmatch(value)
+            if not match or int(value[:-len(match.group(1))]) <= 0:
+                fail(name + " must be a positive size like 32MiB")
 
     s3 = {}
     if storage == "S3":
@@ -234,6 +247,11 @@ def main():
         "enable_refill_cache_on_read = false",
         "schedule_compaction_after_edit = true",
         f"min_compaction_interval = {toml_str(min_compaction_interval)}",
+        *([
+            'sst_mirror_path = "/data/sst-mirror-v1"',
+            f"sst_mirror_capacity = {toml_str(mirror_capacity)}",
+            f"sst_mirror_output_reserve = {toml_str(mirror_reserve)}",
+        ] if mirror == "1" else []),
         "",
         "[logging]",
         'dir = "/data/logs"',

@@ -17,6 +17,7 @@
 | [`.github/workflows/compose.yml`](../.github/workflows/compose.yml) | push/PR 시 비밀 정보·플러그인·회귀·CAN 성능·생성물·프로필·저장소 비용 예산 검사 |
 | [`tools/check_cost_budget.py`](../tools/check_cost_budget.py) | 절대·상대 저장소 비용 게이트 |
 | [`tools/benchmark_greptime_storage.py`](../tools/benchmark_greptime_storage.py) | 격리 Greptime/S3 저장소 벤치 |
+| [`tools/benchmark_greptime_egress.py`](../tools/benchmark_greptime_egress.py) | 로컬 S3에서 조회·집계·compaction·백업·재시작 다운로드를 분리하는 수동 실증 |
 | [`config/cost-budget.json`](../config/cost-budget.json) | 저장소 비용 정책 |
 
 ### Python 도메인
@@ -112,12 +113,27 @@ callback/installer fixture와 실제 native host smoke는 별도 gate입니다. 
 
 Node syntax와 LSP 검사는 구분하세요. LSP가 구성되지 않은 환경에서는 syntax·실행 검사 결과만 보고합니다. 실패·오프라인·강제 종료 시 직접 전송 이벤트는 유실될 수 있고 자동 재시도하지 않습니다. 설치본을 복사하는 Codex·Claude는 재설치하고, 실행 중인 장기 호스트는 정상 재시작·재로딩해야 변경이 적용됩니다. 기존 sender·큐는 소스 갱신으로 종료·이관·삭제하지 않습니다.
 
+성능 수집 변경은 [지원 필드·upstream 핀](../plugins/README.md#성능-필드와-해석)을 기준으로 검사합니다. adapter fixture/실제 loopback, 실제 upstream 바이너리, 실제 provider 호출, 운영 배포는 서로 다른 gate입니다. 과거 직접 전송 suite의 아래 숫자는 이번 성능 기능의 최종 gate 결과가 아닙니다. 새 결과는 실제 실행한 명령·버전·skip·증거와 함께 별도로 기록하세요.
+
+- shared serializer는 finite nonnegative ms·kind·명시 budget 정수, unknown/0, tier provenance를 검사해야 합니다. `ttft_ms`만 있거나 실제 tier를 요청값으로 채운 payload를 허용하지 않습니다.
+- collector는 trace와 log의 native projection을 각각 실제 Alloy로 통과시켜 확인합니다. OMP seconds→ms와 native/provider별 timing kind, Claude native 요청 duration·speed/effort, Codex의 same-request duration 부재를 검사하고 임의 시간 조인으로 보충하지 않습니다.
+- DB는 fresh·legacy·반복 migration에서 native Claude raw 사용량/ID 열을 포함한 20개 nullable 추가 열을 확인합니다. Grafana는 unknown을 0으로 채우지 않고 reported usage와 양의 명시 request duration으로만 request-total throughput을 계산해야 합니다.
+- Claude interactive hook fixture는 stable prompt_id·turn/message ID·non-final batch 0만 인정하고 final-only CLI/SDK, 자동 prompt의 human-origin 오인, ambiguous correlation을 배제합니다. OpenCode ephemeral delta와 `step.streamed`/tool settle 분리, Hermes usage 없는 latency, AGY invocation-only/no estimated tokens도 검사합니다.
+
+사용자 프로필에 설치하거나 native 사용량 소유권을 자동 변경하지 마세요. Claude display 훅과 AGY invocation 훅은 승인 후 재설치·재로딩해야 하며 서버 schema/collector/Grafana는 별도 배포 승인 대상입니다. 이 문서 변경으로 최종 성능 gate·live provider·운영 연결이 통과한 것은 아닙니다.
+
 직접 전송 전환의 최종 macOS 검증은 실제 Codex CLI를 지정한 `node --test --test-concurrency=1 tests/test_plugin_*.mjs`에서 **84개 통과, 실패·skip 0개**였습니다. 별도 실행한 실제 adapter loopback smoke는 Codex·Claude·AGY 수신, OpenCode 비차단 전송·318ms timeout 종료, Hermes 중복 억제·실패 단일 시도를 확인했습니다. 운영 수집기로 보내거나 사용자 설치본을 갱신하지 않았습니다.
+
+이번 성능 수집에서는 실제 OMP 18.11.0을 격리 scratch home에서 실행하고 OpenAI Responses SSE adapter를 합성 로컬 공급자에 연결해 plugin→실제 Alloy→Greptime 경로의 reported usage·TTFT·첫 text·provider duration·wire 요청 tier/effort를 확인했습니다. 이는 실제 upstream 바이너리와 합성 공급자의 로컬 증거이며 유료 vendor/model 성능, 운영 연결, live profile 설치 또는 전체 최종 gate 통과를 뜻하지 않습니다.
+
+실제 Claude Code 2.1.289도 scratch CLI·합성 loopback Anthropic SSE·지속된 `source=native` 설치본으로 실행해 native `claude_code.llm_request`의 TTFT·first content·logical duration·요청 speed/effort·실제 harness version·reported usage가 Alloy를 통과하는 것을 확인했습니다. headless final-only display에는 상호작용 latency가 생기지 않는 것이 정상입니다. OpenCode2·AGY는 실제 adapter 이벤트/HTTP 검사이며 native 공급자 세션 검증이 아닙니다.
+
+실제 Codex 0.160.0 `exec`도 격리 `CODEX_HOME`·합성 loopback Responses로 실행해 native OTLP→Alloy→Greptime의 reported input/output·cache·TTFT·effort를 확인했습니다. 이 native 경로는 input/output을 숫자 문자열로 보낼 수 있어 collector가 검증 후 정규화합니다. 비어 있는 generic completion은 rich completion과 시간 조인하지 않으며, 성능 화면에서 관측값 없는 행으로 제외합니다. 시험의 요청 fast 설정은 custom-model metadata 제약으로 거부되어 wire/native tier 모두 없었으므로 fast 실제 처리나 tier 수집 성공을 주장하지 않습니다. 이 결과도 유료 공급자·운영 검증이 아닙니다.
 
 `.env.example`을 사용한 프로필 검사는 실제 자격 증명 없이 수행하는 구조 검사입니다. 실제 S3 연결, 물리 CAN, 운영 서버 배포·데이터 수집을 검증하지 않습니다. 변경한 기능의 런타임 검증은 별도로 수행하세요.
 
 
-Hermes 플러그인을 변경했다면 별도 Python 테스트도 실행합니다. 최종 직접 전송 suite는 22개 중 **19개 통과, native Hermes 3개 skip**입니다. `HERMES_SOURCE`의 검증된 외부 checkout이 없어 native gate는 실행하지 않았습니다. core·실제 HTTP·Node `serializeEvent()` ID oracle 검사와 native gate를 구분하세요. 필요한 체크아웃과 제약은 [Hermes 문서](../plugins/hermes/README.md#tests)를 참고하세요.
+Hermes 플러그인을 변경했다면 별도 Python 테스트도 실행합니다. 이번 로컬 성능 수집 검증에서는 **core 21개와 native 3개가 통과**했습니다. native 검사는 핀된 `f42f579c` 소스와 격리 Python 3.14 환경의 실제 loader·normalizer·MoA 경로를 사용했습니다. 공급자 호출·운영 설치 검증은 아닙니다. `HERMES_SOURCE` 없이 실행하면 native 3개는 skip되므로 core·실제 HTTP·Node `serializeEvent()` ID oracle과 구분하세요. 필요한 체크아웃과 제약은 [Hermes 문서](../plugins/hermes/README.md#tests)를 참고하세요.
 
 ```bash
 python3 -B -m unittest discover -s plugins/hermes/tests -v
@@ -260,9 +276,107 @@ cold 증거는 재기동 완료 후 **실제 query window 안의 성공한 SST G
 
 ### 조회 외 S3 다운로드 실증
 
-현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 간격은 `0m`, `schedule_compaction_after_edit=true`이며 인덱스 preload·전체 파일 refill은 끕니다. 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다.
+`benchmark_greptime_egress.py`는 운영 `.env`나 원본을 사용하지 않습니다. 로컬 Docker의 GreptimeDB 1.2.1, SHA256으로 고정한 실제 MinIO 바이너리, S3 HTTP meter를 별도 프로젝트로 실행합니다. 호스트 포트는 loopback에만 바인딩하고, 종료 시 소유 컨테이너·볼륨·네트워크의 잔존 여부를 검사합니다. Python의 `PyYAML`과 `boto3`가 필요합니다.
 
-위 [저장소 비용 예산 검사](#저장소-비용-예산-검사)의 benchmark·검증 명령과 측정 범위를 참고하세요. 고정 합성 workload의 cold/warm 조회 결과는 모든 집계·컴팩션·복구 경로의 다운로드나 운영 청구 상한을 증명하지 않습니다.
+현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 간격은 `0m`, `schedule_compaction_after_edit=true`이며 인덱스 preload·전체 파일 refill은 끕니다. 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다. 아래 정책 비교는 이 기본 구성의 검증이 아닌 과거 연구입니다.
+
+```bash
+python3 tools/benchmark_greptime_egress.py --background-only --rows 200000 \
+  --json-out /tmp/datalake-minimum-background-proof.json
+```
+
+과거 세 후보 모두 같은 작은 64KiB 쓰기 캐시와 1MiB page cache, 실제 로컬 MinIO를 사용합니다. `legacy`는 제한 없는 자동 compaction·preload/refill과 반복 집계, `on_demand`는 자동 집계·선읽기만 제거, `deferred`는 compaction 최소 간격을 `36500d`로 명시적으로 고정합니다. 현재 기본값 `0m`과는 다릅니다. 같은 키를 네 차례 적재·flush한 뒤 재시작·캐시 유실 재시작을 수행합니다. routine 최초/최종 meter snapshot 사이의 연속 증가량을 사용하므로 phase 사이의 비동기 읽기도 포함합니다. compaction counter는 DB 재시작으로 초기화되는 구간을 나누어 계산합니다.
+
+이후의 명시적 집계·원본 oracle·수동 compaction은 routine 다운로드에 숨기지 않고 별도 phase로 기록합니다. 수동 집계의 count/sum/min/max와 시간 요약 일치, 재시작·compaction 전후 마지막 덮어쓰기 NULL, 실제 CAN dirty coordinator와 오프라인 S3 백업을 확인합니다. `background_sst_files`는 compaction을 미뤄 증가하는 활성 SST 파일 수·크기를 남깁니다. 이 짧은 실증은 대규모 조회 성능·장기 보존 회수·월간 egress의 보장이 아니며, 수동 유지보수도 S3를 읽을 수 있습니다.
+
+계측은 DB 시작 전부터 종료 후까지 연속으로 수행하고, 별도 백업 SDK meter는 중복 없이 합산합니다. `response_bytes`는 LIST·오류·재시도를 포함한 모든 응답 body이며, GET은 확인된 데이터/인덱스/백업 payload, metadata, unknown으로 나눕니다. `.parquet/.sst` 전용 카운터만으로 전체 payload 0을 주장하지 않습니다. 분류별 합계가 일치해야 하며, payload와 unknown GET이 모두 0이어야 무다운로드 판정을 내립니다. 수동 compaction·집계도 `nonquery_cost`에 포함하고 조회·복원 비용만 별도 표시합니다.
+
+과거 완전 계측 실행에서 유예 후보의 수집·재시작 구간은 전체 응답 199,479 bytes, 확인된 metadata GET 143,112 bytes, payload/unknown GET 모두 0이었습니다. 그러나 수동 집계·compaction·백업을 포함한 비조회 전체는 113,548,190 bytes였습니다. 유예만으로 생애주기 다운로드 문제가 해결된 것은 아닙니다. 당시 계측·생애주기 회귀 64개와 실제 로컬 MinIO/Greptime 세 후보 실행을 통과했습니다.
+
+네이티브 유지보수 정책은 다음 명령으로 별도 비교합니다.
+
+```bash
+python3 tools/benchmark_greptime_egress.py --maintenance-only --rows 20000 \
+  --json-out /tmp/datalake-native-maintenance.json
+```
+
+새 키가 증가하는 네 시간 구간에 재전송·수정·최신 NULL·이전 구간 지연 입력을 섞습니다. 유예, 작은 캐시의 범위 제한 compaction, 1GiB 캐시, 큰 적재 batch를 비교하고 원본·시간 요약·여러 region·재시작·캐시 유실의 결과를 대조합니다. ADMIN 성공만으로 완료를 판정하지 않으며, 단일 입력의 무변경 결과는 `completed_proven=false`로 기록합니다.
+
+로컬 실행에서 1GiB 캐시의 네 구간 compaction은 payload GET 0이었지만, 캐시 유실 뒤 compaction은 2,982,058 bytes를 읽었습니다. 전체 비조회 payload는 유예 5,215,334, 작은 캐시 13,826,778, 1GiB 캐시 2,982,058, 큰 batch 8,142,487 bytes였습니다. 모든 후보의 unknown GET은 0이었고 원본·요약 oracle은 일치했습니다. 캐시 증설이나 batch 변경만으로 원격 fallback을 금지할 수는 없습니다.
+
+전체 만료 SST는 payload/unknown GET 없이 실제로 퇴역했습니다. 반면 만료·유효 행을 함께 담은 물리 SST에서는 만료 행이 여전히 조회됐습니다. 이 검사는 파일의 최소·최대 시각이 실제 TTL 경계를 가로지르는지 확인하므로, 서로 다른 만료/유효 파일을 혼합 파일로 오인하지 않습니다. scan 한도를 8로 낮춘 실제 오류와 한도를 올리지 않은 반복 compaction 복구도 확인합니다.
+
+`active_manifest_bytes`와 실제 저장된 객체 크기를 구분합니다. meter를 통과한 LIST 관측 비용도 비조회 합계에 포함하며, 활성·비활성·퇴역 SST와 소유 볼륨의 할당량을 별도로 기록합니다. 1GiB 후보의 마지막 관측에서는 알려진 퇴역 SST 35개가 원격에서 사라졌고 비활성 SST는 0개였습니다. 네 구간의 유한 실험이며 인덱스·고아 객체의 장기 GC와 전체 물리 저장량 상한은 증명하지 않습니다. `physical_storage_bound_proven=false`와 `production_recommendation=false`를 유지하며, 테스트 자원 삭제를 엔진 GC 증거로 사용하지 않습니다.
+
+현재 `server`는 aggregate와 의존 서비스를 포함하며 `tools/demo.py`도 File·S3 모두 `server`만으로 정상 예약 집계를 실행합니다. 집계를 끄거나 compaction을 무기한 미룬 과거 후보의 절감량을 현재 기본 구성의 비용 예측으로 사용하지 않습니다.
+
+과거 200,000행을 같은 키로 네 차례 적재한 최종 로컬 비교에서, 초기 스키마 준비부터 캐시 유실 재시작까지 **모든 HTTP 응답 body(LIST 포함)**는 `legacy` 429,476,575 bytes, `on_demand` 428,823,698 bytes, `deferred` 199,479 bytes였습니다. SST GET은 각각 429,216,572 / 428,587,864 / 0 bytes였고, 자동 compaction 완료는 32 / 26 / 0회였습니다. 이 비교의 반복 집계는 raw→분→시간 합성 집계이며 운영 aggregate 전체 pass와 동일한 비용 모델은 아닙니다. 실제 CAN coordinator는 별도 명시적 실행 구간에서 검증합니다.
+
+유예 후보의 활성 SST는 32개·108,226,884 bytes로, 기존 후보의 2개·26,756,791 bytes보다 늘었습니다. 이후 명시적 집계가 3,382,112 bytes, 수동 compaction이 109,774,868 bytes를 읽었습니다. 다운로드 비용을 없앤 것이 아니라 요청하지 않은 반복 작업을 멈추고 유지보수 시점으로 옮긴 것입니다. 캐시 유실 후 스키마 재초기화는 GET 0이었고, 원본 200,000행·sum 12,999,000·시간 요약 80그룹과 최신 NULL 의미가 일치했습니다. 실제 S3 백업 최초/동일 세대 재실행의 SDK payload GET은 모두 0입니다.
+
+별도 native exporter 검증은 로컬 MinIO 앞 meter로 기본값/명시적 `STORAGE_METRICS_INTERVAL_SEC=0` 모두 S3 요청 0회, 실제 `/metrics` 응답과 로컬 상태 메트릭 유지를 확인했습니다. 버킷 크기를 0으로 만들지 않고 inventory 비활성·값 없음으로 반환합니다. 과거 선택 `analytics` 프로필의 demo start/check는 OTLP·Fleet 180행 ACK, 분석, 개인정보·인증, 큐 복구, 백업·새 DB 복원, Grafana query API를 통과했습니다. 당시 aggregate를 정지한 별도 구간에서는 OTLP raw 1행이 저장되고 새 요약은 0행이었습니다. 이는 현재 `server`의 예약 집계 경로나 화면 시각 검증·운영 배포 증거가 아닙니다.
+
+```bash
+python3 tools/benchmark_greptime_egress.py \
+  --rows 200000 \
+  --json-out /tmp/datalake-egress-proof.json
+# S3를 주 저장소로 유지하는 경로만 검사:
+python3 tools/benchmark_greptime_egress.py \
+  --s3-only --rows 200000 --large-cache 128MiB \
+  --json-out /tmp/datalake-s3-primary-proof.json
+```
+
+합성 행마다 압축이 잘되지 않는 문자열을 넣어 작은 캐시보다 실제 SST가 크도록 강제합니다. 기본 비교는 S3 주 저장소의 `write_cache_size=64KiB`와 `1GiB`, 그리고 로컬 `File` 주 저장소입니다. 파일 저장소 실증에서도 S3 서버는 로컬 MinIO이며, 백업 아카이브를 실제로 업로드하고 내려받아 새 DB에서 복원합니다.
+
+조회 다운로드와 일상 다운로드는 서로 다른 phase에 기록합니다. 수집·flush 중 자동 compaction, 완료가 확인된 수동 compaction, raw→분→시간 집계, 실제 CAN dirty coordinator의 rollup·주행 요약, 같은 generation 재실행, 캐시를 보존한 재시작, 대기 중 읽기, 첫 백업·변경 없는 백업을 분리합니다. compaction 대기에는 raw COUNT 조회를 섞지 않습니다. 정확성 조회는 별도 phase에서 원본 count/sum/min/max, 시간별 집계와 원본의 일치, 두 주행의 600초·5.7km 결과를 검증합니다. 백업은 실제 `backup.main`과 서버 ChecksumSHA256 응답·HEAD 검증을 사용하며, SDK payload/control 계수도 확인하므로 확장자 없는 pooled SST의 GET을 놓치지 않습니다.
+
+S3 실증은 캐시가 상주한 상태에서 같은 키에 대한 적재→완료된 compaction→집계를 세 차례 추가 반복합니다. 최종 원본·시간 집계 oracle도 다시 확인하며, 충분한 캐시의 모든 일상 phase에서 SST GET 0을 요구합니다. 처음 적재한 SST만 작은/큰 캐시 사이인지 확인합니다. 반복 적재 후 원격에 남아 있는 이전 SST까지 더한 객체 총량은 현재 활성 작업 집합이나 로컬 캐시 점유량으로 해석하지 않습니다. `--large-cache 128MiB`의 Parquet 예산은 64MiB이므로, 이전 1GiB 비교보다 실제 입력·출력 대비 작은 예산으로 반복 작업을 검증합니다. 캐시를 강제로 삭제하는 뒤쪽 phase는 정상 상주 경로가 아닌 다운로드 재발 경계입니다.
+
+S3-only 128MiB 실행은 200,000행·초기 SST 약 26.9MB에서 통과했습니다. 반복 3회와 백업·재시작을 포함한 조회 외 GET body는 64KiB 캐시에서 872,106,627 bytes, 128MiB 캐시에서 17,571 bytes였습니다. 후자의 SST GET은 0이며 나머지는 control 읽기입니다. 원본 count 200,000·sum 12,999,000과 시간 집계 80그룹이 일치했습니다. 강제 캐시 삭제 후 compaction은 26,748,364 bytes를 내려받았고, 소유 컨테이너·볼륨·네트워크 잔존은 없었습니다. 반복 적재 전의 아래 비교와 workload가 다르므로 절대값을 직접 비교하지 않습니다.
+
+200,000행·약 26.9MB SST의 로컬 실행에서 일상 phase의 GET body 합계는 작은 S3 캐시 77,296,729 bytes, 충분한 S3 캐시 17,571 bytes, File 주 저장소 0 bytes였습니다. 충분한 캐시의 SST payload GET은 0이며, 작은 읽기는 메타데이터·백업 COMPLETE 기록입니다. 이 숫자는 해당 실행의 결과이며 10GB·운영 월간 사용량으로 선형 환산하지 않습니다.
+
+두 방법의 경계는 다릅니다.
+
+- **S3 주 저장소 + 상주 디스크 캐시:** 입력 SST와 compaction 출력 및 인덱스가 각 캐시 예산에 들어가야 합니다. [고정 버전의 FileCache](https://github.com/GreptimeTeam/greptimedb/blob/179ff8e5099d35e217a5ffeb6e4096405824dd6c/src/mito2/src/cache/file_cache.rs#L292-L301)는 Parquet/Puffin 용량을 별도로 나누며, 총 1GiB는 각각 512MiB입니다. 캐시 유실·퇴출·재시작 복구와 작업의 경합은 다운로드를 되살릴 수 있습니다. 실증에서도 캐시 삭제 후 compaction은 26,748,364 bytes를 내려받았습니다. 캐시가 큰 것만으로 무조건 과금 안전을 보장하지 않습니다.
+- **File 주 저장소 + S3 오프라인 백업:** 일상 DB 읽기는 로컬 디스크에서 처리하므로 작은 메모리 캐시와 프로세스 재시작에도 S3 GET이 0이었습니다. 현재 운영용 File 백업 CLI는 **로컬 아카이브만 작성**합니다. 이 실증은 기존 verified PUT/HEAD helper로 별도 off-host 업로드를 실행한 것이며 운영 자동 업로드를 추가한 것은 아닙니다. 전체 오프라인 백업이므로 적재량에 맞는 로컬 여유 공간, 백업 중지 시간, 전체 아카이브 업로드량과 백업 간격의 복구 시점 손실을 고려해야 합니다. 기존 S3 볼륨의 설정만 File로 바꾸면 안 되며 별도 저장소 이관이 필요합니다.
+
+원격 백업만 남은 재해 복구는 다운로드가 불가피합니다. File 실증의 아카이브·sidecar GET 60,015,604 bytes는 `restore_exception`으로 별도 기록하고, SHA256 및 실제 복원 DB의 200,000행과 차량 요약을 확인했습니다. 이를 일상 0 bytes에 합치거나 숨기지 않습니다. GET 계수는 실제 응답 body이며 HTTP header·공급자 청구 전체는 포함하지 않습니다. 테스트용 HTTP 예외는 소유 loopback MinIO에만 적용하고 운영 HTTPS 검증은 바꾸지 않습니다.
+
+### 실험적 S3-primary 로컬 입력 엔진
+
+`tools/greptime_local.patch`는 GreptimeDB 1.2.1의 `179ff8e5099d35e217a5ffeb6e4096405824dd6c`에 적용하는 연구 전용 패치입니다. 전체 이력에 비례하는 mirror가 필요하므로 선택한 제한된 로컬 작업 캐시 해법이 아니며, 기본 이미지나 운영 배포를 교체하지 않습니다. 다음 명령은 로컬 Docker 안에서 고정 소스·Rust toolchain을 빌드하며, 원격 Docker endpoint를 거부합니다. 마지막 줄에 출력된 패치 해시 포함 이미지 태그를 `GREPTIME_LOCAL_IMAGE`로 지정합니다.
+
+```bash
+python3 -m venv /tmp/datalake-local-proof-env
+. /tmp/datalake-local-proof-env/bin/activate
+python -m pip install PyYAML==6.0.2 boto3==1.43.98 \
+  grpcio==1.84.0 pyarrow==25.0.1 protobuf==6.33.6 \
+  opentelemetry-proto==1.38.0 py-expression-eval==0.3.14
+python3 tools/build_greptime_local.py build --jobs 2
+python3 tools/build_greptime_local.py build --jobs 2 --native-tests
+python3 tools/benchmark_greptime_egress.py --local-input-only \
+  --greptime-image "${GREPTIME_LOCAL_IMAGE:?빌드 결과 이미지 태그를 지정하세요}" \
+  --rows 20000 --json-out /tmp/datalake-local-input-proof.json
+```
+
+S3는 canonical SST 저장소로 유지합니다. 엔진은 업로드할 완성된 SST·Puffin 파일을 같은 파일시스템의 `/data/sst-mirror-v1`에 hardlink로 보존하며, 일반 LRU 캐시 퇴출과 분리합니다. compaction·인덱스 재구축은 이 로컬 입력만 사용합니다. 입력 누락이나 용량 부족은 실패이며, 원격 GET으로 보충하거나 완료한 것으로 처리하지 않습니다. 출력 예산과 파일시스템 여유를 검사하지만 물리 블록을 선할당하는 것은 아니므로, 외부 쓰기와 실제 ENOSPC도 실패 경로로 남습니다. 일반 사용자 조회는 계속 S3를 읽을 수 있습니다.
+
+출력 예산은 한 유지보수 작업씩 사용합니다. 겹치는 compaction·비동기 인덱스 작업은 대기하며, 단순히 다른 작업이 실행 중이라는 이유로 실패시키거나 출력 예산을 중복 할당하지 않습니다.
+
+빈 로컬 볼륨에 S3 SST만 연결하는 것은 재해 복구가 아닙니다. 기존 오프라인 백업의 WAL·catalog와 S3 snapshot이 함께 필요합니다. 실증은 로컬 archive를 재사용하지 않고 원격 COMPLETE backup을 내려받아 새 볼륨으로 복구합니다. 현재 백업은 mirror도 archive에 포함하며 hardlink를 일반 파일 내용으로 저장하므로, 이 실험 모드의 archive 업로드·복구 용량은 로컬 보존 이력에 비례합니다. SST pool 재사용만으로 archive 전송까지 작아진다고 해석하면 안 됩니다.
+
+선택 집계는 `AGG_LOCAL_SST_ONLY=1`일 때 인증된 `/v1/local-sql`과 Flight action `datalake.local_sst_query.v1`을 사용합니다. 같은 WAL·memtable·SST와 기존 CAN generation/AI sequence fence를 재사용하며, 별도 원본 저널이나 단순 누적 카운터를 만들지 않습니다. endpoint 부재·로컬 입력 누락은 일반 SQL/DoGet 재시도로 숨기지 않습니다. 로컬 원본 재조회 자체를 제거하는 설계는 아니며, 로컬 보존량은 기존 TTL의 활성 이력에 비례합니다.
+
+mirror 모드의 Metric logical-table 복구·DDL 메타데이터 조회도 로컬 입력을 요구합니다. 해당 metadata SST가 유실되면 자동 원격 보충 대신 복구가 실패하므로, 데이터 SST뿐 아니라 metadata mirror와 catalog/WAL도 복원해야 합니다. 명시적 일반 사용자 조회의 원격 접근 정책은 바꾸지 않습니다.
+
+실증은 두 SST 형식·Puffin·재시작·캐시 삭제·입력 누락/복구·출력 예산·파일시스템 부족·TTL·scan 한도·엔진 GC를 검사합니다. 요약 비교는 AI/로그/Home/차량/주행/충전과 배터리 분석을 포함한 열 개 출력 테이블의 모든 셀을 대조합니다. 일반 경로의 비교 oracle 비용은 `baseline_analytics_comparison_costs`로 분리하고 전체 lifecycle 합계에는 남깁니다. 실제 strict 집계와 수동 compaction은 비조회 비용에서 제외하지 않습니다. JSON의 성공 여부·필수 case 완료·payload와 unknown bytes·실제 물리 파일 집합을 함께 확인해야 합니다. 짧은 유한 fixture의 성공도 운영 장기 상한이나 1TB 용량 보장은 아닙니다.
+
+새 로컬 시험 프로젝트에만 `-f compose.yaml -f tools/greptime_local/compose.yaml`을 명시적으로 추가할 수 있습니다. 이 override는 `GREPTIME_LOCAL_IMAGE`, `GREPTIME_SST_MIRROR_CAPACITY`, `GREPTIME_SST_MIRROR_OUTPUT_RESERVE`를 필수로 요구하고 native capability를 검사합니다. 집계와 의존 서비스는 기본 구성과 같이 `server` 프로필을 따릅니다. mirror 용량은 보존 이력·인덱스와 동시 출력 예산을 수용해야 하며, 부족하면 유지보수뿐 아니라 flush도 실패할 수 있습니다. 기존 S3 이력을 가진 볼륨에 설정만 켜면 로컬 입력이 생기지 않습니다. 기존 운영 이관·원격 이력 hydration·운영 재시작은 이 명령의 범위가 아닙니다.
+
+이 실험 override의 `GREPTIME_MIN_COMPACTION_INTERVAL=0m`은 현재 stock 기본값과 같습니다. 실증은 수동 `ADMIN compact_table` 없이 실제 flush 입력이 자동 병합·퇴역하는지와, ACK 직후 미flush 데이터의 SIGKILL/WAL 재시작에서 최신 NULL이 보존되는지도 검사합니다.
+
+고정 소스와 패치 `3cc650a827c7b1c1e238b3e1f050686f5ac49fcf277b4c09bdd7941c1c3aef0a`의 로컬 실측에서는 20,000행 초기 부하와 추가 요약 fixture로 20개 필수 case가 모두 통과했습니다. 자동·수동 유지보수 및 strict 집계의 payload/unknown GET은 각각 0바이트였고, metadata GET은 952,588바이트, 비조회 전체 HTTP 응답 body는 2,207,519바이트였습니다. 조회·비교 oracle·재해 복구 다운로드는 별도 계상하며 lifecycle 총계에서 제거하지 않았습니다. GC 후 활성 SST 129개의 원격·로컬 payload는 각각 29,973,451바이트였고 누락·퇴역 잔존 파일은 없었습니다. 이는 해당 유한 fixture의 관측값이며, 메타데이터 요청·archive 업로드·원격 복구 비용이나 장기 용량 한계가 사라졌다는 뜻은 아닙니다.
 
 ## 가벼운 PR 성능 비교
 
@@ -281,9 +395,20 @@ python3 tools/demo.py status
 python3 tools/demo.py stop
 ```
 
+S3 주 저장소의 실제 서비스 경로는 로컬 MinIO와 별도 계측기를 함께 띄웁니다. File과 마찬가지로 `server`의 예약 집계를 유지하며, `check`는 예약 처리 중 유휴·재시작 비용과 집계 결과, raw 업로드 무결성·백업·복원을 검사합니다. 다운로드 0을 만들기 위해 scheduler를 정지하지 않습니다.
+
+```bash
+python3 tools/demo.py start --storage S3 --state /tmp/datalake-s3-demo
+python3 tools/demo.py check --state /tmp/datalake-s3-demo
+# 필요한 UI 관찰 후:
+python3 tools/demo.py stop --state /tmp/datalake-s3-demo
+```
+
+`proof.json`에 구간별·종료까지의 응답량과 정리 결과가 남습니다. 성공한 `stop`은 인증 파일을 지우고 인증 없는 종료 표식만 보존하므로 반복 호출할 수 있습니다. 새 실행에는 새 state 경로를 사용하세요. 로컬 File·S3 start/check는 합성 Fleet 180행, 사용량 NULL/0·중복 제거, Alloy SIGKILL 대기열 복구, wire/DB 개인정보·인증, Grafana query 8개, 오프라인 백업·새 볼륨 복원의 정확한 행 비교를 통과했습니다. S3 유휴·재시작 비용은 예약 집계를 켠 실행의 계측값으로 판단합니다. 데모는 page cache 128MB·write buffer 64MB·flush 30초·집계 5초를 사용하므로 운영 기본 자원과 동등한 실증이나 대규모·월간 비용 예측이 아닙니다.
+
 네 명령은 동일한 `--state /임시/경로`를 선택적으로 받습니다. 기본은 사용자별 임시 디렉터리이며 기존 state를 덮어쓰지 않습니다. JSON 출력은 `project`, `directory`, `grafana_url`, `credentials_file`, `ui_path`와 검사 후 `last_check`를 제공합니다. `last_check`에는 세션별 정확한 NULL/0/토큰 값, 실제 Grafana datasource query 결과, 교정 전력·팩 전압 쿼리 8개의 결과와 절대 조회 범위(`battery_panels`), fresh restore와 일치한 테이블별 행 수, wire/DB 개인정보 및 SIGKILL 후 대기열 전달 검증 결과가 있습니다. 전력·전압 카드는 조회 끝을 다음 시간창으로 옮겼을 때 이전 숫자 대신 NULL이 되는지도 검사합니다. state/env/기대값은 비공개 `0600`, 디렉터리는 `0700`입니다.
 
-`start`는 원본 `.env`를 읽지 않고 환경에서 운영 Compose 설정을 제거합니다. 별도 프로젝트·File 저장소·합성 인증을 사용하며, 모든 게시 포트는 `127.0.0.1`의 Docker 자동 할당 포트입니다. 저장소 전체를 컨테이너에 마운트하지 않고 필요한 세 공개 코드 파일만 읽기 전용으로 마운트합니다. `start` 출력의 URL에 로그인(사용자 `demo`, `credentials_file`의 합성 `GF_ADMIN_PASSWORD`)해 `/d/datalake-ai-usage`의 세션 원장을 보세요. `demo-known` 7/3, `demo-zero` 0/0, `demo-unknown` 미보고 값을 구분합니다. `check` 후 `demo-queued` 19/5가 추가됩니다. 비용이 미보고·미산정이면 NULL이며 0으로 채우지 않습니다.
+`start`는 원본 `.env`를 읽지 않고 환경에서 운영 Compose 설정을 제거합니다. 별도 프로젝트·기본 File 저장소(선택 시 로컬 S3)·합성 인증을 사용하며, 모든 게시 포트는 `127.0.0.1`의 Docker 자동 할당 포트입니다. 기본 File 경로는 필요한 공개 코드 파일만 읽기 전용으로 마운트하고, S3 검증 경로는 추가 계측·합성 입력 코드를 사용합니다. `start` 출력의 URL에 로그인(사용자 `demo`, `credentials_file`의 합성 `GF_ADMIN_PASSWORD`)해 `/d/datalake-ai-usage`의 세션 원장을 보세요. `demo-known` 7/3, `demo-zero` 0/0, `demo-unknown` 미보고 값을 구분합니다. `check` 후 `demo-queued` 19/5가 추가됩니다. 비용이 미보고·미산정이면 NULL이며 0으로 채우지 않습니다.
 
 실제 합성 Fleet recorder 경로는 2-frame 검증 → `process_frame` → SQLite outbox → `upload_tick` → 실제 Greptime acknowledgement입니다. 가상 차량만 사용하며 실제 ZMQ 네트워크 발행자나 물리 CAN을 검증하지 않습니다. 시간창 마지막 10분 이내에 있는 이전 완료 시간의 V/I 쌍에 데모 범위 교정만 적용합니다. 전력·전압 카드는 완료된 시간창의 마지막 관측이며, raw 단위가 불명확한 다른 물리 값은 unknown 상태로 남습니다.
 
@@ -291,10 +416,10 @@ python3 tools/demo.py stop
 
 호스트와 Docker VM의 시계를 동기화해야 Grafana 로그인 세션과 상대 시각이 정상 동작합니다. 과거의 교정 관측은 `last_check.battery_panels.from_ms/to_ms`를 절대 조회 범위로 사용해 확인할 수 있습니다. 현재 시간창에 관측이 없으면 이전 전력·전압 숫자를 현재 값처럼 표시하지 않습니다.
 
-CI의 `synthetic-runtime` job도 같은 `start/check/stop`을 실행하며 운영 secrets를 받지 않습니다. `check`는 `tests/test_privacy.py`의 실제 protobuf trace/log/metric·exemplar·인증 검사와 error-type 비밀 marker를 재사용합니다. 컨테이너 내부 감사 프록시를 Alloy exporter와 DB 사이에 두므로, VM host-gateway 설정이 필요 없으며 **DB가 필드를 버리기 전 wire protobuf**를 검사합니다. `opentelemetry-proto==1.39.1`은 감사 컨테이너에만 설치합니다.
+CI의 `synthetic-runtime` job은 기본 File 저장소의 같은 `start/check/stop`을 실행하며 운영 secrets를 받지 않습니다. S3 경로는 위 명령으로 별도 실행합니다. `check`는 `tests/test_privacy.py`의 실제 protobuf trace/log/metric·exemplar·인증 검사와 error-type 비밀 marker를 재사용합니다. 컨테이너 내부 감사 프록시를 Alloy exporter와 DB 사이에 두므로, VM host-gateway 설정이 필요 없으며 **DB가 필드를 버리기 전 wire protobuf**를 검사합니다. `opentelemetry-proto==1.39.1`은 감사 컨테이너에만 설치합니다.
 
 이 job은 고정 버전 Python·GreptimeDB·Grafana·Alloy 이미지를 [Google의 공개 Docker Hub 캐시](https://cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images) `mirror.gcr.io`에서 직접 받습니다. `validate`의 packaged CAN 검사도 Python·GreptimeDB에 같은 캐시를 사용합니다. `start`는 기존 `PYTHON_IMAGE`, `BACKUP_IMAGE`, `GREPTIME_IMAGE`, `GRAFANA_IMAGE`, `ALLOY_IMAGE` override만 데모 설정에 전달하며 운영 기본 이미지는 바꾸지 않습니다. 캐시에 이미지가 없으면 Hub로 우회하지 않고 pull 오류로 실패합니다.
 
 대기열 검사는 DB를 중지하고 exporter queue occupancy를 확인한 뒤 Alloy를 SIGKILL합니다. DB와 Alloy를 다시 시작해 동일 identity의 사용량이 정확히 한 번 집계되는지 확인합니다. 복원 검사는 집계기를 먼저 멈춰 합성 원시행·세션·일별·차량 집계와 token metric 테이블의 모든 열을 고정하고, 전체 데모를 멈춘 뒤 오프라인 백업을 만듭니다. 별도 복원 프로젝트의 빈 볼륨에 복원해 DB를 실제로 시작하고 전체 행을 정확히 비교한 뒤 복원 프로젝트만 삭제합니다. 원래 데모는 다시 켜 두며 `stop`은 데모가 만든 두 프로젝트와 그 볼륨에만 한정됩니다.
 
-이 검사는 File-store 소프트웨어 경로에 대한 증거입니다. 실제 S3 계정·호환성, 실제 차량/CAN·펌웨어, 외부 Fleet ZMQ, 개인 에이전트 계정, 운영 배포·대용량 처리, 브라우저의 시각적 렌더링은 CI가 주장하지 않습니다. Grafana query 응답과 dashboard provisioning은 실제 검사하지만 화면 관찰은 별도로 해야 합니다. 시작 중 오류가 나면 같은 state의 `stop`으로 소유 자원을 정리하세요.
+CI는 File-store 소프트웨어 경로를, 별도로 실행한 로컬 S3 검사는 MinIO 기반 서비스 경로를 검증합니다. 실제 S3 공급자 계정·호환성·청구액, 실제 차량/CAN·펌웨어, 외부 Fleet ZMQ, 개인 에이전트 계정, 운영 배포·대용량 장기 처리, 브라우저의 시각적 렌더링은 이 결과로 주장하지 않습니다. Grafana query 응답과 dashboard provisioning은 실제 검사하지만 화면 관찰은 별도로 해야 합니다. 시작 중 오류가 나면 같은 state의 `stop`으로 소유 자원을 정리하세요.

@@ -72,7 +72,7 @@ services:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
     labels:
-      datalake.raw-uploader-revision: "1"
+      datalake.raw-uploader-revision: "2"
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully
@@ -100,7 +100,7 @@ services:
       RAW_UPLOAD_INTERVAL_SEC: ${RAW_UPLOAD_INTERVAL_SEC:-60}
       RAW_UPLOAD_RETRIES: ${RAW_UPLOAD_RETRIES:-8}
       RAW_PREFLIGHT_CHUNK_BYTES: ${RAW_PREFLIGHT_CHUNK_BYTES:-1048576}
-      RAW_INVENTORY_INTERVAL_SEC: ${RAW_INVENTORY_INTERVAL_SEC:-3600}
+      RAW_INVENTORY_INTERVAL_SEC: ${RAW_INVENTORY_INTERVAL_SEC:-0}
     # Container listener is fixed; only this host-side bind is configurable.
     ports:
       - ${RAW_METRICS_HOST:-127.0.0.1}:${RAW_UPLOAD_METRICS_PORT:-9103}:9103

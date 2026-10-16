@@ -38,6 +38,12 @@ only completed successful 2xx GETs with a positive body for paths ending
 in .parquet (native Greptime SST) or .sst (synthetic fixtures). The entry
 keeps only object_kind, never the signed path, query or object name.
 
+response_bytes counts every upstream response body, including LIST, errors
+and retries. payload_read_bytes includes SST, Puffin and backup pool GETs;
+metadata_read_bytes requires a known manifest/marker structure. Everything
+else is unknown_read_bytes, never assumed metadata. These cumulative totals
+and response_bytes_by_object survive bounded request-log rotation.
+
 AWS-chunked / streaming-SigV4 / trailer body modes are NOT silently
 rewritten (that would break the signature): they fail safe with 502 and
 an `unsupported` marker, still counted.
@@ -73,6 +79,8 @@ import xml.etree.ElementTree as ET
 
 _CHUNK = 65536
 _ERROR_BODY_LIMIT = 65536
+_REQUEST_LOG_LIMIT = 100000
+_REQUEST_LOG_TRIM = 10000
 _LOOPBACKS = {"127.0.0.1", "::1", "localhost"}
 
 # AWS SDKs send `amz-sdk-request: attempt=1; max=5` on every try, including
@@ -105,17 +113,36 @@ def classify_op(method, query, headers):
 
 
 def classify_object(path):
-    """Retain only a non-sensitive object class, never an object selector."""
-    if path.endswith((".parquet", ".sst")):
+    """Fail closed: only structurally identified objects count as metadata."""
+    parts = urllib.parse.unquote(path).split("/")
+    if (not path.startswith("/") or len(parts) < 2
+            or not all(p and p not in (".", "..") for p in parts[1:])):
+        return "unknown"
+    name = parts[-1]
+    if name.endswith((".parquet", ".sst")):
         return "sst"
-    parts = path.split("/")
-    if (path.startswith("/") and len(parts) >= 4
-            and all(p and p not in (".", "..") for p in parts[1:])):
+    if name.endswith(".puffin"):
+        return "index"
+    if len(parts) >= 4:
+        if parts[-2] == "_sst" and re.fullmatch(r"[0-9a-f]{64}", name):
+            return "backup_payload"
+        if re.fullmatch(
+                r"greptime-backup-\d{8}T\d{6}\.\d{9}Z-[0-9a-f]{6}",
+                parts[-2]):
+            if name == parts[-2] + ".tar.gz":
+                return "backup_payload"
+            if name in ("COMPLETE", "RETIRING", "manifest.json",
+                        parts[-2] + ".tar.gz.sha256"):
+                return "metadata"
         if parts[-2:] == ["manifest", "_last_checkpoint"]:
             return "manifest_checkpoint_discovery"
-        if parts[-1] == ".dropping":
+        # Native mito2 manifest/storage.rs emits version:020 names.
+        if parts[-2] == "manifest" and re.fullmatch(
+                r"\d{20}\.(?:json|checkpoint)(?:\.gz)?", name):
+            return "metadata"
+        if name == ".dropping":
             return "drop_marker"
-    return "control"
+    return "unknown"
 
 
 def _is_missing_key(body):
@@ -278,11 +305,15 @@ class S3Meter:
         self.requests = []
         self.dropped_requests = 0
         self._client_error_breakdown = {}
+        self._op_requests = {}
+        self._response_bytes_by_object = {}
         self.counters = {"requests": 0, "retries": 0, "unknown_attempts": 0,
                          "errors": 0, "client_errors": 0,
                          "expected_not_found_requests": 0,
                          "expected_not_found_bytes": 0,
                          "read_bytes": 0, "write_bytes": 0, "copy_bytes": 0,
+                         "response_bytes": 0, "payload_read_bytes": 0,
+                         "metadata_read_bytes": 0, "unknown_read_bytes": 0,
                          "sst_get_requests": 0, "sst_read_bytes": 0,
                          "copy_unknown": 0,
                          "payload_bytes": 0, "control_bytes": 0,
@@ -325,14 +356,29 @@ class S3Meter:
                 status == 404 and optional_miss
                 and not entry.get("truncated") and not entry.get("unsupported"))
             self.requests.append(entry)
-            if len(self.requests) > 100000:
-                # Bounded memory on 10M-row runs; totals already folded in.
-                del self.requests[:10000]
-                self.dropped_requests += 10000
+            if len(self.requests) > _REQUEST_LOG_LIMIT:
+                # Bounded memory; cumulative attribution is independent.
+                del self.requests[:_REQUEST_LOG_TRIM]
+                self.dropped_requests += _REQUEST_LOG_TRIM
             c = self.counters
             c["sst_get_requests"] += entry["sst_get_requests"]
             c["sst_read_bytes"] += entry["sst_read_bytes"]
             c["requests"] += 1
+            op = entry["op"]
+            kind = entry["object_kind"]
+            response_bytes = entry["resp_bytes"]
+            self._op_requests[op] = self._op_requests.get(op, 0) + 1
+            self._response_bytes_by_object[kind] = (
+                self._response_bytes_by_object.get(kind, 0) + response_bytes)
+            c["response_bytes"] += response_bytes
+            if op == "GET":
+                if kind in ("sst", "index", "backup_payload"):
+                    c["payload_read_bytes"] += response_bytes
+                elif kind in ("metadata", "manifest_checkpoint_discovery",
+                              "drop_marker"):
+                    c["metadata_read_bytes"] += response_bytes
+                else:
+                    c["unknown_read_bytes"] += response_bytes
             if entry["attempts"] > 1:
                 # Each observed attempt>1 is one retry; attempt=1/2/3 over
                 # the wire is 2 retries, not 0+1+2=3.
@@ -426,7 +472,9 @@ class S3Meter:
                 started = time.time()
                 base = {"ts": started, "method": method,
                         "op": op,
-                        "object_kind": classify_object(parsed.path),
+                        "object_kind": (classify_object(parsed.path)
+                                        if op in ("GET", "HEAD", "PUT", "COPY",
+                                                  "DELETE") else "control"),
                         "expected_not_found": False,
                         "req_bytes": 0, "resp_bytes": 0, "status": None,
                         "range": in_headers.get("Range"),
@@ -560,20 +608,23 @@ class S3Meter:
                             got = 0
                             while got < want:
                                 try:
-                                    data = resp.read(
+                                    data = resp.read1(
                                         min(_CHUNK, want - got))
+                                except http.client.IncompleteRead as exc:
+                                    data = exc.partial
+                                    truncated = True
                                 except Exception:
                                     truncated = True
                                     break
                                 if not data:
                                     truncated = True
                                     break
+                                got += len(data)
                                 try:
                                     self.wfile.write(data)
                                 except OSError:
                                     truncated = True
                                     break
-                                got += len(data)
                                 if error_body is not None:
                                     if len(error_body) + len(data) > _ERROR_BODY_LIMIT:
                                         error_body = None
@@ -588,12 +639,16 @@ class S3Meter:
                             self.end_headers()
                             while True:
                                 try:
-                                    data = resp.read(_CHUNK)
+                                    data = resp.read1(_CHUNK)
+                                except http.client.IncompleteRead as exc:
+                                    data = exc.partial
+                                    truncated = True
                                 except Exception:
                                     truncated = True
                                     break
                                 if not data:
                                     break
+                                resp_bytes += len(data)
                                 try:
                                     self.wfile.write(b"%X\r\n" % len(data))
                                     self.wfile.write(data)
@@ -601,7 +656,6 @@ class S3Meter:
                                 except OSError:
                                     truncated = True
                                     break
-                                resp_bytes += len(data)
                                 if error_body is not None:
                                     if len(error_body) + len(data) > _ERROR_BODY_LIMIT:
                                         error_body = None
@@ -714,10 +768,7 @@ class S3Meter:
     def op_counters(self):
         """Request counts by operation class (each wire attempt counts 1)."""
         with self._lock:
-            agg = {}
-            for r in self.requests:
-                agg[r["op"]] = agg.get(r["op"], 0) + 1
-            return agg
+            return dict(self._op_requests)
 
     def snapshot(self, timeout=60):
         """Return a quiescent view, or fail explicitly if transfers stay active."""
@@ -735,10 +786,10 @@ class S3Meter:
             dropped = self.dropped_requests
             breakdown = [dict(group) for group in
                          self._client_error_breakdown.values()]
-            ops = {}
-            for r in reqs:
-                ops[r["op"]] = ops.get(r["op"], 0) + 1
+            ops = dict(self._op_requests)
+            response_classes = dict(self._response_bytes_by_object)
         return {"counters": counters, "op_requests": ops,
+                "response_bytes_by_object": response_classes,
                 "client_error_breakdown": breakdown,
                 "requests": reqs[-5000:],
                 "truncated_requests": max(0, len(reqs) - 5000) + dropped}
