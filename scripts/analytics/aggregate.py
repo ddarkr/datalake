@@ -2441,30 +2441,34 @@ def ai_section(ctx, cfg):
     return _ai_full(ctx, cfg)
 
 
-def _ai_full(ctx, cfg):
+def _ai_full(ctx, cfg, snapshot=None):
     base_url, auth, db = ctx
     ttl = cfg.get("otel_ttl", "")
-    cols, rows = guarded_fetch(
-        base_url, auth, db,
-        "SELECT " + ", ".join('"' + c + '"' for c in SPAN_COLS) +
-        " FROM opentelemetry_traces", cfg["max_rows"])
-    # Native log usage (Codex sse_event completed, Claude api_request) is
-    # folded in here so dashboards count real billed calls, not traces-only
-    # usage. Same stable (client, session, call) id on both signals bills
-    # once with native usage winning; the merged billed set replaces the
-    # trace-only one below so overrides (not just appends) reach summaries.
-    try:
-        lcols, lrows = guarded_fetch(
+    if snapshot is None:
+        cols, rows = guarded_fetch(
             base_url, auth, db,
-            "SELECT " + ", ".join('"' + c + '"' for c in LOG_COLS) +
-            " FROM opentelemetry_logs", cfg["max_rows"])
-        logs = dedupe_logs(lcols, lrows)
-        raw_logs = [dict(zip(lcols, row)) for row in lrows]
-    except SqlError as e:
-        if not is_missing_table(e):
-            raise
-        logs = []
-        raw_logs = []
+            "SELECT " + ", ".join('"' + c + '"' for c in SPAN_COLS) +
+            " FROM opentelemetry_traces", cfg["max_rows"])
+        try:
+            lcols, lrows = guarded_fetch(
+                base_url, auth, db,
+                "SELECT " + ", ".join('"' + c + '"' for c in LOG_COLS) +
+                " FROM opentelemetry_logs", cfg["max_rows"])
+        except SqlError as e:
+            if not is_missing_table(e):
+                raise
+            lcols, lrows = [], []
+        metric_rows = activity_metric_rows(ctx, cfg)
+    else:
+        frames, metric_rows = snapshot
+        # The full Flight reads already returned the rows AND their upper
+        # watermarks. Re-reading HTTP here doubles cold recovery downloads.
+        tables = {table: (names, _ai_flight_ns_rows(table, names, values))
+                  for table, names, values in frames}
+        cols, rows = tables["opentelemetry_traces"]
+        lcols, lrows = tables["opentelemetry_logs"]
+    logs = dedupe_logs(lcols, lrows)
+    raw_logs = [dict(zip(lcols, row)) for row in lrows]
     spans = _ai_merge(cols, rows, logs)
     now = utcnow()
     bound = retention_boundary(ctx, "otel", ttl, now)
@@ -2472,7 +2476,7 @@ def _ai_full(ctx, cfg):
     # aggregation never fails for pricing; None keeps legacy NULLs.
     prices = load_price_table()
     sessions, activity_days = _ai_compute(spans, cols, rows, raw_logs,
-                                          activity_metric_rows(ctx, cfg), prices)
+                                          metric_rows, prices)
     return _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now)
 
 
@@ -2704,7 +2708,7 @@ def _ai_fenced_full(ctx, cfg, metric_registry, price_digest, prices):
     """Explicit full recovery: unfenced snapshot + upper fence commit."""
     _ = prices
     try:
-        _frames, upper = _ai_fenced_scan(ctx, cfg, None)
+        frames, upper = _ai_fenced_scan(ctx, cfg, None)
     except Exception as exc:
         if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
             total = _ai_full(ctx, cfg)
@@ -2712,47 +2716,22 @@ def _ai_fenced_full(ctx, cfg, metric_registry, price_digest, prices):
             return total
         raise
     try:
-        _mrows, upper = _ai_fenced_metrics_bootstrap(ctx, cfg, upper)
+        metric_rows, upper = _ai_delta_metrics(
+            ctx, cfg, json.loads(metric_registry), None, upper)
+        if len(metric_rows) > cfg["max_rows"]:
+            raise SqlError("activity metric row cap exceeded: refusing partial write")
     except Exception as exc:
         if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
             total = _ai_full(ctx, cfg)
             _ai_commit_state(ctx, "", metric_registry, price_digest)
             return total
         raise
-    total = _ai_full(ctx, cfg)
+    total = _ai_full(ctx, cfg, snapshot=(frames, metric_rows))
     _ai_commit_state(ctx, _ai_encode_fence(upper), metric_registry,
                      price_digest)
     return total
 
 
-def _ai_fenced_metrics_bootstrap(ctx, cfg, upper):
-    """Unfenced per-metric snapshot for bootstrap/recovery. Never fenced."""
-    flight = _ai_flight()
-    if flight is None:
-        raise _ai_no_flight()
-    endpoint = (cfg.get("grpc_url") or "").strip()
-    if not endpoint:
-        raise _ai_no_flight()
-    tables = _ai_metric_tables(ctx, cfg) or []
-    fresh = dict(upper or {})
-    rows = []
-    for table, _instrument in tables:
-        try:
-            _cols, _rows, marks = flight.flight_query(
-                'SELECT * FROM "' + table.replace('"', '""') + '"',
-                endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
-                password=cfg.get("password") or "", lower=None,
-                max_rows=cfg["max_rows"])
-        except Exception as exc:
-            name = type(exc).__name__
-            text = str(exc)
-            if name in ("StaleFence", "FlightUnavailable", "RowCapExceeded",
-                        "FlightError"):
-                raise
-            raise SqlError("ai metric bootstrap failed: " + text[:200])
-        fresh[table] = dict(marks)
-        rows.extend(_rows)
-    return rows, fresh
 
 
 
@@ -4023,7 +4002,7 @@ def battery_section(ctx, cfg):
 
 
 def _rollup_hour_windows(ctx, cfg, scopes_hours):
-    """SQL 1m/1h pushdown restricted to exact dirty hour buckets.
+    """Scan each resolution once for the exact dirty (scope, hour) union.
 
     The NULL-version legacy rows are the durable rediscovery marker: the
     first DELETE removes only rollup_version=2 rows in the exact scope/hour
@@ -4035,44 +4014,40 @@ def _rollup_hour_windows(ctx, cfg, scopes_hours):
     by_hour = {}
     for (scope, hour_ns) in scopes_hours:
         by_hour.setdefault(hour_ns, set()).add(scope)
-    ok = set()
+    if not by_hour:
+        return set()
+    ranges = {"window_start": [], "event_time": []}
     for hour_ns in sorted(by_hour):
         pred = _dirty_scope_predicate(by_hour[hour_ns])
-        start_lit = ns_to_sql_lit(hour_ns)
-        end_lit = ns_to_sql_lit(hour_ns + HOUR_NS)
-        window = ("window_start >= " + start_lit
-                  + " AND window_start < " + end_lit)
-        request_sql(base_url, auth, db,
-                    "DELETE FROM vehicle_agg WHERE " + window
-                    + " AND rollup_version = 2 AND (" + pred + ")",
-                    timeout=120)
-        for resolution, interval in (("1m", "60s"), ("1h", "1h")):
-            res = "'" + resolution.replace("'", "''") + "'"
-            request_sql(
-                base_url, auth, db,
-                "INSERT INTO vehicle_agg (window_start, resolution, vehicle,"
-                " path, source, decode_epoch, source_field, quality, unit_key,"
-                " avg_value, min_value, max_value, sample_count, unit,"
-                " rollup_version) SELECT"
-                " date_bin('" + interval + "'::INTERVAL, event_time)"
-                " AS window_start, " + res + " AS resolution, vehicle, path,"
-                " source, decode_epoch, source_field, quality, unit AS unit_key,"
-                " AVG(value_num), MIN(value_num), MAX(value_num),"
-                " COUNT(value_num), MAX(unit), " + str(ROLLUP_FORMAT_VERSION)
-                + " FROM vehicle_signal"
-                " WHERE event_time >= " + start_lit
-                + " AND event_time < " + end_lit
-                + " AND (" + pred + ")"
-                " GROUP BY date_bin('" + interval + "'::INTERVAL,"
-                " event_time), vehicle, path, source, decode_epoch,"
-                " source_field, quality, unit",
-                timeout=120)
-        request_sql(base_url, auth, db,
-                    "DELETE FROM vehicle_agg WHERE " + window
-                    + " AND rollup_version IS NULL AND (" + pred + ")",
-                    timeout=120)
-        ok.add(hour_ns)
-    return ok
+        for column, predicates in ranges.items():
+            predicates.append("(" + column + " >= " + ns_to_sql_lit(hour_ns)
+                              + " AND " + column + " < " + ns_to_sql_lit(hour_ns + HOUR_NS)
+                              + " AND (" + pred + "))")
+    target = " OR ".join(ranges["window_start"])
+    raw = " OR ".join(ranges["event_time"])
+    request_sql(base_url, auth, db,
+                "DELETE FROM vehicle_agg WHERE (" + target
+                + ") AND rollup_version = 2", timeout=120)
+    for resolution, interval in (("1m", "60s"), ("1h", "1h")):
+        request_sql(
+            base_url, auth, db,
+            "INSERT INTO vehicle_agg (window_start, resolution, vehicle,"
+            " path, source, decode_epoch, source_field, quality, unit_key,"
+            " avg_value, min_value, max_value, sample_count, unit,"
+            " rollup_version) SELECT"
+            " date_bin('" + interval + "'::INTERVAL, event_time)"
+            " AS window_start, '" + resolution + "' AS resolution, vehicle, path,"
+            " source, decode_epoch, source_field, quality, unit AS unit_key,"
+            " AVG(value_num), MIN(value_num), MAX(value_num),"
+            " COUNT(value_num), MAX(unit), " + str(ROLLUP_FORMAT_VERSION)
+            + " FROM vehicle_signal WHERE " + raw
+            + " GROUP BY date_bin('" + interval + "'::INTERVAL,"
+            " event_time), vehicle, path, source, decode_epoch,"
+            " source_field, quality, unit", timeout=120)
+    request_sql(base_url, auth, db,
+                "DELETE FROM vehicle_agg WHERE (" + target
+                + ") AND rollup_version IS NULL", timeout=120)
+    return set(by_hour)
 
 
 def _trip_charge_scope_windows(ctx, cfg, pending):
@@ -4102,7 +4077,7 @@ def _trip_charge_scope_windows(ctx, cfg, pending):
 
 
 def vehicle_history_section(ctx, cfg, now=None):
-    """Process notified sealed hours, checkpointing each successful generation."""
+    """Batch sealed-hour rollups, then checkpoint each successful trip generation."""
     now_ns = dt_to_ns(now or utcnow())
     seal_ns = floor_hour_ns(now_ns)
     revision = _config_revision(cfg)
@@ -4110,13 +4085,18 @@ def vehicle_history_section(ctx, cfg, now=None):
     checkpoints = _load_checkpoints(ctx, cfg, 0, seal_ns)
     pending = _pending_dirty(dirty, checkpoints)
     committed = 0
+    eligible = {}
     for key in sorted(pending)[:DIRTY_MAX_WINDOWS]:
         scope, hour_ns = key
-        observed = pending[key]
+        if _read_dirty_generation(ctx, scope, hour_ns) == pending[key]:
+            eligible[key] = pending[key]
+    _rollup_hour_windows(ctx, cfg, eligible)
+    for key in eligible:
+        scope, hour_ns = key
+        observed = eligible[key]
         if _read_dirty_generation(ctx, scope, hour_ns) != observed:
             continue
         unit = {key: observed}
-        _rollup_hour_windows(ctx, cfg, [key])
         _trip_charge_scope_windows(ctx, cfg, unit)
         if _config_revision(cfg) != revision:
             return committed

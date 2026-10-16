@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Host-only, fail-closed Greptime S3 read experiment guard.
+
+Native counters measure observed OpenDAL reads, not provider billing. Helpers'
+s3_cost retained reports are incomplete lower bounds and are NOT included.
+Polling plus Docker stop has unbounded byte overshoot (not a network quota).
+Run outside Compose under systemd; ExecStopPost must invoke `trip` so a dead
+worker revokes its lease and stops this exact project. Never mount Docker's
+socket in application containers. State and lease directory must persist.
+"""
+import argparse
+import contextlib
+import fcntl
+import json
+import math
+import os
+from pathlib import Path
+import re
+import socket
+import stat
+import subprocess
+import tempfile
+import time
+import urllib.request
+import urllib.parse
+
+COVERAGE = "native Greptime OpenDAL S3 read bytes only; helper/account egress NOT covered"
+
+def notify():
+    """Notify only after a completed loop; a stalled worker misses watchdog."""
+    address = os.environ.get("NOTIFY_SOCKET")
+    if address:
+        if address.startswith("@"):
+            address = "\0" + address[1:]  # Linux abstract Unix socket
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as channel:
+            channel.settimeout(1)
+            channel.connect(address)
+            channel.sendall(b"READY=1\nWATCHDOG=1")
+
+
+
+def atomic(path, text):
+    fd, name = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.chmod(name, 0o600)
+        os.replace(name, path)
+        fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+@contextlib.contextmanager
+def locked(directory):
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
+        raise PermissionError("guard state directory must be owned by current user with mode 0700")
+    with (directory / "lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def save(directory, state):
+    atomic(directory / "state.json", json.dumps(state, sort_keys=True) + "\n")
+
+
+def load(directory):
+    state = json.loads((directory / "state.json").read_text())
+    if (state.get("version") != 1 or type(state.get("blocked")) is not bool
+            or type(state.get("used_bytes")) is not int
+            or state["used_bytes"] < 0 or type(state.get("budget_bytes")) is not int
+            or state["budget_bytes"] <= 0):
+        raise ValueError("invalid persistent guard state")
+    return state
+
+
+def revoke(directory):
+    atomic(directory / "lease", "0\n")
+
+
+def latch(directory, state, reason):
+    # Revoke before state write: crash between the two still denies new starts.
+    revoke(directory)
+    state.update(blocked=True, reason=reason)
+    save(directory, state)
+
+
+def observe(state, values):
+    """Keep each series baseline; missing series or reset loses accounting."""
+    before = state.get("last")
+    if before is not None:
+        if not before.keys() <= values.keys():
+            raise ValueError("native metric series disappeared")
+        if any(values[k] < v for k, v in before.items()):
+            raise ValueError("native counter reset")
+    state["used_bytes"] += sum(v - (before or {}).get(k, 0) for k, v in values.items())
+    state["last"] = values
+    state["sample_at"] = time.time()
+    return state["used_bytes"] >= state["budget_bytes"]
+
+
+def metrics(url, timeout):
+    request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        if response.headers.get("Age") not in (None, "0"):
+            raise ValueError("cached metrics")
+        text = response.read(16 * 1024 * 1024 + 1)
+    if len(text) > 16 * 1024 * 1024:
+        raise ValueError("metrics too large")
+    result = {}
+    for line in text.decode().splitlines():
+        match = re.fullmatch(r'(opendal_operation_bytes_sum\{([^}]*)\})\s+(\S+)(?:\s+(\d+))?', line)
+        if not match:
+            continue
+        labels = dict(re.findall(r'(\w+)="([^"]*)"', match[2]))
+        if labels.get("operation") != "read" or labels.get("scheme") != "s3":
+            continue
+        value = float(match[3])
+        if not math.isfinite(value) or value < 0 or not value.is_integer():
+            raise ValueError("invalid native bytes")
+        if match[4] and abs(time.time() - int(match[4]) / 1000) > timeout:
+            raise ValueError("stale native metrics")
+        key = json.dumps(labels, sort_keys=True)
+        if key in result:
+            raise ValueError("duplicate native series")
+        result[key] = int(value)
+    if not result:
+        raise ValueError("native S3 read metric missing")
+    return result
+
+
+def docker(*args, timeout=30):
+    return subprocess.run(["docker", *args], check=True, capture_output=True,
+                          text=True, timeout=timeout).stdout.strip()
+
+
+def bind_instance(state, container):
+    identity = [container["Id"], container["State"]["StartedAt"]]
+    if state.get("instance") is not None and state["instance"] != identity:
+        raise ValueError("Greptime instance changed")
+    state["instance"] = identity
+
+
+def database(containers, url):
+    matches = [c for c in containers if
+               c["Config"]["Labels"].get("com.docker.compose.service") == "greptimedb"]
+    if len(matches) != 1:
+        raise ValueError("exactly one project Greptime instance required")
+    container = matches[0]
+    endpoint = urllib.parse.urlsplit(url)
+    bindings = container["NetworkSettings"]["Ports"].get("4000/tcp") or []
+    if (endpoint.scheme != "http" or endpoint.hostname not in ("127.0.0.1", "::1", "localhost")
+            or endpoint.path != "/metrics" or endpoint.query or endpoint.username
+            or not any(int(p["HostPort"]) == (endpoint.port or 80) and
+                       p["HostIp"] in ("0.0.0.0", "::", endpoint.hostname)
+                       for p in bindings)):
+        raise ValueError("metrics URL is not this project's published Greptime port")
+    return container
+
+
+def stop(project, grace):
+    # Labels select only this exact project, including one-off/helper containers.
+    ids = docker("ps", "-aq", "--filter", "label=com.docker.compose.project=" + project).split()
+    if ids:
+        try:
+            docker("stop", "--time", str(grace), *ids, timeout=grace + 30)
+        except (subprocess.SubprocessError, OSError):
+            docker("kill", *ids)
+        states = json.loads(docker("inspect", *ids))
+        active = [v["Id"] for v in states if v["State"]["Running"] or v["State"].get("Restarting")]
+        if active:
+            docker("kill", *active)
+    # Catch containers recreated while stop was in progress, rather than report
+    # the original IDs as proof that the entire project is stopped.
+    running = docker("ps", "-q", "--filter", "label=com.docker.compose.project=" + project)
+    if running:
+        raise RuntimeError("project still has running containers")
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--state-dir", required=True, type=Path)
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name in ("arm", "unblock"):
+        p = sub.add_parser(name)
+        p.add_argument("--budget-bytes", required=True, type=int,
+                       help="absolute cumulative ceiling; never resets used bytes")
+        p.add_argument("--startup-seconds", type=int, default=30)
+        if name == "arm":
+            p.add_argument("--project", required=True)
+    sub.add_parser("status")
+    trip = sub.add_parser("trip")
+    trip.add_argument("--grace", type=int, default=10)
+    trip.add_argument("--project", required=True,
+                      help="trusted exact project to stop even if persistent state is unreadable")
+    run = sub.add_parser("run")
+    run.add_argument("--metrics-url", required=True)
+    run.add_argument("--interval", type=float, default=2)
+    run.add_argument("--timeout", type=float, default=3)
+    run.add_argument("--grace", type=int, default=10)
+    args = parser.parse_args(argv)
+    directory = args.state_dir.resolve()
+    if hasattr(args, "grace") and not 0 <= args.grace <= 60:
+        parser.error("grace must be 0..60 seconds")
+    if args.command == "trip":
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.project):
+            parser.error("invalid exact Compose project")
+        try:
+            with locked(directory):
+                revoke(directory)
+                state = load(directory)
+                if state["project"] != args.project:
+                    raise ValueError("trip project differs from persistent state; selected project stopped")
+                latch(directory, state, "explicit trip / monitor stopped")
+        finally:
+            # Storage failure must never bypass the host's explicit stop target.
+            # Do not recreate malformed state or discard its usage evidence.
+            stop(args.project, args.grace)
+        return
+    with locked(directory):
+        if args.command == "arm":
+            if (directory / "state.json").exists():
+                parser.error("already armed; status/unblock never resets usage")
+            if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.project):
+                parser.error("invalid exact Compose project")
+            state = dict(version=1, project=args.project, used_bytes=0, last=None, blocked=True)
+        else:
+            state = load(directory)
+        if args.command in ("arm", "unblock"):
+            if args.budget_bytes <= state["used_bytes"] or not 1 <= args.startup_seconds <= 120:
+                parser.error("ceiling must exceed usage; startup seconds must be 1..120")
+            if args.command == "unblock" and not state["blocked"]:
+                parser.error("not blocked")
+            # Explicit authorization after reset starts a new baseline, charging
+            # its entire first counter. Persisted usage is never subtracted.
+            revoke(directory)
+            state.update(budget_bytes=args.budget_bytes, blocked=False, reason="authorized",
+                         last=None, instance=None, startup_until=time.time() + args.startup_seconds)
+            save(directory, state)
+            # run must start before DB: arm alone does not grant a lease.
+        if args.command != "run":
+            print(json.dumps(dict(state, coverage=COVERAGE), sort_keys=True))
+    if args.command != "run":
+        return
+    if args.interval <= 0 or args.timeout <= 0 or args.interval + args.timeout > 30:
+        parser.error("positive polling/timeout, combined maximum 30 seconds")
+    # Separate process lock prevents two monitor instances without blocking trip.
+    with (directory / "monitor.lock").open("a") as worker:
+        fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        while True:
+            with locked(directory):
+                state = load(directory)
+                containers = []
+                if not state["blocked"]:
+                    ids = docker("ps", "-q", "--filter",
+                                 "label=com.docker.compose.project=" + state["project"]).split()
+                    if ids:
+                        containers = json.loads(docker("inspect", *ids))
+                        # backup/can-backup also implement restore; redecode
+                        # can fetch raw archives outside DB-native accounting.
+                        if any(c["Config"]["Labels"].get("com.docker.compose.service") in
+                               {"backup", "can-backup", "raw-uploader", "redecode"}
+                               for c in containers):
+                            latch(directory, state, "unaccounted S3 helper running")
+                if not state["blocked"]:
+                    try:
+                        container = database(containers, args.metrics_url)
+                        try:
+                            bind_instance(state, container)
+                        except ValueError:
+                            latch(directory, state, "Greptime instance changed")
+                            raise
+                        values = metrics(args.metrics_url, args.timeout)
+                        if state.get("sample_at") and state.get("last") is not None and time.time() - state["sample_at"] > args.interval + args.timeout + 5:
+                            raise ValueError("monitor observation gap")
+                        if observe(state, values):
+                            latch(directory, state, "download budget reached")
+                        else:
+                            save(directory, state)
+                    except Exception:
+                        if state["blocked"] or state.get("last") is not None or time.time() >= state["startup_until"]:
+                            latch(directory, state, "native metrics unavailable, stale, or reset")
+                    if not state["blocked"]:
+                        atomic(directory / "lease", str(int(time.time() + args.interval + args.timeout + 5)) + "\n")
+                blocked = state["blocked"]
+            if blocked:
+                stop(state["project"], args.grace)
+            notify()
+            time.sleep(args.interval)
+
+
+if __name__ == "__main__":
+    main()

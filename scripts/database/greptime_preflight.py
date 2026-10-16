@@ -18,6 +18,7 @@ import os
 import re
 import sys
 import urllib.parse
+import time
 
 IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # Greptime file credential lines split on '=' (user=password), so these
@@ -84,6 +85,17 @@ def atomic_write(path, data, mode=0o600):
 
 def main():
     os.umask(0o077)  # TOML embeds the S3 secret: never create it world-readable
+    guard_enabled = os.environ.get("GREPTIME_EGRESS_GUARD_ENABLED", "false")
+    if guard_enabled not in ("true", "false"):
+        raise SystemExit("GREPTIME_EGRESS_GUARD_ENABLED must be true or false")
+    if guard_enabled == "true":
+        try:
+            with open("/egress-guard/lease", encoding="ascii") as lease:
+                expires = int(lease.read(32).strip())
+            if expires <= time.time():
+                raise ValueError("expired")
+        except (OSError, ValueError):
+            raise SystemExit("egress guard lease missing or expired; host authorization required")
     db = os.environ.get("GREPTIME_DB", "datalake")
     user = os.environ.get("GREPTIME_USER", "datalake")
     password = os.environ.get("GREPTIME_PASSWORD", "")

@@ -413,7 +413,7 @@ def maintenance_verify(records, oracle):
 
 
 def run_variant(label, rows, cache, small_bytes, large_bytes, result, storage_type="S3", background_policy=None,
-                maintenance_policy=None, greptime_image=None, local_input_only=False):
+                maintenance_policy=None, greptime_image=None, local_input_only=False, scenario=None):
     tmp = tempfile.mkdtemp(prefix="gegress-")
     project = "gbench-gbench%d%d" % (os.getpid(), random.getrandbits(32))
     creds = {k: "bench" + os.urandom(16).hex() for k in
@@ -1407,6 +1407,13 @@ def run_variant(label, rows, cache, small_bytes, large_bytes, result, storage_ty
         sql("ALTER TABLE %s ADD COLUMN value_text STRING" % b.TABLE)
         for table in ("bench_minute", "bench_hour"):
             sql('CREATE TABLE %s(bucket_start TIMESTAMP(3) NOT NULL TIME INDEX,vehicle STRING,"path" STRING,cnt BIGINT,sum_v DOUBLE,min_v DOUBLE,max_v DOUBLE,PRIMARY KEY(vehicle,"path"))' % table)
+        if scenario is not None:
+            scenario(dict(sql=sql, records=records, phase=phase, command=command,
+                          tmp=tmp, project=project, env=env, evidence=evidence,
+                          base=base, auth=auth, target=target, access=access,
+                          secret=secret, result=result, rows=rows, cache=cache))
+            result["status"] = "success"
+            return
         if maintenance_policy is not None:
             maintenance_scenario()
             return

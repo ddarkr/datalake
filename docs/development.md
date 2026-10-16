@@ -284,6 +284,17 @@ refill 복원 후 로컬 GreptimeDB·MinIO에서 200,000행을 이전 정상 기
 
 위 [저장소 비용 예산 검사](#저장소-비용-예산-검사)의 benchmark·검증 명령과 측정 범위를 참고하세요. 고정 합성 workload의 cold/warm 조회 결과는 모든 집계·컴팩션·복구 경로의 다운로드나 운영 청구 상한을 증명하지 않습니다.
 
+현재 CAN coordinator는 한 pass의 정확한 dirty `(scope, hour)` 집합을 묶어 해상도별로 한 번씩 읽습니다. 중간에 비어 있는 시간·다른 scope를 범위에 포함하지 않으며, trip/charge와 generation 재확인·checkpoint는 여전히 시간별로 수행합니다. 캐시보다 큰 이력에 대한 실제 경로는 다음 명령으로 확인합니다.
+
+```bash
+python3 tools/benchmark_greptime_dirty.py --json-out /tmp/datalake-dirty-egress.json
+python3 -m tests.test_egress_guard --docker
+```
+
+첫 명령은 stock GreptimeDB/MinIO에서 160,000행·16시간의 약 46MB Parquet와 4MiB 캐시를 사용합니다. 수집 중 실제 compaction, idle, 영속 볼륨 재시작, 캐시 유실, dirty 집계, 수정 generation, 무변경 재실행을 분리하고 raw/hourly 결과를 대조합니다. 중첩된 rollup/trip phase는 coordinator의 부분집합이므로 합산하지 않습니다. 실측에서 시간별 반복 스캔을 묶자 cold coordinator payload GET이 198,401,472에서 76,488,138 bytes로 줄었지만, 수집 중 compaction은 양쪽 모두 66,805,898 bytes였습니다. 전체 생애주기 읽기는 337,702,816에서 207,607,691 bytes였으며 무변경 generation은 양쪽 모두 0 bytes였습니다. 전체 로컬 mirror나 운영 egress 0의 증거는 아닙니다.
+
+두 번째 명령은 실제 stock 이미지의 Compose entrypoint로 계측 실패 후 중지·재시작 거절을 검사합니다. 영속 사용량, DB 인스턴스 변경, 손상된 상태에서 긴급 중지, systemd 알림의 Unix datagram도 확인합니다. 호스트 systemd watchdog·실제 계정 청구 검증은 이 로컬 검사와 별개입니다.
+
 ```bash
 python3 tools/benchmark_greptime_egress.py --background-only --rows 200000 \
   --json-out /tmp/datalake-minimum-background-proof.json

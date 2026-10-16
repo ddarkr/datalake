@@ -1418,6 +1418,7 @@ def test_metric_registry_change_rebuilds():
                 ("m_commit_count",
                  "greptime.semantic.metric.original_name="
                  "coding_agent.commit.count"))
+            _metric_setup(first_metric, table="m_commit_count")
             agg.ai_section(ctx, cfg)
             second = snapshot()
             mark = len(FakeGreptime.queries)

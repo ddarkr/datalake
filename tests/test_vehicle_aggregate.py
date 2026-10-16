@@ -323,6 +323,59 @@ class CoordinatorLogicTest(unittest.TestCase):
         self.assertEqual(agg._legacy_cfgs(cfg, [])[2]["battery_exclude_sources"], ["can"])
 
 
+class DirtyBatchTest(unittest.TestCase):
+    def test_exact_holes_and_scopes_are_preserved(self):
+        import sqlite3
+        from unittest.mock import patch
+        with sqlite3.connect(":memory:") as db:
+            db.create_function("date_bin", 2, lambda interval, stamp:
+                               stamp[:13] + ":00:00.000000000")
+            db.execute("""CREATE TABLE vehicle_signal (
+                event_time TEXT, vehicle TEXT, path TEXT, source TEXT,
+                decode_epoch TEXT, source_field TEXT, quality TEXT,
+                unit TEXT, value_num REAL)""")
+            db.execute("""CREATE TABLE vehicle_agg (
+                window_start TEXT, resolution TEXT, vehicle TEXT, path TEXT,
+                source TEXT, decode_epoch TEXT, source_field TEXT, quality TEXT,
+                unit_key TEXT, avg_value REAL, min_value REAL, max_value REAL,
+                sample_count INTEGER, unit TEXT, rollup_version INTEGER)""")
+            db.executemany("INSERT INTO vehicle_signal VALUES "
+                           "(?, ?, 'speed', 'can', 'e', 'speed', 'ok', 'km/h', ?)",
+                           [("2026-09-20 10:00:00.000000000", "v", 10),
+                            ("2026-09-20 11:00:00.000000000", "v", 999),
+                            ("2026-09-20 12:00:00.000000000", "v", 999),
+                            ("2026-09-20 10:00:00.000000000", "window_start", 999),
+                            ("2026-09-20 12:00:00.000000000", "window_start", 30)])
+            hour = agg.parse_ts_ns("2026-09-20 10:00:00")
+            keys = [(("v", "can", "e"), hour),
+                    (("window_start", "can", "e"), hour + 2 * agg.HOUR_NS)]
+            def execute(_url, _auth, _database, statement, **_kwargs):
+                db.execute(statement.replace("::INTERVAL", ""))
+            with patch.object(agg, "request_sql", execute):
+                agg._rollup_hour_windows(("", "", ""), {}, keys)
+            self.assertEqual(db.execute(
+                "SELECT vehicle, window_start, avg_value, sample_count "
+                "FROM vehicle_agg WHERE resolution='1h' ORDER BY vehicle"
+            ).fetchall(), [
+                ("v", "2026-09-20 10:00:00.000000000", 10, 1),
+                ("window_start", "2026-09-20 12:00:00.000000000", 30, 1)])
+
+    def test_generation_changed_during_batch_is_not_checkpointed(self):
+        from unittest.mock import patch
+        key = (("v", "can", "e"), agg.parse_ts_ns("2026-09-20 10:00:00"))
+        with patch.object(agg, "_load_dirty", return_value={key: "g"}), \
+                patch.object(agg, "_load_checkpoints", return_value={}), \
+                patch.object(agg, "_read_dirty_generation", side_effect=["g", "new"]), \
+                patch.object(agg, "_config_revision", return_value="rev"), \
+                patch.object(agg, "_rollup_hour_windows"), \
+                patch.object(agg, "_trip_charge_scope_windows") as trip, \
+                patch.object(agg, "_commit_checkpoint") as commit:
+            self.assertEqual(agg.vehicle_history_section(
+                ("", "", ""), {}, datetime(2026, 9, 20, 14)), 0)
+        trip.assert_not_called()
+        commit.assert_not_called()
+
+
 class RollupV2SqlTest(unittest.TestCase):
     def test_rollup_preserves_quality_nulls_and_corrected_scope(self):
         import sqlite3

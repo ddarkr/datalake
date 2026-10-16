@@ -75,6 +75,53 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 적용 전에는 [로컬 S3 실증](development.md#조회-외-s3-다운로드-실증)을 실행하고, 허용된 운영 재기동 후에는 실제 수집·집계·compaction 중 `opendal_operation_bytes_sum{operation="read",scheme="s3"}` 증가량을 관찰하세요. 캐시 부족·유실은 다시 다운로드하는 정상 복구 경로이므로 이 구성은 비용의 절대 상한이 아닙니다. 서버가 중지된 상태라면 설정 검토만으로 재기동이 허용되지는 않습니다.
 
+#### 호스트 다운로드 차단기
+
+`scripts/storage/egress_guard.py`는 Compose 밖에서 실행하는 선택적 안전장치입니다. DB의 native S3 read 누적값을 디스크에 저장하고, 한도 초과·계측 중단·카운터 초기화·DB 인스턴스 변경 때 프로젝트를 중지하고 잠급니다. 잠금은 프로세스 재시작으로 해제되지 않습니다. `backup`, `can-backup`, `raw-uploader`, `redecode`는 DB 계측에 포함되지 않으므로 감시 중 실행하면 프로젝트를 중지합니다. 해당 작업에는 별도로 승인하고 계측하는 유지보수 창이 필요합니다.
+
+**이 장치는 사업자 청구액이나 엄격한 네트워크 바이트 상한을 보장하지 않습니다.** 감지·종료 지연과 호스트/Docker 장애 동안 추가 다운로드가 가능합니다. 월간 합성 CI 예산을 실제 계정의 허용량으로 사용하지 마세요. 자동 GitOps 동기화도 별도로 중지해야 하며, `redeployAfterSync=false`만으로 재기동을 막을 수는 없습니다.
+
+Linux Docker 호스트에서 검증된 스크립트를 `/usr/local/libexec/datalake-egress-guard.py`에 설치하고, root 소유 `0700` 영속 디렉터리를 준비합니다. `BUDGET_BYTES`는 이번 운영에 승인한 **누적 절대 상한**이며 시간당 자동 충전량이 아닙니다.
+
+```sh
+install -d -m 700 /var/lib/datalake-egress
+python3 /usr/local/libexec/datalake-egress-guard.py \
+  --state-dir /var/lib/datalake-egress arm \
+  --project datalake --budget-bytes "$BUDGET_BYTES"
+python3 /usr/local/libexec/datalake-egress-guard.py \
+  --state-dir /var/lib/datalake-egress trip --project datalake
+```
+
+실제 Compose 프로젝트 이름을 사용하세요. `.env`에는 `GREPTIME_EGRESS_GUARD_ENABLED=true`, `GREPTIME_EGRESS_GUARD_DIR=/var/lib/datalake-egress`를 설정합니다. 활성화하면 `db-init`뿐 아니라 DB의 매 시작·재생성 때 호스트 감시기가 갱신한 lease를 확인합니다. 유효한 lease가 없으면 DB를 실행하지 않습니다.
+
+호스트 systemd unit 예시는 다음과 같습니다. URL의 포트는 해당 프로젝트 DB의 실제 loopback 공개 포트여야 합니다.
+
+```ini
+[Unit]
+Description=Datalake cumulative S3 read guard
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=root
+ExecStart=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress run --metrics-url http://127.0.0.1:4000/metrics --interval 2 --timeout 3 --grace 10
+ExecStopPost=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress trip --project datalake --grace 10
+WatchdogSec=300
+TimeoutStartSec=300
+TimeoutStopSec=150
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+```
+
+`ExecStopPost`는 감시기 종료 때 lease를 폐기하고, 상태 파일이 손상되어도 명시한 프로젝트를 중지합니다. watchdog은 완료된 감시 루프의 알림이 끊기면 감시기를 종료합니다. 300초는 Docker 명령의 장애 타임아웃을 포함한 값이며 이 기간의 다운로드를 제한하는 값은 아닙니다.
+
+이미지·의존성을 준비하고 감시기를 먼저 실행한 다음, 승인된 재가동 직전에 `unblock --budget-bytes "$BUDGET_BYTES" --startup-seconds 120`을 실행하고 DB를 시작합니다. 두 명령 모두 `--state-dir /var/lib/datalake-egress`가 필요합니다. `unblock`은 기존 사용량을 지우지 않으며 첫 native counter도 전액 합산합니다. `arm`은 기존 상태를 덮어쓰지 않습니다. 상태 파일을 삭제해 예산을 초기화하지 말고 `status`로 누적 사용량·잠금 이유를 확인하세요.
+
 별도의 [실험적 로컬 입력 엔진](development.md#실험적-s3-primary-로컬-입력-엔진)은 S3 주 저장소를 유지하면서 활성 SST·인덱스를 비퇴출 로컬 mirror에 보존합니다. 기본 이미지·기본 집계 정책과는 별개이며 기존 운영 볼륨에 자동 적용하지 않습니다. 로컬 입력이나 출력 여유가 부족하면 S3 fallback 대신 실패하므로 보존 이력에 맞는 디스크가 필요합니다. `AGG_LOCAL_SST_ONLY=1`만 기존 stock 이미지에 설정하면 지원 endpoint가 없어 집계가 실패합니다.
 
 `File` 모드에서는 S3 설정을 사용하지 않지만 DB·Grafana·OTLP 인증은 여전히 필수입니다. `GREPTIME_PASSWORD`에는 `=`과 개행을 넣을 수 없습니다. dotenv 값에 `$`가 있으면 작은따옴표로 감싸 Compose 변수 치환을 방지하세요.

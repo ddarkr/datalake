@@ -6,6 +6,15 @@ services:
     user: "0:0"
     profiles:
       - server
+    # Stock image already uses sh and TARGET_BIN. A host lease gates every
+    # start, including direct restart/recreate (not just db-init).
+    entrypoint:
+      - sh
+      - -c
+      - 'case "$$GREPTIME_EGRESS_GUARD_ENABLED" in true) until=$$(cat /egress-guard/lease 2>/dev/null) || exit 78; case "$$until" in ""|*[!0-9]*) exit 78;; esac; [ "$$until" -gt "$$(date +%s)" ] || exit 78;; false) ;; *) exit 78;; esac; exec "$$TARGET_BIN" "$$@"'
+      - --
+    environment:
+      GREPTIME_EGRESS_GUARD_ENABLED: ${GREPTIME_EGRESS_GUARD_ENABLED:-false}
     command:
       - standalone
       - start
@@ -14,6 +23,7 @@ services:
     volumes:
       - greptime-data:/data
       - greptime-etc:/etc/greptime:ro
+      - ${GREPTIME_EGRESS_GUARD_DIR:-/tmp/datalake-egress-disabled}:/egress-guard:ro
     ports:
       - ${GREPTIME_HTTP_BIND_ADDRESS:-127.0.0.1}:${GREPTIME_HTTP_PORT:-4000}:4000
       - ${GREPTIME_MYSQL_BIND_ADDRESS:-127.0.0.1}:${GREPTIME_MYSQL_PORT:-4002}:4002
@@ -31,13 +41,14 @@ services:
     profiles:
       - server
     labels:
-      datalake.preflight-revision: "1"
+      datalake.preflight-revision: "2"
     working_dir: /app
     command:
       - python
       - -m
       - scripts.database.greptime_preflight
     environment:
+      GREPTIME_EGRESS_GUARD_ENABLED: ${GREPTIME_EGRESS_GUARD_ENABLED:-false}
       GREPTIME_DB: ${GREPTIME_DB:-datalake}
       GREPTIME_USER: ${GREPTIME_USER:-datalake}
       GREPTIME_PASSWORD: ${GREPTIME_PASSWORD:-}
@@ -62,6 +73,7 @@ services:
         target: /app/scripts/database/greptime_preflight.py
     volumes:
       - greptime-etc:/out
+      - ${GREPTIME_EGRESS_GUARD_DIR:-/tmp/datalake-egress-disabled}:/egress-guard:ro
     restart: "no"
 configs:
   greptime_preflight:

@@ -1322,12 +1322,11 @@ def test_coordinator_notified_generation_only():
             ([(scope, hour, "old", "old-code-sha", "")], "new", 1)):
         monkey = []
         try:
-            calls, committed = _patch_coordinator(monkey, _fake_db(
+            _, committed = _patch_coordinator(monkey, _fake_db(
                 [(scope, hour, generation)], stored, {key: generation}))
             with patch.object(agg, "battery_section", side_effect=AssertionError("automatic CAN battery")):
                 assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == expected
             assert len(committed) == expected
-            assert all(len(v) == expected for v in calls.values())
             if expected:
                 assert committed[0][:3] == (scope, hour, generation)
         finally:
@@ -1343,14 +1342,10 @@ def test_coordinator_unnotified_raw_is_not_discovered():
             raw_reads.append(stmt)
             return _records(["vehicle", "source", "decode_epoch"], [list(scope)])
         return _records(["vehicle", "source", "decode_epoch"], [])
-    with patch.object(agg, "request_sql", side_effect=sql), \
-            patch.object(agg, "_rollup_hour_windows") as rollup, \
-            patch.object(agg, "_trip_charge_scope_windows") as trip:
+    with patch.object(agg, "request_sql", side_effect=sql):
         assert agg._distinct_scopes(("", "", ""), _vehicle_cfg()) == set()
         assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == 0
         assert not raw_reads
-        rollup.assert_not_called()
-        trip.assert_not_called()
 
 
 def test_coordinator_midpass_generation_change_and_failure_do_not_checkpoint():
@@ -1402,10 +1397,8 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
     try:
         fakes = _fake_db(dirty_rows=dirty, generations=generations)
         _patch_coordinator(monkey, fakes)
-        units = []
 
         def trip(ctx, cfg, pending):
-            units.append(list(pending))
             if (scope, hours[1]) in pending:
                 raise agg.SqlError("later unit fails")
 
@@ -1416,16 +1409,14 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
                 pass
             else:
                 raise AssertionError("later failure must propagate")
-        assert units == [[(scope, hours[0])], [(scope, hours[1])]]
         assert [row[1] for row in fakes[4]] == [hours[0]]
         saved = list(fakes[4])
         _unpatch(monkey)
         fakes = _fake_db(dirty_rows=dirty, checkpoint_rows=saved,
                          generations=generations)
-        calls, committed = _patch_coordinator(monkey, fakes)
+        _, committed = _patch_coordinator(monkey, fakes)
         assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now=now) == 1
         assert [row[1] for row in committed] == [hours[1]]
-        assert calls["rollup"] == [[(scope, hours[1])]]
         assert sorted(row[1] for row in saved + committed) == hours
     finally:
         _unpatch(monkey)

@@ -93,6 +93,10 @@ oracle로 복구하고 증명된 upper가 있을 때만 커밋한다.
 - Flight deps/grpc endpoint 미증명, terminal watermark 없음,
   STALE, generation reset, digest/revision 불일치: 전체 복구 후
   증명된 upper 커밋.
+- 펜스가 증명된 전체 복구는 Flight가 반환한 원본 행과 메트릭을
+  그대로 재계산에 사용한다. 동일한 원본을 HTTP로 다시 읽지 않으며,
+  그 스냅샷의 upper만 파생 쓰기 완료 뒤 커밋한다. Flight 미지원 시의
+  HTTP 전체 복구와 명시적 oracle 경로는 유지한다.
 - max-row 초과(`RowCapExceeded`): 부분 쓰기 없이 섹션 실패하고
   체크포인트를 전진시키지 않는다. scoped 메트릭 재조회도 같은
   row-cap 가드 아래 있으며, 초과는 전체 복구로 숨기지 않고 그대로
