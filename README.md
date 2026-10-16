@@ -6,6 +6,8 @@
 
 [설치와 운영](docs/operations.md) · [코딩 에이전트 연결](plugins/README.md) · [Fleet Telemetry와 배터리 분석](docs/tesla_fleet.md) · [개발과 검증](docs/development.md)
 
+기본 `server`는 수집·저장·조회와 정기 요약·조건을 충족하는 비-CAN 배터리 분석을 실행하며, GreptimeDB의 자동 컴팩션을 허용합니다. S3에 장기 이력을 보관하고 로컬에는 제한된 작업 캐시를 사용하므로 전체 이력을 복제할 필요는 없습니다. 차가운 입력·과거 수정·재시작에는 다운로드가 발생할 수 있습니다. [캐시와 유지보수](docs/operations.md#s3-주-저장소에서-다운로드-줄이기)의 설정과 비용·공간 제약을 확인하세요.
+
 ## 무엇을 모으나요?
 
 | 영역 | 입력 | 저장·분석하는 내용 |
@@ -23,7 +25,7 @@
 ```mermaid
 flowchart TB
     accTitle: 데이터 수집과 저장 흐름
-    accDescr: 코딩 에이전트와 홈 센서, 차량 수집기가 GreptimeDB로 데이터를 보내고 정기 집계와 Grafana가 이를 조회합니다. CAN 원본은 별도 S3 아카이브로 보관합니다.
+    accDescr: 코딩 에이전트와 홈 센서, 차량 수집기가 GreptimeDB로 데이터를 보내고 Grafana가 이를 조회합니다. 서버는 정기 요약과 조건을 충족하는 비-CAN 배터리 분석을 실행합니다. DB는 S3 이력과 제한된 로컬 작업 캐시를 사용하며 자동 컴팩션을 수행합니다. CAN 원본은 별도 S3 아카이브로 보관합니다.
     subgraph inputs[데이터 생산자]
         agents[코딩 에이전트 / OTel 생산자]
         home[Home Assistant / MQTT]
@@ -41,9 +43,9 @@ flowchart TB
     end
 
     subgraph lake[저장과 분석]
-        db[(GreptimeDB)]
+        db[(GreptimeDB / S3 이력 / 로컬 작업 캐시)]
         archive[(S3 원본 CAN 아카이브)]
-        aggregate[정기 집계 / 배터리 분석]
+        aggregate[정기 요약 / 비-CAN 배터리 분석]
         grafana[Grafana]
     end
 
@@ -58,7 +60,7 @@ flowchart TB
     otel -->|필터링한 telemetry| db
     sensors --> db
     raw -->|MF4 / sidecar / manifest| archive
-    db -->|원시 관측 조회| aggregate
+    db -->|변경 입력 / 필요한 관측 조회| aggregate
     aggregate -->|집계 결과 저장| db
     db --> grafana
 ```
