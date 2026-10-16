@@ -260,7 +260,9 @@ cold 증거는 재기동 완료 후 **실제 query window 안의 성공한 SST G
 
 ### 조회 외 S3 다운로드 실증
 
-현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 간격은 `0m`, `schedule_compaction_after_edit=true`이며 인덱스 preload·전체 파일 refill은 끕니다. 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다.
+현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 간격은 `0m`, `schedule_compaction_after_edit=true`이며 인덱스 preload는 끄고 읽은 파일의 cache refill은 켭니다(`enable_refill_cache_on_read=true`). 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다.
+
+refill 복원 후 로컬 GreptimeDB·MinIO에서 200,000행을 이전 정상 기준 `94caf39`와 비교했습니다. flush·완료된 compaction·cold/warm 조회의 20개 정답 검증을 통과했고, cold GET은 양쪽 모두 145,909 bytes/7회, warm 두 pass는 0 bytes였습니다. 절대 비용 예산과 기존 20% 상대 회귀 기준은 완화하지 않았습니다. 일부 데이터만 읽는 첫 조회의 refill 비용, 캐시 부족·유실 시 재다운로드, 실제 운영 작업 집합과 청구액은 별도로 확인해야 합니다.
 
 위 [저장소 비용 예산 검사](#저장소-비용-예산-검사)의 benchmark·검증 명령과 측정 범위를 참고하세요. 고정 합성 workload의 cold/warm 조회 결과는 모든 집계·컴팩션·복구 경로의 다운로드나 운영 청구 상한을 증명하지 않습니다.
 

@@ -47,7 +47,7 @@ S3 디스크 쓰기 캐시 상한의 기본값은 10GiB이며, 실제 점유량�
 
 - `server`는 `aggregate`를 포함하며 기본 300초 간격으로 AI/log/home/차량 요약과 조건을 충족하는 비-CAN 배터리 분석을 실행합니다. CAN은 기존 dirty/checkpoint 메타데이터에 따라 분·시간 rollup과 주행·충전 요약을 갱신하며 자동 배터리 분석에서는 제외합니다. 긴 기간 차트가 자동으로 raw로 대체된다고 가정하지 마세요.
 - `min_compaction_interval=0m`, `schedule_compaction_after_edit=true`로 정상 자동 컴팩션과 flush/compaction 결과 반영 뒤 후속 후보 검사를 허용합니다. 모든 edit가 즉시 병합된다는 뜻은 아니며 실제 병합은 엔진의 후보·자원 조건을 따릅니다. 정기 전체 수동 compaction을 별도로 추가하지 마세요.
-- 시작 시 인덱스 선다운로드(`preload_index_cache=false`)와 조회 후 전체 파일 cache refill(`enable_refill_cache_on_read=false`)을 끕니다. 필요한 조회·컴팩션은 S3를 읽을 수 있지만 조회를 계기로 전체 파일을 추가 다운로드하는 refill은 하지 않습니다. 반복 조회의 범위 GET은 남을 수 있습니다.
+- 시작 시 인덱스 선다운로드는 끄고(`preload_index_cache=false`), 읽은 파일의 캐시 재사용을 위한 refill은 켭니다(`enable_refill_cache_on_read=true`). refill을 끄면 반복 조회에서 같은 파일의 범위 GET이 늘어날 수 있습니다. 반대로 일부 데이터만 읽는 첫 조회에서는 전체 파일 refill이 다운로드를 늘릴 수 있으므로, 모든 조회가 더 저렴해진다는 뜻은 아닙니다.
 
 자동 집계와 컴팩션을 장기간 미루면 **SST 파일·중복 버전·만료 파일의 공간과 조회 비용이 증가할 수 있습니다.** 정상 스케줄은 Home의 `HOME_RAW_TTL` 정리와 aggregate retention watermark 갱신도 수행합니다. 엔진 TTL은 엄격한 삭제 기한을 보장하는 수단이 아니므로 용량·파일 수·조회 지연과 별도로 실제 보존 요구를 확인하세요.
 

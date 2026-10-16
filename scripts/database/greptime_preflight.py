@@ -229,9 +229,9 @@ def main():
         f"auto_flush_interval = {toml_str(flush_interval)}",
         f"enable_write_cache = {'true' if storage == 'S3' else 'false'}",
         f"write_cache_size = {toml_str(write_cache_size)}",
-        # Do not download index/SST bodies speculatively on open or after reads.
+        # Skip startup index preloads, but retain read refills for cache reuse.
         "preload_index_cache = false",
-        "enable_refill_cache_on_read = false",
+        "enable_refill_cache_on_read = true",
         "schedule_compaction_after_edit = true",
         f"min_compaction_interval = {toml_str(min_compaction_interval)}",
         "",
