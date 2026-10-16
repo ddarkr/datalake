@@ -120,7 +120,7 @@ WantedBy=multi-user.target
 
 `ExecStopPost`는 감시기 종료 때 lease를 폐기하고, 상태 파일이 손상되어도 명시한 프로젝트를 중지합니다. watchdog은 완료된 감시 루프의 알림이 끊기면 감시기를 종료합니다. 300초는 Docker 명령의 장애 타임아웃을 포함한 값이며 이 기간의 다운로드를 제한하는 값은 아닙니다.
 
-이미지·의존성을 준비하고 감시기를 먼저 실행한 다음, 승인된 재가동 직전에 `unblock --budget-bytes "$BUDGET_BYTES" --startup-seconds 120`을 실행하고 DB를 시작합니다. 두 명령 모두 `--state-dir /var/lib/datalake-egress`가 필요합니다. `unblock`은 기존 사용량을 지우지 않으며 첫 native counter도 전액 합산합니다. `arm`은 기존 상태를 덮어쓰지 않습니다. 상태 파일을 삭제해 예산을 초기화하지 말고 `status`로 누적 사용량·잠금 이유를 확인하세요.
+이미지·의존성을 준비하고 감시기를 먼저 실행한 다음, 승인된 재가동 직전에 `unblock --budget-bytes "$BUDGET_BYTES" --startup-seconds 120`을 실행합니다. `unblock`은 lease를 즉시 발급하지 않습니다. 감시기의 다음 관측에서 `/var/lib/datalake-egress/lease`가 현재 Unix 시각보다 큰 값으로 갱신된 것을 확인한 뒤 DB를 시작하세요. 그 전에 시작하면 preflight나 DB가 기동을 거부합니다. DB 기동 후 다른 서비스를 단계적으로 올릴 때는 이미 완료된 의존 작업을 다시 실행해 DB를 재시작하지 않도록 `up -d --no-deps <service>`를 사용하고, 필요한 의존 작업의 성공을 먼저 확인하세요. `arm`·`unblock` 모두 `--state-dir /var/lib/datalake-egress`가 필요합니다. `unblock`은 기존 사용량을 지우지 않으며 첫 native counter도 전액 합산합니다. `arm`은 기존 상태를 덮어쓰지 않습니다. 상태 파일을 삭제해 예산을 초기화하지 말고 `status`로 누적 사용량·잠금 이유를 확인하세요.
 
 별도의 [실험적 로컬 입력 엔진](development.md#실험적-s3-primary-로컬-입력-엔진)은 S3 주 저장소를 유지하면서 활성 SST·인덱스를 비퇴출 로컬 mirror에 보존합니다. 기본 이미지·기본 집계 정책과는 별개이며 기존 운영 볼륨에 자동 적용하지 않습니다. 로컬 입력이나 출력 여유가 부족하면 S3 fallback 대신 실패하므로 보존 이력에 맞는 디스크가 필요합니다. `AGG_LOCAL_SST_ONLY=1`만 기존 stock 이미지에 설정하면 지원 endpoint가 없어 집계가 실패합니다.
 
