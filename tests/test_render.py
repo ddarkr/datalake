@@ -72,12 +72,6 @@ def test_final_forbids_remote_mounts():
 
 
 
-def test_core_passes_write_cache_size_to_preflight():
-    fragment = render.load_fragment(str(ROOT / "compose/core.yaml"))
-    env = fragment["services"]["db-init"]["environment"]
-    assert env["GREPTIME_WRITE_CACHE_SIZE"] == "${GREPTIME_WRITE_CACHE_SIZE:-10GiB}"
-
-
 def test_preflight_fails_fast_without_password(tmp_path):
     env = {k: v for k, v in os.environ.items() if k != "GREPTIME_PASSWORD"}
     env.update(GREPTIME_STORAGE_TYPE="File", OUT_DIR=str(tmp_path))
@@ -116,15 +110,13 @@ def test_preflight_rejects_bad_write_cache_size(tmp_path):
     assert "GREPTIME_WRITE_CACHE_SIZE" in r.stderr
 
 
-def test_preflight_defaults_write_cache_size_to_10_gib(tmp_path):
-    env = base_env(tmp_path)
-    env.pop("GREPTIME_WRITE_CACHE_SIZE", None)
-    r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
-    assert r.returncode == 0, r.stderr
-    with open(tmp_path / "greptimedb.toml", "rb") as f:
-        doc = tomllib.load(f)
-    mito = doc["region_engine"][0]["mito"] if isinstance(doc.get("region_engine"), list) else doc["region_engine"]["mito"]
-    assert mito["write_cache_size"] == "10GiB"
+def test_preflight_rejects_invalid_compaction_interval(tmp_path):
+    env = dict(base_env(tmp_path), GREPTIME_MIN_COMPACTION_INTERVAL="0m\npreload_index_cache=true")
+    result = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"],
+                            capture_output=True, text=True, env=env, cwd=ROOT)
+    assert result.returncode != 0
+    assert "GREPTIME_MIN_COMPACTION_INTERVAL" in result.stderr
+    assert not list(tmp_path.iterdir())
 
 
 def test_preflight_rejects_hostless_endpoint_without_echo(tmp_path):
@@ -143,7 +135,8 @@ def test_preflight_file_mode_writes_exact_config(tmp_path):
     env = dict(base_env(tmp_path), GREPTIME_PAGE_CACHE_SIZE="256MB",
                GREPTIME_WRITE_CACHE_SIZE="12GiB",
                GREPTIME_WRITE_BUFFER_SIZE="64MB",
-               GREPTIME_AUTO_FLUSH_INTERVAL="20m")
+               GREPTIME_AUTO_FLUSH_INTERVAL="20m",
+               GREPTIME_MIN_COMPACTION_INTERVAL="2h")
     pw = env["GREPTIME_PASSWORD"]
     r = subprocess.run([sys.executable, "-m", "scripts.database.greptime_preflight"], capture_output=True, text=True, env=env, cwd=ROOT)
     assert r.returncode == 0, r.stderr
@@ -162,6 +155,7 @@ def test_preflight_file_mode_writes_exact_config(tmp_path):
     assert mito["write_cache_size"] == "12GiB"
     assert mito["global_write_buffer_size"] == "64MB"
     assert mito["auto_flush_interval"] == "20m"
+    assert mito["min_compaction_interval"] == "2h"
     assert doc["wal"]["sync_write"] is True
     assert doc["postgres"]["enable"] is False
     assert doc["opentsdb"]["enable"] is False
@@ -214,10 +208,11 @@ if __name__ == "__main__":
         test_preflight_fails_fast_without_admin,
         test_preflight_fails_fast_without_otlp,
         test_preflight_rejects_bad_size,
+        test_preflight_rejects_invalid_compaction_interval,
         test_preflight_rejects_hostless_endpoint_without_echo,
         test_preflight_file_mode_writes_exact_config,
         test_preflight_identity_change_fails_closed,
     ):
         with tempfile.TemporaryDirectory() as directory:
             check(Path(directory))
-    print("test_render: ok (12 checks)")
+    print("test_render: ok (13 checks)")

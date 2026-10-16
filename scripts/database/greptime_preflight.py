@@ -95,6 +95,7 @@ def main():
     write_cache_size = os.environ.get("GREPTIME_WRITE_CACHE_SIZE", "10GiB")
     write_buf = os.environ.get("GREPTIME_WRITE_BUFFER_SIZE", "128MB")
     flush_interval = os.environ.get("GREPTIME_AUTO_FLUSH_INTERVAL", "10m")
+    min_compaction_interval = os.environ.get("GREPTIME_MIN_COMPACTION_INTERVAL", "0m")
     out_dir = os.environ.get("OUT_DIR", "/out")
 
     for name, value in (("GREPTIME_DB", db), ("GREPTIME_USER", user)):
@@ -124,6 +125,8 @@ def main():
         fail("GREPTIME_WRITE_BUFFER_SIZE must be a size like 128MB")
     if not DURATION_RE.match(flush_interval):
         fail("GREPTIME_AUTO_FLUSH_INTERVAL must be a duration like 10m")
+    if not DURATION_RE.match(min_compaction_interval):
+        fail("GREPTIME_MIN_COMPACTION_INTERVAL must be a duration like 0m")
 
     s3 = {}
     if storage == "S3":
@@ -226,6 +229,11 @@ def main():
         f"auto_flush_interval = {toml_str(flush_interval)}",
         f"enable_write_cache = {'true' if storage == 'S3' else 'false'}",
         f"write_cache_size = {toml_str(write_cache_size)}",
+        # Do not download index/SST bodies speculatively on open or after reads.
+        "preload_index_cache = false",
+        "enable_refill_cache_on_read = false",
+        "schedule_compaction_after_edit = true",
+        f"min_compaction_interval = {toml_str(min_compaction_interval)}",
         "",
         "[logging]",
         'dir = "/data/logs"',

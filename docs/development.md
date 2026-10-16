@@ -258,6 +258,12 @@ cold 증거는 재기동 완료 후 **실제 query window 안의 성공한 SST G
 
 외부 저장소 기여자는 required-check 권한이 없으므로, 위 로컬 명령으로 동일한 게이트를 먼저 실행한 뒤 결과를 PR 설명에 첨부하세요. 공개 CI는 운영 배포를 수행하지 않습니다.
 
+### 조회 외 S3 다운로드 실증
+
+현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 간격은 `0m`, `schedule_compaction_after_edit=true`이며 인덱스 preload·전체 파일 refill은 끕니다. 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다.
+
+위 [저장소 비용 예산 검사](#저장소-비용-예산-검사)의 benchmark·검증 명령과 측정 범위를 참고하세요. 고정 합성 workload의 cold/warm 조회 결과는 모든 집계·컴팩션·복구 경로의 다운로드나 운영 청구 상한을 증명하지 않습니다.
+
 ## 가벼운 PR 성능 비교
 
 [합성 성능 비교](performance.md)는 관련 코드 PR에서 동일 runner의 base/head를

@@ -35,8 +35,42 @@ chmod 600 .env
 | `S3_REGION` | 리전. 일부 Backblaze endpoint만 자동 추론 |
 | `S3_ROOT=greptime` | DB 객체 prefix |
 | `GREPTIME_WRITE_CACHE_SIZE=10GiB` | S3 디스크 쓰기 캐시 상한. 서버 디스크 여유에 맞춰 조정하세요. |
+| `GREPTIME_PAGE_CACHE_SIZE=512MB` | 메모리 페이지 캐시 |
+| `GREPTIME_WRITE_BUFFER_SIZE=128MB` | 전역 쓰기 버퍼 |
+| `GREPTIME_MIN_COMPACTION_INTERVAL=0m` | 자동 컴팩션 후보의 최소 간격 제한 없음 |
 
 S3 디스크 쓰기 캐시 상한의 기본값은 10GiB이며, 실제 점유량은 데이터 수요에 따라 증가합니다. 변경은 설정 파일 재생성과 GreptimeDB 재기동 후 적용됩니다.
+
+#### S3 주 저장소에서 다운로드 줄이기
+
+기본 경로는 **S3의 장기 이력과 제한된 로컬 작업 캐시를 함께 사용하면서 정기 요약과 자동 유지보수를 수행하는 것**입니다. stock GreptimeDB 1.2.1, S3 주 저장소, WAL syncwrite는 유지합니다. 로컬 캐시가 전체 보존 이력을 담을 필요는 없으며 전체 이력 mirror를 만들지 않습니다.
+
+- `server`는 `aggregate`를 포함하며 기본 300초 간격으로 AI/log/home/차량 요약과 조건을 충족하는 비-CAN 배터리 분석을 실행합니다. CAN은 기존 dirty/checkpoint 메타데이터에 따라 분·시간 rollup과 주행·충전 요약을 갱신하며 자동 배터리 분석에서는 제외합니다. 긴 기간 차트가 자동으로 raw로 대체된다고 가정하지 마세요.
+- `min_compaction_interval=0m`, `schedule_compaction_after_edit=true`로 정상 자동 컴팩션과 flush/compaction 결과 반영 뒤 후속 후보 검사를 허용합니다. 모든 edit가 즉시 병합된다는 뜻은 아니며 실제 병합은 엔진의 후보·자원 조건을 따릅니다. 정기 전체 수동 compaction을 별도로 추가하지 마세요.
+- 시작 시 인덱스 선다운로드(`preload_index_cache=false`)와 조회 후 전체 파일 cache refill(`enable_refill_cache_on_read=false`)을 끕니다. 필요한 조회·컴팩션은 S3를 읽을 수 있지만 조회를 계기로 전체 파일을 추가 다운로드하는 refill은 하지 않습니다. 반복 조회의 범위 GET은 남을 수 있습니다.
+
+자동 집계와 컴팩션을 장기간 미루면 **SST 파일·중복 버전·만료 파일의 공간과 조회 비용이 증가할 수 있습니다.** 정상 스케줄은 Home의 `HOME_RAW_TTL` 정리와 aggregate retention watermark 갱신도 수행합니다. 엔진 TTL은 엄격한 삭제 기한을 보장하는 수단이 아니므로 용량·파일 수·조회 지연과 별도로 실제 보존 요구를 확인하세요.
+
+고정 버전의 [자동 컴팩션 간격 검사와 수동 요청 경로](https://github.com/GreptimeTeam/greptimedb/blob/179ff8e5099d35e217a5ffeb6e4096405824dd6c/src/mito2/src/worker/handle_compaction.rs)를 기준으로 한 정책입니다. 이후 엔진 버전으로 올릴 때는 이 경계와 로컬 실증을 다시 확인하세요.
+
+**기존 환경 이전:** `.env`에 명시된 `GREPTIME_MIN_COMPACTION_INTERVAL=36500d`는 새 기본값보다 우선하므로, 별도로 승인된 배포에서 `0m`으로 바꾸세요. 새 배포 파일과 설정 재생성, GreptimeDB 재기동이 필요합니다. 저장소 checkout에서 생성 파일을 갱신할 때는 `python3 tools/render.py`를 사용합니다. 이 문서 변경 자체는 운영 배포나 중지된 서버의 재기동을 승인하거나 수행하지 않습니다. 저장소 식별자·볼륨·런타임 데이터·비공개 배터리 교정은 그대로 보존하세요.
+
+수동 one-shot은 정기 스케줄을 대신 켜는 방법이 아닙니다. **DB와 초기화가 준비되어 있고 정기 aggregate 스케줄러가 실행되지 않는, 별도로 승인된 유지보수 창에서만** 다음 명령을 사용하세요. 정상 `server`가 실행 중이면 정기 pass에 맡기고 별도 작업을 시작하지 마세요. `--no-deps`는 중지된 DB·초기화 서비스를 시작하지 않으며, `AGG_RUN_ONCE=1`은 한 pass 뒤 종료하므로 별도 상주 스케줄러를 만들지 않습니다.
+
+```bash
+docker compose --env-file .env --profile server \
+  run --rm --no-deps -e AGG_RUN_ONCE=1 aggregate
+```
+
+`greptime-data`의 영속 디스크 캐시에는 flush·자동 compaction 출력이 저장되고 S3로 업로드됩니다. 별도 동기화기나 전체 객체 GET 검증은 추가하지 않습니다. `GREPTIME_PAGE_CACHE_SIZE`는 메모리 캐시이므로 디스크 캐시 용량을 대신하지 못합니다.
+
+GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/greptimedb/blob/179ff8e5099d35e217a5ffeb6e4096405824dd6c/src/mito2/src/cache/file_cache.rs#L292-L301)은 Parquet와 Puffin 인덱스에 별도 예산을 배정합니다. 기본 10GiB는 Parquet 약 8GiB와 인덱스 약 2GiB여서 **10GiB SST 전체를 상주시키는 설정이 아닙니다.** 동시에 처리하는 입력과 새 compaction 출력, 다른 테이블 및 잔존 캐시 파일을 고려해 작업 집합에 맞춰 조정하세요. WAL·로그·임시 파일 공간도 별도로 필요하므로 캐시 상한은 전체 로컬 디스크 상한이 아닙니다. 기본 page cache 512MB·write buffer 128MB·디스크 쓰기 캐시 10GiB와 기존 명시적 override를 유지하며, 작은 로컬 실험의 캐시 크기를 운영 권장값으로 적용하지 않습니다.
+
+작업 캐시에 없는 차가운 이력, 과거 입력의 재전송·수정, 집계·컴팩션 및 재시작·복구는 S3 다운로드를 발생시킬 수 있습니다. 캐시 크기가 보존 이력보다 작아도 운영할 수 있지만, 모든 작업의 cache hit나 egress 0·특정 절감률·청구 상한을 보장하지 않습니다.
+
+`greptime-data` 볼륨과 `/data/cache/object/write`를 재배포·재시작 사이에 보존하세요. 캐시를 지우거나 볼륨을 교체하면 집계·compaction만으로도 다시 다운로드할 수 있습니다. 재시작 시 캐시 복구는 비동기이므로 파일 보존만으로 즉시 cache hit를 보장하지 않습니다. 저장소 종류·endpoint·버킷·prefix는 변경하지 않습니다.
+
+적용 전에는 [조회 외 S3 다운로드 실증](development.md#조회-외-s3-다운로드-실증)의 검증 범위를 확인하고, 허용된 운영 재기동 후에는 실제 수집·집계·compaction 중 `opendal_operation_bytes_sum{operation="read",scheme="s3"}` 증가량을 관찰하세요. 캐시 부족·유실은 다시 다운로드하는 정상 복구 경로이므로 이 구성은 비용의 절대 상한이 아닙니다. 서버가 중지된 상태라면 설정 검토만으로 재기동이 허용되지는 않습니다.
 
 `File` 모드에서는 S3 설정을 사용하지 않지만 DB·Grafana·OTLP 인증은 여전히 필수입니다. `GREPTIME_PASSWORD`에는 `=`과 개행을 넣을 수 없습니다. dotenv 값에 `$`가 있으면 작은따옴표로 감싸 Compose 변수 치환을 방지하세요.
 
@@ -433,9 +467,10 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - Fleet의 `fleet_last_receive_timestamp_seconds{topic=...}`는 대상 차량의 유효 envelope를 로컬에서 받은 시각이며, 중복 재수신도 갱신합니다. VSS의 `vss_last_receive_timestamp_seconds`는 broker update/snapshot의 실제 로컬 수신 시각입니다. 받은 적이 없거나 recorder를 재시작한 뒤 아직 수신하지 않았으면 metric이 없습니다. `datalake_trace_last_received_timestamp_seconds{client=...}`는 trace-privacy가 비어 있지 않은 trace batch를 redaction 후 받은 시각이며 DB 저장 ACK가 아닙니다. 이 시각도 프로세스 재시작 후 첫 수신 전에는 없습니다. AI logs/metrics와 Home raw event 시각은 수신 시각이 아니므로 해당 **마지막 실제 수신은 unknown**입니다.
 - `fleet_outbox[_events]_oldest_enqueue_age_seconds`와 `vss_outbox_oldest_enqueue_age_seconds`는 로컬 수신 시 저장한 `ingest_time` 기준 체류 초입니다. `*_oldest_event_age_seconds`는 원본 `event_time`의 age로, 늦은 재전송은 이벤트가 오래되어도 큐 체류는 짧을 수 있습니다. 빈 큐만 0이고, 읽기 실패는 `*_outbox_metrics_success=0` 및 age 없음입니다(VSS 기존 pending/time metric은 실패 시 -1). 통신·조회 실패를 정상 0으로 해석하지 마세요.
 - aggregate는 기존 `backup-data` 볼륨의 `/ops/aggregate-status.json`을 pass/section 시작과 pass 완료에 atomic 교체합니다. storage-metrics는 같은 볼륨을 read-only로 읽습니다. `datalake_aggregate_running`, `datalake_aggregate_success`(마지막 완료 pass 결과), `last_start_timestamp_seconds`, `last_success_timestamp_seconds`, `last_failure_timestamp_seconds`를 노출하며 실패해도 이전 성공 시각은 보존합니다. `time() - datalake_aggregate_last_success_timestamp_seconds`는 **실행 성공 freshness**이지 데이터 처리 지연이 아닙니다. section이 오래 실행되거나 프로세스가 죽으면 `status_timestamp_seconds`가 오래된 채 남을 수 있으므로 interval/running과 함께 확인합니다. SQL pass 성공은 배터리 분석의 교정·품질 정상 판정과 다릅니다.
+- 기본 `server`는 aggregate 스케줄러를 포함합니다. 보관된 status만으로 현재 프로세스가 동작한다고 판단하지 말고 컨테이너 상태와 status 시각·실행 간격을 함께 확인하세요. 오래된 성공이나 `running` 값은 현재 pass의 정상 동작을 증명하지 않습니다.
 - pass 시작 간격은 monotonic clock으로 유지하며 느린 pass와 다음 pass를 겹치지 않습니다. status의 `section_durations_seconds`, `section_counts`는 section 처리 시간과 행 수를 나타냅니다. 상태 관측만을 위한 전체 raw `MAX(event_time)` 조회와 데이터 frontier/공백 지표는 제거했습니다.
 - CAN scope 목록은 pass당 한 번 작은 dirty/checkpoint 메타데이터 테이블의 DISTINCT 합집합에서만 구합니다. 자동 과거 발견·bootstrap·reconciliation·raw checklist·fingerprint 재검사와 sweep 테이블의 런타임 읽기·쓰기는 제거했습니다. 기존 테이블·기록과 원본은 삭제하지 않습니다. 수집 알림 없는 과거 CAN 데이터와 뒤늦은 무알림 입력은 자동으로 찾지 않습니다.
-- 일반 vehicle/trip/battery pass는 registry 등록 여부와 무관하게 `source='can'`을 SQL에서 제외합니다. CAN dirty 시간창은 분·시간 rollup과 주행·충전 요약만 갱신하며 자동 배터리 분석은 실행하지 않습니다. 비-CAN 배터리 정기 분석과 명시적 standalone 배터리 분석은 유지합니다.
+- 일반 vehicle/trip/battery pass는 registry 등록 여부와 무관하게 `source='can'`을 SQL에서 제외합니다. CAN dirty 시간창은 분·시간 rollup과 주행·충전 요약만 갱신하며 자동 배터리 분석은 실행하지 않습니다. 비-CAN 배터리 분석은 `server`의 정기 aggregate pass에 포함되며 명시적 standalone 분석도 유지합니다.
 - 이 변경은 egress 0이나 과금 안전을 보장하지 않습니다. 새 dirty generation의 집계와 다른 section의 조회, DB compaction은 여전히 raw/SST를 읽을 수 있습니다.
 - AI/log/home section은 `vehicle_discovery`와 독립적으로 실행합니다. discovery 실패 시 이에 의존하는 차량 section은 fail-closed로 실행하지 않으며, 빈 결과의 성공으로 바꾸지 않고 전체 pass를 실패로 기록합니다. 실패한 pass도 같은 monotonic 시작 간격으로 다음 주기에 재시도하며 crash-loop하지 않습니다. `AGG_RUN_ONCE=1`은 실패 시 nonzero로 종료합니다. 잘못된 시작 설정(예: 필수 인증 누락, DB 미준비)은 여전히 시작 실패입니다.
 - 차량 checkpoint는 scope·시간별 rollup과 주행·충전 요약이 성공하고 dirty generation 재확인이 일치한 뒤에만 저장합니다. 배터리 분석은 checkpoint의 완료 조건이 아닙니다. 뒤의 작업이 실패해도 앞서 성공한 checkpoint는 남습니다. 주행 raw 조회는 1시간씩 나누되 episode와 열린 주행의 시작 anchor 문맥은 유지합니다.
