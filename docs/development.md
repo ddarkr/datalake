@@ -286,6 +286,8 @@ refill 복원 후 로컬 GreptimeDB·MinIO에서 200,000행을 이전 정상 기
 
 현재 CAN coordinator는 한 pass의 정확한 dirty `(scope, hour)` 집합을 묶어 해상도별로 한 번씩 읽습니다. 중간에 비어 있는 시간·다른 scope를 범위에 포함하지 않으며, trip/charge와 generation 재확인·checkpoint는 여전히 시간별로 수행합니다. 캐시보다 큰 이력에 대한 실제 경로는 다음 명령으로 확인합니다.
 
+다시간 배치의 raw INSERT는 고유 시간대당 120초, 최대 600초의 HTTP deadline을 사용합니다. 단일 시간대는 기존 120초를 유지합니다. 여러 cold SST를 읽는 작업에 단일 시간대 제한을 그대로 적용하면 완료 전에 연결이 끊길 수 있습니다. 이 deadline은 다운로드 바이트 한도가 아니며, 더 긴 대기 자체가 비용 절감을 의미하지 않습니다. 호스트 차단기의 누적 바이트 한도와 전체 집계 완료를 별도로 확인하세요.
+
 ```bash
 python3 tools/benchmark_greptime_dirty.py --json-out /tmp/datalake-dirty-egress.json
 python3 -m tests.test_egress_guard --docker

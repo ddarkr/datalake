@@ -4016,6 +4016,8 @@ def _rollup_hour_windows(ctx, cfg, scopes_hours):
         by_hour.setdefault(hour_ns, set()).add(scope)
     if not by_hour:
         return set()
+    # A cold multi-hour batch must not inherit the single-hour HTTP deadline.
+    scan_timeout = min(600, 120 * len(by_hour))
     ranges = {"window_start": [], "event_time": []}
     for hour_ns in sorted(by_hour):
         pred = _dirty_scope_predicate(by_hour[hour_ns])
@@ -4043,7 +4045,7 @@ def _rollup_hour_windows(ctx, cfg, scopes_hours):
             + " FROM vehicle_signal WHERE " + raw
             + " GROUP BY date_bin('" + interval + "'::INTERVAL,"
             " event_time), vehicle, path, source, decode_epoch,"
-            " source_field, quality, unit", timeout=120)
+            " source_field, quality, unit", timeout=scan_timeout)
     request_sql(base_url, auth, db,
                 "DELETE FROM vehicle_agg WHERE (" + target
                 + ") AND rollup_version IS NULL", timeout=120)
