@@ -30,6 +30,8 @@ services:
     user: "0:0"
     profiles:
       - server
+    labels:
+      datalake.preflight-revision: "1"
     working_dir: /app
     command:
       - python
