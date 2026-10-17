@@ -77,17 +77,21 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 #### 호스트 다운로드 차단기
 
-`scripts/storage/egress_guard.py`는 Compose 밖에서 실행하는 선택적 안전장치입니다. DB의 native S3 read 누적값을 디스크에 저장하고, 한도 초과·계측 중단·카운터 초기화·DB 인스턴스 변경 때 프로젝트를 중지하고 잠급니다. 잠금은 프로세스 재시작으로 해제되지 않습니다. `backup`, `can-backup`, `raw-uploader`, `redecode`는 DB 계측에 포함되지 않으므로 감시 중 실행하면 프로젝트를 중지합니다. 해당 작업에는 별도로 승인하고 계측하는 유지보수 창이 필요합니다.
+`scripts/storage/egress_guard.py`는 Compose 밖에서 실행하는 선택적 안전장치입니다. 한국 시간 하루의 DB native S3 read가 **50 GB 이상이면 Telegram 경고만**, **200 GB 이상이면 프로젝트 전체 정지와 긴급 알림**을 실행합니다. GB는 1,000,000,000 byte입니다. 정상 조회와 비정상 반복 다운로드는 구분하지 않습니다. 계측 중단·카운터 초기화·DB 인스턴스 변경도 프로젝트를 중지하고 잠급니다. `backup`, `can-backup`, `raw-uploader`, `redecode`는 DB 계측에 포함되지 않으므로 감시 중 실행하면 프로젝트를 중지합니다. 해당 작업에는 별도로 승인하고 계측하는 유지보수 창이 필요합니다.
 
 **이 장치는 사업자 청구액이나 엄격한 네트워크 바이트 상한을 보장하지 않습니다.** 감지·종료 지연과 호스트/Docker 장애 동안 추가 다운로드가 가능합니다. 월간 합성 CI 예산을 실제 계정의 허용량으로 사용하지 마세요. 자동 GitOps 동기화도 별도로 중지해야 하며, `redeployAfterSync=false`만으로 재기동을 막을 수는 없습니다.
 
-Linux Docker 호스트에서 검증된 스크립트를 `/usr/local/libexec/datalake-egress-guard.py`에 설치하고, root 소유 `0700` 영속 디렉터리를 준비합니다. `BUDGET_BYTES`는 이번 운영에 승인한 **누적 절대 상한**이며 시간당 자동 충전량이 아닙니다.
+Linux Docker 호스트에서 검증된 스크립트를 `/usr/local/libexec/datalake-egress-guard.py`에 설치하고, root 소유 `0700` 영속 디렉터리를 준비합니다. 사용량·날짜·알림 성공 기록은 프로세스 재시작에도 유지됩니다. 가동 중에는 KST 자정 이후 첫 관측에서 일일 사용량만 초기화하며, 자정을 걸친 관측 증가분은 새 날짜에 전부 합산합니다. 전체 누적값은 보존합니다. 정지된 프로젝트는 자정이 지나도 자동 재개하지 않습니다.
+
+Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600` JSON 파일 `/etc/datalake-egress-telegram.json`에 `token`(문자열), `chat_id`(정수)로 저장합니다. `notify-test --telegram-config /etc/datalake-egress-telegram.json`으로 실제 전송을 확인하세요. 알림은 단계별 하루 한 번이며 전송 실패 시 60초 뒤 재시도합니다. 소프트 알림 직후 하드 한도에 도달하면 기다리지 않고 긴급 알림을 시도합니다. 정지는 알림보다 먼저 실행하므로 Telegram 장애가 차단을 지연시키지 않습니다. 전송 성공 직후 상태 저장 전에 프로세스가 죽으면 중복 알림이 발생할 수 있습니다.
+
+기존 누적 예산의 version 1 상태는 자동 초기화하거나 조용히 변환하지 않습니다. 교체 전 상태를 비공개 백업하고 version 2의 `day`, `day_used_bytes`, `alerted`를 명시적으로 이관하세요. 기존 `used_bytes`, `last`, `sample_at`, `instance`, `blocked`는 보존하고 `budget_bytes`는 제거합니다. 일별 이력이 없으면 이관 당일에 기존 누적값을 보수적으로 전부 합산하고 그 한계를 기록합니다.
 
 ```sh
 install -d -m 700 /var/lib/datalake-egress
 python3 /usr/local/libexec/datalake-egress-guard.py \
   --state-dir /var/lib/datalake-egress arm \
-  --project datalake --budget-bytes "$BUDGET_BYTES"
+  --project datalake
 python3 /usr/local/libexec/datalake-egress-guard.py \
   --state-dir /var/lib/datalake-egress trip --project datalake
 ```
@@ -98,7 +102,7 @@ python3 /usr/local/libexec/datalake-egress-guard.py \
 
 ```ini
 [Unit]
-Description=Datalake cumulative S3 read guard
+Description=Datalake daily S3 read guard
 Requires=docker.service
 After=docker.service
 
@@ -106,7 +110,7 @@ After=docker.service
 Type=notify
 NotifyAccess=main
 User=root
-ExecStart=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress run --metrics-url http://127.0.0.1:4000/metrics --interval 2 --timeout 3 --grace 10
+ExecStart=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress run --metrics-url http://127.0.0.1:4000/metrics --interval 2 --timeout 3 --grace 10 --telegram-config /etc/datalake-egress-telegram.json
 ExecStopPost=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress trip --project datalake --grace 10
 WatchdogSec=300
 TimeoutStartSec=300
@@ -120,7 +124,7 @@ WantedBy=multi-user.target
 
 `ExecStopPost`는 감시기 종료 때 lease를 폐기하고, 상태 파일이 손상되어도 명시한 프로젝트를 중지합니다. watchdog은 완료된 감시 루프의 알림이 끊기면 감시기를 종료합니다. 300초는 Docker 명령의 장애 타임아웃을 포함한 값이며 이 기간의 다운로드를 제한하는 값은 아닙니다.
 
-이미지·의존성을 준비하고 감시기를 먼저 실행한 다음, 승인된 재가동 직전에 `unblock --budget-bytes "$BUDGET_BYTES" --startup-seconds 120`을 실행합니다. `unblock`은 lease를 즉시 발급하지 않습니다. 감시기의 다음 관측에서 `/var/lib/datalake-egress/lease`가 현재 Unix 시각보다 큰 값으로 갱신된 것을 확인한 뒤 DB를 시작하세요. 그 전에 시작하면 preflight나 DB가 기동을 거부합니다. DB 기동 후 다른 서비스를 단계적으로 올릴 때는 이미 완료된 의존 작업을 다시 실행해 DB를 재시작하지 않도록 `up -d --no-deps <service>`를 사용하고, 필요한 의존 작업의 성공을 먼저 확인하세요. `arm`·`unblock` 모두 `--state-dir /var/lib/datalake-egress`가 필요합니다. `unblock`은 기존 사용량을 지우지 않으며 첫 native counter도 전액 합산합니다. `arm`은 기존 상태를 덮어쓰지 않습니다. 상태 파일을 삭제해 예산을 초기화하지 말고 `status`로 누적 사용량·잠금 이유를 확인하세요.
+이미지·의존성을 준비하고 감시기를 먼저 실행한 다음, 승인된 재가동 직전에 `unblock --startup-seconds 120`을 실행합니다. 당일 200 GB에 도달한 상태에서는 해제할 수 없습니다. 다음 날에도 수동 해제가 필요합니다. `unblock`은 lease를 즉시 발급하지 않습니다. 감시기의 다음 관측에서 `/var/lib/datalake-egress/lease`가 현재 Unix 시각보다 큰 값으로 갱신된 것을 확인한 뒤 DB를 시작하세요. 그 전에 시작하면 preflight나 DB가 기동을 거부합니다. DB 기동 후 다른 서비스를 단계적으로 올릴 때는 이미 완료된 의존 작업을 다시 실행해 DB를 재시작하지 않도록 `up -d --no-deps <service>`를 사용하고, 필요한 의존 작업의 성공을 먼저 확인하세요. `arm`·`unblock` 모두 `--state-dir /var/lib/datalake-egress`가 필요합니다. `unblock`은 전체 누적값과 당일 사용량을 지우지 않으며 첫 native counter도 전액 합산합니다. `arm`은 기존 상태를 덮어쓰지 않습니다. 상태 파일을 삭제해 예산을 초기화하지 말고 `status`로 일일·전체 누적 사용량과 잠금 이유를 확인하세요.
 
 별도의 [실험적 로컬 입력 엔진](development.md#실험적-s3-primary-로컬-입력-엔진)은 S3 주 저장소를 유지하면서 활성 SST·인덱스를 비퇴출 로컬 mirror에 보존합니다. 기본 이미지·기본 집계 정책과는 별개이며 기존 운영 볼륨에 자동 적용하지 않습니다. 로컬 입력이나 출력 여유가 부족하면 S3 fallback 대신 실패하므로 보존 이력에 맞는 디스크가 필요합니다. `AGG_LOCAL_SST_ONLY=1`만 기존 stock 이미지에 설정하면 지원 endpoint가 없어 집계가 실패합니다.
 

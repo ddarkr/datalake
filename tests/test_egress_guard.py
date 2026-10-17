@@ -17,10 +17,147 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT = ROOT / "scripts/storage/egress_guard.py"
 
 
+def daily_limits(path):
+    midnight = g.datetime(2026, 10, 18, tzinfo=g.KST).timestamp()
+    state = dict(version=2, project="daily-regression", used_bytes=0, last=None,
+                 blocked=False, day=g.day_at(midnight - 1), day_used_bytes=0, alerted=[])
+    with patch.object(g.time, "time", return_value=midnight - 1):
+        assert not g.observe(state, {"s3": g.SOFT_BYTES - 1})
+        g.save(path, state)
+        with patch.object(g, "telegram") as sent:
+            g.alert(path, path / "telegram.json", False)
+            assert sent.call_count == 0
+            assert not g.observe(state, {"s3": g.SOFT_BYTES})
+            g.save(path, state)
+            g.alert(path, path / "telegram.json", False)
+            g.alert(path, path / "telegram.json", False)
+            assert sent.call_count == 1
+            assert not g.load(path)["blocked"]
+            state = g.load(path)
+            assert g.observe(state, {"s3": g.HARD_BYTES})
+            g.latch(path, state, "daily hard download limit reached")
+            g.alert(path, path / "telegram.json", True)
+            assert sent.call_count == 2  # escalation bypasses soft retry delay
+            assert "정지 확인" in sent.call_args.args[1]
+            g.alert(path, path / "telegram.json", True)
+            assert sent.call_count == 2
+        state = g.load(path)
+        try:
+            g.main(["--state-dir", str(path), "unblock"])
+            raise AssertionError("same-day hard limit bypassed")
+        except SystemExit as exc:
+            assert exc.code == 2
+    with patch.object(g.time, "time", return_value=midnight):
+        # Only explicit unblock advances a stopped guard into the new day.
+        assert state["blocked"] and state["day"] == "2026-10-17"
+        g.main(["--state-dir", str(path), "unblock"])
+        state = g.load(path)
+        assert not state["blocked"] and state["day_used_bytes"] == 0
+        assert state["used_bytes"] == g.HARD_BYTES
+        assert state["alerted"] == []
+        assert (path / "lease").read_text() == "0\n"
+    state.update(last={"s3": g.HARD_BYTES}, day="2026-10-17",
+                 day_used_bytes=g.HARD_BYTES)
+    with patch.object(g.time, "time", return_value=midnight):
+        assert not g.observe(state, {"s3": g.HARD_BYTES + 123})
+        assert state["day_used_bytes"] == 123 and state["used_bytes"] == g.HARD_BYTES + 123
+        state["day_used_bytes"] = g.SOFT_BYTES
+        g.save(path, state)
+        with patch.object(g, "telegram", side_effect=OSError("delivery failed")) as failed:
+            g.alert(path, path / "telegram.json", False)
+            assert g.load(path)["alerted"] == []
+            g.alert(path, path / "telegram.json", False)
+            assert failed.call_count == 1
+    with patch.object(g.time, "time", return_value=midnight + 60):
+        with patch.object(g, "telegram") as sent:
+            g.alert(path, path / "telegram.json", False)
+            assert sent.call_count == 1
+            assert g.load(path)["alerted"] == ["soft"]
+    try:
+        with patch.object(g.time, "time", return_value=midnight - 1):
+            g.observe(state, {"s3": g.HARD_BYTES + 124})
+        raise AssertionError("backward calendar accepted")
+    except ValueError:
+        pass
+
+
+def daily_docker(path):
+    """Real monitor/HTTP/Docker stop, without sending synthetic alerts to users."""
+    path.mkdir(mode=0o700)
+    project = "daily-guard-smoke-" + str(time.time_ns())
+    counter = path / "counter"
+    counter.write_text(str(g.SOFT_BYTES - 1))
+    server = """
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = ('opendal_operation_bytes_sum{scheme="s3",operation="read"} '
+                + Path('/probe/counter').read_text() + '\\n').encode()
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+HTTPServer(('0.0.0.0', 4000), Handler).serve_forever()
+"""
+    worker = None
+    try:
+        g.docker("run", "-d", "--name", project,
+                 "--label", "com.docker.compose.project=" + project,
+                 "--label", "com.docker.compose.service=greptimedb",
+                 "-p", "127.0.0.1::4000", "-v", str(path) + ":/probe:ro",
+                 "python:3.12.8-slim-bookworm", "python", "-c", server)
+        port = json.loads(g.docker("inspect", project))[0]["NetworkSettings"]["Ports"]["4000/tcp"][0]["HostPort"]
+        url = "http://127.0.0.1:" + port + "/metrics"
+        deadline = time.time() + 20
+        while True:
+            try:
+                g.metrics(url, 1)
+                break
+            except OSError:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(0.1)
+        g.main(["--state-dir", str(path), "arm", "--project", project])
+        worker = subprocess.Popen([sys.executable, str(SCRIPT), "--state-dir", str(path),
+                                   "run", "--metrics-url", url, "--interval", "0.1",
+                                   "--timeout", "1", "--grace", "1",
+                                   "--telegram-config", str(path / "intentionally-absent.json")])
+        def reached(predicate):
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                state = g.load(path)
+                if predicate(state):
+                    return state
+                if worker.poll() is not None:
+                    raise AssertionError("guard worker exited")
+                time.sleep(0.1)
+            raise AssertionError("daily guard did not reach expected state")
+        reached(lambda s: s["day_used_bytes"] == g.SOFT_BYTES - 1)
+        g.atomic(counter, str(g.SOFT_BYTES))
+        soft = reached(lambda s: s.get("alert_attempt_level") == "soft")
+        assert not soft["blocked"] and soft["alerted"] == []
+        assert json.loads(g.docker("inspect", project))[0]["State"]["Running"]
+        g.atomic(counter, str(g.HARD_BYTES))
+        hard = reached(lambda s: s.get("alert_attempt_level") == "hard")
+        assert hard["blocked"] and hard["day_used_bytes"] == g.HARD_BYTES
+        assert not json.loads(g.docker("inspect", project))[0]["State"]["Running"]
+        assert (path / "lease").read_text() == "0\n"
+    finally:
+        if worker is not None:
+            worker.terminate()
+            worker.wait(timeout=5)
+        g.docker("rm", "-f", project)
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp)
         unsafe = path / "unsafe"
+        daily_path = path / "daily"
+        daily_path.mkdir(mode=0o700)
+        daily_limits(daily_path)
         unsafe.mkdir(mode=0o755)
         try:
             with g.locked(unsafe):
@@ -35,8 +172,8 @@ def main():
             with patch.dict(os.environ, NOTIFY_SOCKET=address):
                 g.notify()
             assert listener.recv(128) == b"READY=1\nWATCHDOG=1"
-        state = dict(version=1, project="guard-regression", budget_bytes=100,
-                     used_bytes=0, last=None, blocked=False)
+        state = dict(version=2, project="guard-regression", used_bytes=0, last=None,
+                     blocked=False, day=g.day_at(time.time()), day_used_bytes=0, alerted=[])
         first = {"Id": "one", "State": {"StartedAt": "first"}}
         g.bind_instance(state, first)
         assert not g.observe(state, {"s3": 40})
@@ -58,12 +195,12 @@ def main():
             g.latch(path, state, "reset")
         assert g.load(path)["blocked"] and (path / "lease").read_text() == "0\n"
         result = subprocess.run([sys.executable, str(SCRIPT), "--state-dir", tmp, "arm",
-                                 "--project", "guard-regression", "--budget-bytes", "200"],
+                                 "--project", "guard-regression"],
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         assert result.returncode != 0
         assert g.load(path)["used_bytes"] == 60 and g.load(path)["blocked"]
         subprocess.run([sys.executable, str(SCRIPT), "--state-dir", tmp, "unblock",
-                        "--budget-bytes", "200", "--startup-seconds", "1"],
+                        "--startup-seconds", "1"],
                        stdout=subprocess.DEVNULL, check=True)
         assert g.load(path)["used_bytes"] == 60 and g.load(path)["instance"] is None
         if "--docker" in sys.argv:
@@ -106,7 +243,8 @@ def main():
                 # not accept a plausible zero counter.
                 worker = subprocess.Popen([sys.executable, str(SCRIPT), "--state-dir", tmp,
                                            "run", "--metrics-url", url,
-                                           "--interval", "0.1", "--timeout", "1", "--grace", "1"])
+                                           "--interval", "0.1", "--timeout", "1", "--grace", "1",
+                                           "--telegram-config", str(path / "telegram.json")])
                 deadline = time.time() + 20
                 while time.time() < deadline:
                     if g.load(path)["blocked"] and not json.loads(g.docker("inspect", name))[0]["State"]["Running"]:
@@ -136,7 +274,8 @@ def main():
                     worker.terminate()
                     worker.wait(timeout=5)
                 g.docker("rm", "-f", name, name + "-invalid")
-    print("egress guard: persistence/reset/higher-counter rollover/metrics failure/core gate passed")
+            daily_docker(path / "daily-docker")
+    print("egress guard: daily thresholds/rollover/alerts/persistence/reset/metrics failure/core gate passed")
 
 
 if __name__ == "__main__":

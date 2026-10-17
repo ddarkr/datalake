@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-only, fail-closed Greptime S3 read experiment guard.
+"""Host-only, fail-closed Greptime S3 daily read guard.
 
 Native counters measure observed OpenDAL reads, not provider billing. Helpers'
 s3_cost retained reports are incomplete lower bounds and are NOT included.
@@ -10,6 +10,7 @@ socket in application containers. State and lease directory must persist.
 """
 import argparse
 import contextlib
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import math
@@ -25,6 +26,21 @@ import urllib.request
 import urllib.parse
 
 COVERAGE = "native Greptime OpenDAL S3 read bytes only; helper/account egress NOT covered"
+SOFT_BYTES = 50_000_000_000
+HARD_BYTES = 200_000_000_000
+KST = timezone(timedelta(hours=9))
+
+
+def day_at(timestamp):
+    return datetime.fromtimestamp(timestamp, KST).date().isoformat()
+
+
+def daily(state, now):
+    day = day_at(now)
+    if day < state["day"]:
+        raise ValueError("guard clock moved to an earlier day")
+    if day != state["day"]:
+        state.update(day=day, day_used_bytes=0, alerted=[], alert_attempt_at=0)
 
 def notify():
     """Notify only after a completed loop; a stalled worker misses watchdog."""
@@ -75,11 +91,14 @@ def save(directory, state):
 
 def load(directory):
     state = json.loads((directory / "state.json").read_text())
-    if (state.get("version") != 1 or type(state.get("blocked")) is not bool
-            or type(state.get("used_bytes")) is not int
-            or state["used_bytes"] < 0 or type(state.get("budget_bytes")) is not int
-            or state["budget_bytes"] <= 0):
+    if (state.get("version") != 2 or type(state.get("blocked")) is not bool
+            or any(type(state.get(k)) is not int or state[k] < 0
+                   for k in ("used_bytes", "day_used_bytes"))
+            or state["day_used_bytes"] > state["used_bytes"]
+            or not isinstance(state.get("alerted"), list)
+            or any(v not in ("soft", "hard") for v in state["alerted"])):
         raise ValueError("invalid persistent guard state")
+    datetime.strptime(state["day"], "%Y-%m-%d")
     return state
 
 
@@ -102,10 +121,15 @@ def observe(state, values):
             raise ValueError("native metric series disappeared")
         if any(values[k] < v for k, v in before.items()):
             raise ValueError("native counter reset")
-    state["used_bytes"] += sum(v - (before or {}).get(k, 0) for k, v in values.items())
+    now = time.time()
+    daily(state, now)
+    delta = sum(v - (before or {}).get(k, 0) for k, v in values.items())
+    state["used_bytes"] += delta
+    # Charge a sample straddling midnight to the new day, never discard bytes.
+    state["day_used_bytes"] += delta
     state["last"] = values
-    state["sample_at"] = time.time()
-    return state["used_bytes"] >= state["budget_bytes"]
+    state["sample_at"] = now
+    return state["day_used_bytes"] >= HARD_BYTES
 
 
 def metrics(url, timeout):
@@ -186,14 +210,65 @@ def stop(project, grace):
         raise RuntimeError("project still has running containers")
 
 
+
+def telegram(config, text):
+    info = config.stat()
+    if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
+        raise PermissionError("Telegram config must be owned by current user with mode 0600")
+    credentials = json.loads(config.read_text())
+    token, chat = credentials["token"], credentials["chat_id"]
+    if not re.fullmatch(r"\d+:[A-Za-z0-9_-]+", token) or type(chat) is not int:
+        raise ValueError("invalid Telegram credentials")
+    request = urllib.request.Request(
+        "https://api.telegram.org/bot" + token + "/sendMessage",
+        data=json.dumps({"chat_id": chat, "text": text}).encode(),
+        headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(request, timeout=5) as response:
+        result = json.load(response)
+    if not result.get("ok"):
+        raise RuntimeError("Telegram rejected notification")
+
+
+def alert(directory, config, stopped):
+    # Persist acknowledgement only after delivery. A crash in between can
+    # duplicate one alert; losing a hard-limit notification is worse.
+    with locked(directory):
+        state = load(directory)
+        level = ("hard" if state["day_used_bytes"] >= HARD_BYTES else
+                 "soft" if state["day_used_bytes"] >= SOFT_BYTES else None)
+        if not level or level in state["alerted"]:
+            return
+        now = time.time()
+        if state.get("alert_attempt_level") == level and now - state.get("alert_attempt_at", 0) < 60:
+            return
+        state["alert_attempt_at"] = now
+        state["alert_attempt_level"] = level
+        save(directory, state)
+        day = state["day"]
+        action = ("프로젝트 정지 확인. 수동 확인 후 재개하세요." if stopped else
+                  "정지 미확인: 호스트/Docker 상태를 즉시 확인하세요.") if level == "hard" else "서비스는 계속 가동합니다."
+        text = (f"[Datalake {'긴급' if level == 'hard' else '주의'}]\n"
+                f"{day} KST S3 다운로드 {state['day_used_bytes'] / 1e9:.3f} GB\n"
+                f"소프트 50 GB / 하드 200 GB (일일)\n{action}\n"
+                "Greptime 계측 기준이며 공급자 청구량과 다를 수 있습니다.")
+    try:
+        telegram(config, text)
+    except Exception:
+        # Exceptions can contain the token-bearing URL. Never log them.
+        print("Telegram notification failed; retry in 60 seconds", flush=True)
+        return
+    with locked(directory):
+        state = load(directory)
+        if state["day"] == day:
+            state["alerted"] = ["soft", "hard"] if level == "hard" else ["soft"]
+            save(directory, state)
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", required=True, type=Path)
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("arm", "unblock"):
         p = sub.add_parser(name)
-        p.add_argument("--budget-bytes", required=True, type=int,
-                       help="absolute cumulative ceiling; never resets used bytes")
         p.add_argument("--startup-seconds", type=int, default=30)
         if name == "arm":
             p.add_argument("--project", required=True)
@@ -207,10 +282,20 @@ def main(argv=None):
     run.add_argument("--interval", type=float, default=2)
     run.add_argument("--timeout", type=float, default=3)
     run.add_argument("--grace", type=int, default=10)
+    run.add_argument("--telegram-config", required=True, type=Path)
+    test_alert = sub.add_parser("notify-test")
+    test_alert.add_argument("--telegram-config", required=True, type=Path)
     args = parser.parse_args(argv)
     directory = args.state_dir.resolve()
     if hasattr(args, "grace") and not 0 <= args.grace <= 60:
         parser.error("grace must be 0..60 seconds")
+    if args.command == "notify-test":
+        try:
+            telegram(args.telegram_config, "[Datalake 설정 확인]\n일일 50 GB: 경고 / 200 GB: 전체 정지 및 경고\n한국 시간 자정 기준. 정지 후 자동 재개하지 않습니다.")
+        except Exception:
+            parser.exit(1, "Telegram test delivery failed\n")
+        print("Telegram test delivered")
+        return
     if args.command == "trip":
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.project):
             parser.error("invalid exact Compose project")
@@ -232,18 +317,20 @@ def main(argv=None):
                 parser.error("already armed; status/unblock never resets usage")
             if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.project):
                 parser.error("invalid exact Compose project")
-            state = dict(version=1, project=args.project, used_bytes=0, last=None, blocked=True)
+            state = dict(version=2, project=args.project, used_bytes=0, last=None,
+                         blocked=True, day=day_at(time.time()), day_used_bytes=0, alerted=[])
         else:
             state = load(directory)
         if args.command in ("arm", "unblock"):
-            if args.budget_bytes <= state["used_bytes"] or not 1 <= args.startup_seconds <= 120:
-                parser.error("ceiling must exceed usage; startup seconds must be 1..120")
+            daily(state, time.time())
+            if state["day_used_bytes"] >= HARD_BYTES or not 1 <= args.startup_seconds <= 120:
+                parser.error("daily hard limit reached or startup seconds outside 1..120")
             if args.command == "unblock" and not state["blocked"]:
                 parser.error("not blocked")
             # Explicit authorization after reset starts a new baseline, charging
             # its entire first counter. Persisted usage is never subtracted.
             revoke(directory)
-            state.update(budget_bytes=args.budget_bytes, blocked=False, reason="authorized",
+            state.update(blocked=False, reason="authorized",
                          last=None, instance=None, startup_until=time.time() + args.startup_seconds)
             save(directory, state)
             # run must start before DB: arm alone does not grant a lease.
@@ -283,7 +370,7 @@ def main(argv=None):
                         if state.get("sample_at") and state.get("last") is not None and time.time() - state["sample_at"] > args.interval + args.timeout + 5:
                             raise ValueError("monitor observation gap")
                         if observe(state, values):
-                            latch(directory, state, "download budget reached")
+                            latch(directory, state, "daily hard download limit reached")
                         else:
                             save(directory, state)
                     except Exception:
@@ -292,8 +379,14 @@ def main(argv=None):
                     if not state["blocked"]:
                         atomic(directory / "lease", str(int(time.time() + args.interval + args.timeout + 5)) + "\n")
                 blocked = state["blocked"]
+            stopped = False
             if blocked:
-                stop(state["project"], args.grace)
+                try:
+                    stop(state["project"], args.grace)
+                    stopped = True
+                except Exception:
+                    print("Project stop failed; retrying next loop", flush=True)
+            alert(directory, args.telegram_config, stopped)
             notify()
             time.sleep(args.interval)
 
