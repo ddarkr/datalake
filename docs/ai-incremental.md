@@ -39,8 +39,9 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
 - 스톡 pyarrow Flight 클라이언트는 Greptime terminal NONE 프레임을
   읽지 못하므로 raw grpcio + 공식 protobuf + pyarrow IPC를 쓴다
   (`scripts/database/greptime_flight.py`). IPC는 스풀 파일 +
-  `open_stream`으로 dictionary 배치까지 디코드하고, max-row 초과는
-  부분 쓰기 없이 실패한다. 타임스탬프는 int64 ns 정밀도로 읽는다.
+  `open_stream`으로 dictionary 배치까지 디코드한다. 일반 조회는
+  max-row를 넘으면 실패하며, 전체 복구의 sink는 같은 값을 청크당
+  상한으로 사용한다. 타임스탬프는 int64 ns 정밀도로 읽는다.
 
 ## 재계산 (global merge + cohort)
 
@@ -76,37 +77,42 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
 - `fence`: `{table: {region_id: seq}}` upper JSON (커밋된 펜스).
 - `price_digest`: LiteLLM 가격표 sha256('none' 포함). 변경 시 전체
   비용 셀 재빌드.
-- `config_revision`: `'ai:fence-v1'` 불일치 시 전체 복구.
+- `config_revision`: `'ai:fence-v2'` 불일치 시 전체 복구. 기존 v1 상태도
+  신규 입력 여부와 무관하게 한 번 완전히 재계산한다.
 - `input_digest`: 메트릭 레지스트리 `[(table, instrument)]` JSON.
   테이블 추가/삭제/개명 시 전체 복구(COUNT+MAX 스캔 없음).
 - `committed_at`: 커밋 wall 시각. 파생 상태 TTL 없음.
 
 커밋은 파생 쓰기 전부 성공 뒤에만 upper를 기록한다. 전송 실패는
 체크포인트를 전진시키지 않는다(실패하면 펜스가 뒤에 남아 다음
-패스가 같은 구간을 재발견한다). deps/endpoint 미증명으로 펜스
-upper 자체를 증명하지 못하면 빈 펜스로 upper를 단정하지 않는다:
-oracle로 복구하고 증명된 upper가 있을 때만 커밋한다.
+패스가 같은 구간을 재발견한다). deps/endpoint 미증명이나 terminal
+watermark 누락으로 upper를 증명하지 못하면 기존 체크포인트를
+보존하고 실패한다. 빈 펜스로 초기화하거나 부분 스냅샷을 커밋하지 않는다.
 
 ## 복구
 
-- `AGG_AI_FULL_REBUILD=1`: 매 패스 전체 복구(명시적 복구 절차).
-- Flight deps/grpc endpoint 미증명, terminal watermark 없음,
-  STALE, generation reset, digest/revision 불일치: 전체 복구 후
-  증명된 upper 커밋.
-- 펜스가 증명된 전체 복구는 Flight가 반환한 원본 행과 메트릭을
-  그대로 재계산에 사용한다. 동일한 원본을 HTTP로 다시 읽지 않으며,
-  그 스냅샷의 upper만 파생 쓰기 완료 뒤 커밋한다. Flight 미지원 시의
-  HTTP 전체 복구와 명시적 oracle 경로는 유지한다.
-- max-row 초과(`RowCapExceeded`): 부분 쓰기 없이 섹션 실패하고
-  체크포인트를 전진시키지 않는다. scoped 메트릭 재조회도 같은
-  row-cap 가드 아래 있으며, 초과는 전체 복구로 숨기지 않고 그대로
-  전파한다.
+- `AGG_AI_FULL_REBUILD=1`: 매 패스 전체 재계산(명시적 복구 절차).
+- STALE·digest/revision 불일치 또는 일반 조회의 max-row 초과 시
+  `scripts/analytics/ai_recovery.py`의 디스크 기반 전체 복구를 사용한다.
+  `AGG_MAX_ROWS` 기본값은 그대로이며 원본 전체 행 수의 상한이 아니다.
+- 각 Flight 응답의 terminal watermark와 네트워크 EOF를 확인한 뒤
+  IPC를 제한된 크기로 디코드해 임시 SQLite에 저장한다. 원본을 HTTP로
+  다시 읽거나 시간/OFFSET 페이지마다 다른 스냅샷을 조합하지 않는다.
+- 전역 중복·부모/자식·native 우선순위·turn 비용·도구 식별자를 디스크에서
+  처리하고, 활동 집계도 같은 의미 규칙에 디스크 상태와 외부 정렬을 쓴다.
+  단일 세션이 청크보다 커도 날짜별 부분 합을 덮어쓰지 않는다.
+- 네 파생 테이블을 배치로 쓴 뒤에만 해당 스냅샷의 upper를 커밋한다.
+  전송·디코드·디스크·쓰기 실패 시 체크포인트는 전진하지 않으며,
+  재시도는 완전한 입력으로 수렴한다. 일반 증분·무변경 경로는 유지한다.
 - 메트릭 단위 변환(`claude_code.active_time.total` 등)은 oracle과
   fenced 경로가 같은 `_ai_metric_unit` 헬퍼를 공유하므로
   단위/temporality 해석이 갈라지지 않는다.
 - 로그 세션 조건은 네이티브 검증된 `json_get_string` JSONB
   predicate다(`->>` 미지원). 세션 키는 attrs 기준이며 body-only
   별칭은 주장하지 않는다.
+- 로그의 `log_attributes`·`resource_attributes`는 조회 시
+  `json_to_string`으로 변환한다. Flight의 내부 JSONB 바이너리를
+  UTF-8 문자열로 오인해 로그 전용 세션이나 native 사용량을 누락하지 않는다.
 
 ## 한계
 
@@ -114,6 +120,9 @@ oracle로 복구하고 증명된 upper가 있을 때만 커밋한다.
   조회를 주장하지 않는다. dirty 날짜·세션 자체가 크면 재계산도 커진다.
 - TTL로 원본 일부가 만료된 세션/날짜는 기존 집계를 덮어쓰지 않는다
   (`fully_retained` 그대로).
+- 전체 복구는 원본 크기에 비례하는 임시 디스크와 처리 시간이 필요하다.
+  메모리를 제한한다고 전체 스캔이나 S3 읽기가 없어지는 것은 아니다.
+  디스크 공간이 부족하면 기존 체크포인트를 보존한 채 실패한다.
 
 ## 격리 런타임 측정
 

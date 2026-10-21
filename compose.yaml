@@ -114,7 +114,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '31'
+      datalake.aggregate-revision: '32'
     depends_on:
       greptimedb:
         condition: service_started
@@ -158,6 +158,9 @@ services:
       mode: 292
     - source: greptime_flight_py
       target: /app/scripts/database/greptime_flight.py
+      mode: 292
+    - source: ai-recovery-script
+      target: /app/scripts/analytics/ai_recovery.py
       mode: 292
     - source: activity_py
       target: /app/scripts/telemetry/activity.py
@@ -2197,8 +2200,9 @@ configs:
           every section each pass and sleeps; SIGTERM/SIGINT stops between passes.
         AGG_LOOKBACK_HOURS (default 30): bound for vehicle trip/charge/log scans
           and the SQL-pushdownagg windows (vehicle 1m/1h, home 5m/1h/1d).
-        AGG_MAX_ROWS (default 200000): per-section raw-row cap. A section over the
-        cap fails closed (error, no partial writes) instead of OOMing.
+        AGG_MAX_ROWS (default 200000): raw-query work limit. AI overflow recovers
+          from a complete disk-backed snapshot with bounded decoded chunks;
+          other sections fail without partial writes when their query exceeds it.
         AGG_LOCAL_SST_ONLY (default 0): exact 0/1; select strict local-SST HTTP
           and Flight transports for every SQL statement, without remote fallback.
         BATTERY_ANALYSIS_CONFIG (default /app/battery-analysis.json): plain JSON
@@ -4347,7 +4351,7 @@ configs:
           return out
 
 
-      AI_LOGIC_REVISION = "ai:fence-v1"
+      AI_LOGIC_REVISION = "ai:fence-v2"
       AI_STATE_SCOPE = "ai"
       AI_STATE_TABLE = "ai_aggregate_state"
       AI_SPAN_SESSION_COLS = (SESSION, "span_attributes.session.id",
@@ -4456,9 +4460,19 @@ configs:
                              for t, regions in sorted(fence.items())}, sort_keys=True)
 
 
+      def _ai_projection(table, cols):
+          # Flight exposes native JSONB as compact binary, unlike HTTP JSON.
+          # Format on the server so both transports feed the same text parser.
+          return ", ".join(
+              "json_to_string(" + _ai_quote_ident(c) + ") AS " + _ai_quote_ident(c)
+              if table == "opentelemetry_logs" and c in (
+                  "log_attributes", "resource_attributes") else _ai_quote_ident(c)
+              for c in cols)
+
+
       def _ai_table_sql(table):
           cols = SPAN_COLS if table == "opentelemetry_traces" else LOG_COLS
-          return "SELECT " + ", ".join(_ai_quote_ident(c) for c in cols) + " FROM " + table
+          return "SELECT " + _ai_projection(table, cols) + " FROM " + table
 
 
       def _ai_fenced_scan(ctx, cfg, fence):
@@ -4526,7 +4540,7 @@ configs:
           if table == "opentelemetry_traces":
               ors = [" OR ".join(_ai_quote_ident(c) + " = " + str_lit(v)
                                  for c in AI_SPAN_SESSION_COLS) for v in seen]
-              return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in SPAN_COLS) +
+              return ("SELECT " + _ai_projection(table, SPAN_COLS) +
                       " FROM " + table + " WHERE " +
                       " OR ".join("(" + o + ")" for o in ors))
           # GreptimeDB 1.2.1 native JSONB: json_get_string(log_attributes,
@@ -4537,7 +4551,7 @@ configs:
                   "json_get_string(log_attributes, '$$.\"" +
                   c.replace('"', '""').replace("'", "''") + "\"') = " + str_lit(v)
                   for c in AI_LOG_SESSION_COLS))
-          return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in LOG_COLS) +
+          return ("SELECT " + _ai_projection(table, LOG_COLS) +
                   " FROM " + table + " WHERE " +
                   " OR ".join("(" + o + ")" for o in ors))
 
@@ -4577,7 +4591,7 @@ configs:
       def _ai_day_pred(table, cols, day, nxt):
           names = [];
           [names.append(c) for c in cols if c not in names]
-          return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in names) +
+          return ("SELECT " + _ai_projection(table, names) +
                   " FROM " + table + " WHERE timestamp >= " + ts_lit(day) +
                   " AND timestamp < " + ts_lit(nxt))
 
@@ -4627,9 +4641,22 @@ configs:
 
 
       def ai_section(ctx, cfg):
-          if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
-              return _ai_incremental(ctx, cfg)
-          return _ai_full(ctx, cfg)
+          try:
+              if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
+                  return _ai_incremental(ctx, cfg)
+              return _ai_full(ctx, cfg)
+          except Exception as exc:
+              if type(exc).__name__ != "RowCapExceeded" and not (
+                      isinstance(exc, SqlError) and "row cap exceeded" in str(exc)):
+                  raise
+          # Leave the exception scope before recovery so its failed-query buffers
+          # are released instead of remaining live through the disk-backed pass.
+          tables = _ai_metric_tables(ctx, cfg)
+          if tables is None:
+              raise SqlError("AI recovery metric registry unavailable")
+          prices = load_price_table()
+          return _ai_fenced_full(ctx, cfg, json.dumps(sorted(tables), sort_keys=True,
+                                 default=str), _ai_price_digest(prices), prices)
 
 
       def _ai_full(ctx, cfg, snapshot=None):
@@ -4638,13 +4665,11 @@ configs:
           if snapshot is None:
               cols, rows = guarded_fetch(
                   base_url, auth, db,
-                  "SELECT " + ", ".join('"' + c + '"' for c in SPAN_COLS) +
-                  " FROM opentelemetry_traces", cfg["max_rows"])
+                  _ai_table_sql("opentelemetry_traces"), cfg["max_rows"])
               try:
                   lcols, lrows = guarded_fetch(
                       base_url, auth, db,
-                      "SELECT " + ", ".join('"' + c + '"' for c in LOG_COLS) +
-                      " FROM opentelemetry_logs", cfg["max_rows"])
+                      _ai_table_sql("opentelemetry_logs"), cfg["max_rows"])
               except SqlError as e:
                   if not is_missing_table(e):
                       raise
@@ -4896,31 +4921,10 @@ configs:
           return out
 
       def _ai_fenced_full(ctx, cfg, metric_registry, price_digest, prices):
-          """Explicit full recovery: unfenced snapshot + upper fence commit."""
-          _ = prices
-          try:
-              frames, upper = _ai_fenced_scan(ctx, cfg, None)
-          except Exception as exc:
-              if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
-                  total = _ai_full(ctx, cfg)
-                  _ai_commit_state(ctx, "", metric_registry, price_digest)
-                  return total
-              raise
-          try:
-              metric_rows, upper = _ai_delta_metrics(
-                  ctx, cfg, json.loads(metric_registry), None, upper)
-              if len(metric_rows) > cfg["max_rows"]:
-                  raise SqlError("activity metric row cap exceeded: refusing partial write")
-          except Exception as exc:
-              if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
-                  total = _ai_full(ctx, cfg)
-                  _ai_commit_state(ctx, "", metric_registry, price_digest)
-                  return total
-              raise
-          total = _ai_full(ctx, cfg, snapshot=(frames, metric_rows))
-          _ai_commit_state(ctx, _ai_encode_fence(upper), metric_registry,
-                           price_digest)
-          return total
+          """Complete disk-backed recovery; publish upper only after every write."""
+          from scripts.analytics.ai_recovery import recover
+          return recover(sys.modules[__name__], ctx, cfg, metric_registry,
+                         price_digest, prices)
 
 
 
@@ -5319,12 +5323,17 @@ configs:
 
 
       def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
-                    commit=None, dirty_days=None):
+                    commit=None, dirty_days=None, computed=None):
           base_url, auth, db = ctx
           ttl = cfg.get("otel_ttl", "")
           total = 0
-          _, old_rows = guarded_fetch(base_url, auth, db,
-              "SELECT client, session_id, session_start FROM ai_session_summary", cfg["max_rows"])
+          old_rows = []
+          if sessions:
+              predicates = ["(client = " + str_lit(client) + " AND session_id = " +
+                            str_lit(sid) + ")" for client, sid in sessions]
+              _, old_rows = guarded_fetch(base_url, auth, db,
+                  "SELECT client, session_id, session_start FROM ai_session_summary WHERE " +
+                  " OR ".join(predicates), cfg["max_rows"])
           expired = {(client, sid) for client, sid, start in old_rows
                      if not fully_retained(parse_ts(start), ttl, now, bound)}
           session_cols = ["session_start", "session_id", "client", "provider", "models",
@@ -5383,7 +5392,7 @@ configs:
                            "cost_estimated_usd", "cost_unpriced_calls",
                            "llm_spans", "tool_calls", "active_sessions", "error_count"]
           daily_rows = []
-          for d in summarize_daily(spans, prices):
+          for d in (computed[0] if computed is not None else summarize_daily(spans, prices)):
               if dirty_days is not None and d["day"] not in dirty_days:
                   continue
               if bound and d["day"] < bound:
@@ -5402,7 +5411,7 @@ configs:
               total += len(daily_rows)
           tool_cols = ["day_start", "tool_name", "client", "calls", "errors", "avg_duration_ms"]
           tool_rows = []
-          for t in summarize_tools(spans):
+          for t in (computed[1] if computed is not None else summarize_tools(spans)):
               if dirty_days is not None and t["day"] not in dirty_days:
                   continue
               if bound and t["day"] < bound:
@@ -6645,7 +6654,7 @@ configs:
 
 
       def flight_query(sql, *, endpoint, db, user, password, lower=None,
-                       timeout=60, max_rows=200000, local_sst_only=None):
+                       timeout=60, max_rows=200000, local_sst_only=None, row_sink=None):
           """Run one fenced SQL query. Returns (cols, rows, upper).
 
           lower=None means an unfenced snapshot read (full data + upper
@@ -6660,7 +6669,16 @@ configs:
           local_sst_only=None reads AGG_LOCAL_SST_ONLY (exact 0/1). Strict mode
           wraps the same Ticket in datalake.local_sst_query.v1 and decodes each
           Result.body as original FlightData. It never retries ordinary DoGet.
+
+          row_sink(cols, rows), when supplied, consumes bounded decoded chunks
+          instead of materializing a whole result. max_rows then bounds each
+          chunk, not the retained snapshot. Network EOF and terminal watermarks
+          are proved before the first callback; the caller must not publish a
+          checkpoint until this function returns (IPC decoding or the sink can
+          still fail). Sink exceptions propagate unchanged.
           """
+          if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
+              raise ValueError("max_rows must be a positive integer")
           if local_sst_only is None:
               local_sst_only = local_sst_only_enabled()
           if not isinstance(local_sst_only, bool):
@@ -6778,19 +6796,40 @@ configs:
                   try:
                       reader = pa.ipc.open_stream(stream_file)
                       schema = reader.schema
-                      batches = []
-                      for batch in reader:
-                          total_rows += batch.num_rows
-                          if total_rows > max_rows:
-                              raise RowCapExceeded(
-                                  "row cap exceeded (> %d): refusing partial write"
-                                  % max_rows)
-                          batches.append(batch)
-                      table = pa.Table.from_batches(batches, schema=schema)
-                  except FlightError:
-                      raise
                   except Exception as exc:
                       raise FlightError("ipc decode failed: " + str(exc)[:200])
+                  cols = list(schema.names)
+                  rows = []
+                  while True:
+                      try:
+                          batch = next(reader)
+                      except StopIteration:
+                          break
+                      except Exception as exc:
+                          raise FlightError("ipc decode failed: " + str(exc)[:200])
+                      total_rows += batch.num_rows
+                      if row_sink is None and total_rows > max_rows:
+                          raise RowCapExceeded(
+                              "row cap exceeded (> %d): refusing partial write"
+                              % max_rows)
+                      for start in range(0, batch.num_rows, max_rows):
+                          piece = batch.slice(start, max_rows)
+                          columns = []
+                          for i, field in enumerate(schema):
+                              try:
+                                  column = piece.column(i)
+                                  if pa.types.is_timestamp(field.type):
+                                      column = column.cast(
+                                          pa.timestamp("ns", tz=field.type.tz)).cast(pa.int64())
+                                  columns.append(column.to_pylist())
+                              except Exception as exc:
+                                  raise FlightError("column decode failed (%s): %s"
+                                                    % (field.name, str(exc)[:150]))
+                          chunk = [list(r) for r in zip(*columns)] if columns else []
+                          if row_sink is None:
+                              rows.extend(chunk)
+                          else:
+                              row_sink(cols, chunk)
               except FlightError:
                   raise
               except grpc.RpcError as exc:
@@ -6803,21 +6842,6 @@ configs:
                       raise StaleFence("fence below flushed frontier: "
                                        + detail[:200])
                   raise FlightError("flight DoGet failed: " + detail[:200])
-              cols = list(schema.names)
-              columns = []
-              for i, field in enumerate(schema):
-                  try:
-                      if pa.types.is_timestamp(field.type):
-                          # Exact int64 ns: to_pylist on datetimes truncates to us.
-                          columns.append(
-                              table.column(i).cast(pa.timestamp("ns", tz=field.type.tz))
-                              .cast(pa.int64()).to_pylist())
-                      else:
-                          columns.append(table.column(i).to_pylist())
-                  except Exception as exc:
-                      raise FlightError("column decode failed (%s): %s"
-                                        % (field.name, str(exc)[:150]))
-              rows = [list(r) for r in zip(*columns)] if columns else []
               return cols, rows, upper
           finally:
               if stream_file is not None:
@@ -6827,13 +6851,376 @@ configs:
                       channel.close()
               except Exception:
                   pass
+  ai-recovery-script:
+    content: |
+      """Disk-backed complete AI recovery; no retained-history Python collections."""
+      import io
+      import pickle
+      import sqlite3
+      import tempfile
+
+
+      def packed(value):
+          buffer = io.BytesIO()
+          pickler = pickle.Pickler(buffer, protocol=5)
+          # Value identities must not depend on object-alias memoization.
+          pickler.fast = True
+          pickler.dump(value)
+          return buffer.getvalue()
+
+
+      class Recovery:
+          def __init__(self, aggregate, limit):
+              self.a = aggregate
+              self.limit = limit
+              self.directory = tempfile.TemporaryDirectory(prefix="ai-recovery-")
+              self.db = sqlite3.connect(self.directory.name + "/snapshot.sqlite")
+              self.db.execute("PRAGMA cache_size=-8192")
+              self.db.execute("PRAGMA temp_store=FILE")
+              self.db.executescript("""
+                  CREATE TABLE raw (kind TEXT, ordinal INTEGER PRIMARY KEY, payload BLOB);
+                  CREATE INDEX raw_kind ON raw(kind, ordinal);
+                  CREATE TABLE spans (ordinal INTEGER PRIMARY KEY, identity BLOB UNIQUE,
+                      payload BLOB, trace BLOB, span BLOB, parent BLOB, scope BLOB,
+                      call BLOB, turn BLOB, billed INTEGER, money INTEGER DEFAULT 1,
+                      tool INTEGER DEFAULT 0, phase INTEGER DEFAULT 0);
+                  CREATE INDEX span_parent ON spans(trace,parent);
+                  CREATE INDEX span_scope ON spans(scope);
+                  CREATE INDEX span_call ON spans(call);
+                  CREATE INDEX span_turn ON spans(turn);
+                  CREATE TABLE logs (ordinal INTEGER PRIMARY KEY, identity BLOB UNIQUE,
+                      payload BLOB, call BLOB);
+                  CREATE INDEX log_call ON logs(call);
+                  CREATE TABLE winners (kind TEXT, identity BLOB, ordinal INTEGER,
+                      PRIMARY KEY(kind,identity));
+                  CREATE TABLE output (kind TEXT, identity BLOB, payload BLOB,
+                      PRIMARY KEY(kind,identity));
+              """)
+
+          def close(self):
+              self.db.close()
+              self.directory.cleanup()
+
+          def raw_rows(self, kind):
+              for (payload,) in self.db.execute(
+                      "SELECT payload FROM raw WHERE kind=? ORDER BY ordinal", (kind,)):
+                  yield pickle.loads(payload)
+
+          def sink(self, kind, instrument=None, meta=None):
+              a = self.a
+
+              def consume(cols, rows):
+                  rows = a._ai_flight_ns_rows(kind, cols, rows)
+                  for values in rows:
+                      raw = dict(zip(cols, values))
+                      if instrument is not None:
+                          raw = a._ai_norm_metric_row(raw, instrument, meta)
+                          if raw is None:
+                              continue
+                          self.db.execute("INSERT INTO raw(kind,payload) VALUES('metric',?)", (packed(raw),))
+                      else:
+                          self.db.execute("INSERT INTO raw(kind,payload) VALUES(?,?)", (kind, packed(raw)))
+                          if kind == "opentelemetry_traces":
+                              identity = (raw.get("trace_id"), raw.get("span_id"))
+                              if identity == (None, None):
+                                  identity = (None, None, self.db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                              self.add_span(a.norm_span(raw), packed(identity))
+                          else:
+                              rec = a.norm_log(raw)
+                              if rec is None:
+                                  continue
+                              attrs = a.attrs_of(raw)
+                              if rec.get("turn_total") and rec.get("turn") is not None:
+                                  identity = (rec["native"], rec["client"], rec["session"], rec["turn"])
+                              elif rec["call_id"]:
+                                  identity = (rec["native"], rec["client"], rec["session"], rec["call_id"])
+                              else:
+                                  identity = (rec["client"], attrs.get("event.name") or rec["native"],
+                                              rec["ts"], rec["session"], rec["seq"])
+                              call = self.call(rec) if rec.get("native") not in ("tool", "codex_cost") else None
+                              self.db.execute("INSERT OR IGNORE INTO logs(identity,payload,call) VALUES(?,?,?)",
+                                              (packed(identity), packed(rec), call))
+                  self.db.commit()
+              return consume
+
+          @staticmethod
+          def call(row):
+              return packed((row.get("client"), row.get("session"), row["call_id"])) if row.get("call_id") else None
+
+          def add_span(self, row, identity=None):
+              self.db.execute("""INSERT OR IGNORE INTO spans
+                  (identity,payload,trace,span,parent,scope,call,turn,billed)
+                  VALUES(?,?,?,?,?,?,?,?,?)""", (
+                      identity, packed(row), packed(row.get("trace")), packed(row.get("span")),
+                      packed(row.get("parent")), packed((row.get("client"), row.get("session"))),
+                      self.call(row), packed((row.get("client"), row.get("session"), row.get("turn"))),
+                      int(bool(row.get("has_usage") and not self.a.is_rollup_op(row.get("op"))))))
+
+          def rows(self, sql="SELECT ordinal,payload FROM spans ORDER BY phase,ordinal", args=()):
+              for ordinal, payload in self.db.execute(sql, args):
+                  yield ordinal, pickle.loads(payload)
+
+          def parent_filter(self):
+              a = self.a
+              # Parent decisions use all original children, not recursively filtered children.
+              for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
+                  if row.get("trace") is None or row.get("input") is None or row.get("output") is None:
+                      continue
+                  count, inp, out, complete = 0, 0, 0, True
+                  for _, child in self.rows("SELECT ordinal,payload FROM spans WHERE trace=? AND parent=? ORDER BY ordinal",
+                                            (packed(row["trace"]), packed(row["span"]))):
+                      if not child.get("parent") or not child["has_usage"] or a.is_rollup_op(child["op"]):
+                          continue
+                      count += 1
+                      if child["input"] is None or child["output"] is None:
+                          complete = False
+                      else:
+                          inp += child["input"]
+                          out += child["output"]
+                  if count and complete and row["input"] == inp and row["output"] == out:
+                      self.db.execute("UPDATE spans SET billed=0 WHERE ordinal=?", (ordinal,))
+
+          def prepare(self):
+              a = self.a
+              self.parent_filter()
+              # billable() before native merge also applies native-sourced span precedence.
+              self.native_filter()
+              self.db.execute("UPDATE spans SET phase=1 WHERE billed=1")
+              for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
+                  call = self.call(row)
+                  if call is None:
+                      continue
+                  hit = self.db.execute("SELECT payload FROM logs WHERE call=? ORDER BY ordinal LIMIT 1", (call,)).fetchone()
+                  if hit is None:
+                      continue
+                  first = self.db.execute("INSERT OR IGNORE INTO winners VALUES('merge',?,?)", (call, ordinal)).rowcount
+                  if not first:
+                      self.db.execute("DELETE FROM spans WHERE ordinal=?", (ordinal,))
+                      continue
+                  merged = a._override_span(row, pickle.loads(hit[0]))
+                  self.db.execute("UPDATE spans SET payload=?,scope=?,call=?,turn=? WHERE ordinal=?",
+                                  (packed(merged), packed((merged.get("client"), merged.get("session"))),
+                                   self.call(merged), packed((merged.get("client"), merged.get("session"),
+                                                            merged.get("turn"))), ordinal))
+              for _, payload, call in self.db.execute("SELECT ordinal,payload,call FROM logs ORDER BY ordinal"):
+                  if call is not None and self.db.execute(
+                          "SELECT 1 FROM winners WHERE kind='merge' AND identity=?", (call,)).fetchone():
+                      continue
+                  log = pickle.loads(payload)
+                  self.add_span(a._native_row(log))
+                  self.db.execute("UPDATE spans SET phase=? WHERE ordinal=last_insert_rowid()",
+                                  (3 if log.get("native") == "tool" else 2,))
+              # Re-evaluate the post-merge billing rules exactly as the summary oracle does.
+              self.db.execute("UPDATE spans SET billed=0")
+              for ordinal, row in self.rows():
+                  if row.get("has_usage") and not a.is_rollup_op(row.get("op")):
+                      self.db.execute("UPDATE spans SET billed=1 WHERE ordinal=?", (ordinal,))
+              self.parent_filter()
+              self.native_filter()
+              for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY phase,ordinal"):
+                  if row.get("turn_total") and all((row.get("client"), row.get("session"), row.get("turn"))):
+                      self.db.execute("INSERT OR IGNORE INTO winners VALUES('turn',?,?)", (packed((row["client"], row["session"], row["turn"])), ordinal))
+              self.db.execute("""UPDATE spans SET money=0 WHERE billed=1 AND EXISTS
+                  (SELECT 1 FROM winners w WHERE w.kind='turn' AND w.identity=spans.turn AND w.ordinal!=spans.ordinal)""")
+              for ordinal, row in self.rows():
+                  if not row.get("tool"):
+                      continue
+                  identity = packed((row.get("client"), row.get("session"), row["call_id"])) if row.get("call_id") else packed(("anonymous", ordinal))
+                  hit = self.db.execute("SELECT ordinal FROM winners WHERE kind='tool' AND identity=?", (identity,)).fetchone()
+                  if hit is None:
+                      self.db.execute("INSERT INTO winners VALUES('tool',?,?)", (identity, ordinal))
+                      self.db.execute("UPDATE spans SET tool=1 WHERE ordinal=?", (ordinal,))
+                  else:
+                      first = self.db.execute("SELECT payload FROM spans WHERE ordinal=?", hit).fetchone()
+                      kept = pickle.loads(first[0])
+                      for field in ("tool", "session", "client", "provider", "model", "duration_ms"):
+                          if kept.get(field) is None and row.get(field) is not None:
+                              kept[field] = row[field]
+                      kept["error"] = bool(kept.get("error") or row.get("error"))
+                      self.db.execute("UPDATE spans SET payload=? WHERE ordinal=?", (packed(kept), hit[0]))
+              self.db.commit()
+
+          def native_filter(self):
+              for _, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
+                  if row.get("client") and row.get("session") and row.get("billed_source") == "native" and (row.get("input") is not None or row.get("output") is not None):
+                      self.db.execute("INSERT OR IGNORE INTO winners VALUES('native',?,0)", (packed((row["client"], row["session"])),))
+              for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
+                  if row.get("billed_source") != "native" and self.db.execute(
+                          "SELECT 1 FROM winners WHERE kind='native' AND identity=?", (packed((row.get("client"), row.get("session"))),)).fetchone():
+                      self.db.execute("UPDATE spans SET billed=0 WHERE ordinal=?", (ordinal,))
+              self.db.execute("DELETE FROM winners WHERE kind='native'")
+
+          def save(self, kind, key, value):
+              self.db.execute("INSERT INTO output VALUES(?,?,?) ON CONFLICT(kind,identity) DO UPDATE SET payload=excluded.payload", (kind, packed(key), packed(value)))
+
+          def outputs(self, kind):
+              for identity, payload in self.db.execute("SELECT identity,payload FROM output WHERE kind=? ORDER BY rowid", (kind,)):
+                  yield pickle.loads(identity), pickle.loads(payload)
+
+          def reduce(self, prices):
+              a = self.a
+              self.db.execute("CREATE TABLE distincts(kind TEXT, identity BLOB, value BLOB, PRIMARY KEY(kind,identity,value))")
+              additive = ("input", "output", "cache_read", "cache_write", "reasoning", "total", "cost", "llm_spans", "tool_calls", "errors", "cost_estimated_usd", "cost_unpriced_calls")
+
+              def bump(kind, key, row, billed, money, tool):
+                  identity = packed(key)
+                  hit = self.db.execute("SELECT payload FROM output WHERE kind=? AND identity=?", (kind, identity)).fetchone()
+                  if hit is None:
+                      state = {field: None for field in additive}
+                      if prices is not None:
+                          state["cost_unpriced_calls"] = 0
+                      state.update({"provider": None, "session_start": None, "session_end": None})
+                  else:
+                      state = pickle.loads(hit[0])
+                  start = a.parse_ts(row["ts"])
+                  end = a.parse_ts(row["end"] or row["ts"])
+                  if start is not None:
+                      state["session_start"] = min(state["session_start"], start) if state["session_start"] is not None else start
+                  if end is not None:
+                      state["session_end"] = max(state["session_end"], end) if state["session_end"] is not None else end
+                  if state["provider"] is None and row["provider"]:
+                      state["provider"] = row["provider"]
+                  def add(field, value):
+                      if value is not None:
+                          state[field] = (state[field] or 0) + value
+                  if billed:
+                      for field in ("input", "output", "cache_read", "cache_write", "reasoning"):
+                          add(field, row[field])
+                      if row["input"] is not None or row["output"] is not None:
+                          add("total", (row["input"] or 0) + (row["output"] or 0))
+                          add("llm_spans", 1)
+                      if money:
+                          cost, source = a.resolve_cost(row)
+                          add("cost", cost)
+                          if source:
+                              self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "cost", identity, packed(source)))
+                          est, unpriced = a._supplemental([row], {id(row)}, prices)
+                          add("cost_estimated_usd", est)
+                          add("cost_unpriced_calls", unpriced)
+                  if tool:
+                      add("tool_calls", 1)
+                  if row["error"] and (not row.get("tool") or tool):
+                      add("errors", 1)
+                  if row.get("model"):
+                      self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "model", identity, packed(row["model"])))
+                  if row.get("session"):
+                      self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "session", identity, packed(row["session"])))
+                  self.save(kind, key, state)
+
+              for ordinal, row in self.rows():
+                  billed, money, tool = self.db.execute("SELECT billed,money,tool FROM spans WHERE ordinal=?", (ordinal,)).fetchone()
+                  day = a._ai_day_of(row)
+                  if row.get("session"):
+                      bump("session", (row["client"] or "unknown", row["session"]), row, billed, money, tool)
+                  if day is not None:
+                      bump("daily", (day, row["client"] or "unknown", row["provider"] or "unknown", row["model"] or "unknown"), row, billed, money, tool)
+                      if tool:
+                          key = (day, row["tool"], row["client"] or "unknown")
+                          hit = self.db.execute("SELECT payload FROM output WHERE kind='tool' AND identity=?", (packed(key),)).fetchone()
+                          state = pickle.loads(hit[0]) if hit else {"day": day, "tool": key[1], "client": key[2], "calls": 0, "errors": None, "duration": 0, "durations": 0}
+                          state["calls"] += 1
+                          if row["error"]:
+                              state["errors"] = (state["errors"] or 0) + 1
+                          if row["duration_ms"] is not None:
+                              state["duration"] += row["duration_ms"]
+                              state["durations"] += 1
+                          self.save("tool", key, state)
+              for kind in ("session", "daily"):
+                  for key, state in self.outputs(kind):
+                      identity = packed(key)
+                      sources = [pickle.loads(r[0]) for r in self.db.execute("SELECT value FROM distincts WHERE kind=? AND identity=? LIMIT 2", (kind + "cost", identity))]
+                      state["cost_source"] = a.MIXED if len(sources) > 1 else sources[0] if sources else None
+                      if kind == "session":
+                          state.update(client=key[0], session_id=key[1])
+                          models = sorted(pickle.loads(r[0]) for r in self.db.execute("SELECT value FROM distincts WHERE kind=? AND identity=?", (kind + "model", identity)))
+                          state["models"] = models or None
+                          state["model_count"] = len(models) or None
+                          if state["session_start"] is not None and state["session_end"] is not None:
+                              state["duration_s"] = (state["session_end"] - state["session_start"]).total_seconds()
+                      else:
+                          state.update(day=key[0], client=key[1], provider=key[2], model=key[3])
+                          state["sessions"] = self.db.execute("SELECT COUNT(*) FROM distincts WHERE kind=? AND identity=?", (kind + "session", identity)).fetchone()[0] or None
+                      self.save(kind, key, state)
+              for key, state in self.outputs("tool"):
+                  state["avg_ms"] = state["duration"] / state["durations"] if state["durations"] else None
+                  self.save("tool", key, state)
+              self.db.commit()
+
+
+      def recover(a, ctx, cfg, metric_registry, price_digest, prices):
+          from scripts.telemetry.activity import summarize_activity_spooled
+          recovery = Recovery(a, cfg["max_rows"])
+          try:
+              flight = a._ai_flight()
+              if flight is None or not (cfg.get("grpc_url") or "").strip():
+                  raise a._ai_no_flight()
+              upper = {}
+              metas = a._ai_metric_metas(ctx)
+              sources = [(table, None) for table in a.AI_FENCE_TABLES] + list(a.json.loads(metric_registry))
+              for table, instrument in sources:
+                  sql = a._ai_table_sql(table) if instrument is None else 'SELECT * FROM "' + table.replace('"', '""') + '"'
+                  _, _, marks = flight.flight_query(
+                      sql, endpoint=cfg["grpc_url"], db=ctx[2],
+                      user=cfg.get("user") or "", password=cfg.get("password") or "",
+                      lower=None, max_rows=cfg["max_rows"],
+                      row_sink=recovery.sink(table, instrument, (metas or {}).get(table)))
+                  upper[table] = dict(marks)
+              recovery.prepare()
+              recovery.reduce(prices)
+              activity_sessions, activity_days = summarize_activity_spooled(
+                  recovery.raw_rows("opentelemetry_traces"),
+                  recovery.raw_rows("opentelemetry_logs"),
+                  recovery.raw_rows("metric"), recovery.db)
+              for key, activity in activity_sessions:
+                  hit = recovery.db.execute("SELECT payload FROM output WHERE kind='session' AND identity=?", (packed(key),)).fetchone()
+                  session = pickle.loads(hit[0]) if hit else {"client": key[0], "session_id": key[1]}
+                  starts = [v for v in (session.get("session_start"), activity.get("start")) if v is not None]
+                  ends = [v for v in (session.get("session_end"), activity.get("end")) if v is not None]
+                  if starts:
+                      session["session_start"] = min(starts)
+                  if ends:
+                      session["session_end"] = max(ends)
+                  if starts and ends:
+                      session["duration_s"] = (max(ends) - min(starts)).total_seconds()
+                  session.update({field: activity.get(field) for field in a.ACTIVITY_FIELDS})
+                  session.update({field: activity.get(field) for field in ("repo", "branch", "outcome", "activity_sources")})
+                  recovery.save("session", key, session)
+              for day in activity_days:
+                  recovery.save("activity", (day["day_start"], day["client"]), day)
+              now = a.utcnow()
+              bound = a.retention_boundary(ctx, "otel", cfg.get("otel_ttl", ""), now)
+              total = 0
+              batch_limit = min(500, cfg["max_rows"])
+              for kind in ("session", "activity", "daily", "tool"):
+                  batch = []
+                  for key, value in recovery.outputs(kind):
+                      if kind == "session" and value.get("session_start") is None:
+                          continue
+                      batch.append((key, value))
+                      if len(batch) == batch_limit:
+                          total += write_batch(a, ctx, cfg, prices, bound, now, kind, batch)
+                          batch = []
+                  if batch:
+                      total += write_batch(a, ctx, cfg, prices, bound, now, kind, batch)
+              a._ai_commit_state(ctx, a._ai_encode_fence(upper), metric_registry, price_digest)
+              return total
+          finally:
+              recovery.close()
+
+
+      def write_batch(a, ctx, cfg, prices, bound, now, kind, batch):
+          values = [value for _, value in batch]
+          return a._ai_write(ctx, cfg, dict(batch) if kind == "session" else {},
+                             values if kind == "activity" else [], [], prices, bound, now,
+                             computed=(values if kind == "daily" else [],
+                                       values if kind == "tool" else []))
   activity_py:
     content: |
       #!/usr/bin/env python3
-      """AI coding-activity normalization: pure functions, stdlib only.
+      """Stdlib AI coding-activity normalization, with optional SQLite scratch state.
 
       Accepts already-parsed naive UTC datetimes, raw trace/log fields and
-      normalized metric rows; all SQL/OTLP I/O lives elsewhere.
+      normalized metric rows; network SQL/OTLP I/O lives elsewhere.
 
       Key semantics:
       - Native Claude signals outrank OpenLIT per (client, session, field); never
@@ -6864,6 +7251,212 @@ configs:
       """
       import json
       from datetime import datetime, timedelta, timezone
+      import pickle
+      from collections.abc import MutableMapping, MutableSet
+
+
+      class _ActivityRaw:
+          def __init__(self, row):
+              self.row = row
+
+
+      class _ActivityStore:
+          """Disk containers for the oracle's mutable state; never retain raw history."""
+
+          def __init__(self, connection):
+              self.connection = connection
+              connection.execute("PRAGMA temp_store=FILE")
+              for statement in (
+                  "CREATE TABLE IF NOT EXISTS activity_nodes "
+                  "(id INTEGER PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0)",
+                  "CREATE TABLE IF NOT EXISTS activity_entries "
+                  "(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, hash INTEGER NOT NULL, "
+                  "key BLOB NOT NULL, value BLOB NOT NULL)",
+                  "CREATE INDEX IF NOT EXISTS activity_lookup ON activity_entries(owner, hash)",
+                  "CREATE INDEX IF NOT EXISTS activity_iteration ON activity_entries(owner, id)",
+                  "CREATE TABLE IF NOT EXISTS activity_sort "
+                  "(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, ordering TEXT, value BLOB)",
+                  "CREATE INDEX IF NOT EXISTS activity_sort_owner ON activity_sort(owner)",
+              ):
+                  connection.execute(statement)
+              def compare(left, right):
+                  left = pickle.loads(bytes.fromhex(left))
+                  right = pickle.loads(bytes.fromhex(right))
+                  return (left > right) - (left < right)
+
+              connection.create_collation("activity_order", compare)
+
+          def container(self, kind):
+              ident = self.connection.execute(
+                  "INSERT INTO activity_nodes DEFAULT VALUES RETURNING id").fetchone()[0]
+              return {"dict": _ActivityMap, "list": _ActivityList, "set": _ActivitySet}[kind](self, ident)
+
+          def pack(self, value):
+              if isinstance(value, (_ActivityMap, _ActivityList, _ActivitySet)):
+                  return ("ref", value.kind, value.ident)
+              if isinstance(value, (dict, list, set)):
+                  kind = {dict: "dict", list: "list", set: "set"}[type(value)]
+                  out = self.container(kind)
+                  if kind == "dict":
+                      out.update(value)
+                  elif kind == "list":
+                      out.extend(value)
+                  else:
+                      for item in value:
+                          out.add(item)
+                  return ("ref", kind, out.ident)
+              if isinstance(value, tuple):
+                  return ("tuple", tuple(self.pack(item) for item in value))
+              return ("value", value)
+
+          def unpack(self, value):
+              if value[0] == "ref":
+                  return {"dict": _ActivityMap, "list": _ActivityList,
+                          "set": _ActivitySet}[value[1]](self, value[2])
+              if value[0] == "tuple":
+                  return tuple(self.unpack(item) for item in value[1])
+              return value[1]
+
+          def sorted(self, values, key=None):
+              owner = self.connection.execute(
+                  "INSERT INTO activity_nodes DEFAULT VALUES RETURNING id").fetchone()[0]
+              cursor = None
+              try:
+                  for value in values:
+                      ordering = key(value) if key else value
+                      self.connection.execute(
+                          "INSERT INTO activity_sort(owner,ordering,value) VALUES (?, ?, ?)",
+                          (owner, pickle.dumps(ordering).hex(), pickle.dumps(self.pack(value))))
+                  cursor = self.connection.execute(
+                      "SELECT value FROM activity_sort WHERE owner=? "
+                      "ORDER BY ordering COLLATE activity_order, id", (owner,))
+                  for (value,) in cursor:
+                      yield self.unpack(pickle.loads(value))
+              finally:
+                  if cursor is not None:
+                      cursor.close()
+                  self.connection.execute("DELETE FROM activity_sort WHERE owner=?", (owner,))
+                  self.connection.execute("DELETE FROM activity_nodes WHERE id=?", (owner,))
+
+
+      class _ActivityMap(MutableMapping):
+          kind = "dict"
+
+          def __init__(self, store, ident):
+              self.store, self.ident = store, ident
+
+          def _entry(self, key):
+              for ident, candidate, value in self.store.connection.execute(
+                      "SELECT id, key, value FROM activity_entries WHERE owner=? AND hash=?",
+                      (self.ident, hash(key))):
+                  if pickle.loads(candidate) == key:
+                      return ident, value
+              raise KeyError(key)
+
+          def __getitem__(self, key):
+              return self.store.unpack(pickle.loads(self._entry(key)[1]))
+
+          def __setitem__(self, key, value):
+              value = pickle.dumps(self.store.pack(value))
+              try:
+                  ident, _ = self._entry(key)
+              except KeyError:
+                  self.store.connection.execute(
+                      "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",
+                      (self.ident, hash(key), pickle.dumps(key), value))
+              else:
+                  self.store.connection.execute(
+                      "UPDATE activity_entries SET value=? WHERE id=?", (value, ident))
+
+          def __delitem__(self, key):
+              ident, _ = self._entry(key)
+              self.store.connection.execute("DELETE FROM activity_entries WHERE id=?", (ident,))
+
+          def __iter__(self):
+              for (key,) in self.store.connection.execute(
+                      "SELECT key FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
+                  yield pickle.loads(key)
+
+          def __len__(self):
+              return self.store.connection.execute(
+                  "SELECT count(*) FROM activity_entries WHERE owner=?", (self.ident,)).fetchone()[0]
+
+          def __bool__(self):
+              return self.store.connection.execute(
+                  "SELECT 1 FROM activity_entries WHERE owner=? LIMIT 1", (self.ident,)).fetchone() is not None
+
+          def setdefault(self, key, default=None):
+              try:
+                  return self[key]
+              except KeyError:
+                  self[key] = default
+                  return self[key]
+
+
+      class _ActivityList(_ActivityMap):
+          kind = "list"
+
+          def __iter__(self):
+              for (value,) in self.store.connection.execute(
+                      "SELECT value FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
+                  yield self.store.unpack(pickle.loads(value))
+
+          def append(self, value):
+              index = self.store.connection.execute(
+                  "UPDATE activity_nodes SET next_index=next_index+1 WHERE id=? RETURNING next_index-1",
+                  (self.ident,)).fetchone()[0]
+              self[index] = value
+
+          def extend(self, values):
+              for value in values:
+                  self.append(value)
+
+
+
+      class _ActivitySet(_ActivityMap, MutableSet):
+          kind = "set"
+
+          def add(self, value):
+              self[value] = True
+
+          def discard(self, value):
+              try:
+                  del self[value]
+              except KeyError:
+                  pass
+
+
+      def _activity_plain(value):
+          if isinstance(value, _ActivityList):
+              return [_activity_plain(item) for item in value]
+          if isinstance(value, _ActivitySet):
+              return {_activity_plain(item) for item in value}
+          if isinstance(value, _ActivityMap):
+              return {key: _activity_plain(item) for key, item in value.items()}
+          return value
+
+
+      def summarize_activity_spooled(trace_rows, log_rows, metric_rows, connection):
+          """Return replayable session-items and daily iterables backed by connection.
+
+          The caller owns the on-disk SQLite connection and its lifetime. Internal
+          activity_* tables hold all history-sized state; only one source row, one
+          sorted item and one fixed-width output record are decoded at a time.
+          """
+          store = _ActivityStore(connection)
+          sessions, daily = _summarize_activity(trace_rows, log_rows, metric_rows, store)
+
+          class SessionItems:
+              def __iter__(self):
+                  for key, value in sessions.items():
+                      yield key, _activity_plain(value)
+
+          class Daily:
+              def __iter__(self):
+                  for value in daily:
+                      yield _activity_plain(value)
+
+          return SessionItems(), Daily()
 
       ACTIVITY_COUNT_FIELDS = (
           "subagents",
@@ -7165,19 +7758,23 @@ configs:
 
 
       def _merge_intervals(intervals):
-          ordered = sorted(intervals)
-          merged = []
+          ordered = (intervals.store.sorted(intervals)
+                     if isinstance(intervals, _ActivityList) else sorted(intervals))
+          current = None
           for start, end in ordered:
-              if merged and start <= merged[-1][1]:
-                  if end > merged[-1][1]:
-                      merged[-1][1] = end
+              if current is not None and start <= current[1]:
+                  current = (current[0], max(current[1], end))
               else:
-                  merged.append([start, end])
-          return [(s, e) for s, e in merged]
+                  if current is not None:
+                      yield current
+                  current = (start, end)
+          if current is not None:
+              yield current
 
 
       def _clip_union_by_day(intervals):
-          per_day = {}
+          per_day = (intervals.store.container("dict")
+                     if isinstance(intervals, _ActivityList) else {})
           for start, end in _merge_intervals(intervals):
               day = _day_start(start)
               cursor = start
@@ -7232,14 +7829,18 @@ configs:
 
 
       def _day_range(start_day, end_day):
-          # ponytail: intersected UTC days between two day-starts, inclusive, so
-          # a cross-midnight interval poisons intervening days too, not endpoints.
-          days = []
-          cursor = start_day
-          while cursor <= end_day:
-              days.append(cursor)
-              cursor = cursor + timedelta(days=1)
-          return days
+          """Replayable day range without allocating one entry per historical day."""
+          class Days:
+              def __bool__(self):
+                  return start_day <= end_day
+
+              def __iter__(self):
+                  cursor = start_day
+                  while cursor <= end_day:
+                      yield cursor
+                      cursor += timedelta(days=1)
+
+          return Days()
 
 
       def _csum_bump(session, bucket, field, delta_total, day, amount, prov, days):
@@ -7313,8 +7914,16 @@ configs:
           daily: list of dicts with day_start (naive UTC midnight), client, every
             count/value field and activity_sources.
           """
-          sessions = {}
-          wall_pool = {}
+          return _summarize_activity(trace_rows, log_rows, metric_rows)
+
+
+      def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
+          mapping = (lambda: store.container("dict")) if store else dict
+          sequence = (lambda: store.container("list")) if store else list
+          unique = (lambda: store.container("set")) if store else set
+          sort_rows = store.sorted if store else sorted
+          sessions = mapping()
+          wall_pool = mapping()
 
           def session_for(client, session_id):
               key = (client, session_id)
@@ -7322,12 +7931,13 @@ configs:
               if session is None:
                   session = _new_session(client, session_id)
                   sessions[key] = session
+                  session = sessions[key]
               return session
 
           # Traces: dedupe retransmitted/updated spans by identity, latest end wins.
           # Rows without trace/span IDs carry no stable identity, so they are
           # skipped rather than counted under an invented row-index identity.
-          deduped = {}
+          deduped = mapping()
           for row in trace_rows or []:
               if not isinstance(row, dict):
                   continue
@@ -7340,13 +7950,14 @@ configs:
               order = (end or ts or datetime.min, ts or datetime.min)
               key = (trace_id, span_id)
               if key not in deduped or order >= deduped[key][0]:
-                  deduped[key] = (order, row)
-          ordered_traces = [row for _, row in sorted(deduped.values(), key=lambda kv: kv[0])]
+                  deduped[key] = (order, _ActivityRaw(row))
+          ordered_traces = (row for _, row in sort_rows(deduped.values(), key=lambda kv: kv[0]))
 
-          subagent_spans = set()
-          commit_spans = set()
-          pr_spans = set()
+          subagent_spans = unique()
+          commit_spans = unique()
+          pr_spans = unique()
           for index, row in enumerate(ordered_traces):
+              row = row.row
               attrs = _span_attrs(row)
               client, session_id = _identity(attrs, row=row, hint=row.get("span_name"))
               if session_id is None:
@@ -7428,8 +8039,8 @@ configs:
                       session["branch"] = (order, str(branch))
 
           # Logs: subagent completions and Claude edit decisions with stable dedupe.
-          subagent_events = set()
-          decision_events = set()
+          subagent_events = unique()
+          decision_events = unique()
           for row in log_rows or []:
               if not isinstance(row, dict):
                   continue
@@ -7486,8 +8097,8 @@ configs:
           # Metrics: delta points are increments; cumulative points are differenced
           # per (stream, start_ns) in time order. Unknown temporality/start is
           # skipped, never guessed.
-          delta_points = {}
-          cumulative = {}
+          delta_points = mapping()
+          cumulative = mapping()
           for seq, row in enumerate(metric_rows or []):
               if not isinstance(row, dict):
                   continue
@@ -7587,7 +8198,7 @@ configs:
                   else:
                       _bump(session, bucket, field, day, value, prov)
 
-          for key, points in list(cumulative.items()):
+          for key, points in cumulative.items():
               if not isinstance(key, tuple) or len(key) != 5:
                   continue
               client, session_id, instrument, frozen, start_ns = key
@@ -7595,11 +8206,11 @@ configs:
               session = cumulative.get(key + ("session",))
               if not targets or session is None:
                   continue
-              latest = {}
+              latest = mapping()
               for ts, value, seq in points:
                   if ts not in latest or seq >= latest[ts][0]:
                       latest[ts] = (seq, value)
-              ordered = sorted(latest.items())
+              ordered = sort_rows(latest.items())
               try:
                   start_day = datetime.fromtimestamp(
                       start_ns // 1_000_000_000, timezone.utc).replace(tzinfo=None).date()
@@ -7648,9 +8259,9 @@ configs:
                       else:
                           _csum_bump(session, bucket, field, increment, day, increment, prov, poison_days)
 
-          out_sessions = {}
-          daily_cells = {}
-          global_poison = {}
+          out_sessions = mapping()
+          daily_cells = mapping()
+          global_poison = mapping()
           for session in sessions.values():
               for poison_key, days in session["cpoison"].items():
                   bucket, field = poison_key
@@ -7786,8 +8397,8 @@ configs:
                   entry[0] = seconds
                   entry[1].add(_WALL_SRC)
 
-          daily = []
-          for (client, day), cell in sorted(daily_cells.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+          daily = sequence()
+          for (client, day), cell in sort_rows(daily_cells.items(), key=lambda kv: (kv[0][0], kv[0][1])):
               record = {"day_start": day, "client": client}
               sources = {}
               for field in ACTIVITY_COUNT_FIELDS:

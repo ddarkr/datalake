@@ -66,7 +66,7 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.aggregate-revision: "31"
+      datalake.aggregate-revision: "32"
     depends_on:
       greptimedb:
         condition: service_started
@@ -113,6 +113,9 @@ services:
       - source: greptime_flight_py
         target: /app/scripts/database/greptime_flight.py
         mode: 0444
+      - source: ai-recovery-script
+        target: /app/scripts/analytics/ai_recovery.py
+        mode: 0444
       - source: activity_py
         target: /app/scripts/telemetry/activity.py
         mode: 0444
@@ -158,6 +161,8 @@ configs:
     x-source: scripts/analytics/aggregate.py
   greptime_flight_py:
     x-source: scripts/database/greptime_flight.py
+  ai-recovery-script:
+    x-source: scripts/analytics/ai_recovery.py
   activity_py:
     x-source: scripts/telemetry/activity.py
   battery_common_py:

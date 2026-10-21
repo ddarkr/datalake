@@ -258,8 +258,9 @@ def _select_cols(stmt):
         else:
             cur += ch
     parts.append(cur.strip())
+    names = [re.split(r"\s+AS\s+", p, flags=re.I)[-1].strip() for p in parts]
     cols = [p[1:-1] if len(p) > 1 and p.startswith('"') and p.endswith('"')
-            else p for p in parts]
+            else p for p in names]
     return cols, table
 
 
@@ -360,8 +361,13 @@ def route(stmt):
             return _records(["deleted_before"], rows)
         if "FROM ai_session_summary" in stmt:
             cols, _ = _select_cols(stmt)
-            rows = [[r.get(c) for c in cols]
-                    for r in F.derived["ai_session_summary"]]
+            selected = F.derived["ai_session_summary"]
+            if " WHERE " in stmt:
+                keys = {(client.replace("''", "'"), sid.replace("''", "'"))
+                        for client, sid in re.findall(
+                            r"\(client = '((?:''|[^'])*)' AND session_id = '((?:''|[^'])*)'\)", stmt)}
+                selected = [r for r in selected if (r.get("client"), r.get("session_id")) in keys]
+            rows = [[r.get(c) for c in cols] for r in selected]
             F.queries.append((stmt, len(rows)))
             return _records(cols, rows)
         for metric in [t for t, _ in F.catalog]:
@@ -591,7 +597,7 @@ def install_fence(fault_map=None):
     stub = type("flight", (), {"available": staticmethod(lambda: True)})
 
     def patched(sql_text, *, endpoint, db, user, password, lower=None,
-                timeout=60, max_rows=200000):
+                timeout=60, max_rows=200000, row_sink=None):
         if not (endpoint or "").strip():
             raise real_flight.FlightUnavailable("no grpc endpoint configured")
         store = FakeGreptime.store
@@ -604,13 +610,29 @@ def install_fence(fault_map=None):
                  else (logical or "metric"))
         fault = (fault_map or {}).get(table)
         cols, rows, upper = fake_fence(sql_text, store, lower, fault=fault)
-        if len(rows) > max_rows:
+        if fault == "native_jsonb":
+            # Native Flight exposes uncast JSONB as binary, not UTF-8
+            # JSON. The native JSON formatter returns ordinary JSON text.
+            for name in ("log_attributes", "resource_attributes"):
+                formatted = 'json_to_string("' + name + '") AS "' + name + '"'
+                if name in cols and formatted not in sql_text:
+                    index = cols.index(name)
+                    for row in rows:
+                        if row[index] is not None:
+                            row[index] = b"\x40JSONB" + str(row[index]).encode()
+        if row_sink is None and len(rows) > max_rows:
             raise real_flight.RowCapExceeded("row cap exceeded")
         log.append({"sql": sql_text[:160], "kind": "metric"
                     if logical and logical not in agg.AI_FENCE_TABLES
                     else "fence", "table": table,
                     "lower": json.dumps(lower, sort_keys=True, default=str),
                     "rows": len(rows), "upper": dict(upper)})
+        if row_sink is not None:
+            for offset in range(0, len(rows), max_rows):
+                row_sink(cols, rows[offset:offset + max_rows])
+                if fault == "sink_prefix":
+                    raise real_flight.FlightError("snapshot sink prefix failed")
+            return cols, [], upper
         return cols, rows, upper
 
     stub.flight_query = patched
@@ -725,8 +747,7 @@ def oracle_fresh(all_traces, all_logs, cfg, metric=None, preset=None):
             tables = agg._ai_metric_tables(ctx, cfg)
             registry = json.dumps(sorted(tables or []), sort_keys=True,
                                   default=str)
-            agg._ai_fenced_full(ctx, cfg, registry,
-                                agg._ai_price_digest(None), None)
+            agg._ai_full(ctx, cfg)
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1186,7 +1207,7 @@ def test_long_midnight_session_survives_incremental():
         _restore(saved)
 
 
-def test_max_rows_fail_closed_and_restart_converges():
+def test_max_rows_bounds_work_not_complete_snapshot():
     saved = _guard()
     real = install_fence()
     try:
@@ -1197,16 +1218,14 @@ def test_max_rows_fail_closed_and_restart_converges():
         srv = serve()
         try:
             ctx = _ctx(srv)
-            try:
-                seed_fenced(ctx, _cfg(max_rows=2))
-            except (agg.SqlError, real_flight.RowCapExceeded,
-                    real_flight.FlightError):
-                pass
-            else:
-                raise AssertionError("expected failure over the row cap")
-            assert FakeGreptime.state is None
-            assert FakeGreptime.derived["ai_session_summary"] == []
-            seed_fenced(ctx, _cfg())
+            seed_fenced(ctx, _cfg(max_rows=2))
+            require_fence()
+            assert FakeGreptime.derived["ai_session_summary"]
+            # The retained snapshot exceeds the work limit, but every
+            # row is consumed; the next pass is a true fenced no-op.
+            mark = len(FakeGreptime.flight_log)
+            agg.ai_section(ctx, _cfg(max_rows=2))
+            assert sum(f["rows"] for f in FakeGreptime.flight_log[mark:]) == 0
             second = snapshot()
         finally:
             srv.shutdown()
@@ -1625,7 +1644,7 @@ def test_stale_fence_below_frontier_recovers_to_oracle():
         _restore(saved)
 
 
-def test_missing_watermark_rebuilds_never_skips():
+def test_missing_watermark_fails_without_checkpoint():
     saved = _guard()
     real = install_fence({"opentelemetry_traces": "missing_watermark"})
     try:
@@ -1636,13 +1655,17 @@ def test_missing_watermark_rebuilds_never_skips():
         srv = serve()
         try:
             ctx, cfg = _ctx(srv), _cfg()
-            seed_fenced(ctx, cfg)
-            second = snapshot()
-            assert second["ai_session_summary"], "rebuild skipped"
+            try:
+                seed_fenced(ctx, cfg)
+            except real_flight.FlightUnavailable:
+                pass
+            else:
+                raise AssertionError("unproved snapshot must fail")
+            assert FakeGreptime.state is None
+            assert not FakeGreptime.derived["ai_session_summary"]
         finally:
             srv.shutdown()
             srv.server_close()
-        _assert_oracle(second, traces, logs, _cfg())
     finally:
         restore_fence(real)
         _restore(saved)
@@ -1821,6 +1844,145 @@ def test_missing_grpc_endpoint_rebuilds():
         _restore(saved)
 
 
+def test_bounded_long_session_prefix_failure_and_late_retry():
+    saved = _guard()
+    faults = {"opentelemetry_traces": None}
+    real = install_fence(faults)
+    try:
+        traces, logs = base_history()
+        long_rows = [span(DAY1 + dt.timedelta(hours=23, minutes=i),
+                          "long-trace", "long-%d" % i, "long-session",
+                          "codex", i + 1, 2, call="long-call-%d" % i)
+                     for i in range(13)]
+        traces += long_rows + [dict(long_rows[0])]
+        _reset()
+        FakeGreptime.store.append("traces", traces)
+        FakeGreptime.store.append("logs", logs)
+        srv = serve()
+        try:
+            ctx, cfg = _ctx(srv), _cfg(max_rows=2)
+            agg.ai_section(ctx, cfg)
+            before = snapshot()
+            _, checkpoint = require_fence()
+            # A committed late row makes scoped history exceed the same
+            # tiny limit; recovery still must consume the complete session.
+            late = span(DAY2 + dt.timedelta(hours=3), "long-trace", "late",
+                        "long-session", "codex", 31, 7, call="late-call")
+            FakeGreptime.store.append("traces", [late])
+            faults["opentelemetry_traces"] = "sink_prefix"
+            try:
+                agg.ai_section(ctx, cfg)
+            except real_flight.FlightError as exc:
+                assert "prefix failed" in str(exc)
+            else:
+                raise AssertionError("expected prefix failure")
+            assert require_fence()[1] == checkpoint
+            assert snapshot() == before
+            faults["opentelemetry_traces"] = None
+            agg.ai_section(ctx, cfg)
+            result = snapshot()
+            mark = len(FakeGreptime.flight_log)
+            agg.ai_section(ctx, cfg)
+            assert sum(f["rows"] for f in FakeGreptime.flight_log[mark:]) == 0
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        _assert_oracle(result, traces + [late], logs, _cfg())
+    finally:
+        restore_fence(real)
+        _restore(saved)
+
+
+def test_disk_reducer_matches_global_merge_oracle_across_chunks():
+    from scripts.analytics.ai_recovery import Recovery
+    traces, logs = base_history()
+    parent = span(DAY1, "parent-trace", "parent", "parent-session",
+                  "codex", 9, 3, call="parent-call")
+    children = [span(DAY1, "parent-trace", "child-%d" % i, "parent-session",
+                     "codex", value, 1, call="child-call-%d" % i)
+                for i, value in enumerate((2, 3, 4))]
+    for child in children:
+        child["parent_span_id"] = "parent"
+    traces += [parent] + children + [dict(children[0])]
+    traces += [span(DAY1, None, None, None, None, 7, 1),
+               span(DAY1, None, None, None, None, 7, 1)]
+    usage = clog(DAY2, "parent-session", "codex", "child-call-0", 20, 4)
+    attrs = json.loads(usage["log_attributes"])
+    attrs["turn.id"] = "native-filled-turn"
+    usage["log_attributes"] = json.dumps(attrs)
+    receipt = dict(usage)
+    receipt["log_attributes"] = json.dumps({
+        "event.name": "codex.turn_cost", "session.id": "parent-session",
+        "turn.id": "native-filled-turn", "usage.estimated_usd": 0.75})
+    logs += [usage, receipt, dict(receipt)]
+    cols, lcols = list(agg.SPAN_COLS), list(agg.LOG_COLS)
+    rows = [[row.get(c) for c in cols] for row in traces]
+    lrows = [[row.get(c) for c in lcols] for row in logs]
+    for prices in (None, {}):
+        recovery = Recovery(agg, 2)
+        try:
+            for offset in range(0, len(rows), 2):
+                recovery.sink("opentelemetry_traces")(cols, rows[offset:offset + 2])
+            for offset in range(0, len(lrows), 2):
+                recovery.sink("opentelemetry_logs")(lcols, lrows[offset:offset + 2])
+            recovery.prepare()
+            recovery.reduce(prices)
+            merged = agg._ai_merge(cols, rows, agg.dedupe_logs(lcols, lrows))
+            expected = {
+                "session": [((r["client"], r["session_id"]), r)
+                            for r in agg.summarize_sessions(merged, prices)],
+                "daily": [((r["day"], r["client"], r["provider"], r["model"]), r)
+                          for r in agg.summarize_daily(merged, prices)],
+                "tool": [((r["day"], r["tool"], r["client"]), r)
+                         for r in agg.summarize_tools(merged)]}
+            for kind, records in expected.items():
+                actual = dict(recovery.outputs(kind))
+                assert set(actual) == {key for key, _ in records}, kind
+                for key, oracle in records:
+                    assert {field: actual[key].get(field) for field in oracle} == oracle, (
+                        kind, key, actual[key], oracle)
+        finally:
+            recovery.close()
+
+
+def test_native_jsonb_projection_preserves_log_only_sessions():
+    saved = _guard()
+    real = install_fence({"opentelemetry_logs": "native_jsonb"})
+    try:
+        traces, logs = base_history()
+        log_only = clog(DAY2, "jsonb-log-only", "codex", "jsonb-call", 40, 20)
+        logs += [log_only]
+        _reset()
+        FakeGreptime.store.append("traces", traces)
+        FakeGreptime.store.append("logs", logs)
+        srv = serve()
+        try:
+            ctx, cfg = _ctx(srv), _cfg(max_rows=2)
+            agg.ai_section(ctx, cfg)
+            assert _session_input("jsonb-log-only", "codex") == (40, 20)
+            late = clog(DAY2, "jsonb-late", "codex", "jsonb-late-call", 9, 3)
+            FakeGreptime.store.append("logs", [late])
+            agg.ai_section(ctx, cfg)
+            assert _session_input("jsonb-late", "codex") == (9, 3)
+            # A valid old cursor still needs one complete logic cutover:
+            # no new raw commits are needed to recover formerly dropped logs.
+            FakeGreptime.state["rev"] = "ai:fence-v1"
+            FakeGreptime.derived["ai_session_summary"] = [
+                row for row in FakeGreptime.derived["ai_session_summary"]
+                if row.get("session_id") != "jsonb-log-only"]
+            agg.ai_section(ctx, cfg)
+            assert _session_input("jsonb-log-only", "codex") == (40, 20)
+            assert FakeGreptime.state["rev"] == "ai:fence-v2"
+            result = snapshot()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        _assert_oracle(result, traces, logs + [late], _cfg())
+    finally:
+        restore_fence(real)
+        _restore(saved)
+
+
 TESTS = (
     test_fresh_bootstrap_commits_fence_on_first_pass,
     test_fenced_late_arrival_matches_full_oracle,
@@ -1831,7 +1993,10 @@ TESTS = (
     test_duplicate_redelivery_bills_once,
     test_late_native_replaces_trace_cost,
     test_long_midnight_session_survives_incremental,
-    test_max_rows_fail_closed_and_restart_converges,
+    test_max_rows_bounds_work_not_complete_snapshot,
+    test_bounded_long_session_prefix_failure_and_late_retry,
+    test_native_jsonb_projection_preserves_log_only_sessions,
+    test_disk_reducer_matches_global_merge_oracle_across_chunks,
     test_partial_write_failure_keeps_fence_and_converges,
     test_ttl_partial_expiry_preserves_stored_derived,
     test_price_change_rebuilds_cost_cells,
@@ -1840,7 +2005,7 @@ TESTS = (
     test_metric_only_counter_delta_preserved,
     test_sessionless_rows_reach_daily_output,
     test_stale_fence_below_frontier_recovers_to_oracle,
-    test_missing_watermark_rebuilds_never_skips,
+    test_missing_watermark_fails_without_checkpoint,
     test_post_eof_fault_fails_closed_no_checkpoint,
     test_zero_seq_and_new_region_recovery,
     test_missing_grpc_endpoint_rebuilds,

@@ -2,6 +2,10 @@
 import os
 import unittest
 from datetime import datetime
+import pickle
+import sqlite3
+import tempfile
+from datetime import timedelta
 
 from scripts.telemetry import activity as act
 
@@ -490,6 +494,105 @@ class SpanEventTest(unittest.TestCase):
         for field in act.ACTIVITY_COUNT_FIELDS + act.ACTIVITY_VALUE_FIELDS:
             if field != "session_wall_seconds":
                 self.assertIsNone(rec[field], field)
+
+
+class SpooledActivityTest(unittest.TestCase):
+    def compare(self, traces=(), logs=(), metrics=()):
+        expected_sessions, expected_days = act.summarize_activity(traces, logs, metrics)
+        for chunk_size in (1, 3):
+            with tempfile.TemporaryDirectory() as directory:
+                with sqlite3.connect(os.path.join(directory, "activity.sqlite")) as connection:
+                    connection.execute("CREATE TABLE raw (kind TEXT, payload BLOB)")
+                    for kind, rows in (("trace", traces), ("log", logs), ("metric", metrics)):
+                        connection.executemany("INSERT INTO raw VALUES (?, ?)",
+                                               ((kind, pickle.dumps(row)) for row in rows))
+
+                    def replay(kind):
+                        cursor = connection.execute("SELECT payload FROM raw WHERE kind=? ORDER BY rowid",
+                                                    (kind,))
+                        while True:
+                            chunk = cursor.fetchmany(chunk_size)
+                            if not chunk:
+                                return
+                            for (payload,) in chunk:
+                                yield pickle.loads(payload)
+
+                    sessions, days = act.summarize_activity_spooled(
+                        replay("trace"), replay("log"), replay("metric"), connection)
+                    self.assertEqual(dict(sessions), expected_sessions)
+                    self.assertEqual(list(days), expected_days)
+                    self.assertEqual(dict(sessions), expected_sessions)
+                    self.assertEqual(list(days), expected_days)
+
+    def test_midnight_corrections_delta_retransmits_and_shared_poison(self):
+        base = {"instrument": "coding_agent.commit.count", "client": "c",
+                "client_explicit": True, "session_id": "cross", "temporality": 2,
+                "start_ns": ns(dt(2026, 9, 20)), "stream": (("counter", "one"),)}
+        metrics = [
+            dict(base, timestamp=dt(2026, 9, 21, 1), value=10),
+            dict(base, timestamp=dt(2026, 9, 20, 23), value=6),
+            dict(base, timestamp=dt(2026, 9, 21, 1), value=8),
+            dict(base, timestamp=dt(2026, 9, 21, 2), value=2),
+            dict(base, timestamp=dt(2026, 9, 21, 3), value=4),
+            dict(base, session_id="known", temporality=1,
+                 timestamp=dt(2026, 9, 21, 4), value=7),
+            dict(base, session_id="known", temporality=1,
+                 timestamp=dt(2026, 9, 21, 4), value=9),
+            dict(base, instrument="claude_code.active_time.total", type="user",
+                 timestamp=dt(2026, 9, 21, 1), value=0),
+        ]
+        self.compare(metrics=metrics)
+
+    def test_stable_id_dedupe_wall_union_and_null_zero_provenance(self):
+        def trace(ident, name, session, start, end, **attrs):
+            return {"trace_id": "t", "span_id": ident, "span_name": name,
+                    "timestamp": dt(2026, 9, 20, start),
+                    "timestamp_end": dt(2026, 9, 20, end),
+                    "span_attributes": {"client": "c", "session.id": session, **attrs}}
+
+        traces = [
+            trace("wall", "coding_agent.session", "s", 1, 3,
+                  **{"coding_agent.session.lines.added": 0,
+                     "coding_agent.repository.id": REPO, "vcs.ref.head.name": "old",
+                     "coding_agent.session.outcome": "old"}),
+            trace("other-wall", "invoke_agent", "other", 2, 5),
+            trace("wall", "coding_agent.session", "s", 1, 4,
+                  **{"coding_agent.session.lines.added": 0,
+                     "coding_agent.repository.id": "b" * 64, "vcs.ref.head.name": "new",
+                     "coding_agent.session.outcome": "new"}),
+            trace("edit", "coding_agent.edit.decision", "s", 2, 2,
+                  **{"coding_agent.edit.decision": "accept",
+                     "coding_agent.edit.lines.added": 0}),
+            trace("sub1", "coding_agent.subagent", "s", 2, 2,
+                  **{"coding_agent.agent.id": "agent"}),
+            trace("sub2", "coding_agent.subagent", "s", 3, 3,
+                  **{"coding_agent.agent.id": "agent"}),
+            trace("commit1", "coding_agent.git.commit", "s", 2, 2,
+                  **{"vcs.ref.head.revision": "sha"}),
+            trace("commit2", "coding_agent.git.commit", "s", 3, 3,
+                  **{"vcs.ref.head.revision": "sha"}),
+            trace("pr", "coding_agent.git.pull_request", "s", 3, 3),
+        ]
+        traces.append(dict(traces[-1]))
+        logs = [{"timestamp": dt(2026, 9, 20, 2), "log_attributes": {
+            "client": "c", "session.id": "s", "tool_use_id": "edit",
+            "tool_name": "Edit", "decision": "accept"}}] * 2
+        self.compare(traces, logs)
+
+    def test_single_session_many_intervals_and_counter_points(self):
+        start = dt(2026, 9, 20)
+        traces, metrics = [], []
+        for index in range(300):
+            stamp = start + timedelta(seconds=index)
+            traces.append({"trace_id": "t", "span_id": str(index),
+                           "span_name": "invoke_agent", "timestamp": stamp,
+                           "timestamp_end": stamp + timedelta(seconds=2),
+                           "span_attributes": {"session.id": "long", "client": "c"}})
+            metrics.append({"instrument": "coding_agent.commit.count",
+                            "client": "c", "client_explicit": True, "session_id": "long",
+                            "timestamp": stamp, "temporality": 2, "start_ns": ns(start),
+                            "stream": (("counter", "one"),), "value": index})
+        self.compare(traces, metrics=metrics)
 
 
 if __name__ == "__main__":

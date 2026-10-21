@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""AI coding-activity normalization: pure functions, stdlib only.
+"""Stdlib AI coding-activity normalization, with optional SQLite scratch state.
 
 Accepts already-parsed naive UTC datetimes, raw trace/log fields and
-normalized metric rows; all SQL/OTLP I/O lives elsewhere.
+normalized metric rows; network SQL/OTLP I/O lives elsewhere.
 
 Key semantics:
 - Native Claude signals outrank OpenLIT per (client, session, field); never
@@ -33,6 +33,212 @@ its accepted/rejected LOC covers added lines only.
 """
 import json
 from datetime import datetime, timedelta, timezone
+import pickle
+from collections.abc import MutableMapping, MutableSet
+
+
+class _ActivityRaw:
+    def __init__(self, row):
+        self.row = row
+
+
+class _ActivityStore:
+    """Disk containers for the oracle's mutable state; never retain raw history."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        connection.execute("PRAGMA temp_store=FILE")
+        for statement in (
+            "CREATE TABLE IF NOT EXISTS activity_nodes "
+            "(id INTEGER PRIMARY KEY, next_index INTEGER NOT NULL DEFAULT 0)",
+            "CREATE TABLE IF NOT EXISTS activity_entries "
+            "(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, hash INTEGER NOT NULL, "
+            "key BLOB NOT NULL, value BLOB NOT NULL)",
+            "CREATE INDEX IF NOT EXISTS activity_lookup ON activity_entries(owner, hash)",
+            "CREATE INDEX IF NOT EXISTS activity_iteration ON activity_entries(owner, id)",
+            "CREATE TABLE IF NOT EXISTS activity_sort "
+            "(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, ordering TEXT, value BLOB)",
+            "CREATE INDEX IF NOT EXISTS activity_sort_owner ON activity_sort(owner)",
+        ):
+            connection.execute(statement)
+        def compare(left, right):
+            left = pickle.loads(bytes.fromhex(left))
+            right = pickle.loads(bytes.fromhex(right))
+            return (left > right) - (left < right)
+
+        connection.create_collation("activity_order", compare)
+
+    def container(self, kind):
+        ident = self.connection.execute(
+            "INSERT INTO activity_nodes DEFAULT VALUES RETURNING id").fetchone()[0]
+        return {"dict": _ActivityMap, "list": _ActivityList, "set": _ActivitySet}[kind](self, ident)
+
+    def pack(self, value):
+        if isinstance(value, (_ActivityMap, _ActivityList, _ActivitySet)):
+            return ("ref", value.kind, value.ident)
+        if isinstance(value, (dict, list, set)):
+            kind = {dict: "dict", list: "list", set: "set"}[type(value)]
+            out = self.container(kind)
+            if kind == "dict":
+                out.update(value)
+            elif kind == "list":
+                out.extend(value)
+            else:
+                for item in value:
+                    out.add(item)
+            return ("ref", kind, out.ident)
+        if isinstance(value, tuple):
+            return ("tuple", tuple(self.pack(item) for item in value))
+        return ("value", value)
+
+    def unpack(self, value):
+        if value[0] == "ref":
+            return {"dict": _ActivityMap, "list": _ActivityList,
+                    "set": _ActivitySet}[value[1]](self, value[2])
+        if value[0] == "tuple":
+            return tuple(self.unpack(item) for item in value[1])
+        return value[1]
+
+    def sorted(self, values, key=None):
+        owner = self.connection.execute(
+            "INSERT INTO activity_nodes DEFAULT VALUES RETURNING id").fetchone()[0]
+        cursor = None
+        try:
+            for value in values:
+                ordering = key(value) if key else value
+                self.connection.execute(
+                    "INSERT INTO activity_sort(owner,ordering,value) VALUES (?, ?, ?)",
+                    (owner, pickle.dumps(ordering).hex(), pickle.dumps(self.pack(value))))
+            cursor = self.connection.execute(
+                "SELECT value FROM activity_sort WHERE owner=? "
+                "ORDER BY ordering COLLATE activity_order, id", (owner,))
+            for (value,) in cursor:
+                yield self.unpack(pickle.loads(value))
+        finally:
+            if cursor is not None:
+                cursor.close()
+            self.connection.execute("DELETE FROM activity_sort WHERE owner=?", (owner,))
+            self.connection.execute("DELETE FROM activity_nodes WHERE id=?", (owner,))
+
+
+class _ActivityMap(MutableMapping):
+    kind = "dict"
+
+    def __init__(self, store, ident):
+        self.store, self.ident = store, ident
+
+    def _entry(self, key):
+        for ident, candidate, value in self.store.connection.execute(
+                "SELECT id, key, value FROM activity_entries WHERE owner=? AND hash=?",
+                (self.ident, hash(key))):
+            if pickle.loads(candidate) == key:
+                return ident, value
+        raise KeyError(key)
+
+    def __getitem__(self, key):
+        return self.store.unpack(pickle.loads(self._entry(key)[1]))
+
+    def __setitem__(self, key, value):
+        value = pickle.dumps(self.store.pack(value))
+        try:
+            ident, _ = self._entry(key)
+        except KeyError:
+            self.store.connection.execute(
+                "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",
+                (self.ident, hash(key), pickle.dumps(key), value))
+        else:
+            self.store.connection.execute(
+                "UPDATE activity_entries SET value=? WHERE id=?", (value, ident))
+
+    def __delitem__(self, key):
+        ident, _ = self._entry(key)
+        self.store.connection.execute("DELETE FROM activity_entries WHERE id=?", (ident,))
+
+    def __iter__(self):
+        for (key,) in self.store.connection.execute(
+                "SELECT key FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
+            yield pickle.loads(key)
+
+    def __len__(self):
+        return self.store.connection.execute(
+            "SELECT count(*) FROM activity_entries WHERE owner=?", (self.ident,)).fetchone()[0]
+
+    def __bool__(self):
+        return self.store.connection.execute(
+            "SELECT 1 FROM activity_entries WHERE owner=? LIMIT 1", (self.ident,)).fetchone() is not None
+
+    def setdefault(self, key, default=None):
+        try:
+            return self[key]
+        except KeyError:
+            self[key] = default
+            return self[key]
+
+
+class _ActivityList(_ActivityMap):
+    kind = "list"
+
+    def __iter__(self):
+        for (value,) in self.store.connection.execute(
+                "SELECT value FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
+            yield self.store.unpack(pickle.loads(value))
+
+    def append(self, value):
+        index = self.store.connection.execute(
+            "UPDATE activity_nodes SET next_index=next_index+1 WHERE id=? RETURNING next_index-1",
+            (self.ident,)).fetchone()[0]
+        self[index] = value
+
+    def extend(self, values):
+        for value in values:
+            self.append(value)
+
+
+
+class _ActivitySet(_ActivityMap, MutableSet):
+    kind = "set"
+
+    def add(self, value):
+        self[value] = True
+
+    def discard(self, value):
+        try:
+            del self[value]
+        except KeyError:
+            pass
+
+
+def _activity_plain(value):
+    if isinstance(value, _ActivityList):
+        return [_activity_plain(item) for item in value]
+    if isinstance(value, _ActivitySet):
+        return {_activity_plain(item) for item in value}
+    if isinstance(value, _ActivityMap):
+        return {key: _activity_plain(item) for key, item in value.items()}
+    return value
+
+
+def summarize_activity_spooled(trace_rows, log_rows, metric_rows, connection):
+    """Return replayable session-items and daily iterables backed by connection.
+
+    The caller owns the on-disk SQLite connection and its lifetime. Internal
+    activity_* tables hold all history-sized state; only one source row, one
+    sorted item and one fixed-width output record are decoded at a time.
+    """
+    store = _ActivityStore(connection)
+    sessions, daily = _summarize_activity(trace_rows, log_rows, metric_rows, store)
+
+    class SessionItems:
+        def __iter__(self):
+            for key, value in sessions.items():
+                yield key, _activity_plain(value)
+
+    class Daily:
+        def __iter__(self):
+            for value in daily:
+                yield _activity_plain(value)
+
+    return SessionItems(), Daily()
 
 ACTIVITY_COUNT_FIELDS = (
     "subagents",
@@ -334,19 +540,23 @@ def _day_start(ts):
 
 
 def _merge_intervals(intervals):
-    ordered = sorted(intervals)
-    merged = []
+    ordered = (intervals.store.sorted(intervals)
+               if isinstance(intervals, _ActivityList) else sorted(intervals))
+    current = None
     for start, end in ordered:
-        if merged and start <= merged[-1][1]:
-            if end > merged[-1][1]:
-                merged[-1][1] = end
+        if current is not None and start <= current[1]:
+            current = (current[0], max(current[1], end))
         else:
-            merged.append([start, end])
-    return [(s, e) for s, e in merged]
+            if current is not None:
+                yield current
+            current = (start, end)
+    if current is not None:
+        yield current
 
 
 def _clip_union_by_day(intervals):
-    per_day = {}
+    per_day = (intervals.store.container("dict")
+               if isinstance(intervals, _ActivityList) else {})
     for start, end in _merge_intervals(intervals):
         day = _day_start(start)
         cursor = start
@@ -401,14 +611,18 @@ def _bump(session, bucket, field, day, amount, prov):
 
 
 def _day_range(start_day, end_day):
-    # ponytail: intersected UTC days between two day-starts, inclusive, so
-    # a cross-midnight interval poisons intervening days too, not endpoints.
-    days = []
-    cursor = start_day
-    while cursor <= end_day:
-        days.append(cursor)
-        cursor = cursor + timedelta(days=1)
-    return days
+    """Replayable day range without allocating one entry per historical day."""
+    class Days:
+        def __bool__(self):
+            return start_day <= end_day
+
+        def __iter__(self):
+            cursor = start_day
+            while cursor <= end_day:
+                yield cursor
+                cursor += timedelta(days=1)
+
+    return Days()
 
 
 def _csum_bump(session, bucket, field, delta_total, day, amount, prov, days):
@@ -482,8 +696,16 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
     daily: list of dicts with day_start (naive UTC midnight), client, every
       count/value field and activity_sources.
     """
-    sessions = {}
-    wall_pool = {}
+    return _summarize_activity(trace_rows, log_rows, metric_rows)
+
+
+def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
+    mapping = (lambda: store.container("dict")) if store else dict
+    sequence = (lambda: store.container("list")) if store else list
+    unique = (lambda: store.container("set")) if store else set
+    sort_rows = store.sorted if store else sorted
+    sessions = mapping()
+    wall_pool = mapping()
 
     def session_for(client, session_id):
         key = (client, session_id)
@@ -491,12 +713,13 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
         if session is None:
             session = _new_session(client, session_id)
             sessions[key] = session
+            session = sessions[key]
         return session
 
     # Traces: dedupe retransmitted/updated spans by identity, latest end wins.
     # Rows without trace/span IDs carry no stable identity, so they are
     # skipped rather than counted under an invented row-index identity.
-    deduped = {}
+    deduped = mapping()
     for row in trace_rows or []:
         if not isinstance(row, dict):
             continue
@@ -509,13 +732,14 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
         order = (end or ts or datetime.min, ts or datetime.min)
         key = (trace_id, span_id)
         if key not in deduped or order >= deduped[key][0]:
-            deduped[key] = (order, row)
-    ordered_traces = [row for _, row in sorted(deduped.values(), key=lambda kv: kv[0])]
+            deduped[key] = (order, _ActivityRaw(row))
+    ordered_traces = (row for _, row in sort_rows(deduped.values(), key=lambda kv: kv[0]))
 
-    subagent_spans = set()
-    commit_spans = set()
-    pr_spans = set()
+    subagent_spans = unique()
+    commit_spans = unique()
+    pr_spans = unique()
     for index, row in enumerate(ordered_traces):
+        row = row.row
         attrs = _span_attrs(row)
         client, session_id = _identity(attrs, row=row, hint=row.get("span_name"))
         if session_id is None:
@@ -597,8 +821,8 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
                 session["branch"] = (order, str(branch))
 
     # Logs: subagent completions and Claude edit decisions with stable dedupe.
-    subagent_events = set()
-    decision_events = set()
+    subagent_events = unique()
+    decision_events = unique()
     for row in log_rows or []:
         if not isinstance(row, dict):
             continue
@@ -655,8 +879,8 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
     # Metrics: delta points are increments; cumulative points are differenced
     # per (stream, start_ns) in time order. Unknown temporality/start is
     # skipped, never guessed.
-    delta_points = {}
-    cumulative = {}
+    delta_points = mapping()
+    cumulative = mapping()
     for seq, row in enumerate(metric_rows or []):
         if not isinstance(row, dict):
             continue
@@ -756,7 +980,7 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
             else:
                 _bump(session, bucket, field, day, value, prov)
 
-    for key, points in list(cumulative.items()):
+    for key, points in cumulative.items():
         if not isinstance(key, tuple) or len(key) != 5:
             continue
         client, session_id, instrument, frozen, start_ns = key
@@ -764,11 +988,11 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
         session = cumulative.get(key + ("session",))
         if not targets or session is None:
             continue
-        latest = {}
+        latest = mapping()
         for ts, value, seq in points:
             if ts not in latest or seq >= latest[ts][0]:
                 latest[ts] = (seq, value)
-        ordered = sorted(latest.items())
+        ordered = sort_rows(latest.items())
         try:
             start_day = datetime.fromtimestamp(
                 start_ns // 1_000_000_000, timezone.utc).replace(tzinfo=None).date()
@@ -817,9 +1041,9 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
                 else:
                     _csum_bump(session, bucket, field, increment, day, increment, prov, poison_days)
 
-    out_sessions = {}
-    daily_cells = {}
-    global_poison = {}
+    out_sessions = mapping()
+    daily_cells = mapping()
+    global_poison = mapping()
     for session in sessions.values():
         for poison_key, days in session["cpoison"].items():
             bucket, field = poison_key
@@ -955,8 +1179,8 @@ def summarize_activity(trace_rows, log_rows, metric_rows):
             entry[0] = seconds
             entry[1].add(_WALL_SRC)
 
-    daily = []
-    for (client, day), cell in sorted(daily_cells.items(), key=lambda kv: (kv[0][0], kv[0][1])):
+    daily = sequence()
+    for (client, day), cell in sort_rows(daily_cells.items(), key=lambda kv: (kv[0][0], kv[0][1])):
         record = {"day_start": day, "client": client}
         sources = {}
         for field in ACTIVITY_COUNT_FIELDS:

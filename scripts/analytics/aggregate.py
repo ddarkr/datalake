@@ -6,8 +6,9 @@ Stdlib only. Reads GREPTIME_* connection env plus:
     every section each pass and sleeps; SIGTERM/SIGINT stops between passes.
   AGG_LOOKBACK_HOURS (default 30): bound for vehicle trip/charge/log scans
     and the SQL-pushdownagg windows (vehicle 1m/1h, home 5m/1h/1d).
-  AGG_MAX_ROWS (default 200000): per-section raw-row cap. A section over the
-  cap fails closed (error, no partial writes) instead of OOMing.
+  AGG_MAX_ROWS (default 200000): raw-query work limit. AI overflow recovers
+    from a complete disk-backed snapshot with bounded decoded chunks;
+    other sections fail without partial writes when their query exceeds it.
   AGG_LOCAL_SST_ONLY (default 0): exact 0/1; select strict local-SST HTTP
     and Flight transports for every SQL statement, without remote fallback.
   BATTERY_ANALYSIS_CONFIG (default /app/battery-analysis.json): plain JSON
@@ -2156,7 +2157,7 @@ def activity_metric_rows(ctx, cfg):
     return out
 
 
-AI_LOGIC_REVISION = "ai:fence-v1"
+AI_LOGIC_REVISION = "ai:fence-v2"
 AI_STATE_SCOPE = "ai"
 AI_STATE_TABLE = "ai_aggregate_state"
 AI_SPAN_SESSION_COLS = (SESSION, "span_attributes.session.id",
@@ -2265,9 +2266,19 @@ def _ai_encode_fence(fence):
                        for t, regions in sorted(fence.items())}, sort_keys=True)
 
 
+def _ai_projection(table, cols):
+    # Flight exposes native JSONB as compact binary, unlike HTTP JSON.
+    # Format on the server so both transports feed the same text parser.
+    return ", ".join(
+        "json_to_string(" + _ai_quote_ident(c) + ") AS " + _ai_quote_ident(c)
+        if table == "opentelemetry_logs" and c in (
+            "log_attributes", "resource_attributes") else _ai_quote_ident(c)
+        for c in cols)
+
+
 def _ai_table_sql(table):
     cols = SPAN_COLS if table == "opentelemetry_traces" else LOG_COLS
-    return "SELECT " + ", ".join(_ai_quote_ident(c) for c in cols) + " FROM " + table
+    return "SELECT " + _ai_projection(table, cols) + " FROM " + table
 
 
 def _ai_fenced_scan(ctx, cfg, fence):
@@ -2335,7 +2346,7 @@ def _ai_session_pred(table, col, values):
     if table == "opentelemetry_traces":
         ors = [" OR ".join(_ai_quote_ident(c) + " = " + str_lit(v)
                            for c in AI_SPAN_SESSION_COLS) for v in seen]
-        return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in SPAN_COLS) +
+        return ("SELECT " + _ai_projection(table, SPAN_COLS) +
                 " FROM " + table + " WHERE " +
                 " OR ".join("(" + o + ")" for o in ors))
     # GreptimeDB 1.2.1 native JSONB: json_get_string(log_attributes,
@@ -2346,7 +2357,7 @@ def _ai_session_pred(table, col, values):
             "json_get_string(log_attributes, '$.\"" +
             c.replace('"', '""').replace("'", "''") + "\"') = " + str_lit(v)
             for c in AI_LOG_SESSION_COLS))
-    return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in LOG_COLS) +
+    return ("SELECT " + _ai_projection(table, LOG_COLS) +
             " FROM " + table + " WHERE " +
             " OR ".join("(" + o + ")" for o in ors))
 
@@ -2386,7 +2397,7 @@ def _ai_filter_logs(cols, rows, wanted):
 def _ai_day_pred(table, cols, day, nxt):
     names = [];
     [names.append(c) for c in cols if c not in names]
-    return ("SELECT " + ", ".join(_ai_quote_ident(c) for c in names) +
+    return ("SELECT " + _ai_projection(table, names) +
             " FROM " + table + " WHERE timestamp >= " + ts_lit(day) +
             " AND timestamp < " + ts_lit(nxt))
 
@@ -2436,9 +2447,22 @@ def _ai_ensure_schema(ctx):
 
 
 def ai_section(ctx, cfg):
-    if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
-        return _ai_incremental(ctx, cfg)
-    return _ai_full(ctx, cfg)
+    try:
+        if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
+            return _ai_incremental(ctx, cfg)
+        return _ai_full(ctx, cfg)
+    except Exception as exc:
+        if type(exc).__name__ != "RowCapExceeded" and not (
+                isinstance(exc, SqlError) and "row cap exceeded" in str(exc)):
+            raise
+    # Leave the exception scope before recovery so its failed-query buffers
+    # are released instead of remaining live through the disk-backed pass.
+    tables = _ai_metric_tables(ctx, cfg)
+    if tables is None:
+        raise SqlError("AI recovery metric registry unavailable")
+    prices = load_price_table()
+    return _ai_fenced_full(ctx, cfg, json.dumps(sorted(tables), sort_keys=True,
+                           default=str), _ai_price_digest(prices), prices)
 
 
 def _ai_full(ctx, cfg, snapshot=None):
@@ -2447,13 +2471,11 @@ def _ai_full(ctx, cfg, snapshot=None):
     if snapshot is None:
         cols, rows = guarded_fetch(
             base_url, auth, db,
-            "SELECT " + ", ".join('"' + c + '"' for c in SPAN_COLS) +
-            " FROM opentelemetry_traces", cfg["max_rows"])
+            _ai_table_sql("opentelemetry_traces"), cfg["max_rows"])
         try:
             lcols, lrows = guarded_fetch(
                 base_url, auth, db,
-                "SELECT " + ", ".join('"' + c + '"' for c in LOG_COLS) +
-                " FROM opentelemetry_logs", cfg["max_rows"])
+                _ai_table_sql("opentelemetry_logs"), cfg["max_rows"])
         except SqlError as e:
             if not is_missing_table(e):
                 raise
@@ -2705,31 +2727,10 @@ def _ai_metric_keys(metric_rows):
     return out
 
 def _ai_fenced_full(ctx, cfg, metric_registry, price_digest, prices):
-    """Explicit full recovery: unfenced snapshot + upper fence commit."""
-    _ = prices
-    try:
-        frames, upper = _ai_fenced_scan(ctx, cfg, None)
-    except Exception as exc:
-        if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
-            total = _ai_full(ctx, cfg)
-            _ai_commit_state(ctx, "", metric_registry, price_digest)
-            return total
-        raise
-    try:
-        metric_rows, upper = _ai_delta_metrics(
-            ctx, cfg, json.loads(metric_registry), None, upper)
-        if len(metric_rows) > cfg["max_rows"]:
-            raise SqlError("activity metric row cap exceeded: refusing partial write")
-    except Exception as exc:
-        if type(exc).__name__ in ("StaleFence", "FlightUnavailable"):
-            total = _ai_full(ctx, cfg)
-            _ai_commit_state(ctx, "", metric_registry, price_digest)
-            return total
-        raise
-    total = _ai_full(ctx, cfg, snapshot=(frames, metric_rows))
-    _ai_commit_state(ctx, _ai_encode_fence(upper), metric_registry,
-                     price_digest)
-    return total
+    """Complete disk-backed recovery; publish upper only after every write."""
+    from scripts.analytics.ai_recovery import recover
+    return recover(sys.modules[__name__], ctx, cfg, metric_registry,
+                   price_digest, prices)
 
 
 
@@ -3128,12 +3129,17 @@ def _ai_commit_state(ctx, fence_text, metric_registry, price_digest):
 
 
 def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
-              commit=None, dirty_days=None):
+              commit=None, dirty_days=None, computed=None):
     base_url, auth, db = ctx
     ttl = cfg.get("otel_ttl", "")
     total = 0
-    _, old_rows = guarded_fetch(base_url, auth, db,
-        "SELECT client, session_id, session_start FROM ai_session_summary", cfg["max_rows"])
+    old_rows = []
+    if sessions:
+        predicates = ["(client = " + str_lit(client) + " AND session_id = " +
+                      str_lit(sid) + ")" for client, sid in sessions]
+        _, old_rows = guarded_fetch(base_url, auth, db,
+            "SELECT client, session_id, session_start FROM ai_session_summary WHERE " +
+            " OR ".join(predicates), cfg["max_rows"])
     expired = {(client, sid) for client, sid, start in old_rows
                if not fully_retained(parse_ts(start), ttl, now, bound)}
     session_cols = ["session_start", "session_id", "client", "provider", "models",
@@ -3192,7 +3198,7 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
                      "cost_estimated_usd", "cost_unpriced_calls",
                      "llm_spans", "tool_calls", "active_sessions", "error_count"]
     daily_rows = []
-    for d in summarize_daily(spans, prices):
+    for d in (computed[0] if computed is not None else summarize_daily(spans, prices)):
         if dirty_days is not None and d["day"] not in dirty_days:
             continue
         if bound and d["day"] < bound:
@@ -3211,7 +3217,7 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
         total += len(daily_rows)
     tool_cols = ["day_start", "tool_name", "client", "calls", "errors", "avg_duration_ms"]
     tool_rows = []
-    for t in summarize_tools(spans):
+    for t in (computed[1] if computed is not None else summarize_tools(spans)):
         if dirty_days is not None and t["day"] not in dirty_days:
             continue
         if bound and t["day"] < bound:

@@ -162,7 +162,7 @@ def _parse_upper(app_metadata):
 
 
 def flight_query(sql, *, endpoint, db, user, password, lower=None,
-                 timeout=60, max_rows=200000, local_sst_only=None):
+                 timeout=60, max_rows=200000, local_sst_only=None, row_sink=None):
     """Run one fenced SQL query. Returns (cols, rows, upper).
 
     lower=None means an unfenced snapshot read (full data + upper
@@ -177,7 +177,16 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
     local_sst_only=None reads AGG_LOCAL_SST_ONLY (exact 0/1). Strict mode
     wraps the same Ticket in datalake.local_sst_query.v1 and decodes each
     Result.body as original FlightData. It never retries ordinary DoGet.
+
+    row_sink(cols, rows), when supplied, consumes bounded decoded chunks
+    instead of materializing a whole result. max_rows then bounds each
+    chunk, not the retained snapshot. Network EOF and terminal watermarks
+    are proved before the first callback; the caller must not publish a
+    checkpoint until this function returns (IPC decoding or the sink can
+    still fail). Sink exceptions propagate unchanged.
     """
+    if isinstance(max_rows, bool) or not isinstance(max_rows, int) or max_rows <= 0:
+        raise ValueError("max_rows must be a positive integer")
     if local_sst_only is None:
         local_sst_only = local_sst_only_enabled()
     if not isinstance(local_sst_only, bool):
@@ -295,19 +304,40 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
             try:
                 reader = pa.ipc.open_stream(stream_file)
                 schema = reader.schema
-                batches = []
-                for batch in reader:
-                    total_rows += batch.num_rows
-                    if total_rows > max_rows:
-                        raise RowCapExceeded(
-                            "row cap exceeded (> %d): refusing partial write"
-                            % max_rows)
-                    batches.append(batch)
-                table = pa.Table.from_batches(batches, schema=schema)
-            except FlightError:
-                raise
             except Exception as exc:
                 raise FlightError("ipc decode failed: " + str(exc)[:200])
+            cols = list(schema.names)
+            rows = []
+            while True:
+                try:
+                    batch = next(reader)
+                except StopIteration:
+                    break
+                except Exception as exc:
+                    raise FlightError("ipc decode failed: " + str(exc)[:200])
+                total_rows += batch.num_rows
+                if row_sink is None and total_rows > max_rows:
+                    raise RowCapExceeded(
+                        "row cap exceeded (> %d): refusing partial write"
+                        % max_rows)
+                for start in range(0, batch.num_rows, max_rows):
+                    piece = batch.slice(start, max_rows)
+                    columns = []
+                    for i, field in enumerate(schema):
+                        try:
+                            column = piece.column(i)
+                            if pa.types.is_timestamp(field.type):
+                                column = column.cast(
+                                    pa.timestamp("ns", tz=field.type.tz)).cast(pa.int64())
+                            columns.append(column.to_pylist())
+                        except Exception as exc:
+                            raise FlightError("column decode failed (%s): %s"
+                                              % (field.name, str(exc)[:150]))
+                    chunk = [list(r) for r in zip(*columns)] if columns else []
+                    if row_sink is None:
+                        rows.extend(chunk)
+                    else:
+                        row_sink(cols, chunk)
         except FlightError:
             raise
         except grpc.RpcError as exc:
@@ -320,21 +350,6 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
                 raise StaleFence("fence below flushed frontier: "
                                  + detail[:200])
             raise FlightError("flight DoGet failed: " + detail[:200])
-        cols = list(schema.names)
-        columns = []
-        for i, field in enumerate(schema):
-            try:
-                if pa.types.is_timestamp(field.type):
-                    # Exact int64 ns: to_pylist on datetimes truncates to us.
-                    columns.append(
-                        table.column(i).cast(pa.timestamp("ns", tz=field.type.tz))
-                        .cast(pa.int64()).to_pylist())
-                else:
-                    columns.append(table.column(i).to_pylist())
-            except Exception as exc:
-                raise FlightError("column decode failed (%s): %s"
-                                  % (field.name, str(exc)[:150]))
-        rows = [list(r) for r in zip(*columns)] if columns else []
         return cols, rows, upper
     finally:
         if stream_file is not None:
