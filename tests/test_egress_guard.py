@@ -154,6 +154,52 @@ def blocked_alerts(path):
             assert ("정지 미확인" if failure else "정지 확인") in sent.call_args.args[1]
 
 
+def blocked_episode_race(path):
+    # Legacy v2 gains an identity without changing accounting or prior delivery.
+    state = dict(version=2, project="episode-regression", used_bytes=1234,
+                 last=None, blocked=True, day=g.day_at(1000),
+                 day_used_bytes=1000, alerted=["soft"], block_alerted="stopped",
+                 block_alert_attempt_level="stopped", block_alert_attempt_at=999)
+    g.save(path, state)
+    with patch.object(g.time, "time", return_value=1000):
+        migrated = g.load(path)
+        episode = migrated["block_episode"]
+        assert episode and g.load(path) == migrated
+        assert {k: migrated[k] for k in state} == state
+        g.latch(path, migrated, "unaccounted S3 helper running")
+        assert g.load(path)["block_episode"] == episode
+        with patch.object(g, "telegram") as sent:
+            g.alert(path, path / "telegram.json", True)
+            assert sent.call_count == 0
+        g.main(["--state-dir", str(path), "unblock"])
+        g.latch(path, g.load(path), "unaccounted S3 helper running")
+        old_episode = g.load(path)["block_episode"]
+        assert old_episode != episode
+
+        def unblock_and_trip(config, text):
+            assert "계측 외 S3 작업 감지" in text
+            g.main(["--state-dir", str(path), "unblock"])
+            with patch.object(g, "stop") as stopped:
+                g.main(["--state-dir", str(path), "trip", "--project", state["project"]])
+                stopped.assert_called_once_with(state["project"], 10)
+
+        with patch.object(g, "telegram", side_effect=unblock_and_trip) as sent:
+            g.alert(path, path / "telegram.json", True)
+            assert sent.call_count == 1
+        current = g.load(path)
+        assert current["block_episode"] != old_episode
+        assert current["blocked"] and "block_alerted" not in current
+        assert current["used_bytes"] == 1234 and current["day_used_bytes"] == 1000
+        with patch.object(g, "telegram") as sent:
+            g.alert(path, path / "telegram.json", True)
+            g.alert(path, path / "telegram.json", True)
+            assert sent.call_count == 1
+            assert "명시적 차단 / 모니터 종료" in sent.call_args.args[1]
+        g.latch(path, g.load(path), "explicit trip / monitor stopped")
+        assert g.load(path)["block_episode"] == current["block_episode"]
+        assert (g.SOFT_BYTES, g.HARD_BYTES) == (50_000_000_000, 200_000_000_000)
+
+
 def daily_docker(path):
     """Real monitor/HTTP/Docker stop, without sending synthetic alerts to users."""
     path.mkdir(mode=0o700)
@@ -235,6 +281,9 @@ def main():
         blocked_path = path / "blocked"
         blocked_path.mkdir(mode=0o700)
         blocked_alerts(blocked_path)
+        episode_path = path / "episode"
+        episode_path.mkdir(mode=0o700)
+        blocked_episode_race(episode_path)
         unsafe.mkdir(mode=0o755)
         try:
             with g.locked(unsafe):

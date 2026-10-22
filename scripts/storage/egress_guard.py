@@ -24,6 +24,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.parse
+import uuid
 
 COVERAGE = "native Greptime OpenDAL S3 read bytes only; helper/account egress NOT covered"
 SOFT_BYTES = 50_000_000_000
@@ -99,6 +100,9 @@ def load(directory):
             or any(v not in ("soft", "hard") for v in state["alerted"])):
         raise ValueError("invalid persistent guard state")
     datetime.strptime(state["day"], "%Y-%m-%d")
+    if state["blocked"] and "block_episode" not in state:
+        state["block_episode"] = uuid.uuid4().hex
+        save(directory, state)
     return state
 
 
@@ -109,6 +113,12 @@ def revoke(directory):
 def latch(directory, state, reason):
     # Revoke before state write: crash between the two still denies new starts.
     revoke(directory)
+    if not state["blocked"]:
+        state["block_episode"] = uuid.uuid4().hex
+        for key in ("block_alerted", "block_alert_attempt_at", "block_alert_attempt_level"):
+            state.pop(key, None)
+    elif "block_episode" not in state:
+        state["block_episode"] = uuid.uuid4().hex
     state.update(blocked=True, reason=reason)
     save(directory, state)
 
@@ -235,6 +245,7 @@ def alert(directory, config, stopped):
     with locked(directory):
         state = load(directory)
         blocked = state["blocked"]
+        episode = state.get("block_episode")
         level = (("stopped" if stopped else "unconfirmed") if blocked else
                  "hard" if state["day_used_bytes"] >= HARD_BYTES else
                  "soft" if state["day_used_bytes"] >= SOFT_BYTES else None)
@@ -276,7 +287,7 @@ def alert(directory, config, stopped):
     with locked(directory):
         state = load(directory)
         if blocked:
-            if state["blocked"]:
+            if state["blocked"] and state.get("block_episode") == episode:
                 state["block_alerted"] = level
                 save(directory, state)
         elif state["day"] == day:
@@ -363,7 +374,7 @@ def main(argv=None):
             revoke(directory)
             state.update(blocked=False, reason="authorized",
                          last=None, instance=None, startup_until=time.time() + args.startup_seconds)
-            for key in ("block_alerted", "block_alert_attempt_at", "block_alert_attempt_level"):
+            for key in ("block_episode", "block_alerted", "block_alert_attempt_at", "block_alert_attempt_level"):
                 state.pop(key, None)
             save(directory, state)
             # run must start before DB: arm alone does not grant a lease.

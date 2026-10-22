@@ -89,6 +89,10 @@ Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600
 
 기존 누적 예산의 version 1 상태는 자동 초기화하거나 조용히 변환하지 않습니다. 교체 전 상태를 비공개 백업하고 version 2의 `day`, `day_used_bytes`, `alerted`를 명시적으로 이관하세요. 기존 `used_bytes`, `last`, `sample_at`, `instance`, `blocked`는 보존하고 `budget_bytes`는 제거합니다. 일별 이력이 없으면 이관 당일에 기존 누적값을 보수적으로 전부 합산하고 그 한계를 기록합니다.
 
+차단마다 영속 `block_episode`를 부여하며, 전송 성공은 그 회차에만 기록합니다.
+전송 중 수동 재개·재차단이 발생해도 이전 알림이 새 차단을 전달 완료로
+처리하지 않습니다. 기존 version 2 상태에는 사용량을 보존한 채 회차 ID를 추가합니다.
+
 ```sh
 install -d -m 700 /var/lib/datalake-egress
 python3 /usr/local/libexec/datalake-egress-guard.py \
