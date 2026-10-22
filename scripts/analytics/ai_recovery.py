@@ -7,6 +7,8 @@ from collections import OrderedDict
 
 
 def packed(value):
+    if value is None or type(value) in (str, int, float, bool, bytes):
+        return pickle.dumps(value, protocol=5)
     buffer = io.BytesIO()
     pickler = pickle.Pickler(buffer, protocol=5)
     # Value identities must not depend on object-alias memoization.
@@ -30,7 +32,8 @@ class Recovery:
             CREATE TABLE spans (ordinal INTEGER PRIMARY KEY, identity BLOB UNIQUE,
                 payload BLOB, trace BLOB, span BLOB, parent BLOB, scope BLOB,
                 call BLOB, turn BLOB, billed INTEGER, money INTEGER DEFAULT 1,
-                tool INTEGER DEFAULT 0, phase INTEGER DEFAULT 0);
+                tool INTEGER DEFAULT 0, phase INTEGER DEFAULT 0,
+                eligible INTEGER, billed_source TEXT, native_usage INTEGER);
             CREATE INDEX span_parent ON spans(trace,parent);
             CREATE INDEX span_scope ON spans(scope);
             CREATE INDEX span_call ON spans(call);
@@ -114,14 +117,23 @@ class Recovery:
     def call(row):
         return packed((row.get("client"), row.get("session"), row["call_id"])) if row.get("call_id") else None
 
+    def billing(self, row):
+        source = row.get("billed_source")
+        return (int(bool(row.get("has_usage") and not self.a.is_rollup_op(row.get("op")))),
+                source, int(bool(row.get("client") and row.get("session")
+                    and source == "native"
+                    and (row.get("input") is not None or row.get("output") is not None))))
+
     def add_span(self, row, identity=None):
+        billing = self.billing(row)
         self.db.execute("""INSERT OR IGNORE INTO spans
-            (identity,payload,trace,span,parent,scope,call,turn,billed)
-            VALUES(?,?,?,?,?,?,?,?,?)""", (
+            (identity,payload,trace,span,parent,scope,call,turn,billed,
+             eligible,billed_source,native_usage)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 identity, packed(row), packed(row.get("trace")), packed(row.get("span")),
                 packed(row.get("parent")), packed((row.get("client"), row.get("session"))),
                 self.call(row), packed((row.get("client"), row.get("session"), row.get("turn"))),
-                int(bool(row.get("has_usage") and not self.a.is_rollup_op(row.get("op"))))))
+                billing[0], *billing))
 
     def rows(self, sql="SELECT ordinal,payload FROM spans ORDER BY phase,ordinal", args=()):
         for ordinal, payload in self.db.execute(sql, args):
@@ -130,7 +142,12 @@ class Recovery:
     def parent_filter(self):
         a = self.a
         # Parent decisions use all original children, not recursively filtered children.
-        for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
+        for ordinal, row in self.rows("""
+                SELECT ordinal,payload FROM spans AS candidate
+                WHERE billed=1 AND EXISTS (
+                    SELECT 1 FROM spans AS child
+                    WHERE child.trace=candidate.trace AND child.parent=candidate.span)
+                ORDER BY ordinal"""):
             if row.get("trace") is None or row.get("input") is None or row.get("output") is None:
                 continue
             count, inp, out, complete = 0, 0, 0, True
@@ -165,10 +182,11 @@ class Recovery:
                 self.db.execute("DELETE FROM spans WHERE ordinal=?", (ordinal,))
                 continue
             merged = a._override_span(row, pickle.loads(hit[0]))
-            self.db.execute("UPDATE spans SET payload=?,scope=?,call=?,turn=? WHERE ordinal=?",
+            self.db.execute("""UPDATE spans SET payload=?,scope=?,call=?,turn=?,
+                               eligible=?,billed_source=?,native_usage=? WHERE ordinal=?""",
                             (packed(merged), packed((merged.get("client"), merged.get("session"))),
                              self.call(merged), packed((merged.get("client"), merged.get("session"),
-                                                      merged.get("turn"))), ordinal))
+                                                      merged.get("turn"))), *self.billing(merged), ordinal))
         for _, payload, call in self.db.execute("SELECT ordinal,payload,call FROM logs ORDER BY ordinal"):
             if call is not None and self.db.execute(
                     "SELECT 1 FROM winners WHERE kind='merge' AND identity=?", (call,)).fetchone():
@@ -178,10 +196,7 @@ class Recovery:
             self.db.execute("UPDATE spans SET phase=? WHERE ordinal=last_insert_rowid()",
                             (3 if log.get("native") == "tool" else 2,))
         # Re-evaluate the post-merge billing rules exactly as the summary oracle does.
-        self.db.execute("UPDATE spans SET billed=0")
-        for ordinal, row in self.rows():
-            if row.get("has_usage") and not a.is_rollup_op(row.get("op")):
-                self.db.execute("UPDATE spans SET billed=1 WHERE ordinal=?", (ordinal,))
+        self.db.execute("UPDATE spans SET billed=eligible")
         self.parent_filter()
         self.native_filter()
         for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY phase,ordinal"):
@@ -208,13 +223,11 @@ class Recovery:
         self.db.commit()
 
     def native_filter(self):
-        for _, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
-            if row.get("client") and row.get("session") and row.get("billed_source") == "native" and (row.get("input") is not None or row.get("output") is not None):
-                self.db.execute("INSERT OR IGNORE INTO winners VALUES('native',?,0)", (packed((row["client"], row["session"])),))
-        for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
-            if row.get("billed_source") != "native" and self.db.execute(
-                    "SELECT 1 FROM winners WHERE kind='native' AND identity=?", (packed((row.get("client"), row.get("session"))),)).fetchone():
-                self.db.execute("UPDATE spans SET billed=0 WHERE ordinal=?", (ordinal,))
+        self.db.execute("""INSERT OR IGNORE INTO winners
+            SELECT 'native',scope,0 FROM spans WHERE billed=1 AND native_usage=1""")
+        self.db.execute("""UPDATE spans SET billed=0
+            WHERE billed=1 AND billed_source IS NOT 'native' AND EXISTS (
+                SELECT 1 FROM winners w WHERE w.kind='native' AND w.identity=spans.scope)""")
         self.db.execute("DELETE FROM winners WHERE kind='native'")
 
     def save(self, kind, key, value):

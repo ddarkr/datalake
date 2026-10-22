@@ -179,8 +179,10 @@ class _ActivityMap(MutableMapping):
     def _remember(self, key, entry):
         cache = self.store.entries
         cache_key = (self.ident, key)
-        cache.pop(cache_key, None)
-        if len(entry[1]) <= 256 and pickle.loads(pickle.dumps(key)) == key:
+        previous = cache.pop(cache_key, None)
+        payload = entry[1]
+        if len(payload) <= 256 and (previous is not None or
+                pickle.loads(pickle.dumps(key)) == key):
             cache[cache_key] = entry
             if len(cache) > 1024:
                 cache.popitem(last=False)
@@ -196,16 +198,18 @@ class _ActivityMap(MutableMapping):
                 "SELECT id, key, value FROM activity_entries WHERE owner=? AND hash=?",
                 (self.ident, hash(key))):
             if pickle.loads(candidate) == key:
-                return self._remember(key, (ident, value))
+                return self._remember(
+                    key, (ident, value, self.store.unpack(pickle.loads(value))))
         raise KeyError(key)
 
     def __getitem__(self, key):
-        return self.store.unpack(pickle.loads(self._entry(key)[1]))
+        return self._entry(key)[2]
 
     def __setitem__(self, key, value):
-        value = pickle.dumps(self.store.pack(value))
+        packed = self.store.pack(value)
+        value = pickle.dumps(packed)
         try:
-            ident, _ = self._entry(key)
+            ident = self._entry(key)[0]
         except KeyError:
             ident = self.store.connection.execute(
                 "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",
@@ -213,10 +217,10 @@ class _ActivityMap(MutableMapping):
         else:
             self.store.connection.execute(
                 "UPDATE activity_entries SET value=? WHERE id=?", (value, ident))
-        self._remember(key, (ident, value))
+        self._remember(key, (ident, value, self.store.unpack(packed)))
 
     def __delitem__(self, key):
-        ident, _ = self._entry(key)
+        ident = self._entry(key)[0]
         self.store.connection.execute("DELETE FROM activity_entries WHERE id=?", (ident,))
         self.store.entries.pop((self.ident, key), None)
 
@@ -389,6 +393,9 @@ ACTIVITY_TRACE_ATTRIBUTES = (
     "vcs.ref.head.name",
     "vcs.ref.head.revision",
 )
+_TRACE_ATTRIBUTE_COLUMNS = tuple(("span_attributes." + key, key)
+                                 for key in ACTIVITY_TRACE_ATTRIBUTES)
+
 
 _SESSION_KEYS = ("coding_agent.session.id", "session.id", "conversation.id",
                  "gen_ai.conversation.id")
@@ -550,12 +557,10 @@ def _span_attrs(row):
     nested = row.get("span_attributes")
     if isinstance(nested, dict):
         out.update(nested)
-    prefix = "span_attributes."
-    for key, value in row.items():
-        if key.startswith(prefix):
-            out[key[len(prefix):]] = value
-    for key in ACTIVITY_TRACE_ATTRIBUTES:
-        if key not in out and key in row:
+    for column, key in _TRACE_ATTRIBUTE_COLUMNS:
+        if column in row:
+            out[key] = row[column]
+        elif key not in out and key in row:
             out[key] = row[key]
     return out
 

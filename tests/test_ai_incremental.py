@@ -1974,6 +1974,12 @@ def test_disk_reducer_matches_global_merge_oracle_across_chunks():
         "event.name": "codex.turn_cost", "session.id": "parent-session",
         "turn.id": "native-filled-turn", "usage.estimated_usd": 0.75})
     logs += [usage, receipt, dict(receipt)]
+    # Native zero is authoritative, but only inside its exact client/session.
+    traces += [
+        span(DAY1, "zero-trace", "zero", "zero-session", "codex", 8, 2, call="zero-call"),
+        span(DAY1, "orphan-trace", "orphan", "zero-session", "codex", 5, 1),
+        span(DAY1, "other-client", "other", "zero-session", "oh-my-pi", 6, 3)]
+    logs += [clog(DAY2, "zero-session", "codex", "zero-call", 0, 0)]
     cols, lcols = list(agg.SPAN_COLS), list(agg.LOG_COLS)
     rows = [[row.get(c) for c in cols] for row in traces]
     lrows = [[row.get(c) for c in lcols] for row in logs]

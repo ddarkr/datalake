@@ -259,11 +259,20 @@ except ImportError:
 try:
     from scripts.database import greptime_flight as _flight
     real_flight = _flight.flight_query
-    def flight_watching(sql_text, *, endpoint, db, user, password, lower=None, timeout=60, max_rows=200000):
+    def flight_watching(sql_text, *, endpoint, db, user, password, lower=None, timeout=60, max_rows=200000, row_sink=None, local_sst_only=None):
         w0, c0 = time.monotonic(), time.process_time()
         before_req, before_resp = grpc_bytes["req"], grpc_bytes["resp"]
-        cols, rows, upper = real_flight(sql_text, endpoint=endpoint, db=db, user=user, password=password, lower=lower, timeout=timeout, max_rows=max_rows)
-        flights.append({"sql": sql_text[:160], "rows": len(rows),
+        sink_rows = 0
+        def consume(cols, rows):
+            nonlocal sink_rows
+            sink_rows += len(rows)
+            row_sink(cols, rows)
+        cols, rows, upper = real_flight(
+            sql_text, endpoint=endpoint, db=db, user=user, password=password,
+            lower=lower, timeout=timeout, max_rows=max_rows,
+            row_sink=consume if row_sink is not None else None,
+            local_sst_only=local_sst_only)
+        flights.append({"sql": sql_text[:160], "rows": sink_rows if row_sink is not None else len(rows),
                         "upper": {str(k): v for k, v in (upper or {}).items()},
                         "lower": json.dumps(lower, sort_keys=True, default=str),
                         "request_bytes": grpc_bytes["req"] - before_req,

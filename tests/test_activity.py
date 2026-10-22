@@ -398,6 +398,20 @@ class SpanEventTest(unittest.TestCase):
             [mk(2, dt(2026, 9, 20, 2)), mk(5, dt(2026, 9, 20, 3))], [], [])
         self.assertEqual(sessions[("c", "s1")]["commit_count"], 5)
 
+    def test_flattened_activity_null_and_zero_override_nested_and_direct_values(self):
+        field = "coding_agent.session.commit_count"
+        for value in (None, 0, 7):
+            with self.subTest(value=value):
+                row = {
+                    "trace_id": "t", "span_id": "root", "span_name": "coding_agent.session",
+                    "timestamp": dt(2026, 9, 20, 1),
+                    "timestamp_end": dt(2026, 9, 20, 2),
+                    "span_attributes": {"session.id": "s1", "client": "c", field: 9},
+                    field: 11, "span_attributes." + field: value}
+                sessions, days = act.summarize_activity([row], [], [])
+                self.assertEqual(sessions[("c", "s1")]["commit_count"], value)
+                self.assertEqual(days[0]["commit_count"], value)
+
     def test_midnight_union_session_roots_only(self):
         t = [{"trace_id": "t", "span_id": "a", "span_name": "coding_agent.session",
               "timestamp": dt(2026, 9, 20, 23), "timestamp_end": dt(2026, 9, 21, 1),
