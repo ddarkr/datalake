@@ -316,19 +316,10 @@ def main(argv=None):
     run.add_argument("--timeout", type=float, default=3)
     run.add_argument("--grace", type=int, default=10)
     run.add_argument("--telegram-config", required=True, type=Path)
-    test_alert = sub.add_parser("notify-test")
-    test_alert.add_argument("--telegram-config", required=True, type=Path)
     args = parser.parse_args(argv)
     directory = args.state_dir.resolve()
     if hasattr(args, "grace") and not 0 <= args.grace <= 60:
         parser.error("grace must be 0..60 seconds")
-    if args.command == "notify-test":
-        try:
-            telegram(args.telegram_config, "[Datalake 설정 확인]\n일일 50 GB: 경고 / 200 GB: 전체 정지 및 경고\n한국 시간 자정 기준. 정지 후 자동 재개하지 않습니다.")
-        except Exception:
-            parser.exit(1, "Telegram test delivery failed\n")
-        print("Telegram test delivered")
-        return
     if args.command == "trip":
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.project):
             parser.error("invalid exact Compose project")
