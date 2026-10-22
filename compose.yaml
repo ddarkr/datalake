@@ -114,7 +114,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '33'
+      datalake.aggregate-revision: '34'
     depends_on:
       greptimedb:
         condition: service_started
@@ -5339,6 +5339,9 @@ configs:
                   " OR ".join(predicates), cfg["max_rows"])
           expired = {(client, sid) for client, sid, start in old_rows
                      if not fully_retained(parse_ts(start), ttl, now, bound)}
+          stale = {(client, sid) for client, sid, start in old_rows
+                   if (client, sid) in sessions and
+                   parse_ts(start) != sessions[(client, sid)].get("session_start")}
           session_cols = ["session_start", "session_id", "client", "provider", "models",
                           "model_count", "session_end", "duration_s", "input_tokens",
                           "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -5370,6 +5373,8 @@ configs:
               insert_rows(base_url, auth, db, "ai_session_summary",
                           session_cols, [row for _, row in pending])
               for s, _ in pending:
+                  if (s["client"], s["session_id"]) not in stale:
+                      continue
                   request_sql(base_url, auth, db,
                               "DELETE FROM ai_session_summary WHERE session_id = " +
                               str_lit(s["session_id"]) + " AND client = " +
@@ -6861,6 +6866,7 @@ configs:
       import pickle
       import sqlite3
       import tempfile
+      from collections import OrderedDict
 
 
       def packed(value):
@@ -6881,7 +6887,8 @@ configs:
               self.db.execute("PRAGMA cache_size=-8192")
               self.db.execute("PRAGMA temp_store=FILE")
               self.db.executescript("""
-                  CREATE TABLE raw (kind TEXT, ordinal INTEGER PRIMARY KEY, payload BLOB);
+                  CREATE TABLE raw_schema (ordinal INTEGER PRIMARY KEY, columns BLOB UNIQUE);
+                  CREATE TABLE raw (kind TEXT, ordinal INTEGER PRIMARY KEY, schema INTEGER, payload BLOB);
                   CREATE INDEX raw_kind ON raw(kind, ordinal);
                   CREATE TABLE spans (ordinal INTEGER PRIMARY KEY, identity BLOB UNIQUE,
                       payload BLOB, trace BLOB, span BLOB, parent BLOB, scope BLOB,
@@ -6905,12 +6912,32 @@ configs:
               self.directory.cleanup()
 
           def raw_rows(self, kind):
-              for (payload,) in self.db.execute(
-                      "SELECT payload FROM raw WHERE kind=? ORDER BY ordinal", (kind,)):
-                  yield pickle.loads(payload)
+              schema, columns = None, None
+              for schema_id, payload in self.db.execute(
+                      "SELECT schema,payload FROM raw WHERE kind=? ORDER BY ordinal", (kind,)):
+                  if schema_id != schema:
+                      columns = pickle.loads(self.db.execute(
+                          "SELECT columns FROM raw_schema WHERE ordinal=?", (schema_id,)).fetchone()[0])
+                      schema = schema_id
+                  yield dict(zip(columns, pickle.loads(payload)))
 
           def sink(self, kind, instrument=None, meta=None):
               a = self.a
+              schema, schema_id = None, None
+
+              def append_raw(raw_kind, raw):
+                  nonlocal schema, schema_id
+                  columns = tuple(raw)
+                  if columns != schema:
+                      encoded = packed(columns)
+                      self.db.execute("INSERT OR IGNORE INTO raw_schema(columns) VALUES(?)", (encoded,))
+                      schema_id = self.db.execute(
+                          "SELECT ordinal FROM raw_schema WHERE columns=?", (encoded,)).fetchone()[0]
+                      schema = columns
+                  # Store projected names once, without dropping explicit nulls or
+                  # conflating a missing key with a present key whose value is None.
+                  return self.db.execute("INSERT INTO raw(kind,schema,payload) VALUES(?,?,?)",
+                                         (raw_kind, schema_id, packed(tuple(raw.values())))).lastrowid
 
               def consume(cols, rows):
                   rows = a._ai_flight_ns_rows(kind, cols, rows)
@@ -6920,13 +6947,13 @@ configs:
                           raw = a._ai_norm_metric_row(raw, instrument, meta)
                           if raw is None:
                               continue
-                          self.db.execute("INSERT INTO raw(kind,payload) VALUES('metric',?)", (packed(raw),))
+                          append_raw("metric", raw)
                       else:
-                          self.db.execute("INSERT INTO raw(kind,payload) VALUES(?,?)", (kind, packed(raw)))
+                          ordinal = append_raw(kind, raw)
                           if kind == "opentelemetry_traces":
                               identity = (raw.get("trace_id"), raw.get("span_id"))
                               if identity == (None, None):
-                                  identity = (None, None, self.db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                                  identity = (None, None, ordinal)
                               self.add_span(a.norm_span(raw), packed(identity))
                           else:
                               rec = a.norm_log(raw)
@@ -7064,17 +7091,25 @@ configs:
               a = self.a
               self.db.execute("CREATE TABLE distincts(kind TEXT, identity BLOB, value BLOB, PRIMARY KEY(kind,identity,value))")
               additive = ("input", "output", "cache_read", "cache_write", "reasoning", "total", "cost", "llm_spans", "tool_calls", "errors", "cost_estimated_usd", "cost_unpriced_calls")
+              # Fixed-width accumulators only; distinct models/sessions stay in SQLite.
+              pending = OrderedDict()
 
               def bump(kind, key, row, billed, money, tool):
                   identity = packed(key)
-                  hit = self.db.execute("SELECT payload FROM output WHERE kind=? AND identity=?", (kind, identity)).fetchone()
-                  if hit is None:
-                      state = {field: None for field in additive}
-                      if prices is not None:
-                          state["cost_unpriced_calls"] = 0
-                      state.update({"provider": None, "session_start": None, "session_end": None})
+                  cache_key = (kind, identity)
+                  cached = pending.pop(cache_key, None)
+                  if cached is not None:
+                      _, state = cached
                   else:
-                      state = pickle.loads(hit[0])
+                      hit = self.db.execute("SELECT payload FROM output WHERE kind=? AND identity=?", (kind, identity)).fetchone()
+                      if hit is None:
+                          state = {field: None for field in additive}
+                          if prices is not None:
+                              state["cost_unpriced_calls"] = 0
+                          state.update({"provider": None, "session_start": None, "session_end": None})
+                          self.save(kind, key, state)
+                      else:
+                          state = pickle.loads(hit[0])
                   start = a.parse_ts(row["ts"])
                   end = a.parse_ts(row["end"] or row["ts"])
                   if start is not None:
@@ -7108,10 +7143,14 @@ configs:
                       self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "model", identity, packed(row["model"])))
                   if row.get("session"):
                       self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "session", identity, packed(row["session"])))
-                  self.save(kind, key, state)
+                  pending[cache_key] = (key, state)
+                  if len(pending) > 128:
+                      (old_kind, _), (old_key, old_state) = pending.popitem(last=False)
+                      self.save(old_kind, old_key, old_state)
 
-              for ordinal, row in self.rows():
-                  billed, money, tool = self.db.execute("SELECT billed,money,tool FROM spans WHERE ordinal=?", (ordinal,)).fetchone()
+              for ordinal, payload, billed, money, tool in self.db.execute(
+                      "SELECT ordinal,payload,billed,money,tool FROM spans ORDER BY phase,ordinal"):
+                  row = pickle.loads(payload)
                   day = a._ai_day_of(row)
                   if row.get("session"):
                       bump("session", (row["client"] or "unknown", row["session"]), row, billed, money, tool)
@@ -7128,6 +7167,8 @@ configs:
                               state["duration"] += row["duration_ms"]
                               state["durations"] += 1
                           self.save("tool", key, state)
+              for (kind, _), (key, state) in pending.items():
+                  self.save(kind, key, state)
               for kind in ("session", "daily"):
                   for key, state in self.outputs(kind):
                       identity = packed(key)
@@ -7255,6 +7296,7 @@ configs:
       import json
       from datetime import datetime, timedelta, timezone
       import pickle
+      from collections import OrderedDict
       from collections.abc import MutableMapping, MutableSet
 
 
@@ -7268,6 +7310,8 @@ configs:
 
           def __init__(self, connection):
               self.connection = connection
+              # ponytail: 1024 hot scalar/reference fields; raw payloads stay on disk.
+              self.entries = OrderedDict()
               connection.execute("PRAGMA temp_store=FILE")
               for statement in (
                   "CREATE TABLE IF NOT EXISTS activity_nodes "
@@ -7280,6 +7324,11 @@ configs:
                   "CREATE TABLE IF NOT EXISTS activity_sort "
                   "(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, ordering TEXT, value BLOB)",
                   "CREATE INDEX IF NOT EXISTS activity_sort_owner ON activity_sort(owner)",
+                  "CREATE TABLE IF NOT EXISTS activity_traces "
+                  "(id INTEGER PRIMARY KEY, hash INTEGER, key BLOB, "
+                  "ending TEXT, starting TEXT, payload BLOB)",
+                  "CREATE INDEX IF NOT EXISTS activity_trace_lookup ON activity_traces(hash)",
+                  "CREATE INDEX IF NOT EXISTS activity_trace_order ON activity_traces(ending,starting,id)",
               ):
                   connection.execute(statement)
               def compare(left, right):
@@ -7320,19 +7369,60 @@ configs:
                   return tuple(self.unpack(item) for item in value[1])
               return value[1]
 
-          def sorted(self, values, key=None):
+          def ordered_traces(self, rows):
+              # Keep each raw row once; the ordering index carries only timestamps.
+              self.connection.execute("DELETE FROM activity_traces")
+              cursor = None
+              try:
+                  for row in rows or []:
+                      if not isinstance(row, dict):
+                          continue
+                      key = (row.get("trace_id"), row.get("span_id"))
+                      if key[0] is None or key[1] is None:
+                          continue
+                      ts, end = _as_dt(row.get("timestamp")), _as_dt(row.get("timestamp_end"))
+                      order = tuple(v.isoformat(timespec="microseconds")
+                                    for v in (end or ts or datetime.min, ts or datetime.min))
+                      for ident, candidate, ending, starting in self.connection.execute(
+                              "SELECT id,key,ending,starting FROM activity_traces WHERE hash=?",
+                              (hash(key),)):
+                          if pickle.loads(candidate) == key:
+                              if order >= (ending, starting):
+                                  self.connection.execute(
+                                      "UPDATE activity_traces SET ending=?,starting=?,payload=? WHERE id=?",
+                                      (*order, pickle.dumps(row), ident))
+                              break
+                      else:
+                          self.connection.execute(
+                              "INSERT INTO activity_traces(hash,key,ending,starting,payload) VALUES(?,?,?,?,?)",
+                              (hash(key), pickle.dumps(key), *order, pickle.dumps(row)))
+                  cursor = self.connection.execute(
+                      "SELECT payload FROM activity_traces ORDER BY ending,starting,id")
+                  for (payload,) in cursor:
+                      yield _ActivityRaw(pickle.loads(payload))
+              finally:
+                  if cursor is not None:
+                      cursor.close()
+                  self.connection.execute("DELETE FROM activity_traces")
+
+          def sorted(self, values, key=None, *, datetime_pairs=False):
               owner = self.connection.execute(
                   "INSERT INTO activity_nodes DEFAULT VALUES RETURNING id").fetchone()[0]
               cursor = None
               try:
                   for value in values:
                       ordering = key(value) if key else value
+                      # Fixed-width naive UTC datetime pairs have the same lexical
+                      # order as Python tuples, without a Python/pickle comparator.
+                      ordering = ("|".join(item.isoformat(timespec="microseconds") for item in ordering)
+                                  if datetime_pairs else pickle.dumps(ordering).hex())
                       self.connection.execute(
                           "INSERT INTO activity_sort(owner,ordering,value) VALUES (?, ?, ?)",
-                          (owner, pickle.dumps(ordering).hex(), pickle.dumps(self.pack(value))))
+                          (owner, ordering, pickle.dumps(self.pack(value))))
+                  collation = "" if datetime_pairs else " COLLATE activity_order"
                   cursor = self.connection.execute(
                       "SELECT value FROM activity_sort WHERE owner=? "
-                      "ORDER BY ordering COLLATE activity_order, id", (owner,))
+                      f"ORDER BY ordering{collation}, id", (owner,))
                   for (value,) in cursor:
                       yield self.unpack(pickle.loads(value))
               finally:
@@ -7348,12 +7438,27 @@ configs:
           def __init__(self, store, ident):
               self.store, self.ident = store, ident
 
+          def _remember(self, key, entry):
+              cache = self.store.entries
+              cache_key = (self.ident, key)
+              cache.pop(cache_key, None)
+              if len(entry[1]) <= 256 and pickle.loads(pickle.dumps(key)) == key:
+                  cache[cache_key] = entry
+                  if len(cache) > 1024:
+                      cache.popitem(last=False)
+              return entry
+
           def _entry(self, key):
+              cache_key = (self.ident, key)
+              cache = self.store.entries
+              if cache_key in cache:
+                  cache.move_to_end(cache_key)
+                  return cache[cache_key]
               for ident, candidate, value in self.store.connection.execute(
                       "SELECT id, key, value FROM activity_entries WHERE owner=? AND hash=?",
                       (self.ident, hash(key))):
                   if pickle.loads(candidate) == key:
-                      return ident, value
+                      return self._remember(key, (ident, value))
               raise KeyError(key)
 
           def __getitem__(self, key):
@@ -7364,21 +7469,34 @@ configs:
               try:
                   ident, _ = self._entry(key)
               except KeyError:
-                  self.store.connection.execute(
+                  ident = self.store.connection.execute(
                       "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",
-                      (self.ident, hash(key), pickle.dumps(key), value))
+                      (self.ident, hash(key), pickle.dumps(key), value)).lastrowid
               else:
                   self.store.connection.execute(
                       "UPDATE activity_entries SET value=? WHERE id=?", (value, ident))
+              self._remember(key, (ident, value))
 
           def __delitem__(self, key):
               ident, _ = self._entry(key)
               self.store.connection.execute("DELETE FROM activity_entries WHERE id=?", (ident,))
+              self.store.entries.pop((self.ident, key), None)
 
           def __iter__(self):
               for (key,) in self.store.connection.execute(
                       "SELECT key FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
                   yield pickle.loads(key)
+
+          def items(self):
+              for key, value in self.store.connection.execute(
+                      "SELECT key, value FROM activity_entries WHERE owner=? ORDER BY id",
+                      (self.ident,)):
+                  yield pickle.loads(key), self.store.unpack(pickle.loads(value))
+
+          def values(self):
+              for (value,) in self.store.connection.execute(
+                      "SELECT value FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
+                  yield self.store.unpack(pickle.loads(value))
 
           def __len__(self):
               return self.store.connection.execute(
@@ -7761,7 +7879,7 @@ configs:
 
 
       def _merge_intervals(intervals):
-          ordered = (intervals.store.sorted(intervals)
+          ordered = (intervals.store.sorted(intervals, datetime_pairs=True)
                      if isinstance(intervals, _ActivityList) else sorted(intervals))
           current = None
           for start, end in ordered:
@@ -7940,21 +8058,24 @@ configs:
           # Traces: dedupe retransmitted/updated spans by identity, latest end wins.
           # Rows without trace/span IDs carry no stable identity, so they are
           # skipped rather than counted under an invented row-index identity.
-          deduped = mapping()
-          for row in trace_rows or []:
-              if not isinstance(row, dict):
-                  continue
-              trace_id = row.get("trace_id")
-              span_id = row.get("span_id")
-              if trace_id is None or span_id is None:
-                  continue
-              ts = _as_dt(row.get("timestamp"))
-              end = _as_dt(row.get("timestamp_end"))
-              order = (end or ts or datetime.min, ts or datetime.min)
-              key = (trace_id, span_id)
-              if key not in deduped or order >= deduped[key][0]:
-                  deduped[key] = (order, _ActivityRaw(row))
-          ordered_traces = (row for _, row in sort_rows(deduped.values(), key=lambda kv: kv[0]))
+          if store:
+              ordered_traces = store.ordered_traces(trace_rows)
+          else:
+              deduped = mapping()
+              for row in trace_rows or []:
+                  if not isinstance(row, dict):
+                      continue
+                  trace_id = row.get("trace_id")
+                  span_id = row.get("span_id")
+                  if trace_id is None or span_id is None:
+                      continue
+                  ts = _as_dt(row.get("timestamp"))
+                  end = _as_dt(row.get("timestamp_end"))
+                  order = (end or ts or datetime.min, ts or datetime.min)
+                  key = (trace_id, span_id)
+                  if key not in deduped or order >= deduped[key][0]:
+                      deduped[key] = (order, _ActivityRaw(row))
+              ordered_traces = (row for _, row in sort_rows(deduped.values(), key=lambda kv: kv[0]))
 
           subagent_spans = unique()
           commit_spans = unique()

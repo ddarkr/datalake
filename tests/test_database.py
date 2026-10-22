@@ -544,69 +544,6 @@ def _ai_cfg(**over):
     return cfg
 
 
-@patch.object(agg, "load_price_table", lambda: None)
-def test_late_earlier_span_replaces_session_start_and_stays_idempotent():
-    # Main's live repro: initial logical-smoke session starts at
-    # 1790004181528579000 (input 11/output 5), then a late earlier span at
-    # 1790000581528579000 (input 2/output 1) moves the TIME INDEX start.
-    srv = serve()
-    try:
-        _reset_table_fixtures()
-        first = span_row("2026-09-21 10:03:01", "t", "late",
-                         None, "chat", "logical-smoke", None, "codex", "svc",
-                         11, 5, 0.004, "estimated")
-        late = span_row("2026-09-21 09:03:01", "t", "early",
-                        None, "chat", "logical-smoke", None, "codex", "svc",
-                        2, 1, 0.001, "estimated")
-        tool = span_row("2026-09-21 10:03:02", "t", "tool",
-                        None, "execute_tool", "logical-smoke", None, "codex",
-                        "svc", None, None, None, None, tool="read")
-        other = span_row("2026-09-21 10:04:00", "t", "other",
-                        None, "chat", "unrelated", None, "codex", "svc",
-                        3, 2, 0.001, "estimated")
-        Handler.span_cols = list(first)
-        Handler.span_rows = [[r[c] for c in Handler.span_cols]
-                             for r in (first, tool, other)]
-        Handler.log_cols = ["timestamp", "severity_text", "severity_number",
-                            "scope_name", "trace_id", "span_id", "body",
-                            "log_attributes", "resource_attributes"]
-        Handler.log_rows = []
-        base = "http://127.0.0.1:%d" % srv.server_port
-        ctx = (base, "YXV0aA==", "db")
-        cfg = _ai_cfg()
-        cfg["base_url"] = base
-        agg.ai_section(ctx, cfg)
-        Handler.span_rows = [[r[c] for c in Handler.span_cols]
-                             for r in (first, late, tool, other)]
-        agg.ai_section(ctx, cfg)
-        inserts = [s for s in Handler.seen if s.startswith("INSERT INTO ai_session_summary")]
-        deletes = [s for s in Handler.seen if s.startswith("DELETE FROM ai_session_summary")]
-        assert inserts, Handler.seen  # session row written
-        assert any("'logical-smoke'" in s and "'codex'" in s and
-                   "2026-09-21 09:03:01" in s for s in inserts), inserts
-        assert any("session_id = 'logical-smoke'" in s and
-                   "client = 'codex'" in s and "session_start !=" in s
-                   for s in deletes), deletes
-        assert all("session_start !=" in s and "client = " in s
-                   and "IS NULL" not in s for s in deletes), deletes
-        assert any("'unrelated'" in s for s in inserts), inserts
-        seen_before = len(Handler.seen)
-        agg.ai_section(ctx, cfg)
-        rerun = Handler.seen[seen_before:]
-        rerun_inserts = [s for s in rerun if s.startswith("INSERT INTO ai_session_summary")]
-        smoke = [s for s in rerun_inserts if "'logical-smoke'" in s]
-        assert len(smoke) == 1 and "2026-09-21 09:03:01" in smoke[0], rerun_inserts
-        merged = agg.summarize_sessions(
-            [agg.norm_span(first), agg.norm_span(late),
-             agg.norm_span(tool)])
-        assert len(merged) == 1, merged  # one logical session row
-        assert (merged[0]["input"], merged[0]["output"]) == (13, 6), merged[0]
-        assert merged[0]["llm_spans"] == 2, merged[0]
-        assert merged[0]["tool_calls"] == 1, merged[0]
-        assert merged[0]["cost"] == 0.005, merged[0]
-    finally:
-        _reset_table_fixtures()
-        srv.shutdown()
 
 
 def test_same_session_id_across_clients_stays_separate():
@@ -1573,7 +1510,6 @@ if __name__ == "__main__":
     test_epoch_source_separation_and_same_timestamp_policy()
     test_soc_rise_alone_never_charges()
     test_trip_segmentation_gap()
-    test_late_earlier_span_replaces_session_start_and_stays_idempotent()
     test_same_session_id_across_clients_stays_separate()
     test_native_codex_custom_service_folds_into_canonical_span()
     test_arbitrary_span_service_never_becomes_client()

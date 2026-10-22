@@ -3145,6 +3145,9 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
             " OR ".join(predicates), cfg["max_rows"])
     expired = {(client, sid) for client, sid, start in old_rows
                if not fully_retained(parse_ts(start), ttl, now, bound)}
+    stale = {(client, sid) for client, sid, start in old_rows
+             if (client, sid) in sessions and
+             parse_ts(start) != sessions[(client, sid)].get("session_start")}
     session_cols = ["session_start", "session_id", "client", "provider", "models",
                     "model_count", "session_end", "duration_s", "input_tokens",
                     "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -3176,6 +3179,8 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
         insert_rows(base_url, auth, db, "ai_session_summary",
                     session_cols, [row for _, row in pending])
         for s, _ in pending:
+            if (s["client"], s["session_id"]) not in stale:
+                continue
             request_sql(base_url, auth, db,
                         "DELETE FROM ai_session_summary WHERE session_id = " +
                         str_lit(s["session_id"]) + " AND client = " +

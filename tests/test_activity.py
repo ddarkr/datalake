@@ -579,6 +579,38 @@ class SpooledActivityTest(unittest.TestCase):
             "tool_name": "Edit", "decision": "accept"}}] * 2
         self.compare(traces, logs)
 
+    def test_datetime_pair_sort_preserves_microseconds_and_stable_ties(self):
+        start = dt(2026, 9, 20, 1)
+        traces = []
+        for ident, offset, branch in (
+                ("late", 2, "later"), ("first", 1, "first"),
+                ("tie", 1, "tie"), ("early", 0, "early")):
+            stamp = start + timedelta(microseconds=offset)
+            traces.append({
+                "trace_id": "t", "span_id": ident, "span_name": "coding_agent.session",
+                "timestamp": stamp, "timestamp_end": stamp + timedelta(microseconds=1),
+                "span_attributes": {"client": "c", "session.id": "other" if ident == "late" else "s",
+                                    "vcs.ref.head.name": branch}})
+        # Equal ordering pairs retain insertion order, including retransmits.
+        traces.append(dict(traces[1], span_attributes={
+            "client": "c", "session.id": "s", "vcs.ref.head.name": "replacement"}))
+        self.compare(traces)
+
+    def test_interleaved_sessions_survive_disk_field_cache_eviction(self):
+        traces = []
+        for revision in range(3):
+            for index in range(150):
+                stamp = dt(2026, 9, 20) + timedelta(seconds=revision * 150 + index)
+                traces.append({
+                    "trace_id": str(index), "span_id": str(revision),
+                    "span_name": "coding_agent.session", "timestamp": stamp,
+                    "timestamp_end": stamp + timedelta(seconds=1),
+                    "span_attributes": {
+                        "client": "c", "session.id": str(index),
+                        "coding_agent.session.lines.added": revision + index,
+                        "vcs.ref.head.name": str(revision)}})
+        self.compare(traces)
+
     def test_single_session_many_intervals_and_counter_points(self):
         start = dt(2026, 9, 20)
         traces, metrics = [], []

@@ -34,6 +34,7 @@ its accepted/rejected LOC covers added lines only.
 import json
 from datetime import datetime, timedelta, timezone
 import pickle
+from collections import OrderedDict
 from collections.abc import MutableMapping, MutableSet
 
 
@@ -47,6 +48,8 @@ class _ActivityStore:
 
     def __init__(self, connection):
         self.connection = connection
+        # ponytail: 1024 hot scalar/reference fields; raw payloads stay on disk.
+        self.entries = OrderedDict()
         connection.execute("PRAGMA temp_store=FILE")
         for statement in (
             "CREATE TABLE IF NOT EXISTS activity_nodes "
@@ -59,6 +62,11 @@ class _ActivityStore:
             "CREATE TABLE IF NOT EXISTS activity_sort "
             "(id INTEGER PRIMARY KEY, owner INTEGER NOT NULL, ordering TEXT, value BLOB)",
             "CREATE INDEX IF NOT EXISTS activity_sort_owner ON activity_sort(owner)",
+            "CREATE TABLE IF NOT EXISTS activity_traces "
+            "(id INTEGER PRIMARY KEY, hash INTEGER, key BLOB, "
+            "ending TEXT, starting TEXT, payload BLOB)",
+            "CREATE INDEX IF NOT EXISTS activity_trace_lookup ON activity_traces(hash)",
+            "CREATE INDEX IF NOT EXISTS activity_trace_order ON activity_traces(ending,starting,id)",
         ):
             connection.execute(statement)
         def compare(left, right):
@@ -99,19 +107,60 @@ class _ActivityStore:
             return tuple(self.unpack(item) for item in value[1])
         return value[1]
 
-    def sorted(self, values, key=None):
+    def ordered_traces(self, rows):
+        # Keep each raw row once; the ordering index carries only timestamps.
+        self.connection.execute("DELETE FROM activity_traces")
+        cursor = None
+        try:
+            for row in rows or []:
+                if not isinstance(row, dict):
+                    continue
+                key = (row.get("trace_id"), row.get("span_id"))
+                if key[0] is None or key[1] is None:
+                    continue
+                ts, end = _as_dt(row.get("timestamp")), _as_dt(row.get("timestamp_end"))
+                order = tuple(v.isoformat(timespec="microseconds")
+                              for v in (end or ts or datetime.min, ts or datetime.min))
+                for ident, candidate, ending, starting in self.connection.execute(
+                        "SELECT id,key,ending,starting FROM activity_traces WHERE hash=?",
+                        (hash(key),)):
+                    if pickle.loads(candidate) == key:
+                        if order >= (ending, starting):
+                            self.connection.execute(
+                                "UPDATE activity_traces SET ending=?,starting=?,payload=? WHERE id=?",
+                                (*order, pickle.dumps(row), ident))
+                        break
+                else:
+                    self.connection.execute(
+                        "INSERT INTO activity_traces(hash,key,ending,starting,payload) VALUES(?,?,?,?,?)",
+                        (hash(key), pickle.dumps(key), *order, pickle.dumps(row)))
+            cursor = self.connection.execute(
+                "SELECT payload FROM activity_traces ORDER BY ending,starting,id")
+            for (payload,) in cursor:
+                yield _ActivityRaw(pickle.loads(payload))
+        finally:
+            if cursor is not None:
+                cursor.close()
+            self.connection.execute("DELETE FROM activity_traces")
+
+    def sorted(self, values, key=None, *, datetime_pairs=False):
         owner = self.connection.execute(
             "INSERT INTO activity_nodes DEFAULT VALUES RETURNING id").fetchone()[0]
         cursor = None
         try:
             for value in values:
                 ordering = key(value) if key else value
+                # Fixed-width naive UTC datetime pairs have the same lexical
+                # order as Python tuples, without a Python/pickle comparator.
+                ordering = ("|".join(item.isoformat(timespec="microseconds") for item in ordering)
+                            if datetime_pairs else pickle.dumps(ordering).hex())
                 self.connection.execute(
                     "INSERT INTO activity_sort(owner,ordering,value) VALUES (?, ?, ?)",
-                    (owner, pickle.dumps(ordering).hex(), pickle.dumps(self.pack(value))))
+                    (owner, ordering, pickle.dumps(self.pack(value))))
+            collation = "" if datetime_pairs else " COLLATE activity_order"
             cursor = self.connection.execute(
                 "SELECT value FROM activity_sort WHERE owner=? "
-                "ORDER BY ordering COLLATE activity_order, id", (owner,))
+                f"ORDER BY ordering{collation}, id", (owner,))
             for (value,) in cursor:
                 yield self.unpack(pickle.loads(value))
         finally:
@@ -127,12 +176,27 @@ class _ActivityMap(MutableMapping):
     def __init__(self, store, ident):
         self.store, self.ident = store, ident
 
+    def _remember(self, key, entry):
+        cache = self.store.entries
+        cache_key = (self.ident, key)
+        cache.pop(cache_key, None)
+        if len(entry[1]) <= 256 and pickle.loads(pickle.dumps(key)) == key:
+            cache[cache_key] = entry
+            if len(cache) > 1024:
+                cache.popitem(last=False)
+        return entry
+
     def _entry(self, key):
+        cache_key = (self.ident, key)
+        cache = self.store.entries
+        if cache_key in cache:
+            cache.move_to_end(cache_key)
+            return cache[cache_key]
         for ident, candidate, value in self.store.connection.execute(
                 "SELECT id, key, value FROM activity_entries WHERE owner=? AND hash=?",
                 (self.ident, hash(key))):
             if pickle.loads(candidate) == key:
-                return ident, value
+                return self._remember(key, (ident, value))
         raise KeyError(key)
 
     def __getitem__(self, key):
@@ -143,21 +207,34 @@ class _ActivityMap(MutableMapping):
         try:
             ident, _ = self._entry(key)
         except KeyError:
-            self.store.connection.execute(
+            ident = self.store.connection.execute(
                 "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",
-                (self.ident, hash(key), pickle.dumps(key), value))
+                (self.ident, hash(key), pickle.dumps(key), value)).lastrowid
         else:
             self.store.connection.execute(
                 "UPDATE activity_entries SET value=? WHERE id=?", (value, ident))
+        self._remember(key, (ident, value))
 
     def __delitem__(self, key):
         ident, _ = self._entry(key)
         self.store.connection.execute("DELETE FROM activity_entries WHERE id=?", (ident,))
+        self.store.entries.pop((self.ident, key), None)
 
     def __iter__(self):
         for (key,) in self.store.connection.execute(
                 "SELECT key FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
             yield pickle.loads(key)
+
+    def items(self):
+        for key, value in self.store.connection.execute(
+                "SELECT key, value FROM activity_entries WHERE owner=? ORDER BY id",
+                (self.ident,)):
+            yield pickle.loads(key), self.store.unpack(pickle.loads(value))
+
+    def values(self):
+        for (value,) in self.store.connection.execute(
+                "SELECT value FROM activity_entries WHERE owner=? ORDER BY id", (self.ident,)):
+            yield self.store.unpack(pickle.loads(value))
 
     def __len__(self):
         return self.store.connection.execute(
@@ -540,7 +617,7 @@ def _day_start(ts):
 
 
 def _merge_intervals(intervals):
-    ordered = (intervals.store.sorted(intervals)
+    ordered = (intervals.store.sorted(intervals, datetime_pairs=True)
                if isinstance(intervals, _ActivityList) else sorted(intervals))
     current = None
     for start, end in ordered:
@@ -719,21 +796,24 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
     # Traces: dedupe retransmitted/updated spans by identity, latest end wins.
     # Rows without trace/span IDs carry no stable identity, so they are
     # skipped rather than counted under an invented row-index identity.
-    deduped = mapping()
-    for row in trace_rows or []:
-        if not isinstance(row, dict):
-            continue
-        trace_id = row.get("trace_id")
-        span_id = row.get("span_id")
-        if trace_id is None or span_id is None:
-            continue
-        ts = _as_dt(row.get("timestamp"))
-        end = _as_dt(row.get("timestamp_end"))
-        order = (end or ts or datetime.min, ts or datetime.min)
-        key = (trace_id, span_id)
-        if key not in deduped or order >= deduped[key][0]:
-            deduped[key] = (order, _ActivityRaw(row))
-    ordered_traces = (row for _, row in sort_rows(deduped.values(), key=lambda kv: kv[0]))
+    if store:
+        ordered_traces = store.ordered_traces(trace_rows)
+    else:
+        deduped = mapping()
+        for row in trace_rows or []:
+            if not isinstance(row, dict):
+                continue
+            trace_id = row.get("trace_id")
+            span_id = row.get("span_id")
+            if trace_id is None or span_id is None:
+                continue
+            ts = _as_dt(row.get("timestamp"))
+            end = _as_dt(row.get("timestamp_end"))
+            order = (end or ts or datetime.min, ts or datetime.min)
+            key = (trace_id, span_id)
+            if key not in deduped or order >= deduped[key][0]:
+                deduped[key] = (order, _ActivityRaw(row))
+        ordered_traces = (row for _, row in sort_rows(deduped.values(), key=lambda kv: kv[0]))
 
     subagent_spans = unique()
     commit_spans = unique()

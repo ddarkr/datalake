@@ -3,6 +3,7 @@ import io
 import pickle
 import sqlite3
 import tempfile
+from collections import OrderedDict
 
 
 def packed(value):
@@ -23,7 +24,8 @@ class Recovery:
         self.db.execute("PRAGMA cache_size=-8192")
         self.db.execute("PRAGMA temp_store=FILE")
         self.db.executescript("""
-            CREATE TABLE raw (kind TEXT, ordinal INTEGER PRIMARY KEY, payload BLOB);
+            CREATE TABLE raw_schema (ordinal INTEGER PRIMARY KEY, columns BLOB UNIQUE);
+            CREATE TABLE raw (kind TEXT, ordinal INTEGER PRIMARY KEY, schema INTEGER, payload BLOB);
             CREATE INDEX raw_kind ON raw(kind, ordinal);
             CREATE TABLE spans (ordinal INTEGER PRIMARY KEY, identity BLOB UNIQUE,
                 payload BLOB, trace BLOB, span BLOB, parent BLOB, scope BLOB,
@@ -47,12 +49,32 @@ class Recovery:
         self.directory.cleanup()
 
     def raw_rows(self, kind):
-        for (payload,) in self.db.execute(
-                "SELECT payload FROM raw WHERE kind=? ORDER BY ordinal", (kind,)):
-            yield pickle.loads(payload)
+        schema, columns = None, None
+        for schema_id, payload in self.db.execute(
+                "SELECT schema,payload FROM raw WHERE kind=? ORDER BY ordinal", (kind,)):
+            if schema_id != schema:
+                columns = pickle.loads(self.db.execute(
+                    "SELECT columns FROM raw_schema WHERE ordinal=?", (schema_id,)).fetchone()[0])
+                schema = schema_id
+            yield dict(zip(columns, pickle.loads(payload)))
 
     def sink(self, kind, instrument=None, meta=None):
         a = self.a
+        schema, schema_id = None, None
+
+        def append_raw(raw_kind, raw):
+            nonlocal schema, schema_id
+            columns = tuple(raw)
+            if columns != schema:
+                encoded = packed(columns)
+                self.db.execute("INSERT OR IGNORE INTO raw_schema(columns) VALUES(?)", (encoded,))
+                schema_id = self.db.execute(
+                    "SELECT ordinal FROM raw_schema WHERE columns=?", (encoded,)).fetchone()[0]
+                schema = columns
+            # Store projected names once, without dropping explicit nulls or
+            # conflating a missing key with a present key whose value is None.
+            return self.db.execute("INSERT INTO raw(kind,schema,payload) VALUES(?,?,?)",
+                                   (raw_kind, schema_id, packed(tuple(raw.values())))).lastrowid
 
         def consume(cols, rows):
             rows = a._ai_flight_ns_rows(kind, cols, rows)
@@ -62,13 +84,13 @@ class Recovery:
                     raw = a._ai_norm_metric_row(raw, instrument, meta)
                     if raw is None:
                         continue
-                    self.db.execute("INSERT INTO raw(kind,payload) VALUES('metric',?)", (packed(raw),))
+                    append_raw("metric", raw)
                 else:
-                    self.db.execute("INSERT INTO raw(kind,payload) VALUES(?,?)", (kind, packed(raw)))
+                    ordinal = append_raw(kind, raw)
                     if kind == "opentelemetry_traces":
                         identity = (raw.get("trace_id"), raw.get("span_id"))
                         if identity == (None, None):
-                            identity = (None, None, self.db.execute("SELECT last_insert_rowid()").fetchone()[0])
+                            identity = (None, None, ordinal)
                         self.add_span(a.norm_span(raw), packed(identity))
                     else:
                         rec = a.norm_log(raw)
@@ -206,17 +228,25 @@ class Recovery:
         a = self.a
         self.db.execute("CREATE TABLE distincts(kind TEXT, identity BLOB, value BLOB, PRIMARY KEY(kind,identity,value))")
         additive = ("input", "output", "cache_read", "cache_write", "reasoning", "total", "cost", "llm_spans", "tool_calls", "errors", "cost_estimated_usd", "cost_unpriced_calls")
+        # Fixed-width accumulators only; distinct models/sessions stay in SQLite.
+        pending = OrderedDict()
 
         def bump(kind, key, row, billed, money, tool):
             identity = packed(key)
-            hit = self.db.execute("SELECT payload FROM output WHERE kind=? AND identity=?", (kind, identity)).fetchone()
-            if hit is None:
-                state = {field: None for field in additive}
-                if prices is not None:
-                    state["cost_unpriced_calls"] = 0
-                state.update({"provider": None, "session_start": None, "session_end": None})
+            cache_key = (kind, identity)
+            cached = pending.pop(cache_key, None)
+            if cached is not None:
+                _, state = cached
             else:
-                state = pickle.loads(hit[0])
+                hit = self.db.execute("SELECT payload FROM output WHERE kind=? AND identity=?", (kind, identity)).fetchone()
+                if hit is None:
+                    state = {field: None for field in additive}
+                    if prices is not None:
+                        state["cost_unpriced_calls"] = 0
+                    state.update({"provider": None, "session_start": None, "session_end": None})
+                    self.save(kind, key, state)
+                else:
+                    state = pickle.loads(hit[0])
             start = a.parse_ts(row["ts"])
             end = a.parse_ts(row["end"] or row["ts"])
             if start is not None:
@@ -250,10 +280,14 @@ class Recovery:
                 self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "model", identity, packed(row["model"])))
             if row.get("session"):
                 self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "session", identity, packed(row["session"])))
-            self.save(kind, key, state)
+            pending[cache_key] = (key, state)
+            if len(pending) > 128:
+                (old_kind, _), (old_key, old_state) = pending.popitem(last=False)
+                self.save(old_kind, old_key, old_state)
 
-        for ordinal, row in self.rows():
-            billed, money, tool = self.db.execute("SELECT billed,money,tool FROM spans WHERE ordinal=?", (ordinal,)).fetchone()
+        for ordinal, payload, billed, money, tool in self.db.execute(
+                "SELECT ordinal,payload,billed,money,tool FROM spans ORDER BY phase,ordinal"):
+            row = pickle.loads(payload)
             day = a._ai_day_of(row)
             if row.get("session"):
                 bump("session", (row["client"] or "unknown", row["session"]), row, billed, money, tool)
@@ -270,6 +304,8 @@ class Recovery:
                         state["duration"] += row["duration_ms"]
                         state["durations"] += 1
                     self.save("tool", key, state)
+        for (kind, _), (key, state) in pending.items():
+            self.save(kind, key, state)
         for kind in ("session", "daily"):
             for key, state in self.outputs(kind):
                 identity = packed(key)

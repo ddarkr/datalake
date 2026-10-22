@@ -1982,6 +1982,31 @@ def test_disk_reducer_matches_global_merge_oracle_across_chunks():
             recovery.close()
 
 
+def test_disk_snapshot_preserves_raw_schema_and_nulls():
+    from scripts.analytics.ai_recovery import Recovery
+    recovery = Recovery(agg, 2)
+    try:
+        consume = recovery.sink("opentelemetry_traces")
+        expected = [
+            {"trace_id": "raw-a", "span_id": "a", "explicit_null": None,
+             "nested": {"empty": "", "values": [None, 0, False]}},
+            {"span_id": "b", "trace_id": "raw-b", "nested": None},
+            {"trace_id": "raw-c", "span_id": "c", "explicit_null": None,
+             "nested": {"empty": "", "values": [None, 0, False]}},
+        ]
+        # One stream may change projection/order between batches, then return
+        # to an earlier schema. Activity must receive the full original maps.
+        for raw in expected:
+            consume(list(raw), [list(raw.values())])
+        actual = list(recovery.raw_rows("opentelemetry_traces"))
+        assert actual == expected, actual
+        assert [list(row) for row in actual] == [list(row) for row in expected]
+        assert "explicit_null" not in actual[1]
+        assert actual[0]["explicit_null"] is None
+    finally:
+        recovery.close()
+
+
 def test_native_jsonb_projection_preserves_log_only_sessions():
     saved = _guard()
     real = install_fence({"opentelemetry_logs": "native_jsonb"})
@@ -2034,6 +2059,7 @@ TESTS = (
     test_bounded_long_session_prefix_failure_and_late_retry,
     test_native_jsonb_projection_preserves_log_only_sessions,
     test_disk_reducer_matches_global_merge_oracle_across_chunks,
+    test_disk_snapshot_preserves_raw_schema_and_nulls,
     test_partial_write_failure_keeps_fence_and_converges,
     test_expired_anchor_isolated_by_client_and_session,
     test_ttl_partial_expiry_preserves_stored_derived,
