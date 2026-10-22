@@ -195,7 +195,8 @@ def test_ttl_boundary_ai_section_keeps_expired_aggregates():
         _no_network_prices()
         agg.utcnow = lambda: now
         ctx = ("http://127.0.0.1:%d" % srv.server_port, "YXV0aA==", "db")
-        total = agg.ai_section(ctx, {"otel_ttl": "7d", "max_rows": 1000})
+        total = agg.ai_section(ctx, {"otel_ttl": "7d", "max_rows": 1000,
+                                     "ai_full_rebuild": True})
         assert total >= 1
         writes = [s for s in Handler.seen
                   if s.startswith("INSERT") or s.startswith("DELETE")]

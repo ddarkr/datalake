@@ -31,14 +31,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     rows = []
     cols = []
     types = []
-    # Per-table fixtures for multi-SELECT sections (ai_section reads traces
-    # then logs): when set (not None), the matching table's SELECT is served
-    # from these instead of the generic cols/rows above.
-    # Cross-contract: tests/test_ai_incremental.py owns issue #1's fenced
-    # behavior with its own HTTP fake + fake Flight fence; this Handler
-    # keeps the original fixtures (the state SELECT below serves zero rows,
-    # so the shared path takes the explicit full rebuild), pinning the
-    # full-scan oracle output the fenced path must match.
+    # HTTP-only full-rebuild fixtures. Sequence-fence recovery is covered by
+    # tests/test_ai_incremental.py with its separate Flight-aware store.
     span_cols = None
     span_rows = None
     span_types = None
@@ -63,12 +57,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
             cols, rows, types = Handler.cols, Handler.rows, Handler.types
             if "information_schema.tables" in stmt:
                 cols, rows, types = ["table_name", "create_options"], [], None
-            elif "FROM ai_aggregate_state" in stmt:
-                # No stored fence on these fixtures: the shared fenced path
-                # takes the explicit full rebuild (fence schema).
-                cols, rows, types = (
-                    ["fence", "price_digest",
-                     "config_revision", "input_digest"], [], None)
             elif "FROM raw_retention_watermark" in stmt:
                 cols, rows, types = ["deleted_before"], Handler.retention_rows, None
             elif "opentelemetry_traces" in stmt and Handler.span_cols is not None:
@@ -547,6 +535,7 @@ def _ai_cfg(**over):
     cfg = {"base_url": "", "db": "db", "user": "u", "password": "p",
            "lookback_h": 30, "interval_s": 1, "max_rows": 1000,
            "otel_ttl": "", "vehicle": "",
+           "ai_full_rebuild": True,
            "paths": {"speed": "", "soc": "", "energy": "",
                      "power": "", "charging": ""},
            "home": {"table": "", "time_col": "ts", "entity_col": "",
