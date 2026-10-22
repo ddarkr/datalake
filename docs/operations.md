@@ -533,6 +533,7 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - 이 변경은 egress 0이나 과금 안전을 보장하지 않습니다. 새 dirty generation의 집계와 다른 section의 조회, DB compaction은 여전히 raw/SST를 읽을 수 있습니다.
 - AI/log/home section은 `vehicle_discovery`와 독립적으로 실행합니다. discovery 실패 시 이에 의존하는 차량 section은 fail-closed로 실행하지 않으며, 빈 결과의 성공으로 바꾸지 않고 전체 pass를 실패로 기록합니다. 실패한 pass도 같은 monotonic 시작 간격으로 다음 주기에 재시도하며 crash-loop하지 않습니다. `AGG_RUN_ONCE=1`은 실패 시 nonzero로 종료합니다. 잘못된 시작 설정(예: 필수 인증 누락, DB 미준비)은 여전히 시작 실패입니다.
 - 차량 checkpoint는 scope·시간별 rollup과 주행·충전 요약이 성공하고 dirty generation 재확인이 일치한 뒤에만 저장합니다. 배터리 분석은 checkpoint의 완료 조건이 아닙니다. 뒤의 작업이 실패해도 앞서 성공한 checkpoint는 남습니다. 주행 raw 조회는 1시간씩 나누되 episode와 열린 주행의 시작 anchor 문맥은 유지합니다.
+- SST의 최소 시각은 늦게 수신한 미플러시 원본의 시작을 증명하지 못합니다. 비-CAN rollup은 설정된 lookback 전체를 처리하며, 주행·충전의 첫 구간이 조회 시작 경계에 걸리면 lookback만큼 앞선 구간을 더 읽어 시작을 복구합니다. 전체 raw `MIN` 조회는 하지 않고, 각 조회의 1시간 청크와 누적 행 상한을 유지합니다. 실제 시작을 확인하기 위한 추가 읽기는 발생할 수 있으며 과거 CAN 전체 자동 재탐색을 다시 켜는 변경은 아닙니다.
 - SQL 진단은 느린 조회(1초 이상)와 실패에 대해 허용된 operation·table·fingerprint·실제 UTC 조회 경계·경과 시간만 기록합니다. raw SQL, 인증 정보, 차량·scope 식별자는 로그에 남기지 않습니다.
 
 - 비-CAN 정기 분석과 명시적 standalone 배터리 조회는 같은 구간·scope의 이벤트를 먼저 읽고 분석에 필요한 `source_field`만 가져옵니다. 제외 조건은 SQL의 `LIMIT` 전에 적용하며, 정확한 나노초 경계의 최대 1시간 청크로 조회해 기존 24시간 문맥과 누적 `BATTERY_MAX_ROWS` 한도를 유지합니다. scope는 고유한 전체 태그 조합으로 구분합니다. 경고 이벤트가 없는 오프라인 구간에는 경고 문맥용 전체 신호 조회를 생략하지만, 필드와 무관한 scope 탐색은 유지해 기존 결과의 무효화를 빠뜨리지 않습니다. 실제 경고가 있거나 온라인 가용성 검사가 필요하면 기존 문맥을 보존합니다. 누적 한도 초과나 조회 실패 시 부분 결과를 저장하지 않습니다.

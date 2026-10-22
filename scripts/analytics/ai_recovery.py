@@ -383,6 +383,12 @@ def recover(a, ctx, cfg, metric_registry, price_digest, prices):
                     batch = []
             if batch:
                 total += write_batch(a, ctx, cfg, prices, bound, now, kind, batch)
+        for kind in a.AI_SUMMARY_KEYS:
+            def contains(key):
+                return recovery.db.execute(
+                    "SELECT 1 FROM output WHERE kind=? AND identity=?",
+                    (kind, packed(key))).fetchone() is not None
+            a._ai_prune_summary(ctx, cfg, kind, contains, bound)
         a._ai_commit_state(ctx, a._ai_encode_fence(upper), metric_registry, price_digest)
         return total
     finally:
@@ -394,4 +400,4 @@ def write_batch(a, ctx, cfg, prices, bound, now, kind, batch):
     return a._ai_write(ctx, cfg, dict(batch) if kind == "session" else {},
                        values if kind == "activity" else [], [], prices, bound, now,
                        computed=(values if kind == "daily" else [],
-                                 values if kind == "tool" else []))
+                                 values if kind == "tool" else []), reconcile=False)

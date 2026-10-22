@@ -330,6 +330,28 @@ def route(stmt):
         F.fault_n += 1
         if F.fault_n == F.fault[1]:
             raise FakeFault("injected failure on " + F.fault[0])
+    summary = re.search(r"\bFROM (ai_daily_summary|ai_tool_daily)\b", stmt)
+    if summary and stmt.startswith(("SELECT ", "DELETE ")):
+        table = summary.group(1)
+        keys = _UPSERT_KEYS[table]
+        stored = F.derived[table]
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE " + table + " (" +
+                       ", ".join(key + " TEXT" for key in keys) + ")")
+            db.executemany("INSERT INTO " + table + " VALUES (" +
+                           ",".join("?" for _ in keys) + ")", [
+                               tuple(agg.ts_lit(agg.parse_ts(row.get(key)))[1:-1]
+                                     if key == "day_start" else row.get(key)
+                                     for key in keys) for row in stored])
+            result = db.execute(stmt)
+            if stmt.startswith("SELECT "):
+                rows = result.fetchall()
+                F.queries.append((stmt, len(rows)))
+                return _records([col[0] for col in result.description], rows)
+            survivors = {row[0] - 1 for row in db.execute("SELECT rowid FROM " + table)}
+        F.derived[table] = [row for index, row in enumerate(stored) if index in survivors]
+        F.queries.append((stmt, len(stored) - len(survivors)))
+        return {"output": [{"affectedrows": len(stored) - len(survivors)}]}
     if stmt.startswith("SELECT"):
         if "information_schema.columns" in stmt:
             m = re.search(r"table_name\s*=\s*'((?:''|[^'])*)'", stmt)
@@ -2034,7 +2056,6 @@ def test_native_jsonb_projection_preserves_log_only_sessions():
                 if row.get("session_id") != "jsonb-log-only"]
             agg.ai_section(ctx, cfg)
             assert _session_input("jsonb-log-only", "codex") == (40, 20)
-            assert FakeGreptime.state["rev"] == "ai:fence-v2"
             result = snapshot()
         finally:
             srv.shutdown()
@@ -2045,7 +2066,104 @@ def test_native_jsonb_projection_preserves_log_only_sessions():
         _restore(saved)
 
 
+def test_late_model_reconciliation_retries_without_advancing_fence():
+    saved = _guard()
+    real = install_fence()
+    _reset()
+    srv = serve()
+    try:
+        ctx, cfg = _ctx(srv), _cfg()
+        trace = span(DAY2, "late-model", "call", "session", "codex",
+                     5, 5, call="request", model=None)
+        other = span(DAY1, "other", "call", "other", "codex", 7, 3)
+        FakeGreptime.store.append("traces", [trace, other])
+        seed_fenced(ctx, cfg)
+        old_state = dict(FakeGreptime.state)
+        old_day = [dict(r) for r in FakeGreptime.derived["ai_daily_summary"]
+                   if agg.parse_ts(r["day_start"]) == DAY1]
+        native = clog(DAY2, "session", "codex", "request", 50, 30)
+        attrs = json.loads(native["log_attributes"])
+        attrs["model"] = "resolved-model"
+        native["log_attributes"] = json.dumps(attrs)
+        FakeGreptime.store.append("logs", [native])
+        FakeGreptime.fault = ("DELETE FROM ai_daily_summary", 1)
+        try:
+            agg.ai_section(ctx, cfg)
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("failed reconciliation must fail the pass")
+        assert FakeGreptime.state == old_state
+        FakeGreptime.fault = None
+        agg.ai_section(ctx, cfg)
+        rows = [r for r in FakeGreptime.derived["ai_daily_summary"]
+                if agg.parse_ts(r["day_start"]) == DAY2]
+        assert [(r["model"], r["input_tokens"], r["output_tokens"]) for r in rows] == [
+            ("resolved-model", 50, 30)]
+        assert _session_input("session", "codex") == (50, 30)
+        assert [r for r in FakeGreptime.derived["ai_daily_summary"]
+                if agg.parse_ts(r["day_start"]) == DAY1] == old_day
+        assert FakeGreptime.state != old_state
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        restore_fence(real)
+        _restore(saved)
+
+
+def test_full_reconciliation_pages_and_preserves_partial_retention_day():
+    saved = _guard()
+    real = install_fence()
+    _reset()
+    srv = serve()
+    try:
+        ctx, cfg = _ctx(srv), _cfg(max_rows=2)
+        traces = [span(DAY2, "old-model", "call", "session", "codex", 5, 5)]
+        traces += [span(DAY2, "old-tools", str(i), "session", "codex",
+                        None, None, op="tool", tool="old-" + str(i)) for i in range(5)]
+        traces += [span(DAY1, "expired", "tool", "past", "codex",
+                        7, 3, op="tool", tool="past-tool")]
+        FakeGreptime.store.append("traces", traces)
+        seed_fenced(ctx, cfg)
+        before = {table: [dict(r) for r in FakeGreptime.derived[table]]
+                  for table in ("ai_daily_summary", "ai_tool_daily")}
+        # Current complete raw snapshot has corrected dimensions and no tools.
+        FakeGreptime.store = SeqStore()
+        FakeGreptime.store.append("traces", [
+            span(DAY2, "old-model", "call", "session", "codex", 50, 30, model="fixed")])
+        FakeGreptime.watermark = _fmt(DAY1 + dt.timedelta(hours=12))
+        FakeGreptime.state["rev"] = "ai:fence-v2"
+        old_state = dict(FakeGreptime.state)
+        FakeGreptime.fault = ("INSERT INTO ai_daily_summary", 1)
+        try:
+            agg.ai_section(ctx, cfg)
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("failed replacement write must fail the pass")
+        assert FakeGreptime.state == old_state
+        assert all(FakeGreptime.derived[table] == rows for table, rows in before.items())
+        FakeGreptime.fault = None
+        agg.ai_section(ctx, cfg)
+        daily = [r for r in FakeGreptime.derived["ai_daily_summary"]
+                 if agg.parse_ts(r["day_start"]) == DAY2]
+        assert [(r["model"], r["input_tokens"]) for r in daily] == [("fixed", 50)]
+        assert not [r for r in FakeGreptime.derived["ai_tool_daily"]
+                    if agg.parse_ts(r["day_start"]) == DAY2]
+        for table in before:
+            assert [r for r in FakeGreptime.derived[table]
+                    if agg.parse_ts(r["day_start"]) == DAY1] == [
+                        r for r in before[table] if agg.parse_ts(r["day_start"]) == DAY1]
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        restore_fence(real)
+        _restore(saved)
+
+
 TESTS = (
+    test_late_model_reconciliation_retries_without_advancing_fence,
+    test_full_reconciliation_pages_and_preserves_partial_retention_day,
     test_fresh_bootstrap_commits_fence_on_first_pass,
     test_fenced_late_arrival_matches_full_oracle,
     test_noop_second_pass_reads_no_rows,

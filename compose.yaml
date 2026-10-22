@@ -114,7 +114,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.aggregate-revision: '35'
+      datalake.aggregate-revision: '37'
     depends_on:
       greptimedb:
         condition: service_started
@@ -2223,7 +2223,7 @@ configs:
         or revision mismatch, AGG_AI_FULL_REBUILD=1) rebuilds instead of
         skipping.
 
-      Retention policy (fail-closed; DELETE only drops obsolete same-session starts):
+      Retention policy (fail-closed; obsolete starts and fully retained daily keys):
         AI summaries default to a bounded fenced pass and fall back to the
         full retained-range rebuild (see docs/ai-incremental.md) whenever the
         sequence fence is unproved: missing Flight deps/grpc endpoint/state
@@ -4351,7 +4351,7 @@ configs:
           return out
 
 
-      AI_LOGIC_REVISION = "ai:fence-v2"
+      AI_LOGIC_REVISION = "ai:fence-v3"
       AI_STATE_SCOPE = "ai"
       AI_STATE_TABLE = "ai_aggregate_state"
       AI_SPAN_SESSION_COLS = (SESSION, "span_attributes.session.id",
@@ -5322,8 +5322,59 @@ configs:
                         ts_lit(utcnow())]])
 
 
+      AI_SUMMARY_KEYS = {
+          "daily": ("ai_daily_summary", ("day_start", "client", "provider", "model")),
+          "tool": ("ai_tool_daily", ("day_start", "tool_name", "client")),
+      }
+
+
+      def _ai_prune_summary(ctx, cfg, kind, contains, bound, days=None):
+          """Remove absent keys only after complete replacement writes succeed."""
+          table, columns = AI_SUMMARY_KEYS[kind]
+          limit = min(500, cfg["max_rows"])
+          for day in sorted(days) if days is not None else (None,):
+              if day is not None and bound is not None and day < bound:
+                  continue
+              scope = (["day_start = " + ts_lit(day)] if day is not None else
+                       ["day_start >= " + ts_lit(bound)] if bound is not None else [])
+              cursor = None
+              while True:
+                  filters = list(scope)
+                  if cursor is not None:
+                      after = []
+                      equal = []
+                      for column, value in zip(columns, cursor):
+                          after.append("(" + " AND ".join(equal + [column + " > " + value]) + ")")
+                          equal.append(column + " = " + value)
+                      filters.append("(" + " OR ".join(after) + ")")
+                  where = " WHERE " + " AND ".join(filters) if filters else ""
+                  names, rows = fetch_rows(*ctx, "SELECT " + ", ".join(columns) +
+                                           " FROM " + table + where + " ORDER BY " +
+                                           ", ".join(columns) + " LIMIT " + str(limit))
+                  if names != list(columns) or len(rows) > limit:
+                      raise SqlError("invalid AI summary key page")
+                  stale = []
+                  for row in rows:
+                      if len(row) != len(columns) or any(not isinstance(v, str) for v in row[1:]):
+                          raise SqlError("invalid AI summary key")
+                      stamp = parse_ts(row[0])
+                      if stamp is None:
+                          raise SqlError("invalid AI summary day")
+                      key = (stamp, *row[1:])
+                      cursor = [ts_lit(stamp)] + [str_lit(v) for v in row[1:]]
+                      if not contains(key):
+                          stale.append("(" + " AND ".join(
+                              col + " = " + value for col, value in zip(columns, cursor)) + ")")
+                  # Bounded predicates avoid the planner cost of hundreds of OR keys.
+                  for offset in range(0, len(stale), 32):
+                      request_sql(*ctx, "DELETE FROM " + table + " WHERE " +
+                                  " OR ".join(stale[offset:offset + 32]))
+                  if len(rows) < limit:
+                      break
+
+
       def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
-                    commit=None, dirty_days=None, computed=None):
+                    commit=None, dirty_days=None, computed=None, reconcile=True):
           base_url, auth, db = ctx
           ttl = cfg.get("otel_ttl", "")
           total = 0
@@ -5400,11 +5451,14 @@ configs:
                            "cost_estimated_usd", "cost_unpriced_calls",
                            "llm_spans", "tool_calls", "active_sessions", "error_count"]
           daily_rows = []
+          daily_keys = set()
           for d in (computed[0] if computed is not None else summarize_daily(spans, prices)):
               if dirty_days is not None and d["day"] not in dirty_days:
                   continue
               if bound and d["day"] < bound:
                   continue  # partly expired day: keep the old row
+              if reconcile:
+                  daily_keys.add((d["day"], d["client"], d["provider"], d["model"]))
               daily_rows.append([ts_lit(d["day"]), str_lit(d["client"]), str_lit(d["provider"]),
                             str_lit(d["model"]), num_lit(d["input"]), num_lit(d["output"]),
                             num_lit(d["cache_read"]), num_lit(d["cache_write"]),
@@ -5419,17 +5473,23 @@ configs:
               total += len(daily_rows)
           tool_cols = ["day_start", "tool_name", "client", "calls", "errors", "avg_duration_ms"]
           tool_rows = []
+          tool_keys = set()
           for t in (computed[1] if computed is not None else summarize_tools(spans)):
               if dirty_days is not None and t["day"] not in dirty_days:
                   continue
               if bound and t["day"] < bound:
                   continue  # partly expired day: keep the old row
+              if reconcile:
+                  tool_keys.add((t["day"], t["tool"], t["client"]))
               tool_rows.append([ts_lit(t["day"]), str_lit(t["tool"]), str_lit(t["client"]),
                             num_lit(t["calls"]), num_lit(t["errors"]), num_lit(t["avg_ms"])])
           if tool_rows:
               insert_rows(base_url, auth, db, "ai_tool_daily",
                           tool_cols, tool_rows)
               total += len(tool_rows)
+          if reconcile:
+              for kind, keys in (("daily", daily_keys), ("tool", tool_keys)):
+                  _ai_prune_summary(ctx, cfg, kind, keys.__contains__, bound, dirty_days)
           if commit is not None:
               _ai_commit_state(ctx, commit[0], commit[1], commit[2])
           return total
@@ -5500,13 +5560,7 @@ configs:
       def _vehicle_rollup(ctx, cfg, exclude=None):
           base_url, auth, db = ctx
           now = utcnow()
-          floor_ns = _flushed_floor_ns(ctx)
-          cov = (_ns_to_dt(floor_ns) if floor_ns is not None else
-                 coverage_min(base_url, auth, db, "vehicle_signal", "event_time",
-                              " WHERE NOT COALESCE(source = 'can', false)"))
           aligned = floor_hour(now - dt.timedelta(hours=cfg["lookback_h"]))
-          if cov:
-              aligned = max(aligned, floor_hour(cov))
           cut = aligned.strftime("%Y-%m-%d %H:%M:%S")
           seal_m = floor_minute(now).strftime("%Y-%m-%d %H:%M:%S")
           seal_h = floor_hour(now).strftime("%Y-%m-%d %H:%M:%S")
@@ -5898,55 +5952,12 @@ configs:
           return out
 
 
-      def _flushed_floor_ns(ctx):
-          """Oldest flushed event_time from SST metadata, exact ns; None only when
-          a successful query proves that no visible SSTs are pinned. Missing or
-          stale metadata failures propagate so discovery fails closed. Pinned
-          information_schema.ssts_manifest MIN(min_ts) for this database's
-          vehicle_signal table_id: a metadata scalar that reads zero SST rows. (A
-          raw MIN(event_time) over flushed SSTs scans them instead, so it is never
-          used here.) Absent SSTs are NOT absent raw."""
-          base_url, auth, db = ctx
-          cols, rows = fetch_rows(
-              base_url, auth, db,
-              "SELECT MIN(min_ts) FROM information_schema.ssts_manifest"
-              " WHERE table_id = (SELECT table_id FROM"
-              " information_schema.tables WHERE table_schema = "
-              + str_lit(db) + " AND table_name = 'vehicle_signal')"
-              + " AND visible = true LIMIT 2")
-          if not rows or not rows[0]:
-              return None
-          return parse_ts_ns(rows[0][0])
-
-
       def _distinct_scopes(ctx, cfg):
           """Known CAN scopes only; unnotified history is not discovered."""
           return _registered_scopes(ctx, cfg)
 
 
-      def _raw_coverage_ns(ctx, scope):
-          """Oldest raw event_time for one scope, exact ns; None when empty.
-          A scoped raw MIN(event_time) scan (reads SSTs when flushed), so it is
-          ONLY a memtable-only fallback when no SST floor is pinned. Flushed
-          history always starts at the ssts_manifest floor instead."""
-          base_url, auth, db = ctx
-          v, src, epoch = scope
-          try:
-              cols, rows = fetch_rows(
-                  base_url, auth, db,
-                  "SELECT MIN(event_time) FROM vehicle_signal"
-                  " WHERE vehicle = " + str_lit(v) + " AND source = "
-                  + str_lit(src) + " AND decode_epoch = " + str_lit(epoch)
-                  + " LIMIT 2")
-          except SqlError as e:
-              if is_missing_table(e):
-                  return None
-              raise
-          if not rows or not rows[0]:
-              return None
-          return parse_ts_ns(rows[0][0])
-
-      def _extend_vehicle_head(ctx, key, segments, raw_from, cutoff, gap_s, lookback_h):
+      def _extend_vehicle_head(segments, raw_from, cutoff, gap_s, lookback_h):
           """Recover a cut head in bounded steps; never relabel a tail as a new trip."""
           head_gap = (_ts_diff_s(segments[0]["start"], raw_from)
                       if segments else None)
@@ -5956,15 +5967,9 @@ configs:
                   or (tail_gap is not None and tail_gap > 0
                       and not segments[0].get("open"))):
               return None
-          first = _flushed_floor_ns(ctx)
-          if first is None:
-              first = _raw_coverage_ns(ctx, key)
-          if first is None:
-              return None
-          first_dt = _ns_to_dt(first)
-          if first_dt >= raw_from:
-              return None
-          return max(first_dt, raw_from - dt.timedelta(hours=lookback_h))
+          # SST bounds exclude late unflushed rows. Read one more bounded window
+          # until the first segment is separated from the query boundary by a gap.
+          return raw_from - dt.timedelta(hours=lookback_h)
 
 
       def trip_section(ctx, cfg, *, window=None, scope=None):
@@ -6088,7 +6093,7 @@ configs:
                   bound_s = trip_gap * 60 + max_age
                   segs = segment_trips(pts, gap_min=trip_gap, min_speed=min_speed)
                   earlier = _extend_vehicle_head(
-                      ctx, key, segs, raw_from, cutoff, trip_gap * 60, cfg["lookback_h"])
+                      segs, raw_from, cutoff, trip_gap * 60, cfg["lookback_h"])
                   if earlier is not None:
                       return total, earlier
                   for seg in segs:
@@ -6126,7 +6131,7 @@ configs:
                   segs = segment_charges(cpts, gap_min=charge_gap,
                                          min_speed=min_speed)
                   earlier = _extend_vehicle_head(
-                      ctx, key, segs, raw_from, cutoff, charge_gap * 60, cfg["lookback_h"])
+                      segs, raw_from, cutoff, charge_gap * 60, cfg["lookback_h"])
                   if earlier is not None:
                       return total, earlier
 
@@ -7268,6 +7273,12 @@ configs:
                           batch = []
                   if batch:
                       total += write_batch(a, ctx, cfg, prices, bound, now, kind, batch)
+              for kind in a.AI_SUMMARY_KEYS:
+                  def contains(key):
+                      return recovery.db.execute(
+                          "SELECT 1 FROM output WHERE kind=? AND identity=?",
+                          (kind, packed(key))).fetchone() is not None
+                  a._ai_prune_summary(ctx, cfg, kind, contains, bound)
               a._ai_commit_state(ctx, a._ai_encode_fence(upper), metric_registry, price_digest)
               return total
           finally:
@@ -7279,7 +7290,7 @@ configs:
           return a._ai_write(ctx, cfg, dict(batch) if kind == "session" else {},
                              values if kind == "activity" else [], [], prices, bound, now,
                              computed=(values if kind == "daily" else [],
-                                       values if kind == "tool" else []))
+                                       values if kind == "tool" else []), reconcile=False)
   activity_py:
     content: |
       #!/usr/bin/env python3

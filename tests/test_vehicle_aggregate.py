@@ -481,8 +481,10 @@ class RollupV2SqlTest(unittest.TestCase):
                 db.execute("""INSERT INTO vehicle_signal VALUES
                     ('2026-09-20 10:00:10.000000000','fleet-v','speed','fleet',
                      NULL,'speed','ok','km/h',50)""")
+                db.execute("""INSERT INTO vehicle_signal VALUES
+                    ('2026-09-20 09:00:10.000000000','fleet-v','speed','fleet',
+                     NULL,'speed','ok','km/h',30)""")
                 with patch.object(agg, "utcnow", return_value=datetime(2026, 9, 20, 12)), \
-                        patch.object(agg, "_flushed_floor_ns", return_value=hour), \
                         patch.object(agg, "_migrate_legacy_hours", return_value=0):
                     agg._vehicle_rollup(("", "", ""), {"lookback_h": 30})
                 self.assertEqual(db.execute(
@@ -491,8 +493,8 @@ class RollupV2SqlTest(unittest.TestCase):
                 ).fetchone(), (4,))
                 self.assertEqual(db.execute(
                     "SELECT avg_value FROM vehicle_agg"
-                    " WHERE vehicle='fleet-v' ORDER BY resolution"
-                ).fetchall(), [(50, ), (50, )])
+                    " WHERE vehicle='fleet-v' ORDER BY resolution, window_start"
+                ).fetchall(), [(30, ), (50, ), (30, ), (50, )])
 
 
 if __name__ == "__main__":

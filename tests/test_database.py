@@ -59,6 +59,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 cols, rows, types = ["table_name", "create_options"], [], None
             elif "FROM raw_retention_watermark" in stmt:
                 cols, rows, types = ["deleted_before"], Handler.retention_rows, None
+            elif "FROM ai_daily_summary" in stmt or "FROM ai_tool_daily" in stmt:
+                cols = [c.strip() for c in stmt.split(" FROM ", 1)[0][7:].split(",")]
+                rows, types = [], None
             elif "opentelemetry_traces" in stmt and Handler.span_cols is not None:
                 cols, rows = Handler.span_cols, Handler.span_rows
                 types = Handler.span_types
@@ -933,6 +936,9 @@ def test_session_batch_replacement_isolation_and_failure_keeps_anchor():
                                     [list(r) for r in rows])
                 if "FROM raw_retention_watermark" in stmt:
                     return _records(["deleted_before"], [[None]])
+                if "FROM ai_daily_summary" in stmt or "FROM ai_tool_daily" in stmt:
+                    cols = [c.strip() for c in stmt.split(" FROM ", 1)[0][7:].split(",")]
+                    return _records(cols, [])
                 return _records(["table_name", "create_options"], [])
             if stmt.startswith("INSERT INTO ai_session_summary"):
                 faults["session_inserts"] += 1
@@ -1422,23 +1428,50 @@ def test_sql_diagnostics_never_emit_scope_literals_or_errors():
     assert output.getvalue() == ""
 
 
-def test_vehicle_flushed_floor_avoids_unbounded_raw_min():
+def test_late_unflushed_trip_and_charge_preserve_full_heads():
     import datetime as dt
-    floor = agg.dt_to_ns(dt.datetime(2026, 9, 19))
-    with patch.object(agg, "_flushed_floor_ns", return_value=floor), \
-            patch.object(agg, "coverage_min", side_effect=AssertionError("raw MIN")), \
-            patch.object(agg, "request_sql", return_value={}), \
-            patch.object(agg, "_migrate_legacy_hours", return_value=0):
-        agg._vehicle_rollup(("", "", ""), _vehicle_cfg())
-    with patch.object(agg, "_flushed_floor_ns", side_effect=agg.SqlError("metadata")), \
-            patch.object(agg, "coverage_min") as raw:
-        try:
-            agg._vehicle_rollup(("", "", ""), _vehicle_cfg())
-        except agg.SqlError:
-            pass
+    import re
+    cols = ["event_time", "vehicle", "path", "source", "decode_epoch",
+            "value_num", "value_bool", "unit"]
+    scope = ("car", "fleet", "epoch")
+    start = dt.datetime(2026, 9, 21, 8)
+    window = (agg.dt_to_ns(start + dt.timedelta(hours=2)),
+              agg.dt_to_ns(start + dt.timedelta(hours=3)))
+    for kind in ("trip", "charge"):
+        rows, writes = [], []
+        for minute in range(0, 176, 5):
+            stamp = agg.dt_to_ns(start + dt.timedelta(minutes=minute))
+            values = ([("speed", 60, "km/h"), ("drive_energy", 100 + minute / 5, "kWh")]
+                      if kind == "trip" else
+                      [("power", 12, "kW"), ("charge_energy", 100 + minute / 5, "kWh")])
+            for path, value, unit in values:
+                rows.append([stamp, scope[0], path, *scope[1:], value, None, unit])
+        def sql(_url, _auth, _db, stmt, **kwargs):
+            if "information_schema.ssts_manifest" in stmt:
+                # Existing SSTs begin after the newly arrived unflushed data.
+                return _records(["MIN(min_ts)"], [[window[0]]])
+            lo, hi = [agg.parse_ts_ns(value) for value in re.findall(
+                r"event_time\s*(?:>=|<)\s*'([^']+)'", stmt)]
+            limit = int(stmt.rsplit(" LIMIT ", 1)[1])
+            return _records(cols, [r for r in rows if lo <= r[0] < hi][:limit])
+        cfg = _vehicle_cfg(lookback_h=1, paths={p: p for p in
+                           ("speed", "drive_energy", "power", "charge_energy")})
+        with patch.object(agg, "_load_anchors", return_value={}), \
+                patch.object(agg, "request_sql", side_effect=sql), \
+                patch.object(agg, "insert_rows",
+                             side_effect=lambda *args: writes.append(args[3:])):
+            assert agg.trip_section(("", "", ""), cfg, window=window, scope=scope) == 1
+        table, columns, stored = writes[0]
+        row = dict(zip(columns, stored[0]))
+        assert row["started_at"] == agg.ns_to_sql_lit(agg.dt_to_ns(start))
+        assert row["duration_s"] == agg.num_lit(175 * 60)
+        if kind == "trip":
+            assert table == "trip_summary"
+            assert row["distance_km"] == agg.num_lit(175)
+            assert row["energy_kwh"] == agg.num_lit(35)
         else:
-            raise AssertionError("metadata failure must propagate")
-        raw.assert_not_called()
+            assert table == "charge_session"
+            assert row["energy_added_kwh"] == agg.num_lit(35)
 
 
 def test_trip_hour_chunks_preserve_context_and_refuse_total_cap():
@@ -1483,8 +1516,6 @@ def test_trip_hour_chunks_preserve_context_and_refuse_total_cap():
             return _records(cols, selected)
         with patch.object(agg, "HOUR_NS", chunk_width), \
                 patch.object(agg, "_load_anchors", return_value={}), \
-                patch.object(agg, "_flushed_floor_ns", return_value=None), \
-                patch.object(agg, "_raw_coverage_ns", return_value=None), \
                 patch.object(agg, "request_sql", side_effect=sql), \
                 patch.object(agg, "insert_rows",
                              side_effect=lambda *args: writes.append(args[3:])):
@@ -1514,8 +1545,8 @@ def test_trip_hour_chunks_preserve_context_and_refuse_total_cap():
 
 
 if __name__ == "__main__":
+    test_late_unflushed_trip_and_charge_preserve_full_heads()
     test_trip_hour_chunks_preserve_context_and_refuse_total_cap()
-    test_vehicle_flushed_floor_avoids_unbounded_raw_min()
     test_coordinator_earlier_unit_survives_later_failure_and_retry()
     test_coordinator_sst_hull_batch_only_checkpoints_completed_hours()
     test_sql_diagnostics_never_emit_scope_literals_or_errors()
