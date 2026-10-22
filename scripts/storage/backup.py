@@ -116,6 +116,7 @@ Exit codes: 0 ok, 1 usage/env error, 2 precondition failure, 3 IO error.
 
 import base64
 import calendar
+import fcntl
 import glob
 from contextlib import closing, contextmanager
 from contextvars import ContextVar
@@ -1226,6 +1227,44 @@ def load_manifest(path):
     return manifest, raw, members, None, 0
 
 
+@contextmanager
+def restore_target_locks(paths):
+    """Own target directory inodes through preflight, installation and rollback."""
+    modes = {}
+    for path in sorted({os.path.realpath(os.path.abspath(p)) for p in paths}):
+        parent = os.path.dirname(path)
+        if not os.path.isdir(parent):
+            raise OSError("mount missing: " + path)
+        modes[path] = fcntl.LOCK_EX
+        while parent != os.path.dirname(parent):
+            modes.setdefault(parent, fcntl.LOCK_SH)
+            parent = os.path.dirname(parent)
+        modes.setdefault(parent, fcntl.LOCK_SH)
+    held = []
+    inodes = set()
+    try:
+        for path in sorted(modes, key=lambda p: (p.count(os.sep), p)):
+            if modes[path] == fcntl.LOCK_EX:
+                os.makedirs(path, exist_ok=True)
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                st = os.fstat(fd)
+                inode = (st.st_dev, st.st_ino)
+                if inode in inodes:
+                    os.close(fd)
+                    continue
+                fcntl.flock(fd, modes[path] | fcntl.LOCK_NB)
+            except BaseException:
+                os.close(fd)
+                raise
+            held.append(fd)
+            inodes.add(inode)
+        yield
+    finally:
+        for fd in reversed(held):
+            os.close(fd)
+
+
 def ensure_targets_empty():
     for target, _label in targets():
         parent = os.path.dirname(target)
@@ -1329,75 +1368,78 @@ def download_remote_backup(d, client, bucket, bp, want):
         ref_key = acquire_generation_ref(client, bucket, bp, bid)
     except IOError as e:
         return None, None, str(e)[:250]
-    complete, cerr = fetch_complete(client, bucket, bp, bid)
-    if cerr is not None:
-        release_generation_ref(client, bucket, ref_key)
-        return None, None, cerr
-    rbase = remote_base(bp, bid)
-    expected_tar = bid + BACKUP_SUFFIX
-    top = set()
-    for o in s3_list_all(client, bucket, rbase):
-        rel = o["Key"][len(rbase):]
-        if not rel or "/" in rel:
-            continue  # nested inventory (e.g. sst/ tree) never an archive
-        top.add(rel)
-    if expected_tar not in top:
-        release_generation_ref(client, bucket, ref_key)
-        return None, None, ("remote backup %s has no exact top-level archive %s"
-                             % (bid, expected_tar))
-    if expected_tar + SIDECAR_SUFFIX not in top:
-        release_generation_ref(client, bucket, ref_key)
-        return None, None, ("remote backup %s missing sidecar (refusing)" % bid)
-    if MANIFEST_NAME not in top:
-        release_generation_ref(client, bucket, ref_key)
-        return None, None, ("remote backup %s missing manifest copy (refusing)" % bid)
-    path = os.path.join(d, expected_tar)
-    tmp = path + ".tmp"
+    def download():
+        complete, cerr = fetch_complete(client, bucket, bp, bid)
+        if cerr is not None:
+            return None, None, cerr
+        rbase = remote_base(bp, bid)
+        expected_tar = bid + BACKUP_SUFFIX
+        top = set()
+        for o in s3_list_all(client, bucket, rbase):
+            rel = o["Key"][len(rbase):]
+            if not rel or "/" in rel:
+                continue  # nested inventory (e.g. sst/ tree) never an archive
+            top.add(rel)
+        if expected_tar not in top:
+            return None, None, ("remote backup %s has no exact top-level archive %s"
+                                 % (bid, expected_tar))
+        if expected_tar + SIDECAR_SUFFIX not in top:
+            return None, None, ("remote backup %s missing sidecar (refusing)" % bid)
+        if MANIFEST_NAME not in top:
+            return None, None, ("remote backup %s missing manifest copy (refusing)" % bid)
+        path = os.path.join(d, expected_tar)
+        tmp = path + ".tmp"
+        try:
+            h = hashlib.sha256()
+            size = 0
+            with closing(client.get_object(Bucket=bucket, Key=rbase + expected_tar)["Body"]) as body:
+                with open(tmp, "wb") as f:
+                    while True:
+                        chunk = body.read(CHUNK)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        h.update(chunk)
+                        size += len(chunk)
+            if h.hexdigest() != complete["tar_sha256"] or size != complete["tar_size"]:
+                raise IOError("downloaded tar differs from COMPLETE record (refusing)")
+            side_raw = s3_get_control(client, bucket, rbase + expected_tar + SIDECAR_SUFFIX,
+                                      SIDECAR_CAP)
+            parts = side_raw.decode("utf-8").split()
+            if len(parts) != 2 or parts[0] != complete["tar_sha256"]:
+                raise IOError("remote sidecar differs from COMPLETE record (refusing)")
+            if hashlib.sha256(side_raw).hexdigest() != complete["sidecar_sha256"]:
+                raise IOError("remote sidecar bytes differ from COMPLETE record (refusing)")
+            remote_manifest = s3_get_control(client, bucket, rbase + MANIFEST_NAME)
+            if hashlib.sha256(remote_manifest).hexdigest() != complete["manifest_sha256"]:
+                raise IOError("remote manifest differs from COMPLETE record (refusing)")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+            os.chmod(path, 0o600)
+            with open(path + SIDECAR_SUFFIX, "wb") as f:
+                f.write(side_raw)
+            os.chmod(path + SIDECAR_SUFFIX, 0o600)
+        except IOError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return None, None, str(e)[:250]
+        except Exception as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            return None, None, "remote download failed: " + str(e)[:200]
+        return path, complete, ref_key
+    transferred = False
     try:
-        h = hashlib.sha256()
-        size = 0
-        with closing(client.get_object(Bucket=bucket, Key=rbase + expected_tar)["Body"]) as body:
-            with open(tmp, "wb") as f:
-                while True:
-                    chunk = body.read(CHUNK)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    h.update(chunk)
-                    size += len(chunk)
-        if h.hexdigest() != complete["tar_sha256"] or size != complete["tar_size"]:
-            raise IOError("downloaded tar differs from COMPLETE record (refusing)")
-        side_raw = s3_get_control(client, bucket, rbase + expected_tar + SIDECAR_SUFFIX,
-                                  SIDECAR_CAP)
-        parts = side_raw.decode("utf-8").split()
-        if len(parts) != 2 or parts[0] != complete["tar_sha256"]:
-            raise IOError("remote sidecar differs from COMPLETE record (refusing)")
-        if hashlib.sha256(side_raw).hexdigest() != complete["sidecar_sha256"]:
-            raise IOError("remote sidecar bytes differ from COMPLETE record (refusing)")
-        remote_manifest = s3_get_control(client, bucket, rbase + MANIFEST_NAME)
-        if hashlib.sha256(remote_manifest).hexdigest() != complete["manifest_sha256"]:
-            raise IOError("remote manifest differs from COMPLETE record (refusing)")
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
-        os.chmod(path, 0o600)
-        with open(path + SIDECAR_SUFFIX, "wb") as f:
-            f.write(side_raw)
-        os.chmod(path + SIDECAR_SUFFIX, 0o600)
-    except IOError as e:
-        release_generation_ref(client, bucket, ref_key)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return None, None, str(e)[:250]
-    except Exception as e:
-        release_generation_ref(client, bucket, ref_key)
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        return None, None, "remote download failed: " + str(e)[:200]
-    return path, complete, ref_key
+        result = download()
+        transferred = result[0] is not None
+        return result
+    finally:
+        if not transferred:
+            release_generation_ref(client, bucket, ref_key)
 
 
 def s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
@@ -1507,98 +1549,111 @@ def cmd_restore():
             ref_key = derr_or_ref
         except Exception as e:
             return fail("remote download failed: " + str(e)[:200], code=3)
-    def _fail_ref(msg, code=1):
-        if ref_key is not None and s3 is not None:
-            release_generation_ref(s3, env("S3_BUCKET"), ref_key)
-        return fail(msg, code=code)
-    if not os.path.isfile(path):
-        return _fail_ref("backup file not found: " + path, code=2)
-    side_digest, serr = read_sidecar_digest(path)
-    if serr is not None:
-        return _fail_ref(serr, code=2)
-    if ident["storage_type"] == "File" and sha256_file(path) != side_digest:
-        return _fail_ref("backup hash mismatch (torn/corrupt download?): " + path, code=2)
-    manifest, raw_manifest, members, merr, mcode = load_manifest(path)
-    if merr is not None:
-        return _fail_ref(merr, code=mcode)
-    problem = ensure_targets_empty()
-    if problem is not None:
-        return _fail_ref(problem, code=2)
-    reserve, rerr = read_reserve()
-    if rerr is not None:
-        return _fail_ref(rerr, code=1)
-    try:
-        members_total = sum(m.size for m in members if m.isfile())
-        tar_size = os.path.getsize(path)
-        if shutil.disk_usage(d).free < tar_size + members_total + reserve:
-            return _fail_ref("restore refused: insufficient staging space in " + d,
-                             code=2)
-        for target, _label in targets():
-            if shutil.disk_usage(target).free < members_total + reserve:
-                return _fail_ref("restore refused: insufficient space for restore targets",
-                                 code=2)
-    except OSError as e:
-        return _fail_ref("restore preflight failed: " + str(e)[:200], code=3)
-    written_sst = []
-    if ident["storage_type"] == "S3":
-        miss = s3_missing()
-        if miss:
-            return _fail_ref("S3 restore needs S3 settings: " + ", ".join(miss), code=2)
-        bucket = env("S3_BUCKET")
-        root_pfx = norm_prefix(env("S3_ROOT", "greptime"))
-        try:
-            if s3 is None:
-                s3 = open_s3_client()
-            if complete is None:
-                try:
-                    ref_key = acquire_generation_ref(
-                        s3, bucket, norm_prefix(ident["backup_prefix"]),
-                        manifest["backup_id"])
-                except IOError as e:
-                    return _fail_ref(str(e)[:250], code=2)
-                complete, cerr = fetch_complete(
-                    s3, bucket, norm_prefix(ident["backup_prefix"]),
-                    manifest["backup_id"])
-                if cerr is not None:
-                    return _fail_ref(cerr + " (a local tar from a failed upload is"
-                                      " not restorable)", code=2)
-            problem = check_against_complete(
-                path, side_digest, raw_manifest,
-                manifest["sst_snapshot"]["objects"], complete)
+    def consume():
+        nonlocal s3, complete, ref_key
+        def _fail_ref(msg, code=1):
+            return fail(msg, code=code)
+        if not os.path.isfile(path):
+            return _fail_ref("backup file not found: " + path, code=2)
+        side_digest, serr = read_sidecar_digest(path)
+        if serr is not None:
+            return _fail_ref(serr, code=2)
+        if ident["storage_type"] == "File" and sha256_file(path) != side_digest:
+            return _fail_ref("backup hash mismatch (torn/corrupt download?): " + path, code=2)
+        manifest, raw_manifest, members, merr, mcode = load_manifest(path)
+        if merr is not None:
+            return _fail_ref(merr, code=mcode)
+        def install():
+            nonlocal s3, complete, ref_key
+            problem = ensure_targets_empty()
             if problem is not None:
                 return _fail_ref(problem, code=2)
+            reserve, rerr = read_reserve()
+            if rerr is not None:
+                return _fail_ref(rerr, code=1)
             try:
-                written_sst = _s3_restore_snapshot(
-                    s3, bucket, root_pfx,
-                    manifest["sst_snapshot"], manifest["sst_snapshot"]["objects"])
+                members_total = sum(m.size for m in members if m.isfile())
+                tar_size = os.path.getsize(path)
+                if shutil.disk_usage(d).free < tar_size + members_total + reserve:
+                    return _fail_ref("restore refused: insufficient staging space in " + d,
+                                     code=2)
+                for target, _label in targets():
+                    if shutil.disk_usage(target).free < members_total + reserve:
+                        return _fail_ref("restore refused: insufficient space for restore targets",
+                                         code=2)
+            except OSError as e:
+                return _fail_ref("restore preflight failed: " + str(e)[:200], code=3)
+            written_sst = []
+            if ident["storage_type"] == "S3":
+                miss = s3_missing()
+                if miss:
+                    return _fail_ref("S3 restore needs S3 settings: " + ", ".join(miss), code=2)
+                bucket = env("S3_BUCKET")
+                root_pfx = norm_prefix(env("S3_ROOT", "greptime"))
+                try:
+                    if s3 is None:
+                        s3 = open_s3_client()
+                    if complete is None:
+                        try:
+                            ref_key = acquire_generation_ref(
+                                s3, bucket, norm_prefix(ident["backup_prefix"]),
+                                manifest["backup_id"])
+                        except IOError as e:
+                            return _fail_ref(str(e)[:250], code=2)
+                        complete, cerr = fetch_complete(
+                            s3, bucket, norm_prefix(ident["backup_prefix"]),
+                            manifest["backup_id"])
+                        if cerr is not None:
+                            return _fail_ref(cerr + " (a local tar from a failed upload is"
+                                              " not restorable)", code=2)
+                    problem = check_against_complete(
+                        path, side_digest, raw_manifest,
+                        manifest["sst_snapshot"]["objects"], complete)
+                    if problem is not None:
+                        return _fail_ref(problem, code=2)
+                    try:
+                        written_sst = _s3_restore_snapshot(
+                            s3, bucket, root_pfx,
+                            manifest["sst_snapshot"], manifest["sst_snapshot"]["objects"])
+                    except IOError as e:
+                        if "conflicts with snapshot" in str(e):
+                            return _fail_ref(str(e)[:250], code=2)
+                        return _fail_ref("SST restore failed (own writes rolled back): "
+                                         + str(e)[:250], code=3)
+                except IOError as e:
+                    return _fail_ref(str(e)[:300], code=3)
+                except Exception as e:
+                    return _fail_ref("SST restore failed (own writes rolled back): "
+                                     + str(e)[:200], code=3)
+            try:
+                staged_populate(d, path)
+                record_restore_verification(d, manifest["backup_id"])
             except IOError as e:
-                if "conflicts with snapshot" in str(e):
-                    return _fail_ref(str(e)[:250], code=2)
-                return _fail_ref("SST restore failed (own writes rolled back): "
-                                 + str(e)[:250], code=3)
-        except IOError as e:
-            return _fail_ref(str(e)[:300], code=3)
-        except Exception as e:
-            return _fail_ref("SST restore failed (own writes rolled back): "
-                             + str(e)[:200], code=3)
-    try:
-        staged_populate(d, path)
-        record_restore_verification(d, manifest["backup_id"])
-    except IOError as e:
+                for target, _label in targets():
+                    try:
+                        clear_dir(target)
+                    except OSError:
+                        pass
+                if s3 is not None and written_sst:
+                    rollback_owned(s3, env("S3_BUCKET"), written_sst)
+                return _fail_ref(str(e)[:300], code=3)
+            sys.stdout.write("backup: restore ok: " + os.path.basename(path) + "\n"
+                             + "backup: note: restored greptime-etc credentials are stale;"
+                             " next preflight regenerates them from the current .env\n")
+            return 0
         for target, _label in targets():
-            try:
-                clear_dir(target)
-            except OSError:
-                pass
-        if s3 is not None and written_sst:
-            rollback_owned(s3, env("S3_BUCKET"), written_sst)
-        return _fail_ref(str(e)[:300], code=3)
-    if ref_key is not None and s3 is not None:
-        release_generation_ref(s3, env("S3_BUCKET"), ref_key)
-    sys.stdout.write("backup: restore ok: " + os.path.basename(path) + "\n"
-                     + "backup: note: restored greptime-etc credentials are stale;"
-                     " next preflight regenerates them from the current .env\n")
-    return 0
+            if not os.path.isdir(os.path.dirname(target)):
+                return _fail_ref("mount missing: " + target, code=2)
+        try:
+            with restore_target_locks(target for target, _label in targets()):
+                return install()
+        except OSError as exc:
+            return _fail_ref("restore target ownership failed: " + str(exc)[:200], code=3)
+    try:
+        return consume()
+    finally:
+        if ref_key is not None and s3 is not None:
+            release_generation_ref(s3, env("S3_BUCKET"), ref_key)
 
 
 def retention_settings(current_bid=None):
@@ -1799,14 +1854,14 @@ def acquire_generation_ref(client, bucket, bp, bid, token=None):
     if "/" in token or token in (".", ".."):
         raise IOError("ref token escapes generation scope (refusing)")
     key = generation_ref_key(bp, bid, token)
-    client.put_object(Bucket=bucket, Key=key, Body=b"ref", ContentLength=3)
-    recheck = {o["Key"] for o in s3_list_all(client, bucket, rbase)}
-    if rbase + RETIRING_NAME in recheck or rbase + COMPLETE_NAME not in recheck:
-        try:
-            s3_delete_keys(client, bucket, [key])
-        except Exception:
-            pass
-        raise IOError("generation %s retired during ref acquire (refusing)" % bid)
+    try:
+        client.put_object(Bucket=bucket, Key=key, Body=b"ref", ContentLength=3)
+        recheck = {o["Key"] for o in s3_list_all(client, bucket, rbase)}
+        if rbase + RETIRING_NAME in recheck or rbase + COMPLETE_NAME not in recheck:
+            raise IOError("generation %s retired during ref acquire (refusing)" % bid)
+    except BaseException:
+        release_generation_ref(client, bucket, key)
+        raise
     return key
 
 
@@ -1814,8 +1869,8 @@ def release_generation_ref(client, bucket, key):
     """Release one reader ref. Best effort; missing keys are already gone."""
     try:
         s3_delete_keys(client, bucket, [key])
-    except Exception:
-        pass
+    except Exception as exc:
+        sys.stderr.write("backup: reader ref cleanup failed: " + type(exc).__name__ + "\n")
 
 
 def read_retiring_identity(client, bucket, bp, bid):

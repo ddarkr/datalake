@@ -1040,6 +1040,15 @@ def cmd_restore():
     err = offline_error("restore")
     if err is not None:
         return err
+    try:
+        with bk.restore_target_locks([restore_raw_dir(), restore_defs_dir()]):
+            return _restore_owned()
+    except OSError as e:
+        return bk.fail("restore target ownership failed: " + str(e)[:200],
+                       code=3)
+
+
+def _restore_owned():
     d, derr0 = ensure_backup_dir()
     if derr0 is not None:
         return bk.fail(derr0, code=2)

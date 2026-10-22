@@ -348,6 +348,11 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 정리 자체가 파일시스템 오류로 실패해 잔여 파일이 있으면 기존 non-empty 거부는
 유지되므로, 대상 상태를 확인하기 전 강제로 덮어쓰지 마세요.
 
+복원끼리는 raw·definitions 대상 디렉터리의 POSIX inode 잠금을 빈 대상 검사부터
+최종 rollback까지 유지합니다. 둘 중 한 대상만 공유해도 경쟁 복원을 거부하며,
+실패한 작업이 다른 복원의 결과를 삭제하지 않습니다. receiver/worker의
+offline 확인은 별도 조건이며, 이 잠금을 사용하지 않는 외부 writer는 보호하지 않습니다.
+
 `python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver·worker를 시작합니다. OTLP 영속 ACK·재시작·중복 보존과 파일 수신의 worker 중지·부분 파일 재시작·중복 범위 재전송·정확한 ns의 Greptime 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver·worker 인계
@@ -584,6 +589,11 @@ COMPOSE_PROJECT_NAME=datalake-recovery docker compose --env-file .env up -d
 ```
 
 복원은 비어 있지 않은 대상 볼륨을 거부하며 강제 덮어쓰기 옵션은 없습니다. 같은 S3 live prefix를 쓰는 기존 DB와 복원 DB를 동시에 실행하지 마세요. 복원 후 현재 `.env`로 인증 설정이 다시 생성됩니다.
+
+File/S3 모두 로컬 대상 디렉터리의 POSIX inode 잠금을 빈 대상 검사 전에 잡고
+설치·rollback이 끝날 때까지 유지합니다. 경로 별칭이나 겹치는 대상도 잠금으로
+검사하며, 대상 안에 별도 lock 파일을 남기지 않습니다. 잠금을 지원하는
+파일시스템과 같은 잠금 규칙을 사용하는 복원 도구가 필요합니다.
 
 동일 버킷·정규화된 S3 live root의 복원은 원격 claim으로 직렬화합니다.
 backup prefix가 달라도 같은 live root라면 두 번째 복원을 거부하며, claim은

@@ -71,6 +71,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -3098,7 +3099,181 @@ def test_original_owned_rollback_preserves_reuse_and_rejects_damaged_data():
         restore_env()
 
 
+def test_restore_target_locks_alias_overlap_and_process():
+    with tempfile.TemporaryDirectory() as root:
+        target = os.path.join(root, "target")
+        child = os.path.join(target, "child")
+        os.makedirs(child)
+        alias = os.path.join(root, "alias")
+        os.symlink(target, alias)
+        with bk.restore_target_locks([target, alias]):
+            for paths in ([alias], [child], [root]):
+                try:
+                    with bk.restore_target_locks(paths):
+                        raise AssertionError("overlapping restore acquired ownership")
+                except OSError:
+                    pass
+            code = (
+                "import sys\nfrom scripts.storage import backup as bk\n"
+                "try:\n with bk.restore_target_locks([sys.argv[1]]): pass\n"
+                "except OSError: sys.exit(0)\n"
+                "sys.exit(1)\n")
+            assert subprocess.run([sys.executable, "-c", code, alias],
+                                  check=False).returncode == 0
+            assert os.listdir(target) == ["child"]
+        with bk.restore_target_locks([alias, child]):
+            pass
+
+
+def test_restore_owns_targets_before_precheck_and_through_rollback():
+    for mode in ("File", "S3"):
+        fake = FakeS3(sst_fixture()) if mode == "S3" else None
+        tmp, src, tgt, _bdir, env = fresh_layout(mode, fake)
+        original = bk.ensure_targets_empty
+        calls = []
+        try:
+            setenv(env)
+            assert bk.cmd_backup() == 0
+            expected = hash_tree(src)
+            def interleaved():
+                if not calls:
+                    calls.append(True)
+                    assert bk.cmd_restore() == 3
+                    assert hash_tree(tgt) == {}
+                return original()
+            bk.ensure_targets_empty = interleaved
+            assert bk.cmd_restore() == 0
+            assert calls and hash_tree(tgt) == expected
+            bk.ensure_targets_empty = original
+            assert bk.cmd_restore() == 2
+            assert hash_tree(tgt) == expected
+            reset_targets(tgt)
+            original_populate = bk.staged_populate
+            def failed_populate(*args):
+                with open(os.path.join(tgt, bk.LABELS[0], "partial"), "wb") as stream:
+                    stream.write(b"partial")
+                assert bk.cmd_restore() == 3
+                raise IOError("injected local install failure")
+            try:
+                bk.staged_populate = failed_populate
+                assert bk.cmd_restore() == 3
+                assert hash_tree(tgt) == {}
+            finally:
+                bk.staged_populate = original_populate
+            assert bk.cmd_restore() == 0
+            assert hash_tree(tgt) == expected
+        finally:
+            bk.ensure_targets_empty = original
+            shutil.rmtree(tmp, ignore_errors=True)
+            restore_env()
+
+
+def test_ref_cleanup_warning_does_not_disclose_transport_details():
+    fake = FakeS3({})
+    secret = "https://private-user:synthetic-secret@private-endpoint.invalid/"
+    original_delete = fake.delete_objects
+    original_stderr = sys.stderr
+    captured = io.StringIO()
+    def denied(**kwargs):
+        raise OSError(secret)
+    try:
+        fake.delete_objects = denied
+        sys.stderr = captured
+        bk.release_generation_ref(fake, "test-bucket", "own-reader")
+        assert captured.getvalue(), "cleanup failure must remain observable"
+        assert secret not in captured.getvalue()
+        assert "synthetic-secret" not in captured.getvalue()
+        assert "private-endpoint" not in captured.getvalue()
+    finally:
+        sys.stderr = original_stderr
+        fake.delete_objects = original_delete
+
+
+def test_ref_acquire_exception_cleanup_preserves_other_readers():
+    for failure in ("put", "postcheck"):
+        fake = FakeS3(sst_fixture())
+        ids, tmp, env = retention_ids(fake, count=1)
+        put = fake.put_object
+        listing = fake.list_objects_v2
+        bid = ids[0]
+        bp = "test-backups/"
+        own = bk.generation_ref_key(bp, bid, "failed-reader")
+        other = bk.generation_ref_key(bp, bid, "other-reader")
+        fake.objects[other] = b"ref"
+        sent = []
+        error = OSError("injected " + failure)
+        def fault_put(**kw):
+            result = put(**kw)
+            if kw["Key"] == own:
+                sent.append(True)
+                if failure == "put":
+                    raise error
+            return result
+        def fault_list(**kw):
+            if sent and failure == "postcheck":
+                raise error
+            return listing(**kw)
+        try:
+            fake.put_object = fault_put
+            fake.list_objects_v2 = fault_list
+            try:
+                bk.acquire_generation_ref(fake, "test-bucket", bp, bid,
+                                          token="failed-reader")
+                raise AssertionError("ref acquisition unexpectedly succeeded")
+            except OSError as exc:
+                assert exc is error
+            assert own not in fake.objects
+            assert fake.objects[other] == b"ref"
+            fake.put_object = put
+            fake.list_objects_v2 = listing
+            bk.release_generation_ref(fake, "test-bucket", other)
+            bk.retire_generation(fake, "test-bucket", bp, {"backup_id": bid})
+            assert bk.remote_base(bp, bid) + bk.COMPLETE_NAME not in fake.objects
+        finally:
+            fake.put_object = put
+            fake.list_objects_v2 = listing
+            end_retention_run(tmp)
+
+
+def test_download_inventory_exception_releases_reader():
+    fake = FakeS3(sst_fixture())
+    ids, tmp, env = retention_ids(fake, count=1)
+    original = bk.s3_list_all
+    acquired = []
+    acquire = bk.acquire_generation_ref
+    error = OSError("download inventory unavailable")
+    def remember(*args, **kwargs):
+        key = acquire(*args, **kwargs)
+        acquired.append(key)
+        return key
+    def broken(*args, **kwargs):
+        if acquired:
+            raise error
+        return original(*args, **kwargs)
+    try:
+        bk.acquire_generation_ref = remember
+        bk.s3_list_all = broken
+        try:
+            bk.download_remote_backup(tmp, fake, "test-bucket", "test-backups/", ids[0])
+            raise AssertionError("download inventory unexpectedly succeeded")
+        except OSError as exc:
+            assert exc is error
+        assert acquired and acquired[0] not in fake.objects
+        bk.s3_list_all = original
+        bk.retire_generation(fake, "test-bucket", "test-backups/",
+                             {"backup_id": ids[0]})
+    finally:
+        bk.acquire_generation_ref = acquire
+        bk.s3_list_all = original
+        end_retention_run(tmp)
+
+
 if __name__ == "__main__":
+    test_restore_target_locks_alias_overlap_and_process()
+    test_restore_owns_targets_before_precheck_and_through_rollback()
+    test_ref_acquire_exception_cleanup_preserves_other_readers()
+    test_ref_cleanup_warning_does_not_disclose_transport_details()
+    test_download_inventory_exception_releases_reader()
     test_backup_refuses_running_db()
     test_backup_requires_offline_confirmation()
     test_file_mode_roundtrip_hash_match()

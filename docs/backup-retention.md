@@ -66,7 +66,10 @@ dry-run은 `resume <id>`와 `candidate <id>`를 구분하고, 공유 객체 정�
   `RETIRING` 부재) → 고유 ref PUT → 사후 재확인(마커 + COMPLETE) 후 사용.
   재확인이 실패하면 방금 쓴 ref를 해제하고 거부하므로, 경쟁에서 이긴 writer가
   진행할 수 있고 reader는 retiring/retired 세대를 소비하지 않습니다.
-  검증된 로컬 tar 확보 뒤에만 해제하며, 모든 실패 경로에서도 해제합니다.
+  검증된 로컬 tar 확보 뒤에만 해제합니다. PUT 응답 유실·사후 LIST 오류·다운로드
+  실패도 자기 ref 정리를 시도하며, 다른 reader의 ref는 삭제하지 않습니다.
+  정리 요청 자체가 실패하면 stderr 경고를 남깁니다. 남은 ref는 소유 작업이
+  끝났음을 확인한 뒤 수동 회수해야 하며, 그전에는 retention이 계속 거부됩니다.
 - 로컬 tar 복원도 SST snapshot 검증·사용이 끝날 때까지 ref를 유지합니다(조기
   해제 없음). SST 충돌을 포함한 모든 S3 복원 오류 경로에서 ref를 해제합니다.
 - 같은 prefix의 모든 backup/retention 작업이 이 claim 절차를 사용하는

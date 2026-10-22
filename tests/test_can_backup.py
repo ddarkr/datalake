@@ -480,8 +480,55 @@ def test_restore_refuses_nonempty_and_tampered_sidecar():
         restore_env()
 
 
+def test_restore_owns_both_targets_before_freshness_check():
+    for shared_defs_only in (False, True):
+        tmp, db_path, defs, bdir, raw_dir, defs_dir, before, env = \
+            fresh_layout("File")
+        real_fresh = cb.ensure_restore_fresh
+        entered = []
+        try:
+            setenv(env)
+            assert cb.cmd_backup() == 0
+            with tarfile.open(newest_tar(bdir), "r:gz") as tar:
+                expected_db = tar.extractfile("raw.sqlite3").read()
+            other_raw = os.path.join(tmp, "other-raw")
+
+            def interleaved_fresh(raw, definitions):
+                if not entered:
+                    entered.append(True)
+                    if shared_defs_only:
+                        os.environ["CAN_RESTORE_RAW_DIR"] = other_raw
+                    try:
+                        assert cb.cmd_restore() == 3
+                    finally:
+                        os.environ["CAN_RESTORE_RAW_DIR"] = raw_dir
+                    assert os.listdir(raw_dir) == []
+                    assert os.listdir(defs_dir) == []
+                    assert not os.path.exists(other_raw) or \
+                        os.listdir(other_raw) == []
+                return real_fresh(raw, definitions)
+
+            cb.ensure_restore_fresh = interleaved_fresh
+            assert cb.cmd_restore() == 0
+            assert entered
+            with open(os.path.join(raw_dir, "raw.sqlite3"), "rb") as restored:
+                assert restored.read() == expected_db
+            assert dump_state(os.path.join(raw_dir, "raw.sqlite3"),
+                              defs_dir) == before
+            assert cb.cmd_restore() == 2
+            assert dump_state(os.path.join(raw_dir, "raw.sqlite3"),
+                              defs_dir) == before
+            assert dump_state(db_path, defs) == before
+        finally:
+            cb.ensure_restore_fresh = real_fresh
+            shutil.rmtree(tmp, ignore_errors=True)
+            restore_env()
+
+
 def test_restore_partial_copy_cleanup_allows_retry():
-    for failed_name in ("raw.sqlite3", "observed.json"):
+    for failed_name, partial in (("raw.sqlite3", False),
+                                 ("raw.sqlite3", True),
+                                 ("observed.json", True)):
         tmp, db_path, defs, bdir, raw_dir, defs_dir, before, env = \
             fresh_layout("File")
         real_copy = shutil.copyfile
@@ -496,9 +543,23 @@ def test_restore_partial_copy_cleanup_allows_retry():
 
             def partial_copy(src, dst, *args, **kwargs):
                 if dst == failed_dst:
-                    with open(src, "rb") as source, open(dst, "wb") as target:
-                        target.write(source.read(1))
-                    raise OSError(errno.ENOSPC, "injected partial copy")
+                    prior = {
+                        directory: {
+                            name: bk.sha256_file(os.path.join(directory, name))
+                            for name in os.listdir(directory)
+                        } for directory in (raw_dir, defs_dir)
+                    }
+                    assert cb.cmd_restore() == 3
+                    assert prior == {
+                        directory: {
+                            name: bk.sha256_file(os.path.join(directory, name))
+                            for name in os.listdir(directory)
+                        } for directory in (raw_dir, defs_dir)
+                    }, "competing restore changed the owner's output"
+                    if partial:
+                        with open(src, "rb") as source, open(dst, "wb") as target:
+                            target.write(source.read(1))
+                    raise OSError(errno.ENOSPC, "injected copy failure")
                 return real_copy(src, dst, *args, **kwargs)
 
             shutil.copyfile = partial_copy
@@ -824,6 +885,7 @@ if __name__ == "__main__":
     test_restore_targets_gated_but_live_source_may_run()
     test_definitions_symlink_or_empty_refused()
     test_restore_refuses_nonempty_and_tampered_sidecar()
+    test_restore_owns_both_targets_before_freshness_check()
     test_restore_partial_copy_cleanup_allows_retry()
     test_insufficient_space_refuses_before_writes()
     test_restore_rejects_member_mismatch()
@@ -836,4 +898,4 @@ if __name__ == "__main__":
     test_s3_checksum_corrupt_same_size_put_fails()
     test_s3_unsupported_checksum_fails_safely()
     test_can_failed_put_persists_cost_report()
-    print("test_can_backup: ok (18 tests)")
+    print("test_can_backup: ok")
