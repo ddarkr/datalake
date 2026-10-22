@@ -77,8 +77,8 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
 - `fence`: `{table: {region_id: seq}}` upper JSON (커밋된 펜스).
 - `price_digest`: LiteLLM 가격표 sha256('none' 포함). 변경 시 전체
   비용 셀 재빌드.
-- `config_revision`: `'ai:fence-v3'` 불일치 시 전체 복구. 기존 v1/v2 상태도
-  신규 입력 여부와 무관하게 한 번 완전히 재계산하고 오래된 일별 키를 정리한다.
+- `config_revision`: `'ai:fence-v4'` 불일치 시 전체 복구. 기존 v1/v2/v3 상태도
+  신규 입력 여부와 무관하게 한 번 완전히 재계산하고 누락·오래된 일별 키를 정리한다.
 - `input_digest`: 메트릭 레지스트리 `[(table, instrument)]` JSON.
   테이블 추가/삭제/개명 시 전체 복구(COUNT+MAX 스캔 없음).
 - `committed_at`: 커밋 wall 시각. 파생 상태 TTL 없음.
@@ -97,6 +97,10 @@ watermark 누락으로 upper를 증명하지 못하면 기존 체크포인트를
 전체 복구의 존재 여부 비교는 임시 SQLite에 둔 결과를 사용하며, 모든 키를
 메모리에 모으거나 원본을 다시 읽지 않는다. 쓰기·정리 실패 시 체크포인트를
 유지하고 다음 pass에서 재시도한다. 무변경 증분 pass에는 이 조회를 추가하지 않는다.
+
+client·provider·model·tool 차원은 그룹화 전에 SQL 저장과 같은 문자열 표현으로
+정규화한다. 숫자 `123`과 문자열 `"123"`은 같은 키로 합산하며, 증분과 디스크
+복구가 같은 규칙을 사용한다. 기존 누락·빈 값의 기본값 처리는 유지한다.
 
 ## 복구
 

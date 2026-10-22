@@ -696,6 +696,11 @@ _NATIVE_SERVICE_CLIENTS = {
 }
 _CODEX_PREFIX = "codex."
 
+def ai_dimension(value):
+    """Match SQL string keys before grouping; preserve missing/falsy semantics."""
+    return str(value) if value else value
+
+
 def norm_span(row):
     """Normalize one deduped span dict. Missing-source fields stay None;
     unverified service names stay None (never guessed into identity)."""
@@ -727,10 +732,10 @@ def norm_span(row):
         "parent": row.get("parent_span_id"),
         "op": row.get(OP_NAME),
         "session": session,
-        "client": client,
-        "provider": row.get(PROVIDER),
-        "model": model,
-        "tool": row.get(TOOL_NAME),
+        "client": ai_dimension(client),
+        "provider": ai_dimension(row.get(PROVIDER)),
+        "model": ai_dimension(model),
+        "tool": ai_dimension(row.get(TOOL_NAME)),
         "input": row.get(TOKEN_IN),
         "output": row.get(TOKEN_OUT),
         "cache_read": row.get(TOKEN_CACHE_READ),
@@ -941,9 +946,9 @@ def norm_log(row):
             "session": (a.get("coding_agent.session.id") or a.get("session.id")
                         or a.get("conversation.id")
                         or a.get("gen_ai.conversation.id")),
-            "client": client,
-            "provider": a.get("gen_ai.provider.name"),
-            "model": a.get("model") or a.get("gen_ai.request.model"),
+            "client": ai_dimension(client),
+            "provider": ai_dimension(a.get("gen_ai.provider.name")),
+            "model": ai_dimension(a.get("model") or a.get("gen_ai.request.model")),
             "tool": None, "input": None, "output": None, "cache_read": None,
             "cache_write": None, "reasoning": None, "total": None,
             "cost": cost, "cost_source": "estimated",
@@ -964,11 +969,11 @@ def norm_log(row):
             "session": (a.get("coding_agent.session.id") or a.get("session.id")
                         or a.get("conversation.id")
                         or a.get("gen_ai.conversation.id")),
-            "client": client,
-            "provider": a.get("gen_ai.provider.name"),
-            "model": a.get("model") or a.get("gen_ai.request.model"),
-            "tool": (a.get("tool_name") or a.get("gen_ai.tool.name")
-                     or a.get("tool")),
+            "client": ai_dimension(client),
+            "provider": ai_dimension(a.get("gen_ai.provider.name")),
+            "model": ai_dimension(a.get("model") or a.get("gen_ai.request.model")),
+            "tool": ai_dimension(a.get("tool_name") or a.get("gen_ai.tool.name")
+                                 or a.get("tool")),
             "input": None, "output": None, "cache_read": None,
             "cache_write": None, "reasoning": None, "total": None,
             "cost": None, "cost_source": None,
@@ -1011,11 +1016,11 @@ def norm_log(row):
         "session": (a.get("coding_agent.session.id") or a.get("session.id")
                     or a.get("conversation.id")
                     or a.get("gen_ai.conversation.id")),
-        "client": client,
-        "provider": a.get("gen_ai.provider.name"),
-        "model": a.get("model") or a.get("gen_ai.request.model"),
-        "tool": (a.get("tool_name") or a.get("gen_ai.tool.name")
-                 or a.get("tool")),
+        "client": ai_dimension(client),
+        "provider": ai_dimension(a.get("gen_ai.provider.name")),
+        "model": ai_dimension(a.get("model") or a.get("gen_ai.request.model")),
+        "tool": ai_dimension(a.get("tool_name") or a.get("gen_ai.tool.name")
+                             or a.get("tool")),
         "input": inp, "output": outp, "cache_read": cache_read,
         "cache_write": cache_write, "reasoning": reasoning, "total": total,
         "cost": cost, "cost_source": cost_src,
@@ -2137,7 +2142,7 @@ def activity_metric_rows(ctx, cfg):
                 # Missing/unsupported units cannot establish seconds.
                 value = value * factor if value is not None and factor is not None else None
             out.append({
-                "instrument": instrument, "client": client,
+                "instrument": instrument, "client": ai_dimension(client),
                 "client_explicit": bool(explicit),
                 "session_id": row.get("coding_agent_session_id") or row.get("session_id")
                     or row.get("conversation_id") or row.get("gen_ai_conversation_id"),
@@ -2157,7 +2162,7 @@ def activity_metric_rows(ctx, cfg):
     return out
 
 
-AI_LOGIC_REVISION = "ai:fence-v3"
+AI_LOGIC_REVISION = "ai:fence-v4"
 AI_STATE_SCOPE = "ai"
 AI_STATE_TABLE = "ai_aggregate_state"
 AI_SPAN_SESSION_COLS = (SESSION, "span_attributes.session.id",
@@ -3037,7 +3042,7 @@ def _ai_norm_metric_row(row, instrument, meta=None):
     if not isinstance(stamp, dt.datetime):
         stamp = parse_ts(stamp)
     return {
-        "instrument": instrument, "client": client,
+        "instrument": instrument, "client": ai_dimension(client),
         "client_explicit": bool(explicit),
         "session_id": row.get("coding_agent_session_id") or row.get("session_id")
             or row.get("conversation_id") or row.get("gen_ai_conversation_id"),

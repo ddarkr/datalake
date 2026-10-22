@@ -2161,7 +2161,78 @@ def test_full_reconciliation_pages_and_preserves_partial_retention_day():
         _restore(saved)
 
 
+def test_scalar_dimensions_merge_and_v3_checkpoint_repairs_without_input():
+    saved = _guard()
+    real = install_fence()
+    _reset()
+    srv = serve()
+    try:
+        ctx, cfg = _ctx(srv), _cfg(max_rows=2)
+
+        def usage(call, model, provider, inp, outp):
+            row = clog(DAY2, "scalar-session", "codex", call, inp, outp)
+            attrs = json.loads(row["log_attributes"])
+            attrs.update({"model": model, "gen_ai.provider.name": provider,
+                          "coding_agent.client": 321})
+            row["log_attributes"] = json.dumps(attrs)
+            return row
+
+        first = usage("numeric", 123, True, 50, 30)
+        tools = [span(DAY2, "scalar-tools", str(i), "scalar-session", 321,
+                      None, None, op="tool", tool=value, model=123,
+                      provider=True) for i, value in enumerate((456, "456"))]
+        FakeGreptime.store.append("logs", [first])
+        FakeGreptime.store.append("traces", tools)
+        agg.ai_section(ctx, cfg)
+        assert _session_input("scalar-session", "321") == (50, 30)
+        require_fence()
+
+        def totals(inp, outp):
+            daily = FakeGreptime.derived["ai_daily_summary"]
+            assert [(r["client"], r["provider"], r["model"],
+                     r["input_tokens"], r["output_tokens"]) for r in daily] == [
+                         ("321", "True", "123", inp, outp)], daily
+            tool = FakeGreptime.derived["ai_tool_daily"]
+            assert [(r["client"], r["tool_name"], r["calls"]) for r in tool] == [
+                ("321", "456", 2)], tool
+
+        totals(50, 30)
+        FakeGreptime.store.append("logs", [usage("text", "123", "True", 7, 3)])
+        agg.ai_section(ctx, cfg)
+        totals(57, 33)
+        assert _session_input("scalar-session", "321") == (57, 33)
+        expected = snapshot()
+        # Reproduce a valid v3 cursor whose daily output was pruned away.
+        FakeGreptime.state["rev"] = "ai:fence-v3"
+        FakeGreptime.derived["ai_daily_summary"] = []
+        agg.ai_section(ctx, cfg)
+        totals(57, 33)
+        assert snapshot() == expected
+        assert FakeGreptime.state["rev"] == "ai:fence-v4"
+        require_fence()
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        restore_fence(real)
+        _restore(saved)
+
+
+def test_dimension_normalization_matches_sql_scalar_strings():
+    from decimal import Decimal
+    for value in (123, 1.25, Decimal("1.2300"), True, "한글 '모델'"):
+        normalized = agg.norm_span(span(
+            DAY2, "scalar", "scalar", "session", value, 1, 1,
+            model=value, provider=value, tool=value))
+        for field in ("client", "provider", "model", "tool"):
+            assert normalized[field] == str(value), (field, value, normalized)
+            assert agg.str_lit(normalized[field]) == agg.str_lit(value)
+    for value in (None, "", False, 0, Decimal("0")):
+        assert agg.ai_dimension(value) == value
+
+
 TESTS = (
+    test_scalar_dimensions_merge_and_v3_checkpoint_repairs_without_input,
+    test_dimension_normalization_matches_sql_scalar_strings,
     test_late_model_reconciliation_retries_without_advancing_fence,
     test_full_reconciliation_pages_and_preserves_partial_retention_day,
     test_fresh_bootstrap_commits_fence_on_first_pass,
