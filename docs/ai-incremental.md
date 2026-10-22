@@ -104,6 +104,9 @@ watermark 누락으로 upper를 증명하지 못하면 기존 체크포인트를
 - 네 파생 테이블을 배치로 쓴 뒤에만 해당 스냅샷의 upper를 커밋한다.
   전송·디코드·디스크·쓰기 실패 시 체크포인트는 전진하지 않으며,
   재시도는 완전한 입력으로 수렴한다. 일반 증분·무변경 경로는 유지한다.
+- 기존 세션 anchor는 client별 `session_id IN (...)`으로 조회한다.
+  수백 개 `(client, session_id)` OR 조건의 계획 비용을 피하면서
+  만료된 원본을 가진 다른 client/세션의 집계는 보호한다.
 - 메트릭 단위 변환(`claude_code.active_time.total` 등)은 oracle과
   fenced 경로가 같은 `_ai_metric_unit` 헬퍼를 공유하므로
   단위/temporality 해석이 갈라지지 않는다.

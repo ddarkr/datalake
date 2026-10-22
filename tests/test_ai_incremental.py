@@ -26,6 +26,7 @@ import datetime as dt
 import http.server
 import json
 import re
+import sqlite3
 import threading
 import urllib.parse
 
@@ -363,10 +364,16 @@ def route(stmt):
             cols, _ = _select_cols(stmt)
             selected = F.derived["ai_session_summary"]
             if " WHERE " in stmt:
-                keys = {(client.replace("''", "'"), sid.replace("''", "'"))
-                        for client, sid in re.findall(
-                            r"\(client = '((?:''|[^'])*)' AND session_id = '((?:''|[^'])*)'\)", stmt)}
-                selected = [r for r in selected if (r.get("client"), r.get("session_id")) in keys]
+                with sqlite3.connect(":memory:") as db:
+                    db.execute("CREATE TABLE ai_session_summary "
+                               "(client TEXT, session_id TEXT, session_start TEXT)")
+                    db.executemany("INSERT INTO ai_session_summary VALUES (?,?,?)",
+                                   [(r.get("client"), r.get("session_id"),
+                                     _fmt(r.get("session_start"))) for r in selected])
+                    result = db.execute(stmt)
+                    rows = result.fetchall()
+                F.queries.append((stmt, len(rows)))
+                return _records(cols, rows)
             rows = [[r.get(c) for c in cols] for r in selected]
             F.queries.append((stmt, len(rows)))
             return _records(cols, rows)
@@ -1288,6 +1295,36 @@ def test_partial_write_failure_keeps_fence_and_converges():
         _restore(saved)
 
 
+def test_expired_anchor_isolated_by_client_and_session():
+    saved = _guard()
+    real = install_fence()
+    try:
+        old = {"session_start": "2026-09-10 10:00:00",
+               "session_id": "shared", "client": "codex",
+               "input_tokens": 99, "output_tokens": 99}
+        traces = [span(DAY2, "scope-" + str(i), "scope-" + str(i), sid,
+                       client, 5 + i, 2, call="scope-" + str(i))
+                  for i, (client, sid) in enumerate(
+                      [("codex", "shared"), ("oh-my-pi", "shared"),
+                       ("codex", "other's")])]
+        _reset()
+        FakeGreptime.store.append("traces", [dict(r) for r in traces])
+        FakeGreptime.derived["ai_session_summary"] = [dict(old)]
+        srv = serve()
+        cfg = _cfg(otel_ttl="7d")
+        try:
+            seed_fenced(_ctx(srv), cfg)
+            result = snapshot()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        _assert_oracle(result, traces, [], cfg,
+                       preset={"ai_session_summary": [old]})
+    finally:
+        restore_fence(real)
+        _restore(saved)
+
+
 def test_ttl_partial_expiry_preserves_stored_derived():
     saved = _guard()
     real = install_fence()
@@ -1998,6 +2035,7 @@ TESTS = (
     test_native_jsonb_projection_preserves_log_only_sessions,
     test_disk_reducer_matches_global_merge_oracle_across_chunks,
     test_partial_write_failure_keeps_fence_and_converges,
+    test_expired_anchor_isolated_by_client_and_session,
     test_ttl_partial_expiry_preserves_stored_derived,
     test_price_change_rebuilds_cost_cells,
     test_metric_registry_change_rebuilds,

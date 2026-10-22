@@ -3135,8 +3135,11 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
     total = 0
     old_rows = []
     if sessions:
-        predicates = ["(client = " + str_lit(client) + " AND session_id = " +
-                      str_lit(sid) + ")" for client, sid in sessions]
+        clients = {}
+        for client, sid in sessions:
+            clients.setdefault(client, []).append(str_lit(sid))
+        predicates = ["(client = " + str_lit(client) + " AND session_id IN (" +
+                      ",".join(ids) + "))" for client, ids in clients.items()]
         _, old_rows = guarded_fetch(base_url, auth, db,
             "SELECT client, session_id, session_start FROM ai_session_summary WHERE " +
             " OR ".join(predicates), cfg["max_rows"])
