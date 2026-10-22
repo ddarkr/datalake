@@ -1456,20 +1456,26 @@ def insert_rows(base_url, auth, db, table, columns, rows, batch=500):
 ROLLUP_FORMAT_VERSION = 2
 
 
-def vehicle_agg_sql(resolution, interval, cutoff, sealed, filt=""):
-    res = "'" + resolution.replace("'", "''") + "'"
+def vehicle_agg_sql(raw, hour_sealed=None):
+    """Read raw once; build the two constant resolutions before streaming it."""
+    window = ("CASE WHEN r.resolution = '1m' THEN v.minute_start"
+              " ELSE v.hour_start END")
+    groups = ("v.vehicle, v.path, v.source, v.decode_epoch,"
+              " v.source_field, v.quality, v.unit")
+    sealed = (" WHERE r.resolution = '1m' OR v.hour_start < " + str_lit(hour_sealed)
+              if hour_sealed is not None else "")
     return ("INSERT INTO vehicle_agg (window_start, resolution, vehicle, path, source,"
             " decode_epoch, source_field, quality, unit_key, avg_value, min_value,"
-            " max_value, sample_count, unit, rollup_version) SELECT"
-            " date_bin('" + interval + "'::INTERVAL, event_time) AS window_start,"
-            " " + res + " AS resolution, vehicle, path, source, decode_epoch,"
-            " source_field, quality, unit AS unit_key,"
-            " AVG(value_num), MIN(value_num), MAX(value_num), COUNT(value_num),"
-            " MAX(unit), " + str(ROLLUP_FORMAT_VERSION)
-            + " FROM vehicle_signal WHERE event_time >= '" + cutoff + "'"
-            + " AND event_time < '" + sealed + "'" + filt
-            + " GROUP BY date_bin('" + interval + "'::INTERVAL, event_time),"
-            " vehicle, path, source, decode_epoch, source_field, quality, unit")
+            " max_value, sample_count, unit, rollup_version) SELECT "
+            + window + " AS window_start, r.resolution, " + groups
+            + ", AVG(v.value_num), MIN(v.value_num), MAX(v.value_num),"
+            " COUNT(v.value_num), MAX(v.unit), " + str(ROLLUP_FORMAT_VERSION)
+            + " FROM (SELECT '1m' AS resolution UNION ALL SELECT '1h' AS resolution) r"
+            " CROSS JOIN (SELECT date_bin('60s'::INTERVAL, event_time) AS minute_start,"
+            " date_bin('1h'::INTERVAL, event_time) AS hour_start,"
+            " vehicle, path, source, decode_epoch, source_field, quality, unit, value_num"
+            " FROM vehicle_signal WHERE (" + raw + ")) v" + sealed
+            + " GROUP BY " + window + ", r.resolution, " + groups)
 
 
 def home_agg_sql(table, time_col, entity_col, value_col, resolution, interval,
@@ -3394,14 +3400,14 @@ def _vehicle_rollup(ctx, cfg, exclude=None):
                 " AND window_start >= '" + cut + "'"
                 " AND window_start < '" + seal_m + "'" + filt, timeout=120)
     request_sql(base_url, auth, db,
-                vehicle_agg_sql("1m", "60s", cut, seal_m, filt), timeout=120)
-    request_sql(base_url, auth, db,
                 "DELETE FROM vehicle_agg WHERE resolution = '1h'"
                 " AND rollup_version = 2"
                 " AND window_start >= '" + cut + "'"
                 " AND window_start < '" + seal_h + "'" + filt, timeout=120)
     request_sql(base_url, auth, db,
-                vehicle_agg_sql("1h", "1h", cut, seal_h, filt), timeout=120)
+                vehicle_agg_sql("event_time >= " + str_lit(cut)
+                                + " AND event_time < " + str_lit(seal_m) + filt,
+                                hour_sealed=seal_h), timeout=120)
     migrated = _migrate_legacy_hours(ctx, cfg, excluded)
     request_sql(base_url, auth, db,
                 "DELETE FROM vehicle_agg WHERE resolution = '1m'"
@@ -3436,7 +3442,7 @@ def _migrate_legacy_hours(ctx, cfg, excluded):
     is never reselected; documented: it will NOT auto-retry if historical
     raw arrives later, only the normal lookback covers new raw); else
     marker-safe rebuild via _rollup_hour_windows (legacy rows deleted only
-    after both v2 INSERTs succeed, so any failure leaves the NULL marker
+    after both v2 resolutions are written, so any failure leaves the NULL marker
     for rediscovery). Failures propagate like every other section. Returns
     rebuilt hour count."""
     base_url, auth, db = ctx
@@ -4026,12 +4032,12 @@ def battery_section(ctx, cfg):
 
 
 def _rollup_hour_windows(ctx, cfg, scopes_hours):
-    """Scan each resolution once for the exact dirty (scope, hour) union.
+    """Read the exact dirty (scope, hour) union once for both resolutions.
 
     The NULL-version legacy rows are the durable rediscovery marker: the
     first DELETE removes only rollup_version=2 rows in the exact scope/hour
-    window, then both v2 INSERTs run, and only finally are legacy rows
-    deleted. A crash/failure before the final cleanup leaves the NULL rows
+    window, then one INSERT writes both resolutions, and only finally are legacy
+    rows deleted. A crash/failure before the final cleanup leaves the NULL rows
     behind, so the hour is rediscovered and rebuilt on the next pass.
     Returns hours successfully rolled."""
     base_url, auth, db = ctx
@@ -4074,22 +4080,7 @@ def _rollup_hour_windows(ctx, cfg, scopes_hours):
     request_sql(base_url, auth, db,
                 "DELETE FROM vehicle_agg WHERE (" + target
                 + ") AND rollup_version = 2", timeout=120)
-    for resolution, interval in (("1m", "60s"), ("1h", "1h")):
-        request_sql(
-            base_url, auth, db,
-            "INSERT INTO vehicle_agg (window_start, resolution, vehicle,"
-            " path, source, decode_epoch, source_field, quality, unit_key,"
-            " avg_value, min_value, max_value, sample_count, unit,"
-            " rollup_version) SELECT"
-            " date_bin('" + interval + "'::INTERVAL, event_time)"
-            " AS window_start, '" + resolution + "' AS resolution, vehicle, path,"
-            " source, decode_epoch, source_field, quality, unit AS unit_key,"
-            " AVG(value_num), MIN(value_num), MAX(value_num),"
-            " COUNT(value_num), MAX(unit), " + str(ROLLUP_FORMAT_VERSION)
-            + " FROM vehicle_signal WHERE " + raw
-            + " GROUP BY date_bin('" + interval + "'::INTERVAL,"
-            " event_time), vehicle, path, source, decode_epoch,"
-            " source_field, quality, unit", timeout=scan_timeout)
+    request_sql(base_url, auth, db, vehicle_agg_sql(raw), timeout=scan_timeout)
     request_sql(base_url, auth, db,
                 "DELETE FROM vehicle_agg WHERE (" + target
                 + ") AND rollup_version IS NULL", timeout=120)

@@ -408,6 +408,7 @@ class RollupV2SqlTest(unittest.TestCase):
                  ("2026-09-20 10:00:30.000000000", "v", "invalid", "km/h", 999),
                  ("2026-09-20 10:00:40.000000000", "v", "ok", "m/s", 5),
                  ("2026-09-20 10:01:00.000000000", "v", "ok", "km/h", None),
+                 ("2026-09-20 10:02:00.000000000", "v", "ok", "km/h", 100),
                  ("2026-09-20 10:00:10.000000000", "other", "ok", "km/h", 75)])
 
             def execute(_url, _auth, _database, statement, **_kwargs):
@@ -426,7 +427,13 @@ class RollupV2SqlTest(unittest.TestCase):
                     ("invalid", "km/h", 999, 999, 999, 1, 2),
                     ("ok", "km/h", 15, 10, 20, 2, 2),
                     ("ok", "m/s", 5, 5, 5, 1, 2),
-                    ("ok", "km/h", None, None, None, 0, 2)])
+                    ("ok", "km/h", None, None, None, 0, 2),
+                    ("ok", "km/h", 100, 100, 100, 1, 2)])
+                hour = db.execute("""SELECT avg_value,min_value,max_value,sample_count
+                    FROM vehicle_agg WHERE vehicle='v' AND resolution='1h'
+                    AND quality='ok' AND unit='km/h'""").fetchone()
+                self.assertAlmostEqual(hour[0], 130 / 3)
+                self.assertEqual(hour[1:], (10, 100, 3))
                 db.execute("UPDATE vehicle_signal SET quality='ok'"
                            " WHERE vehicle='v' AND quality='invalid'")
                 agg._rollup_hour_windows(("", "", ""), {}, scopes[:1])
@@ -443,14 +450,20 @@ class RollupV2SqlTest(unittest.TestCase):
                     VALUES ('2026-09-20 10:00:00.000000000','1h',
                             'v','speed','can','e',999,10)""")
 
+                db.execute("""CREATE TRIGGER reject_hour BEFORE INSERT ON vehicle_agg
+                    WHEN NEW.vehicle='v' AND NEW.resolution='1h'
+                    AND NEW.rollup_version=2
+                    BEGIN SELECT RAISE(ABORT,'injected rollup failure'); END""")
                 def interrupted(url, auth, database, statement, **kwargs):
-                    if statement.startswith("INSERT") and "date_bin('1h'" in statement:
-                        raise agg.SqlError("injected second-resolution failure")
-                    return execute(url, auth, database, statement, **kwargs)
+                    try:
+                        return execute(url, auth, database, statement, **kwargs)
+                    except sqlite3.IntegrityError as error:
+                        raise agg.SqlError("injected rollup failure") from error
 
                 with patch.object(agg, "request_sql", interrupted):
                     with self.assertRaises(agg.SqlError):
                         agg._rollup_hour_windows(("", "", ""), {}, scopes[:1])
+                db.execute("DROP TRIGGER reject_hour")
                 self.assertEqual(db.execute(
                     "SELECT avg_value FROM vehicle_agg WHERE rollup_version IS NULL"
                 ).fetchall(), [(999,)])
@@ -476,7 +489,7 @@ class RollupV2SqlTest(unittest.TestCase):
                 self.assertEqual(db.execute(
                     "SELECT SUM(sample_count) FROM vehicle_agg"
                     " WHERE vehicle='v' AND resolution='1h'"
-                ).fetchone(), (4,))
+                ).fetchone(), (5,))
                 # Legacy pass processes fleet but leaves unregistered CAN untouched.
                 db.execute("""INSERT INTO vehicle_signal VALUES
                     ('2026-09-20 10:00:10.000000000','fleet-v','speed','fleet',
@@ -484,17 +497,22 @@ class RollupV2SqlTest(unittest.TestCase):
                 db.execute("""INSERT INTO vehicle_signal VALUES
                     ('2026-09-20 09:00:10.000000000','fleet-v','speed','fleet',
                      NULL,'speed','ok','km/h',30)""")
-                with patch.object(agg, "utcnow", return_value=datetime(2026, 9, 20, 12)), \
+                db.execute("""INSERT INTO vehicle_signal VALUES
+                    ('2026-09-20 11:29:59.999999999','fleet-v','speed','fleet',
+                     NULL,'speed','ok','km/h',70),
+                    ('2026-09-20 11:30:00.000000000','fleet-v','speed','fleet',
+                     NULL,'speed','ok','km/h',900)""")
+                with patch.object(agg, "utcnow", return_value=datetime(2026, 9, 20, 11, 30, 30)), \
                         patch.object(agg, "_migrate_legacy_hours", return_value=0):
                     agg._vehicle_rollup(("", "", ""), {"lookback_h": 30})
                 self.assertEqual(db.execute(
                     "SELECT SUM(sample_count) FROM vehicle_agg"
                     " WHERE vehicle='v' AND resolution='1h'"
-                ).fetchone(), (4,))
+                ).fetchone(), (5,))
                 self.assertEqual(db.execute(
                     "SELECT avg_value FROM vehicle_agg"
                     " WHERE vehicle='fleet-v' ORDER BY resolution, window_start"
-                ).fetchall(), [(30, ), (50, ), (30, ), (50, )])
+                ).fetchall(), [(30, ), (50, ), (30, ), (50, ), (70, )])
 
 
 if __name__ == "__main__":

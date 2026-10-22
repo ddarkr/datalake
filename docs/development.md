@@ -284,9 +284,11 @@ refill 복원 후 로컬 GreptimeDB·MinIO에서 200,000행을 이전 정상 기
 
 위 [저장소 비용 예산 검사](#저장소-비용-예산-검사)의 benchmark·검증 명령과 측정 범위를 참고하세요. 고정 합성 workload의 cold/warm 조회 결과는 모든 집계·컴팩션·복구 경로의 다운로드나 운영 청구 상한을 증명하지 않습니다.
 
-현재 CAN coordinator는 한 pass의 정확한 dirty `(scope, hour)` 집합을 묶어 해상도별로 한 번씩 읽습니다. SQL 조건에 중간의 빈 시간·다른 scope를 포함하지 않지만, native SST pruning은 떨어진 시간대 사이까지 포함한 외곽 범위를 읽을 수 있습니다. manifest의 파일 시각으로 이 외곽 범위에 겹치는 파일을 세고, 기본 동시 조회 한도 384개보다 여유 있는 256개 이내의 시간대 묶음을 선택합니다. 단일 시간대는 항상 시도하며 native 한도는 변경하지 않습니다. 나머지 시간대는 다음 pass에 남기고, 실제 rollup을 마친 시간대만 trip/charge·generation 재확인·checkpoint를 진행합니다. 캐시보다 큰 이력에 대한 실제 경로는 다음 명령으로 확인합니다.
+현재 CAN coordinator는 한 pass의 정확한 dirty `(scope, hour)` 집합을 묶고, 한 raw SELECT에서 분·시간 집계를 함께 만듭니다. 두 해상도 상수 행을 CROSS JOIN의 왼쪽에, 원본 스트림을 오른쪽에 놓아 전체 원본을 join build 쪽에 보관하지 않도록 합니다. 시간 평균은 분 평균을 다시 평균내지 않고 원본에서 직접 계산하며, source field·quality·unit 구분과 NULL-only 그룹의 `COUNT(value_num)=0`을 보존합니다. SQL 조건에 중간의 빈 시간·다른 scope를 포함하지 않지만, native SST pruning은 떨어진 시간대 사이까지 포함한 외곽 범위를 읽을 수 있습니다. manifest의 파일 시각으로 이 외곽 범위에 겹치는 파일을 세고, 기본 동시 조회 한도 384개보다 여유 있는 256개 이내의 시간대 묶음을 선택합니다. 단일 시간대는 항상 시도하며 native 한도는 변경하지 않습니다. 나머지 시간대는 다음 pass에 남기고, 실제 rollup을 마친 시간대만 trip/charge·generation 재확인·checkpoint를 진행합니다. 캐시보다 큰 이력에 대한 실제 경로는 다음 명령으로 확인합니다.
 
 다시간 배치의 raw INSERT는 고유 시간대당 120초, 최대 600초의 HTTP deadline을 사용합니다. 단일 시간대는 기존 120초를 유지합니다. 여러 cold SST를 읽는 작업에 단일 시간대 제한을 그대로 적용하면 완료 전에 연결이 끊길 수 있습니다. 이 deadline은 다운로드 바이트 한도가 아니며, 더 긴 대기 자체가 비용 절감을 의미하지 않습니다. 호스트 차단기의 누적 바이트 한도와 전체 집계 완료를 별도로 확인하세요.
+
+일반 차량 집계도 같은 SQL을 사용하지만 닫힌 분과 닫힌 시간의 경계는 따로 적용합니다. 현재 시간의 완료된 분은 분 집계에 포함하되 미완료 분과 현재 시간의 시간 집계는 제외합니다. legacy NULL-version 표식은 두 해상도의 쓰기가 성공한 뒤에만 제거하므로 실패한 시간은 다음 pass에서 다시 처리할 수 있습니다. SQL 스캔 수 감소가 S3 다운로드 감소를 보장하지는 않습니다. 첫 읽기의 cache refill과 compaction 다운로드는 그대로 발생할 수 있으며 실제 GET bytes를 별도로 계측해야 합니다.
 
 ```bash
 python3 tools/benchmark_greptime_dirty.py --json-out /tmp/datalake-dirty-egress.json
@@ -294,6 +296,16 @@ python3 -m tests.test_egress_guard --docker
 ```
 
 첫 명령은 stock GreptimeDB/MinIO에서 160,000행·16시간의 약 46MB Parquet와 4MiB 캐시를 사용합니다. 수집 중 실제 compaction, idle, 영속 볼륨 재시작, 캐시 유실, dirty 집계, 수정 generation, 무변경 재실행을 분리하고 raw/hourly 결과를 대조합니다. 중첩된 rollup/trip phase는 coordinator의 부분집합이므로 합산하지 않습니다. 실측에서 시간별 반복 스캔을 묶자 cold coordinator payload GET이 198,401,472에서 76,488,138 bytes로 줄었지만, 수집 중 compaction은 양쪽 모두 66,805,898 bytes였습니다. 전체 생애주기 읽기는 337,702,816에서 207,607,691 bytes였으며 무변경 generation은 양쪽 모두 0 bytes였습니다. 전체 로컬 mirror나 운영 egress 0의 증거는 아닙니다.
+
+분·시간 해상도 통합은 정정 1행을 포함한 160,001행의 동일 raw SST에서 별도로 비교했습니다. 매회 소유 캐시만 비우고 실행 순서를 바꾸어 각각 3회 측정했으며, 두 해상도의 결과 7,842행이 모두 일치했습니다. 다음은 각 3회의 중앙값입니다.
+
+| 지표 | 해상도별 두 INSERT | 통합 INSERT |
+| --- | ---: | ---: |
+| 집계 payload GET bytes | 86,284,984 | 72,844,164 |
+| 조회 시간(초) | 1.044 | 1.071 |
+| cold restart 이후 컨테이너 `memory.peak`(bytes) | 510,210,048 | 355,618,816 |
+
+이 정정 workload의 집계 GET은 약 15.6% 줄었지만 속도 향상은 확인하지 못했습니다. 메모리는 파일 캐시를 포함한 cgroup peak이며 쿼리 전용 RSS가 아닙니다. 정정 전 신규 배치의 별도 실행에서는 집계 GET이 양쪽에서 같았습니다. 따라서 이 수치를 전체 생애주기·compaction·운영 청구 절감률로 일반화하지 않습니다. native 실행 계획에서 raw `MergeScanExec`는 두 개에서 한 개로 줄었고, 일반 차량 경로의 NULL·품질·단위·source field·현재 분/시간 경계도 별도의 native fixture로 기존 결과와 대조했습니다.
 
 두 번째 명령은 실제 stock 이미지의 Compose entrypoint로 계측 실패 후 중지·재시작 거절을 검사합니다. 영속 사용량, DB 인스턴스 변경, 손상된 상태에서 긴급 중지, systemd 알림의 Unix datagram도 확인합니다. 호스트 systemd watchdog·실제 계정 청구 검증은 이 로컬 검사와 별개입니다.
 
