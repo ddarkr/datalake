@@ -341,6 +341,11 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 
 복원본의 정의 SHA·연속 seq·epoch·cursor·outbox를 확인한 뒤 별도 receiver·worker로 검증하세요. 운영 archive를 복원본으로 교체(인계)할 때는 receiver와 worker **둘 다** 먼저 정상 종료하고, 같은 archive에 구·신 writer를 병렬 실행하지 마세요. `CAN_BACKUP_RESERVE_BYTES`와 `BACKUP_RESERVE_BYTES`는 각각 CAN·DB staging 예산에 추가할 여유 byte이며 기본 64 MiB입니다. 백업은 snapshot과 압축 작업 공간, 복원은 archive와 해제될 파일 및 대상 파일시스템별 공간을 사전 검사합니다. 공간 부족을 발견하면 기존 원본·복원 대상 데이터를 변경하지 않습니다.
 
+복원 중 DB나 definition 파일의 복사가 실패하면 이번 작업이 만든 부분 파일을
+정리합니다. 공간·I/O 오류를 해결한 뒤 같은 명령으로 재시도할 수 있습니다.
+정리 자체가 파일시스템 오류로 실패해 잔여 파일이 있으면 기존 non-empty 거부는
+유지되므로, 대상 상태를 확인하기 전 강제로 덮어쓰지 마세요.
+
 `python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver·worker를 시작합니다. OTLP 영속 ACK·재시작·중복 보존과 파일 수신의 worker 중지·부분 파일 재시작·중복 범위 재전송·정확한 ns의 Greptime 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver·worker 인계
@@ -577,6 +582,15 @@ COMPOSE_PROJECT_NAME=datalake-recovery docker compose --env-file .env up -d
 ```
 
 복원은 비어 있지 않은 대상 볼륨을 거부하며 강제 덮어쓰기 옵션은 없습니다. 같은 S3 live prefix를 쓰는 기존 DB와 복원 DB를 동시에 실행하지 마세요. 복원 후 현재 `.env`로 인증 설정이 다시 생성됩니다.
+
+동일 버킷·정규화된 S3 live root의 복원은 원격 claim으로 직렬화합니다.
+backup prefix가 달라도 같은 live root라면 두 번째 복원을 거부하며, claim은
+원격 SST 처리부터 로컬 설치와 실패 rollback이 끝날 때까지 유지됩니다.
+버킷의 `.datalake-restore-locks/`는 예약된 control 경로이므로 live/backup
+prefix로 사용하지 마세요. 이 보호는 강한 PUT/LIST 일관성과 모든 복원 도구의
+같은 프로토콜 사용을 전제로 합니다. 강제 종료로 남은 claim은 소유 프로세스가
+끝났음을 독립적으로 확인한 뒤에만 수동 제거하세요. 서로 겹치는 별도 root나
+실행 중인 외부 DB writer까지 보호하지 않으므로 기존 offline 조건은 유지됩니다.
 
 성공한 복원은 백업 볼륨의 `BACKUP_DIR/restore-verification.json`에 `{timestamp_seconds, backup_id}`를 atomic 교체로 기록합니다. 이는 archive SHA256·크기, SST HEAD identity·크기(기존 SHA256 형식의 SST 백업은 종전 hash 검증)와 대상 파일 복원이 끝났다는 **마지막 오프라인 성공 기록**이며, DB 재기동·SQL 조회·데이터 수집이 정상이라는 증거가 아닙니다. 실패하면 이전 성공 기록을 유지하고 파일이 없으면 검증 이력은 unknown입니다. 최신 복원 시도가 성공했다는 뜻으로 해석하지 말고 종료 코드도 확인하세요.
 

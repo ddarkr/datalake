@@ -678,6 +678,118 @@ def test_s3_restore_copy_failure_deletes_own_writes():
         restore_env()
 
 
+def test_restore_destination_claim_blocks_reuse_until_rollback():
+    original = {"snapshot/a.sst": b"a", "snapshot/b.sst": b"b",
+                "other-snapshot/a.sst": b"a", "live/keep.sst": b"keep"}
+    fake = FakeS3(original)
+    records = [{"key": name + ".sst", "size": 1,
+                "sha256": hashlib.sha256(name.encode()).hexdigest()}
+               for name in ("a", "b")]
+    copy = fake.copy_object
+    refused = []
+
+    def interleaved_copy(**kw):
+        if kw["Key"] == "live/b.sst":
+            assert fake.objects["live/a.sst"] == b"a"
+            try:
+                bk.s3_restore_snapshot(fake, "bucket", "/live/",
+                                       {"snap_prefix": "other-snapshot/"}, records[:1])
+            except IOError:
+                refused.append(True)
+            else:
+                raise AssertionError("second restore reused uncommitted live SST")
+            assert fake.objects["live/a.sst"] == b"a"
+            # A different root does not contend, even while A is rolling back.
+            bk.s3_restore_snapshot(fake, "bucket", "independent/",
+                                   {"snap_prefix": "other-snapshot/"}, records[:1])
+            raise IOError("second copy failed")
+        return copy(**kw)
+
+    fake.copy_object = interleaved_copy
+    try:
+        bk.s3_restore_snapshot(fake, "bucket", "live",
+                               {"snap_prefix": "snapshot/"}, records)
+    except IOError:
+        pass
+    else:
+        raise AssertionError("copy failure was ignored")
+    assert refused == [True]
+    assert fake.objects == dict(original, **{"independent/a.sst": b"a"})
+    fake.copy_object = copy
+    bk.s3_restore_snapshot(fake, "bucket", "live/",
+                           {"snap_prefix": "snapshot/"}, records)
+    assert fake.objects["live/a.sst"] == b"a"
+    assert fake.objects["live/keep.sst"] == b"keep"
+
+
+def test_restore_claim_partial_put_failure_cleans_up_for_retry():
+    original = {"snapshot/a.sst": b"a", "another-generation/a.sst": b"a"}
+    fake = FakeS3(original)
+    put = fake.put_object
+    record = {"key": "a.sst", "size": 1,
+              "sha256": hashlib.sha256(b"a").hexdigest()}
+
+    def partial_put(**kw):
+        put(**kw)
+        raise IOError("claim PUT response lost")
+
+    fake.put_object = partial_put
+    try:
+        bk.s3_restore_snapshot(fake, "bucket", "live/",
+                               {"snap_prefix": "snapshot/"}, [record])
+    except IOError:
+        pass
+    else:
+        raise AssertionError("uncertain claim entered restore")
+    assert fake.objects == original
+    fake.put_object = put
+    bk.s3_restore_snapshot(fake, "bucket", "live/",
+                           {"snap_prefix": "snapshot/"}, [record])
+    assert fake.objects == dict(original, **{"live/a.sst": b"a"})
+
+
+def test_cli_restore_claim_covers_local_staging_and_remote_rollback():
+    fake = FakeS3(sst_fixture())
+    tmp, _src, tgt, bdir, env = fresh_layout("S3", fake)
+    populate, rollback = bk.staged_populate, bk.rollback_owned
+    checks = []
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        original = {k: v for k, v in fake.objects.items()
+                    if not k.startswith("test-root/")}
+        fake.objects = dict(original)
+
+        def assert_contender_refused():
+            # Use the valid archive identity so refusal comes from the live lock.
+            assert bk.cmd_restore() == 3
+            checks.append(True)
+
+        def fail_staging(*args):
+            assert_contender_refused()
+            raise IOError("injected local staging failure")
+
+        def guarded_rollback(*args):
+            assert_contender_refused()
+            return rollback(*args)
+
+        bk.staged_populate = fail_staging
+        bk.rollback_owned = guarded_rollback
+        assert bk.cmd_restore() == 3
+        assert checks == [True, True]
+        assert fake.objects == original
+        assert hash_tree(tgt) == {}
+        bk.staged_populate = populate
+        bk.rollback_owned = rollback
+        assert bk.cmd_restore() == 0
+        assert hash_tree(tgt) == hash_tree(os.path.join(tmp, "src"))
+    finally:
+        bk.staged_populate = populate
+        bk.rollback_owned = rollback
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
 def test_s3_restore_refuses_legacy_archive():
     fake = FakeS3(sst_fixture())
     tmp, _src, tgt, bdir, env = fresh_layout("S3", fake)
@@ -1623,6 +1735,43 @@ def test_retention_truncated_newer_tar_keeps_valid_recovery():
         assert error is None
         keep, deletes, _ = bk.retention_plan(gens, settings)
         assert keep == [ids[0]] and not deletes
+    finally:
+        end_retention_run(tmp)
+
+
+def test_shared_generation_missing_and_zero_size_pool_objects():
+    objects = sst_fixture()
+    objects["test-root/empty.sst"] = b""
+    fake = FakeS3(objects)
+    ids, tmp, _env = retention_ids(fake, count=2)
+    try:
+        def generations():
+            gens, error = bk.remote_generations(fake, "test-bucket", "test-backups/")
+            assert error is None
+            assert {g["backup_id"] for g in gens} == set(ids)
+            return gens
+
+        gens = generations()
+        assert all(g["status"] == "complete" for g in gens)
+        records = gens[0]["complete"]["sst"]
+        empty = next(o for o in records if o["size"] == 0)
+        nonempty = next(o for o in records if o["size"] > 0)
+        # Both generations share the same objects, including a valid empty SST.
+        del fake.objects[empty["snapshot_key"]]
+        gens = generations()
+        relative = empty["snapshot_key"][len(bk.pool_prefix("test-backups/")):]
+        assert all(g["status"] == "incomplete" and relative in g["reason"]
+                   and "size mismatch" not in g["reason"] for g in gens)
+        fake.objects[empty["snapshot_key"]] = b""
+        original = fake.objects[nonempty["snapshot_key"]]
+        for replacement in (b"", original[:-1]):
+            fake.objects[nonempty["snapshot_key"]] = replacement
+            gens = generations()
+            assert all(g["status"] == "incomplete"
+                       and "size mismatch " + nonempty["key"] in g["reason"]
+                       for g in gens)
+        fake.objects[nonempty["snapshot_key"]] = original
+        assert all(g["status"] == "complete" for g in generations())
     finally:
         end_retention_run(tmp)
 
@@ -2990,6 +3139,9 @@ if __name__ == "__main__":
     test_restore_rejects_identity_change()
     test_prune_never_deletes_just_written()
     test_unreadable_live_sst_is_never_overwritten_or_deleted()
+    test_restore_destination_claim_blocks_reuse_until_rollback()
+    test_restore_claim_partial_put_failure_cleans_up_for_retry()
+    test_cli_restore_claim_covers_local_staging_and_remote_rollback()
     test_head_snapshot_refuses_same_size_identity_changes()
     test_historical_sha256_snapshot_restores_and_rejects_corruption()
     test_large_sst_inventory_roundtrips_local_and_remote()
@@ -3001,6 +3153,7 @@ if __name__ == "__main__":
     test_retention_off_default_deletes_nothing()
     test_retention_dryrun_matches_enforce_selection()
     test_retention_truncated_newer_tar_keeps_valid_recovery()
+    test_shared_generation_missing_and_zero_size_pool_objects()
     test_retention_keeps_pinned_age_minimum_current()
     test_retention_fail_closed_faults()
     test_retire_complete_first_and_idempotent()

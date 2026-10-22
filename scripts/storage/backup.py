@@ -440,7 +440,7 @@ _POOL_INVENTORY = ContextVar("backup_pool_inventory", default=None)
 
 
 @contextmanager
-def shared_pool_lock(client, bucket, bp, token=None):
+def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
     """Exclusive unique claims require strongly consistent LIST/PUT.
 
     ponytail: serialize this backup prefix; per-object guards only if measured
@@ -448,7 +448,7 @@ def shared_pool_lock(client, bucket, bp, token=None):
     requires independently proving its owner exited before manual removal.
     """
     identity = (bucket, norm_prefix(bp))
-    if _POOL_GUARD.get() == identity:
+    if reentrant and _POOL_GUARD.get() == identity:
         yield
         return
     locks = norm_prefix(bp) + POOL_LOCK_DIR
@@ -463,7 +463,11 @@ def shared_pool_lock(client, bucket, bp, token=None):
     try:
         claim = {"claim": key.rsplit("/", 1)[-1], "pid": os.getpid(),
                  "host": socket.gethostname(), "created_ns": time.time_ns()}
-        s3_put_bytes_verified(client, bucket, key, json.dumps(claim).encode())
+        payload = json.dumps(claim).encode()
+        if verify_claim:
+            s3_put_bytes_verified(client, bucket, key, payload)
+        else:
+            client.put_object(Bucket=bucket, Key=key, Body=payload)
         if {o["Key"] for o in s3_list_all(client, bucket, locks)} != {key}:
             raise IOError("pool writer/GC claim collision (refusing)")
         token = _POOL_GUARD.set(identity)
@@ -476,6 +480,24 @@ def shared_pool_lock(client, bucket, bp, token=None):
             _POOL_GUARD.reset(token)
         s3_delete_keys(client, bucket, [key])
 
+
+
+RESTORE_LOCK_ROOT = ".datalake-restore-locks/"
+
+
+def restore_destination_lock(client, bucket, root_pfx):
+    """Cooperating restores of one exact root; not a guard against DB writers.
+
+    Controls live outside SST/backup inventories. Overlapping distinct roots
+    are unsupported. Strong LIST/PUT and manual crash-claim recovery are required.
+    Claim payload is diagnostic only: exclusive key presence, not its digest,
+    establishes ownership. Restore data verification is unchanged.
+    """
+    root = norm_prefix(root_pfx)
+    if root.startswith(RESTORE_LOCK_ROOT) or RESTORE_LOCK_ROOT.startswith(root):
+        raise IOError("live root overlaps reserved restore control namespace")
+    scope = RESTORE_LOCK_ROOT + hashlib.sha256(root.encode()).hexdigest() + "/"
+    return shared_pool_lock(client, bucket, scope, reentrant=False, verify_claim=False)
 
 def pool_inventory(client, bucket, bp, excluding=None):
     """Published COMPLETE inventories are the pool identity ledger.
@@ -635,6 +657,14 @@ def open_s3_client(component="backup"):
         run["clients"].append(client)
         if run["operation"] == "cmd_backup" and component == "backup":
             guard = shared_pool_lock(client, env("S3_BUCKET"), current_identity()["backup_prefix"])
+            guard.__enter__()
+            run["guard"] = guard
+        elif run["operation"] == "cmd_restore" and component == "backup":
+            bp = norm_prefix(current_identity()["backup_prefix"])
+            if bp.startswith(RESTORE_LOCK_ROOT) or RESTORE_LOCK_ROOT.startswith(bp):
+                raise IOError("backup prefix overlaps reserved restore control namespace")
+            guard = restore_destination_lock(
+                client, env("S3_BUCKET"), env("S3_ROOT", "greptime"))
             guard.__enter__()
             run["guard"] = guard
     return client
@@ -1371,6 +1401,11 @@ def download_remote_backup(d, client, bucket, bp, want):
 
 
 def s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
+    with restore_destination_lock(s3, bucket, root_pfx):
+        return _s3_restore_snapshot(s3, bucket, norm_prefix(root_pfx), snap, objs)
+
+
+def _s3_restore_snapshot(s3, bucket, root_pfx, snap, objs):
     """Restore missing SSTs, refuse conflicting live keys, roll back own writes.
 
     Pool generations copy from backup-owned pool objects (no GET); per-key
@@ -1533,7 +1568,7 @@ def cmd_restore():
             if problem is not None:
                 return _fail_ref(problem, code=2)
             try:
-                written_sst = s3_restore_snapshot(
+                written_sst = _s3_restore_snapshot(
                     s3, bucket, root_pfx,
                     manifest["sst_snapshot"], manifest["sst_snapshot"]["objects"])
             except IOError as e:
@@ -1659,13 +1694,10 @@ def remote_generations(client, bucket, bp, now_ns=None):
             pool_keys = sorted(o["snapshot_key"][len(pool_prefix(bp)):]
                                for o in complete["sst"])
             pool_bytes = sum(pool_sizes.get(k, 0) for k in pool_keys)
-            missing_pool = sorted(k for k in pool_keys
-                                  if pool_prefix(bp) + k not in
-                                  {o["Key"] for o in objs})
+            missing_pool = sorted(k for k in pool_keys if k not in pool_sizes)
             size_mismatch = sorted(o["key"] for o in complete["sst"]
-                                   if o["snapshot_key"]
-                                   in {o2["Key"] for o2 in objs}
-                                   and pool_sizes.get(o["snapshot_key"][len(pool_prefix(bp)):]) != o["size"])
+                                   if o["snapshot_key"][len(pool_prefix(bp)):] in pool_sizes
+                                   and pool_sizes[o["snapshot_key"][len(pool_prefix(bp)):]] != o["size"])
             if missing_top or missing_pool or size_mismatch:
                 gens.append(dict(base, status="incomplete",
                                 reason="missing " + ",".join(sorted(missing_top | set(missing_pool[:3])))

@@ -1152,8 +1152,8 @@ def cmd_restore():
                               + f["name"])
             staged_defs.append((f, p))
         dst_db = os.path.join(raw_dir, CAN_ARCHIVE)
-        shutil.copyfile(staged_db, dst_db)
         written.append(dst_db)
+        shutil.copyfile(staged_db, dst_db)
         dirs = manifest["dirs"]
         apply_identity(raw_dir, {"uid": dirs["raw_uid"], "gid": dirs["raw_gid"],
                                  "mode": dirs["raw_mode"]}, "restored raw dir")
@@ -1164,8 +1164,8 @@ def cmd_restore():
                        "restored definitions dir")
         for f, p in staged_defs:
             dst = os.path.join(defs_dir_out, f["name"])
-            shutil.copyfile(p, dst)
             written.append(dst)
+            shutil.copyfile(p, dst)
             apply_identity(dst, f, "restored definition " + f["name"])
         if bk.sha256_file(dst_db) != manifest["archive"]["sha256"]:
             raise IOError("restored archive differs after copy (refusing)")

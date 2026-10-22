@@ -71,6 +71,16 @@ dry-run은 `resume <id>`와 `candidate <id>`를 구분하고, 공유 객체 정�
   해제 없음). SST 충돌을 포함한 모든 S3 복원 오류 경로에서 ref를 해제합니다.
 - 같은 prefix의 모든 backup/retention 작업이 이 claim 절차를 사용하는
   버전이어야 합니다. 실패·정상 종료 시 자기 claim만 제거합니다.
+- 복원 대상은 세대 reader ref와 별도로
+  `.datalake-restore-locks/<정규화 live root의 SHA256>/_locks/<uuid>`에서
+  직렬화합니다. 동일 버킷·live root이면 backup prefix와 무관하게 충돌하며
+  로컬 설치와 최종 rollback까지 claim을 유지합니다. 이 예약 경로는 SST와
+  백업 inventory 밖에 둡니다. 강한 PUT/LIST 일관성이 필요하고, 강제 종료로
+  남은 claim은 소유자가 종료됐음을 확인한 뒤 수동 회수합니다. 서로 겹치는
+  별도 root나 이 프로토콜을 따르지 않는 DB writer는 보호 대상이 아닙니다.
+  복원 계정에는 이 control 경로의 LIST/PUT/DELETE 권한이 필요합니다.
+  claim 내용은 진단용이며 배타성은 고유 key의 존재로 판단하므로 이 PUT에는
+  서버 checksum을 요구하지 않습니다. SST·archive의 기존 검증은 그대로입니다.
 - retention 삭제(writer)도 two-phase입니다: 사전 확인(refs/`RETIRING` 부재,
   COMPLETE 존재) → `RETIRING` 마커 기록 → 마커 뒤 refs 사후 재확인 →
   `COMPLETE` 단독 삭제 → `COMPLETE` 부재 재확인 → payload 삭제(재확인) →
@@ -148,6 +158,9 @@ pin/참조/retiring 세대가 참조하는 pool 키는 절대 삭제하지 않�
 inventory가 원본·복사본 ETag/size와 pool 참조의 ledger이며, 재사용 경로는
 guard당 한 번 로드해 각 pool HEAD와 대조합니다. LIST의 정규 pool data
 키 자체로 unpublished orphan와 부분 삭제 뒤의 재시도 대상을 찾습니다.
+세대 분류에서는 한 번 조회한 LIST로 만든 크기 인덱스를 모든 SST에
+재사용합니다. 객체 누락과 0바이트 객체는 구분하며, 크기 불일치의
+incomplete 판정은 유지합니다. 이 검사에 추가 S3 요청은 없습니다.
 GC는 세대 retirement 뒤 생존 inventory를 다시 읽고 참조 없는 키만
 삭제합니다. pin·reader ref·retiring 참조를 보존하며, 알 수 없는 pool 키,
 읽을 수 없거나 손상·미완료인 inventory, 검증 불가 legacy 참조는 GC를

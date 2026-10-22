@@ -5,6 +5,7 @@ receiver archive) plus invented definition bytes. No vehicle data, no
 production hosts, no real S3.
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -479,6 +480,45 @@ def test_restore_refuses_nonempty_and_tampered_sidecar():
         restore_env()
 
 
+def test_restore_partial_copy_cleanup_allows_retry():
+    for failed_name in ("raw.sqlite3", "observed.json"):
+        tmp, db_path, defs, bdir, raw_dir, defs_dir, before, env = \
+            fresh_layout("File")
+        real_copy = shutil.copyfile
+        try:
+            setenv(env)
+            assert cb.cmd_backup() == 0
+            with tarfile.open(newest_tar(bdir), "r:gz") as tar:
+                expected_db = tar.extractfile("raw.sqlite3").read()
+            failed_dst = os.path.join(
+                raw_dir if failed_name == "raw.sqlite3" else defs_dir,
+                failed_name)
+
+            def partial_copy(src, dst, *args, **kwargs):
+                if dst == failed_dst:
+                    with open(src, "rb") as source, open(dst, "wb") as target:
+                        target.write(source.read(1))
+                    raise OSError(errno.ENOSPC, "injected partial copy")
+                return real_copy(src, dst, *args, **kwargs)
+
+            shutil.copyfile = partial_copy
+            assert cb.cmd_restore() == 3
+            assert os.listdir(raw_dir) == []
+            assert os.listdir(defs_dir) == []
+            assert dump_state(db_path, defs) == before
+            shutil.copyfile = real_copy
+            assert cb.cmd_restore() == 0
+            with open(os.path.join(raw_dir, "raw.sqlite3"), "rb") as restored:
+                assert restored.read() == expected_db
+            assert dump_state(os.path.join(raw_dir, "raw.sqlite3"),
+                              defs_dir) == before
+            assert dump_state(db_path, defs) == before
+        finally:
+            shutil.copyfile = real_copy
+            shutil.rmtree(tmp, ignore_errors=True)
+            restore_env()
+
+
 def test_insufficient_space_refuses_before_writes():
     tmp, db_path, defs, bdir, raw_dir, defs_dir, before, env = \
         fresh_layout("File")
@@ -784,6 +824,7 @@ if __name__ == "__main__":
     test_restore_targets_gated_but_live_source_may_run()
     test_definitions_symlink_or_empty_refused()
     test_restore_refuses_nonempty_and_tampered_sidecar()
+    test_restore_partial_copy_cleanup_allows_retry()
     test_insufficient_space_refuses_before_writes()
     test_restore_rejects_member_mismatch()
     test_s3_backup_uploads_and_restore_verifies()
@@ -795,4 +836,4 @@ if __name__ == "__main__":
     test_s3_checksum_corrupt_same_size_put_fails()
     test_s3_unsupported_checksum_fails_safely()
     test_can_failed_put_persists_cost_report()
-    print("test_can_backup: ok (17 tests)")
+    print("test_can_backup: ok (18 tests)")
