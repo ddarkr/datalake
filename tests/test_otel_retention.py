@@ -49,6 +49,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             elif "FROM ai_session_summary" in stmt:
                 cols, rows = (["client", "session_id", "session_start"],
                               Handler.summary_rows)
+            elif "FROM ai_daily_summary" in stmt:
+                cols, rows = ["day_start", "client", "provider", "model"], []
+            elif "FROM ai_tool_daily" in stmt:
+                cols, rows = ["day_start", "tool_name", "client"], []
             elif "FROM ai_aggregate_state" in stmt:
                 # Zero rows: incremental path falls back to full rebuild.
                 cols, rows = (["completed_through_ingest", "price_digest",
