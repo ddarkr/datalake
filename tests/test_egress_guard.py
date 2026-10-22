@@ -81,6 +81,79 @@ def daily_limits(path):
         pass
 
 
+def blocked_alerts(path):
+    state = dict(version=2, project="blocked-regression", used_bytes=1000,
+                 last=None, blocked=False, day=g.day_at(1000),
+                 day_used_bytes=1000, alerted=[])
+    g.save(path, state)
+    config = path / "telegram.json"
+    with patch.object(g.time, "time", return_value=1000), patch.object(g, "telegram") as sent:
+        g.latch(path, state, "native metrics unavailable: https://user:secret@example.invalid")
+        g.alert(path, config, False)
+        text = sent.call_args.args[1]
+        assert "긴급" in text and "정지 미확인" in text
+        assert "secret" not in text and "계측 또는 보호 상태 이상" in text
+        assert "계속 가동" not in text
+        g.alert(path, config, False)
+        assert sent.call_count == 1
+        g.alert(path, config, True)
+        assert sent.call_count == 2 and "정지 확인" in sent.call_args.args[1]
+        g.alert(path, config, True)
+        assert sent.call_count == 2
+        g.main(["--state-dir", str(path), "unblock"])
+        state = g.load(path)
+        state.update(used_bytes=g.SOFT_BYTES, day_used_bytes=g.SOFT_BYTES)
+        g.save(path, state)
+        g.alert(path, config, False)
+        assert "계속 가동" in sent.call_args.args[1]
+        state = g.load(path)
+        g.latch(path, state, "unaccounted S3 helper running")
+        g.alert(path, config, False)
+        assert sent.call_count == 4 and "계측 외 S3 작업" in sent.call_args.args[1]
+    # Delivery failure persists across calls/reloads; exact 60s retries.
+    state = g.load(path)
+    state.pop("block_alerted")
+    state.pop("block_alert_attempt_level")
+    g.save(path, state)
+    with patch.object(g.time, "time", return_value=2000), patch.object(g, "telegram", side_effect=OSError("secret")) as sent:
+        g.alert(path, config, True)
+        g.alert(path, config, True)
+        assert sent.call_count == 1
+    with patch.object(g.time, "time", return_value=2059), patch.object(g, "telegram") as sent:
+        g.alert(path, config, True)
+        assert sent.call_count == 0
+    with patch.object(g.time, "time", return_value=2060), patch.object(g, "telegram") as sent:
+        g.alert(path, config, True)
+        assert sent.call_count == 1
+    # Exercise explicit trip's real stop-result consumer, including failure.
+    for failure in (True, False):
+        g.main(["--state-dir", str(path), "unblock"])
+        with patch.object(g, "stop", side_effect=RuntimeError("Docker unavailable") if failure else None), patch.object(g, "telegram") as sent:
+            try:
+                g.main(["--state-dir", str(path), "trip", "--project", state["project"],
+                        "--telegram-config", str(config)])
+                assert not failure
+            except RuntimeError:
+                assert failure
+            text = sent.call_args.args[1]
+            assert ("정지 미확인" if failure else "정지 확인") in text
+            assert "명시적 차단 / 모니터 종료" in text
+    # The running monitor must report the actual result, not just the latch.
+    for failure in (True, False):
+        state = g.load(path)
+        for key in ("block_alerted", "block_alert_attempt_level"):
+            state.pop(key, None)
+        g.save(path, state)
+        with patch.object(g, "stop", side_effect=RuntimeError("Docker unavailable") if failure else None), patch.object(g, "telegram") as sent, patch.object(g, "notify"), patch.object(g.time, "sleep", side_effect=LookupError("end loop")):
+            try:
+                g.main(["--state-dir", str(path), "run", "--metrics-url", "http://127.0.0.1:4000/metrics",
+                        "--telegram-config", str(config)])
+                raise AssertionError("monitor did not loop")
+            except LookupError:
+                pass
+            assert ("정지 미확인" if failure else "정지 확인") in sent.call_args.args[1]
+
+
 def daily_docker(path):
     """Real monitor/HTTP/Docker stop, without sending synthetic alerts to users."""
     path.mkdir(mode=0o700)
@@ -136,11 +209,12 @@ HTTPServer(('0.0.0.0', 4000), Handler).serve_forever()
             raise AssertionError("daily guard did not reach expected state")
         reached(lambda s: s["day_used_bytes"] == g.SOFT_BYTES - 1)
         g.atomic(counter, str(g.SOFT_BYTES))
-        soft = reached(lambda s: s.get("alert_attempt_level") == "soft")
+        soft = reached(lambda s: s["day_used_bytes"] == g.SOFT_BYTES)
         assert not soft["blocked"] and soft["alerted"] == []
         assert json.loads(g.docker("inspect", project))[0]["State"]["Running"]
         g.atomic(counter, str(g.HARD_BYTES))
-        hard = reached(lambda s: s.get("alert_attempt_level") == "hard")
+        hard = reached(lambda s: s["blocked"] and
+                       not json.loads(g.docker("inspect", project))[0]["State"]["Running"])
         assert hard["blocked"] and hard["day_used_bytes"] == g.HARD_BYTES
         assert not json.loads(g.docker("inspect", project))[0]["State"]["Running"]
         assert (path / "lease").read_text() == "0\n"
@@ -158,6 +232,9 @@ def main():
         daily_path = path / "daily"
         daily_path.mkdir(mode=0o700)
         daily_limits(daily_path)
+        blocked_path = path / "blocked"
+        blocked_path.mkdir(mode=0o700)
+        blocked_alerts(blocked_path)
         unsafe.mkdir(mode=0o755)
         try:
             with g.locked(unsafe):

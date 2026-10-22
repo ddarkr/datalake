@@ -234,20 +234,36 @@ def alert(directory, config, stopped):
     # duplicate one alert; losing a hard-limit notification is worse.
     with locked(directory):
         state = load(directory)
-        level = ("hard" if state["day_used_bytes"] >= HARD_BYTES else
+        blocked = state["blocked"]
+        level = (("stopped" if stopped else "unconfirmed") if blocked else
+                 "hard" if state["day_used_bytes"] >= HARD_BYTES else
                  "soft" if state["day_used_bytes"] >= SOFT_BYTES else None)
-        if not level or level in state["alerted"]:
+        acknowledged = (state.get("block_alerted") == level if blocked else
+                        level in state["alerted"])
+        if not level or acknowledged:
             return
         now = time.time()
-        if state.get("alert_attempt_level") == level and now - state.get("alert_attempt_at", 0) < 60:
+        prefix = "block_alert" if blocked else "alert"
+        if state.get(prefix + "_attempt_level") == level and now - state.get(prefix + "_attempt_at", 0) < 60:
             return
-        state["alert_attempt_at"] = now
-        state["alert_attempt_level"] = level
+        state[prefix + "_attempt_at"] = now
+        state[prefix + "_attempt_level"] = level
         save(directory, state)
         day = state["day"]
         action = ("프로젝트 정지 확인. 수동 확인 후 재개하세요." if stopped else
-                  "정지 미확인: 호스트/Docker 상태를 즉시 확인하세요.") if level == "hard" else "서비스는 계속 가동합니다."
-        text = (f"[Datalake {'긴급' if level == 'hard' else '주의'}]\n"
+                  "정지 미확인: 호스트/Docker 상태를 즉시 확인하세요.") if blocked or level == "hard" else "서비스는 계속 가동합니다."
+        # Diagnostics may contain URLs/credentials. Only fixed cause labels
+        # leave the host; retain the original reason in the private state.
+        reason = state.get("reason", "")
+        cause = {
+            "daily hard download limit reached": "일일 다운로드 한도 초과",
+            "Greptime instance changed": "Greptime 인스턴스 변경",
+            "unaccounted S3 helper running": "계측 외 S3 작업 감지",
+            "explicit trip / monitor stopped": "명시적 차단 / 모니터 종료",
+        }.get(reason, "계측 또는 보호 상태 이상")
+        if blocked:
+            action = f"보호 차단: {cause}\n{action}"
+        text = (f"[Datalake {'긴급' if blocked or level == 'hard' else '주의'}]\n"
                 f"{day} KST S3 다운로드 {state['day_used_bytes'] / 1e9:.3f} GB\n"
                 f"소프트 50 GB / 하드 200 GB (일일)\n{action}\n"
                 "Greptime 계측 기준이며 공급자 청구량과 다를 수 있습니다.")
@@ -259,7 +275,11 @@ def alert(directory, config, stopped):
         return
     with locked(directory):
         state = load(directory)
-        if state["day"] == day:
+        if blocked:
+            if state["blocked"]:
+                state["block_alerted"] = level
+                save(directory, state)
+        elif state["day"] == day:
             state["alerted"] = ["soft", "hard"] if level == "hard" else ["soft"]
             save(directory, state)
 
@@ -275,6 +295,8 @@ def main(argv=None):
     sub.add_parser("status")
     trip = sub.add_parser("trip")
     trip.add_argument("--grace", type=int, default=10)
+    trip.add_argument("--telegram-config", type=Path,
+                      help="send stop outcome when state is readable; no retry worker")
     trip.add_argument("--project", required=True,
                       help="trusted exact project to stop even if persistent state is unreadable")
     run = sub.add_parser("run")
@@ -309,7 +331,16 @@ def main(argv=None):
         finally:
             # Storage failure must never bypass the host's explicit stop target.
             # Do not recreate malformed state or discard its usage evidence.
-            stop(args.project, args.grace)
+            stopped = False
+            try:
+                stop(args.project, args.grace)
+                stopped = True
+            finally:
+                if args.telegram_config:
+                    try:
+                        alert(directory, args.telegram_config, stopped)
+                    except Exception:
+                        print("Trip notification unavailable; inspect private guard state", flush=True)
         return
     with locked(directory):
         if args.command == "arm":
@@ -332,6 +363,8 @@ def main(argv=None):
             revoke(directory)
             state.update(blocked=False, reason="authorized",
                          last=None, instance=None, startup_until=time.time() + args.startup_seconds)
+            for key in ("block_alerted", "block_alert_attempt_at", "block_alert_attempt_level"):
+                state.pop(key, None)
             save(directory, state)
             # run must start before DB: arm alone does not grant a lease.
         if args.command != "run":

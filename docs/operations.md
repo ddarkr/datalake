@@ -83,7 +83,9 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 Linux Docker 호스트에서 검증된 스크립트를 `/usr/local/libexec/datalake-egress-guard.py`에 설치하고, root 소유 `0700` 영속 디렉터리를 준비합니다. 사용량·날짜·알림 성공 기록은 프로세스 재시작에도 유지됩니다. 가동 중에는 KST 자정 이후 첫 관측에서 일일 사용량만 초기화하며, 자정을 걸친 관측 증가분은 새 날짜에 전부 합산합니다. 전체 누적값은 보존합니다. 정지된 프로젝트는 자정이 지나도 자동 재개하지 않습니다.
 
-Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600` JSON 파일 `/etc/datalake-egress-telegram.json`에 `token`(문자열), `chat_id`(정수)로 저장합니다. `notify-test --telegram-config /etc/datalake-egress-telegram.json`으로 실제 전송을 확인하세요. 알림은 단계별 하루 한 번이며 전송 실패 시 60초 뒤 재시도합니다. 소프트 알림 직후 하드 한도에 도달하면 기다리지 않고 긴급 알림을 시도합니다. 정지는 알림보다 먼저 실행하므로 Telegram 장애가 차단을 지연시키지 않습니다. 전송 성공 직후 상태 저장 전에 프로세스가 죽으면 중복 알림이 발생할 수 있습니다.
+Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600` JSON 파일 `/etc/datalake-egress-telegram.json`에 `token`(문자열), `chat_id`(정수)로 저장합니다. `notify-test --telegram-config /etc/datalake-egress-telegram.json`으로 실제 전송을 확인하세요. 사용량 경고는 단계별 하루 한 번이며, 보호 차단은 사용량과 무관하게 별도의 긴급 알림을 보냅니다. 소프트 경고를 이미 보냈어도 차단 알림은 생략하지 않으며, 정지 미확인에서 정지 확인으로 바뀌면 다시 알립니다. 같은 상태의 전송 실패는 60초 뒤 재시도하고, 수동 재개 뒤 새 차단은 새로 알립니다. 정지는 알림보다 먼저 실행하므로 Telegram 장애가 차단을 지연시키지 않습니다. 원인은 고정된 분류만 전송하며 차단 원인은 호스트의 `state.json`에 남깁니다. 전송 성공 직후 상태 저장 전에 프로세스가 죽으면 중복 알림이 발생할 수 있습니다.
+
+수동 `trip`과 systemd 종료 후에도 알리려면 `--telegram-config`를 전달하세요. 단발 `trip`은 정지 결과를 한 번 전송하며 자체 재시도 루프는 없습니다. 상태 파일이 손상돼 읽을 수 없거나 호스트·네트워크가 중단된 경우 알림을 보장하지 않습니다. 기존 version 2 상태는 그대로 읽으며 차단 알림 기록은 필요할 때 추가합니다.
 
 기존 누적 예산의 version 1 상태는 자동 초기화하거나 조용히 변환하지 않습니다. 교체 전 상태를 비공개 백업하고 version 2의 `day`, `day_used_bytes`, `alerted`를 명시적으로 이관하세요. 기존 `used_bytes`, `last`, `sample_at`, `instance`, `blocked`는 보존하고 `budget_bytes`는 제거합니다. 일별 이력이 없으면 이관 당일에 기존 누적값을 보수적으로 전부 합산하고 그 한계를 기록합니다.
 
@@ -111,7 +113,7 @@ Type=notify
 NotifyAccess=main
 User=root
 ExecStart=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress run --metrics-url http://127.0.0.1:4000/metrics --interval 2 --timeout 3 --grace 10 --telegram-config /etc/datalake-egress-telegram.json
-ExecStopPost=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress trip --project datalake --grace 10
+ExecStopPost=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress trip --project datalake --grace 10 --telegram-config /etc/datalake-egress-telegram.json
 WatchdogSec=300
 TimeoutStartSec=300
 TimeoutStopSec=150
