@@ -351,8 +351,9 @@ class DirtyBatchTest(unittest.TestCase):
                     (("window_start", "can", "e"), hour + 2 * agg.HOUR_NS)]
             def execute(_url, _auth, _database, statement, **_kwargs):
                 db.execute(statement.replace("::INTERVAL", ""))
-            with patch.object(agg, "request_sql", execute):
-                agg._rollup_hour_windows(("", "", ""), {}, keys)
+            with patch.object(agg, "request_sql", execute), \
+                    patch.object(agg, "guarded_fetch", return_value=([], [])):
+                agg._rollup_hour_windows(("", "", ""), {"max_rows": 200000}, keys)
             self.assertEqual(db.execute(
                 "SELECT vehicle, window_start, avg_value, sample_count "
                 "FROM vehicle_agg WHERE resolution='1h' ORDER BY vehicle"
@@ -367,7 +368,7 @@ class DirtyBatchTest(unittest.TestCase):
                 patch.object(agg, "_load_checkpoints", return_value={}), \
                 patch.object(agg, "_read_dirty_generation", side_effect=["g", "new"]), \
                 patch.object(agg, "_config_revision", return_value="rev"), \
-                patch.object(agg, "_rollup_hour_windows"), \
+                patch.object(agg, "_rollup_hour_windows", return_value={key[1]}), \
                 patch.object(agg, "_trip_charge_scope_windows") as trip, \
                 patch.object(agg, "_commit_checkpoint") as commit:
             self.assertEqual(agg.vehicle_history_section(
