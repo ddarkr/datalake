@@ -417,9 +417,10 @@ def main(argv=None):
                             latch(directory, state, "daily hard download limit reached")
                         else:
                             save(directory, state)
-                    except Exception:
+                    except Exception as exc:
                         if state["blocked"] or state.get("last") is not None or time.time() >= state["startup_until"]:
-                            latch(directory, state, "native metrics unavailable, stale, or reset")
+                            latch(directory, state,
+                                  f"native metrics unavailable, stale, or reset: {type(exc).__name__}: {exc}")
                     if not state["blocked"]:
                         atomic(directory / "lease", str(int(time.time() + args.interval + args.timeout + 5)) + "\n")
                 blocked = state["blocked"]
