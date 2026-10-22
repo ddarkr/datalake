@@ -1220,6 +1220,7 @@ def _patch_coordinator(monkey, fakes, fail_at=None):
             calls[name].append(pending)
             if fail_at == name:
                 raise agg.SqlError("work failed")
+            return {hour for _, hour in pending}
         return apply
     for name, fn in (("_load_dirty", dirty), ("_load_checkpoints", checkpoints),
                      ("_read_dirty_generation", read), ("_commit_checkpoint", commit),
@@ -1347,6 +1348,31 @@ def test_coordinator_earlier_unit_survives_later_failure_and_retry():
     finally:
         _unpatch(monkey)
 
+
+
+def test_coordinator_sst_hull_batch_only_checkpoints_completed_hours():
+    import datetime as dt
+    now = dt.datetime(2026, 9, 20, 12)
+    first = agg.dt_to_ns(now - dt.timedelta(hours=4))
+    last = agg.dt_to_ns(now - dt.timedelta(hours=1))
+    scope = ("v", "can", "epoch")
+    dirty = [(scope, hour, "gen") for hour in (first, last)]
+    saved = []
+    fakes = _fake_db(dirty, saved, {(scope, hour): "gen" for hour in (first, last)})
+    gap = now - dt.timedelta(hours=3)
+    files = [("sst-" + str(i), gap, gap + dt.timedelta(minutes=1)) for i in range(400)]
+    cfg = _vehicle_cfg(paths=dict.fromkeys(agg._VEHICLE_ATTRS, ""))
+    with patch.object(agg, "_load_dirty", fakes[0]), \
+            patch.object(agg, "_load_checkpoints", fakes[1]), \
+            patch.object(agg, "_read_dirty_generation", fakes[2]), \
+            patch.object(agg, "_commit_checkpoint", fakes[3]), \
+            patch.object(agg, "guarded_fetch", return_value=(["file_id", "min_ts", "max_ts"], files)), \
+            patch.object(agg, "_request_sql", return_value={"output": [{"affectedrows": 1}]}):
+        assert agg.vehicle_history_section(("", "", ""), cfg, now) == 1
+        assert [row[1] for row in fakes[4]] == [first]
+        saved.extend(fakes[4])
+        assert agg.vehicle_history_section(("", "", ""), cfg, now) == 1
+        assert [row[1] for row in fakes[4]] == [first, last]
 
 
 def test_sql_diagnostics_never_emit_scope_literals_or_errors():
@@ -1491,6 +1517,7 @@ if __name__ == "__main__":
     test_trip_hour_chunks_preserve_context_and_refuse_total_cap()
     test_vehicle_flushed_floor_avoids_unbounded_raw_min()
     test_coordinator_earlier_unit_survives_later_failure_and_retry()
+    test_coordinator_sst_hull_batch_only_checkpoints_completed_hours()
     test_sql_diagnostics_never_emit_scope_literals_or_errors()
     test_sql_error_raises()
     test_per_call_billing_excludes_rollups_and_cumulative_parents()

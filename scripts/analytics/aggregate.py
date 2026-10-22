@@ -4030,6 +4030,26 @@ def _rollup_hour_windows(ctx, cfg, scopes_hours):
         by_hour.setdefault(hour_ns, set()).add(scope)
     if not by_hour:
         return set()
+    if len(by_hour) > 1:
+        _, files = guarded_fetch(
+            base_url, auth, db,
+            "SELECT file_id,min_ts,max_ts FROM information_schema.ssts_manifest"
+            " WHERE visible=true AND table_id=(SELECT table_id FROM"
+            " information_schema.tables WHERE table_schema=" + str_lit(db) +
+            " AND table_name='vehicle_signal')", cfg["max_rows"])
+        bounds = [(ident, parse_ts(lo), parse_ts(hi)) for ident, lo, hi in files]
+        first = _ns_to_dt(min(by_hour))
+        selected = {}
+        for hour_ns in sorted(by_hour):
+            end = _ns_to_dt(hour_ns + HOUR_NS)
+            # Native pruning can use the OR hull, including gaps. Leave
+            # headroom below its 384-file default; always attempt one hour.
+            touched = {ident for ident, lo, hi in bounds
+                       if lo is None or hi is None or (lo < end and hi >= first)}
+            if selected and len(touched) > 256:
+                break
+            selected[hour_ns] = by_hour[hour_ns]
+        by_hour = selected
     # A cold multi-hour batch must not inherit the single-hour HTTP deadline.
     scan_timeout = min(600, 120 * len(by_hour))
     ranges = {"window_start": [], "event_time": []}
@@ -4106,9 +4126,11 @@ def vehicle_history_section(ctx, cfg, now=None):
         scope, hour_ns = key
         if _read_dirty_generation(ctx, scope, hour_ns) == pending[key]:
             eligible[key] = pending[key]
-    _rollup_hour_windows(ctx, cfg, eligible)
+    completed = _rollup_hour_windows(ctx, cfg, eligible)
     for key in eligible:
         scope, hour_ns = key
+        if hour_ns not in completed:
+            continue
         observed = eligible[key]
         if _read_dirty_generation(ctx, scope, hour_ns) != observed:
             continue
