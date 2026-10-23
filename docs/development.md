@@ -198,6 +198,8 @@ python -m tests.test_vehicle_aggregate
 
 배터리의 V/I 동기화와 conditions/energy as-of 조회는 정렬된 시각을 이진 탐색합니다. 같은 시각의 마지막 입력, 무효 입력으로 끊긴 구간, skew/gap과 교정 조건은 유지합니다. 변경 시 정상 입력뿐 아니라 중복 시각·무효 장벽·구간 경계를 기존 구현과 비교하세요.
 
+대시보드 검사는 Grafana YAML을 프로세스당 한 번 파싱하고, 각 검사는 별도의 dashboard JSON을 디코드합니다.
+
 측정 조건·복구 경계·재현 명령은 [AI 증분 집계](ai-incremental.md), [Fleet/VSS 배치 저장](outbox-batching.md), [CAN pending 조회](can-pending.md), [RAW 메모리·임시 디스크](raw-memory.md), [백업 세대 보존](backup-retention.md), [OTel 보존·용량 정책](otel-retention.md)에 정리되어 있습니다. 합성 비교는 전체 재계산·원본 hash·빈 대상 복원을 먼저 확인하고, 운영 처리량이나 물리 장치 내구성으로 확대 해석하지 않습니다.
 
 ### 저장소 비용 예산 검사

@@ -1,17 +1,25 @@
 """Execute dashboard coverage SQL: missing input must not look healthy."""
 import json
+from functools import cache
 import re
 from pathlib import Path
 import sqlite3
+from types import MappingProxyType
 
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
 
 
+@cache
+def _grafana_configs():
+    """Parse the immutable fragment once; each test decodes its own dashboard JSON."""
+    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    return MappingProxyType({name: MappingProxyType(config) for name, config in configs.items()})
+
 
 def test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for name, config in configs.items():
         if not name.startswith("grafana-dash-"):
             continue
@@ -27,7 +35,7 @@ def test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors():
 def test_dashboard_and_folder_uids_are_disjoint():
     from scripts.database.grafana_folders import FOLDERS
 
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     providers = yaml.safe_load(configs["grafana-dashboards"]["content"])["providers"]
     folder_uids = {uid for uid, _, _ in FOLDERS}
     folder_uids.update(p["folderUid"] for p in providers if p.get("folderUid"))
@@ -39,7 +47,7 @@ def test_dashboard_and_folder_uids_are_disjoint():
     assert not folder_uids.intersection(dashboard_uids), "Folder/dashboard UID collision"
 
 def test_coverage_distinguishes_absence_from_observed_zero():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     queries = []
     for name in ("grafana-dash-ai-usage", "grafana-dash-ai-sessions"):
         dashboard = json.loads(configs[name]["content"])
@@ -72,7 +80,7 @@ def test_coverage_distinguishes_absence_from_observed_zero():
         assert [db.execute(q).fetchone()[0] for q in queries] == [1, 1]
 
 def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-ai-usage"]["content"])
     panel = next(p for p in dashboard["panels"] if p["id"] == 12)
     query = panel["targets"][0]["rawSql"].replace("$$", "$")
@@ -110,6 +118,40 @@ def _all_battery_panels(panels):
     for panel in panels:
         yield panel
         yield from _all_battery_panels(panel.get("panels") or [])
+
+
+def test_overview_coverage_keeps_selected_and_historical_times_separate():
+    dashboard = json.loads(_grafana_configs()["grafana-dash-overview"]["content"])
+    panel = next(p for p in dashboard["panels"] if p["id"] == 13)
+    query = panel["targets"][0]["rawSql"].replace("$$", "$")
+    query = re.sub(r"\$__timeFilter\((\w+)\)",
+                   r"\1 BETWEEN 1000 AND 2000", query)
+    query = query.replace("$__unixEpochTo()", "2000").replace(
+        " AS TIMESTAMP(6)", " AS INTEGER")
+    with sqlite3.connect(":memory:") as db:
+        db.create_function("FROM_UNIXTIME", 1, lambda value: value)
+        for table, timestamp in (
+                ("opentelemetry_traces", "timestamp"),
+                ("opentelemetry_logs", "timestamp"),
+                ("vehicle_agg", "window_start"),
+                ("vehicle_analysis", "window_start"),
+                ("vehicle_event", "event_time"),
+                ("trip_summary", "started_at"),
+                ("charge_session", "started_at"),
+                ("ai_session_summary", "session_start"),
+                ("mqtt_consumer", "greptime_timestamp"),
+                ("home_agg", "window_start")):
+            db.execute(f"CREATE TABLE {table} ({timestamp} INTEGER)")
+        db.execute("CREATE TABLE vehicle_signal (event_time INTEGER, source TEXT)")
+        assert all(row[1:] == (None, None, None, "No observations in range")
+                   for row in db.execute(query))
+        db.executemany("INSERT INTO vehicle_signal VALUES (?, ?)",
+                       [(1500, "can"), (900, "fleet")])
+        db.execute("INSERT INTO opentelemetry_traces VALUES (2500)")
+        rows = {row[0]: row[1:] for row in db.execute(query)}
+        assert rows["차량 CAN"] == (1, 1500, 1500, "Observed")
+        assert rows["차량 Fleet"] == (None, None, 900, "No observations in range")
+        assert rows["OTel 스팬"] == (None, None, None, "No observations in range")
 
 
 def _battery_query(configs, panel_id):
@@ -176,7 +218,7 @@ def _battery_db():
 
 
 def test_battery_dashboard_latest_revision_wins_before_status_filter():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _battery_query(configs, 6)
     with _battery_db() as db:
         # Empty analyses show unknown, never a healthy zero.
@@ -210,7 +252,7 @@ def test_battery_dashboard_latest_revision_wins_before_status_filter():
 
 def test_battery_dashboard_warning_overlap_keeps_started_before_range():
     """Alerts-only lifecycle: open needs valid active evidence."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     ledger = _battery_query(configs, 18)
     state = _battery_query(configs, 19)
     counts = _battery_query(configs, 5)
@@ -263,7 +305,7 @@ def test_battery_dashboard_warning_overlap_keeps_started_before_range():
 
 def test_battery_cards_raw_display_latest_valid_only():
     """Panel 25 shows the newest BatteryLevel report; a bad newest stays NULL."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _battery_query(configs, 25)
     with _battery_db() as db:
         # No reports: no rows (unknown), never a zero fill.
@@ -305,7 +347,7 @@ def test_battery_cards_raw_display_latest_valid_only():
 
 def test_battery_cards_latest_window_energy_not_lifetime():
     """Panel 30 shows the newest window's energy; a bad newest never resurrects older goods."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _battery_query(configs, 30)
     metric = 'battery.energy.discharge_energy_kwh'
     with _battery_db() as db:
@@ -345,7 +387,7 @@ def test_battery_cards_latest_window_energy_not_lifetime():
 
 def test_battery_soh_card_prefers_absolute_then_estimate_with_error():
     """Panel 33: full-discharge SOH wins; else the estimate carries its ±range."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = (_battery_query(configs, 33)
              .replace("CAST(ROUND(uncertainty, 1) AS STRING)", "ROUND(uncertainty, 1)")
              .replace("CAST(window_start AS TIMESTAMP(6))", "window_start"))
@@ -377,7 +419,7 @@ def test_battery_soh_card_prefers_absolute_then_estimate_with_error():
 
 def test_battery_period_totals_sum_latest_revision_per_window():
     """Panels 37-40: period totals add each window's newest derived kWh once."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for panel, metrics in ((37, ("battery.energy.discharge_energy_kwh",
                                  "battery.energy.parked_discharge_kwh")),
                            (39, ("battery.energy.dc_charging_energy_in_kwh",))):
@@ -476,7 +518,7 @@ def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
     return "".join(parts)
 
 def test_physical_cards_latest_analysis_and_new_raw_barriers():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     cards = (("grafana-dash-vehicle-overview", 6, "latest_power_kw", "kW", -18.45),
              ("grafana-dash-drives", 7, "latest_power_kw", "kW", -18.45),
              ("grafana-dash-charging", 6, "latest_power_kw", "kW", -18.45),
@@ -535,7 +577,7 @@ def test_physical_cards_latest_analysis_and_new_raw_barriers():
 
 
 def test_physical_graphs_keep_signed_samples_and_latest_invalid_revision():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for dashboard, panel in (("grafana-dash-vehicle-overview", 12),
                              ("grafana-dash-charging", 10),
                              ("grafana-dash-battery", 56)):
@@ -557,7 +599,7 @@ def test_physical_graphs_keep_signed_samples_and_latest_invalid_revision():
 
 
 def test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for panel, field, unit in ((44, "BrickVoltageMax", "V"),
                                (45, "BrickVoltageMin", "V"),
                                (51, "ModuleTempMax", "celsius"),
@@ -699,7 +741,7 @@ def test_calibrated_graphs_render_hourly_samples_beside_verified_raw():
     timestamp (value_text); the spread uses the completed window_start
     bucket scaled V->mV. Bad latest revisions stay NULL (no resurrection);
     scope and time filters are honored."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
     assert panels[47]["targets"][1]["refId"] == "B"
@@ -784,7 +826,7 @@ def test_calibrated_extrema_fallback_and_frontier():
     and unknown ingest stay NULL (no resurrection)."""
     from scripts.analytics.battery import battery_runtime as battery_runtime
 
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     cases = ((44, "BrickVoltageMax", "battery.conditions.brick_max_v", "V", 3, 4.02),
              (45, "BrickVoltageMin", "battery.conditions.brick_min_v", "V", 3, 3.92),
              (51, "ModuleTempMax", "battery.conditions.module_temp_max_c", "celsius", 3, 25.5),
@@ -882,7 +924,7 @@ def test_calibrated_extrema_retained_without_raw_join():
     frontier outside the initial selection then blocks the stale value."""
     from scripts.analytics.battery import battery_runtime as battery_runtime
 
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     cases = ((44, "BrickVoltageMax", "battery.conditions.brick_max_v", "V", 3, 4.02),
              (45, "BrickVoltageMin", "battery.conditions.brick_min_v", "V", 3, 3.92),
              (51, "ModuleTempMax", "battery.conditions.module_temp_max_c", "celsius", 3, 25.5),
@@ -926,7 +968,7 @@ def test_calibrated_extrema_retained_without_raw_join():
 
 
 def test_can_reports_keep_invalid_latest_and_scope_boundaries():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     cases = (
         (1, "x292.BMS_socUI", "%", 62, None, 4, 62),
         (2, "x352.BMS_nominalEnergyRemaining", "kWh", 38, None, 3, 38),
@@ -973,7 +1015,7 @@ def test_temperature_cards_keep_both_cabin_and_outside_readings():
     own leg, and fleet-relabeled CAN rows stay excluded."""
     for dashboard, panel in (("grafana-dash-battery", 53),
                              ("grafana-dash-vehicle-overview", 9)):
-        configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+        configs = _grafana_configs()
         query = _physical_query(configs, dashboard, panel)
         with _battery_db() as db:
             db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
@@ -999,7 +1041,7 @@ def test_temperature_cards_keep_both_cabin_and_outside_readings():
             assert cabin is None and outside == 15.0, rows
 
 def test_vehicle_coverage_separates_observation_from_receipt():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-vehicle-overview", 92)
     query = query.replace("$__timeFilter(ingest_time)", "ingest_time BETWEEN 1000 AND 2000")
     with _battery_db() as db:
@@ -1016,7 +1058,7 @@ def test_vehicle_coverage_separates_observation_from_receipt():
 
 
 def test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-vehicle-overview", 11)
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
@@ -1032,7 +1074,7 @@ def test_can_soc_graph_rejects_wrong_units_and_keeps_null_gaps():
 
 
 def test_vehicle_identity_canonical_selection_and_scope_split():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     variables = {v["name"]: v for v in dashboard["templating"]["list"]}
     panels = {p["id"]: p for p in _all_battery_panels(dashboard["panels"])}
@@ -1110,7 +1152,7 @@ def test_vehicle_identity_canonical_selection_and_scope_split():
 
 def test_transition_timeline_starts_from_boundary_sample():
     """Gear timeline: latest pre-range row anchors the series; tombstones stay NULL."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-vehicle-overview", 14)
     query = (query.replace("$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
              .replace("$__unixEpochFrom()", "1000"))
@@ -1135,7 +1177,7 @@ def test_transition_timeline_starts_from_boundary_sample():
 
 
 def test_cell_frequency_respects_selected_source_and_epoch():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
@@ -1161,7 +1203,7 @@ def test_cell_frequency_respects_selected_source_and_epoch():
 
 
 def test_can_latest_cards_keep_invalid_reports_and_separate_epochs():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-can-battery"]["content"])
     raw = next(p for p in dashboard["panels"] if p["id"] == 20)["targets"][0]["rawSql"]
     query = (raw.replace("$$", "$")
@@ -1198,7 +1240,7 @@ def test_provenance_table_matches_card_eligibility():
     timestamps/bases, latest-invalid stays NULL, no-raw retained stays visible."""
     from scripts.analytics.battery import battery_runtime as battery_runtime
 
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query, ns_timestamp, ts_display = _native_ts_query(
         configs, "grafana-dash-battery", 94, start=1000, end=1700000000)
     observed = battery_runtime.ns_to_sql_ts(1500000000)
@@ -1284,7 +1326,7 @@ def test_fleet_gear_and_charge_timelines_include_latest_invalid():
     """Gear/charge timelines (overview 13/14, drives 9, charging 11, battery 57)
     carry both Fleet and CAN branches: a newer invalid report wins and renders
     NULL instead of resurrecting the older good value."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     cases = (("grafana-dash-vehicle-overview", 14, "Gear",
               "Vehicle.Powertrain.Transmission.CurrentGear", "D",
               "DI_gear", "Vehicle.CAN.x118.DI_gear", "DI_GEAR_D"),
@@ -1357,7 +1399,7 @@ def _scoped_graph_query(configs, dashboard_name, panel_id):
 def test_speed_soc_scope_separation_units_and_invalid_buckets():
     """Speed/SOC graphs keep raw vehicle/source/epoch scopes separate, gate on
     expected units (km/h, %) and leave invalid-only buckets NULL, never 0."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
@@ -1403,7 +1445,7 @@ def test_speed_soc_scope_separation_units_and_invalid_buckets():
 def test_rollup_weighted_mean_skips_invalid_and_legacy():
     """Long-range speed leg weights buckets by sample_count (never avg-of-avgs);
     invalid-only quality stays NULL and legacy rollup_version rows are skipped."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=3000000)
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
@@ -1426,7 +1468,7 @@ def test_rollup_weighted_mean_skips_invalid_and_legacy():
 def test_rollup_missing_buckets_stay_missing_without_raw_fallback():
     """A long range with raw rows but no rollup coverage returns no rows;
     unprocessed buckets are never backfilled from raw."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=3000000)
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
@@ -1441,7 +1483,7 @@ def test_rollup_missing_buckets_stay_missing_without_raw_fallback():
 def test_rollup_resolution_thresholds_and_mixed_scopes():
     """Mid ranges use the 1m leg only, long ranges the 1h leg only; scopes with
     different source/epoch never merge into one weighted mean."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     mid = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=200000)
     long = _physical_query(configs, "grafana-dash-drives", 1, start=0, end=3000000)
     with _battery_db() as db:
@@ -1465,7 +1507,7 @@ def test_ledger_overlap_window_and_nested_raw_scopes():
     """Drive/charge ledgers return sessions overlapping the range (not just
     started inside it); every ledger and nested raw sibling carries
     source/epoch filters."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
         db.create_function("FROM_UNIXTIME", 1, lambda value: value)
@@ -1541,7 +1583,7 @@ def test_dbc_divergence_exact_soc_aliases_with_unit_gate():
     BMS_socUI/Avg vs Fleet Soc/BatteryLevel canonical paths) under the %
     reported gate; a missing counterpart yields NULL diff, never a
     fabricated zero."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-dbc-health", 9)
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
@@ -1583,7 +1625,7 @@ def test_battery_lifecycle_counts_only_valid_active_evidence():
     """Warning lifecycle (panel 19): an invalid-only active episode surfaces
     as unknown_activity with zero valid-active observations for diagnosis —
     never counted as an open episode."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     state = _battery_query(configs, 19)
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
@@ -1606,7 +1648,7 @@ def test_cell_latest_raw_scope_across_epochs_with_cap():
     """Cell latest table (panel 91) projects raw scope identifiers, keeps all
     96 bricks visible across 3 epochs, and documents its row cap; the
     per-brick coverage sibling (panel 93) accounts every brick/epoch."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-can-cells", 91)
     with _battery_db() as db:
         db.row_factory = sqlite3.Row
@@ -1631,12 +1673,15 @@ def test_cell_latest_raw_scope_across_epochs_with_cap():
 
 def test_ai_runtime_dedup_ttft_and_subagent_samples():
     """Execute dashboard SQL: exact request dedup, missing identity, zero and eligibility."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     runtime = json.loads(configs["grafana-dash-ai-runtime"]["content"])
     panels = {p["id"]: p for p in runtime["panels"]}
 
     def query(panel_id):
-        sql = panels[panel_id]["targets"][0]["rawSql"].replace("$$", "$")
+        panel = panels[panel_id]
+        if panel.get("datasource", {}).get("uid") == "-- Dashboard --":
+            panel = panels[panel["targets"][0]["panelId"]]
+        sql = panel["targets"][0]["rawSql"].replace("$$", "$")
         sql = sql.replace("$__timeFilter(timestamp)", "timestamp BETWEEN 1000 AND 2000")
         sql = sql.replace("FROM_UNIXTIME($__unixEpochTo() - 172800)", "0")
         for variable in runtime["templating"]["list"]:
@@ -1658,6 +1703,7 @@ def test_ai_runtime_dedup_ttft_and_subagent_samples():
         columns.update(("timestamp", "trace_id", "span_id", "service_name", "span_name", "duration_nano"))
         db.execute("CREATE TABLE opentelemetry_traces (" + ",".join('"' + c + '"' for c in sorted(columns)) + ")")
         db.execute("CREATE TABLE opentelemetry_logs (timestamp, trace_id, span_id, log_attributes, resource_attributes)")
+        assert db.execute(query(10)).fetchone()["ttft_samples"] is None
 
         def span(trace, span_id, **attrs):
             values = {"timestamp": 1500, "trace_id": trace, "span_id": span_id,
@@ -1743,7 +1789,7 @@ def test_ai_runtime_dedup_ttft_and_subagent_samples():
 
 
 def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for dashboard, panel in (("grafana-dash-battery", 25),
                              ("grafana-dash-vehicle-overview", 1)):
         query = _physical_query(configs, dashboard, panel).replace(
@@ -1812,7 +1858,7 @@ def test_last_reported_snapshots_keep_history_without_resurrecting_invalid():
 
 def test_analysis_ah_observed_completed_windows_only():
     """Panel 130: only observed completed windows; sparse coverage is shown, never a daily total."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _battery_query(configs, 130)
     with _battery_db() as db:
         assert db.execute(query).fetchall() == []
@@ -1860,7 +1906,7 @@ def test_analysis_ah_summary_selected_vs_observed_gap():
     """Panel 130 target B: per-direction (metric) rows, so one observed hour with both
     charge+discharge counts ONE window per direction (distinct=1), never 2; a missing
     direction stays derived 0, not fully covered."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     panel = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == 130)
     query = (panel["targets"][1]["rawSql"].replace("$$", "$")
@@ -1904,7 +1950,7 @@ def test_analysis_ah_summary_selected_vs_observed_gap():
 
 def test_analysis_counter_vs_vi_same_window_no_addition():
     """Panel 131: counter and VI legs join only on the exact same window/scope; AC+DC never added."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _battery_query(configs, 131)
     with _battery_db() as db:
         assert db.execute(query).fetchall() == []
@@ -1946,7 +1992,7 @@ def test_analysis_counter_vs_vi_same_window_no_addition():
 
 def test_analysis_brick_id_latest_invalid_never_resurrected():
     """Panel 132: newest unavailable ID row wins; max/min stay separate (diagnostic only)."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _battery_query(configs, 132)
     with _battery_db() as db:
         assert db.execute(query).fetchall() == []
@@ -1979,7 +2025,7 @@ def test_analysis_brick_id_latest_invalid_never_resurrected():
 
 def test_analysis_level_minus_soc_exact_timestamp_only():
     """Panel 133: BatteryLevel-Soc only at identical event_time+scope; async/invalid/conflict excluded."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     db = _battery_db()
     db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
     query = _battery_query(configs, 133)
@@ -2055,9 +2101,7 @@ _SIGNAL_COLS = "(event_time,vehicle,source,decode_epoch,source_field,value_num,u
 
 def test_uistatus_current_power_needs_fresh_completed_window():
     """Panel 110 CURRENT: stale completed window stays NULL; fresh completed window shows value. No resurrection."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 110, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2075,9 +2119,7 @@ def test_uistatus_current_power_needs_fresh_completed_window():
 
 def test_uistatus_future_raw_never_suppresses_current():
     """Panels 110/111: raw beyond selectedEnd is excluded early; historical current state stays visible."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for pid, metric, aid, val, unit in ((110, "battery.energy.latest_power_kw", "battery_energy", 7.5, "kW"), (111, "battery.energy.latest_pack_voltage_v", "battery_voltage", 400.0, "V")):
         q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
         with _uistatus_db() as db:
@@ -2094,9 +2136,7 @@ def test_uistatus_future_raw_never_suppresses_current():
 
 def test_uistatus_inrange_raw_keeps_conservative_guard():
     """Panels 110/111: in-range raw newer than the analyzed observation suppresses the card; older raw does not."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for pid, metric, aid, val, unit in ((110, "battery.energy.latest_power_kw", "battery_energy", 7.5, "kW"), (111, "battery.energy.latest_pack_voltage_v", "battery_voltage", 400.0, "V")):
         q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
         with _uistatus_db() as db:
@@ -2119,9 +2159,7 @@ def test_uistatus_inrange_raw_keeps_conservative_guard():
 
 def test_uistatus_last_completed_is_timestamped_nonlive():
     """Panel 112 LAST: newest completed window shows value with observed_at/window/computed_at; explicitly history, not live."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 112, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2138,9 +2176,7 @@ def test_uistatus_last_completed_is_timestamped_nonlive():
 
 def test_uistatus_evidence_keeps_analysis_identities_separate():
     """Panel 113: same scope/metric with two analysis_ids yields two rows; identities never merge."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2157,9 +2193,7 @@ def test_uistatus_evidence_keeps_analysis_identities_separate():
 
 def test_uistatus_evidence_raw_snapshot_basis():
     """Panel 113: raw BatteryLevel snapshot keeps before-range latest, excludes future, shows invalid; CAN alias is reported_unverified."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2185,9 +2219,7 @@ def test_uistatus_evidence_raw_snapshot_basis():
 
 def test_uistatus_evidence_raw_energy_cabin():
     """Panel 113: raw EnergyRemaining/cabin snapshots follow the same selectedEnd-bounded latest-valid rule."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2204,9 +2236,7 @@ def test_uistatus_evidence_raw_energy_cabin():
 
 def test_uistatus_newest_invalid_blocks_older_valid():
     """Panels 110/112: newest unavailable revision NULLs the value; older derived never resurrects. Scope-isolated."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for pid in (110, 112):
         q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
         with _uistatus_db() as db:
@@ -2233,9 +2263,7 @@ def test_uistatus_latest_rank_keeps_canonical_unavailable_over_rogue_value():
     number); DashboardRecovery owns the source fix (per-scope canonical
     constraint or analysis_id-aware rank). This test pins the coexistence
     shape that the fix must resolve toward the canonical NULL."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     for pid in (112, 114):
         q, ns, disp, fl = _uistatus_query(configs, pid, start=0, end=7200)
         with _uistatus_db() as db:
@@ -2256,9 +2284,7 @@ def test_uistatus_latest_rank_keeps_canonical_unavailable_over_rogue_value():
 
 def test_uistatus_window_end_fence_blocks_unfinished():
     """Panels 110/112/113/114: window_end beyond selected end never displays."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 112, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2275,9 +2301,7 @@ def test_uistatus_pending_states_follow_scoped_evidence():
     """Panel 115: scoped bounded observation evidence only. Observed raw with no
     analysis remains pending; a completed window with later in-range raw needs
     reanalysis; covered/latest input produces no pending row."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     qp, ns, disp, fl = _uistatus_query(configs, 115, start=1000, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2315,9 +2339,7 @@ def test_uistatus_pending_ignores_superseded_windows_and_future_analysis():
     """Panel 115: two completed window_ends (09/10) with raw 09:30 covered by the
     newest window must not pend; raw without analysis remains pending;
     future analysis rows never confirm."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     qp, ns, disp, fl = _uistatus_query(configs, 115, start=1000, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2350,9 +2372,7 @@ def test_uistatus_pending_ignores_superseded_windows_and_future_analysis():
 
 def test_uistatus_evidence_times_match_card_logic():
     """Panel 113 observed_at/window/computed_at equal the per-identity latest analysis row; raw times are selectedEnd-bounded."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 113, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2369,9 +2389,7 @@ def test_uistatus_evidence_times_match_card_logic():
 
 def test_uistatus_pending_fences_selected_end():
     """Panel 115: completed window beyond selectedEnd never confirms; future raw never lists."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     qp, ns, disp, fl = _uistatus_query(configs, 115, start=1000, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2388,9 +2406,7 @@ def test_uistatus_pending_fences_selected_end():
 
 def test_uistatus_observation_vs_receipt_distinct():
     """Panel 116 keeps event_time and ingest_time as separate columns; receipt never poses as freshness."""
-    import yaml
-    import tests.test_dashboards as _T
-    configs = yaml.safe_load((_T.ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     q, ns, disp, fl = _uistatus_query(configs, 116, start=0, end=7200)
     with _uistatus_db() as db:
         import math
@@ -2406,7 +2422,7 @@ def test_uistatus_observation_vs_receipt_distinct():
 
 def test_uistatus_row118_holds_flat_panels_only():
     """Row 118 contract: flat regular-panel move children only (Grafana one-level rows); observed energy 30 stays visible."""
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-battery"]["content"])
     row = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == 118)
     assert row["type"] == "row" and row.get("collapsed") is True
@@ -2419,7 +2435,7 @@ def test_uistatus_row118_holds_flat_panels_only():
     assert 30 in tops, tops
 
 def test_analysis_input_latest_preserves_invalid_and_scope_identity():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     query = _physical_query(configs, "grafana-dash-battery", 142)
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *args: "".join(str(v or "") for v in args))
@@ -2443,7 +2459,7 @@ def test_analysis_input_latest_preserves_invalid_and_scope_identity():
 
 
 def test_analysis_input_trends_keep_unit_and_quality_boundaries():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *args: "".join(str(v or "") for v in args))
         db.executemany("""INSERT INTO vehicle_signal
@@ -2473,7 +2489,7 @@ def test_analysis_input_trends_keep_unit_and_quality_boundaries():
 
 
 def test_analysis_input_states_keep_boundary_and_invalid_transition():
-    configs = yaml.safe_load((ROOT / "compose/grafana.yaml").read_text())["configs"]
+    configs = _grafana_configs()
     with _battery_db() as db:
         db.create_function("CONCAT", -1, lambda *args: "".join(str(v or "") for v in args))
         db.executemany("""INSERT INTO vehicle_signal
@@ -2490,6 +2506,7 @@ def test_analysis_input_states_keep_boundary_and_invalid_transition():
 
 if __name__ == "__main__":
     test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors()
+    test_overview_coverage_keeps_selected_and_historical_times_separate()
     test_analysis_input_latest_preserves_invalid_and_scope_identity()
     test_analysis_input_trends_keep_unit_and_quality_boundaries()
     test_analysis_input_states_keep_boundary_and_invalid_transition()
@@ -2527,7 +2544,6 @@ if __name__ == "__main__":
     test_battery_lifecycle_counts_only_valid_active_evidence()
     test_cell_latest_raw_scope_across_epochs_with_cap()
     test_ai_runtime_dedup_ttft_and_subagent_samples()
-    test_temperature_cards_keep_both_cabin_and_outside_readings()
     test_analysis_ah_observed_completed_windows_only()
     test_analysis_ah_summary_selected_vs_observed_gap()
     test_analysis_counter_vs_vi_same_window_no_addition()
