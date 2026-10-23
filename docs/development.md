@@ -159,6 +159,8 @@ CAN receiver의 합성 회귀는 `python -m pip install cantools==40.7.1 opentel
 
 `python -m tests.test_can_raw_cache`는 별도 `PYTHONPATH` 설정 없이 실행합니다. 큰 청크와 여러 짧은 세션의 바이트 예산·지속 수신, 미ACK·다중 epoch·partial 재시작 보존을 확인하며 CI에서도 실행합니다. `python -m tests.test_database`는 집계 metadata 오류의 raw 조회 차단을, `python -m tests.test_dashboards`는 대시보드 SQL 회귀를 검사합니다.
 
+Compose CI의 CAN 성능 비교는 base/head 커밋을 검증한 뒤 CAN 구현·관련 테스트·벤치 도구/의존성·패키지 초기화 파일·workflow 변경에만 실행합니다. 무관한 변경은 `not-applicable` artifact를 남기고 의존성 설치와 baseline 추출·벤치를 건너뜁니다. 잘못되거나 없는 커밋은 실패하며, 최초 push의 0 SHA만 baseline 없음으로 처리합니다. `python -m tests.test_can_decode_benchmark`는 임시 Git 저장소에서 실제 workflow 셸을 실행해 이 경계를 검사합니다.
+
 `python -m tests.test_can_http_deadline`은 실제 loopback HTTP에서 요청별 절대
 deadline, 같은 keep-alive socket의 timeout 초과 재사용, 느린 client 종료와
 ACK 유실 후 원본 중복 제거를 검사합니다. deadline은 연결 전체 수명이 아니라

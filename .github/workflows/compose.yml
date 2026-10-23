@@ -175,14 +175,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - name: Install pinned synthetic CAN decode dependencies
-        run: |
-          python -m pip install --only-binary=:all: cantools==40.7.1 \
-            opentelemetry-proto==1.38.0 protobuf==6.33.6
-      - name: Materialize baseline archive under RUNNER_TEMP
+      - name: Decide CAN relevance and materialize baseline archive
         id: baseline
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PUSH_BEFORE_SHA: ${{ github.event.before }}
         run: |
           set -euo pipefail
@@ -193,8 +190,10 @@ jobs:
           sha=""
           if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
             sha="$PR_BASE_SHA"
+            head="$PR_HEAD_SHA"
           elif [ "$GITHUB_EVENT_NAME" = "push" ]; then
             sha="$PUSH_BEFORE_SHA"
+            head="$GITHUB_SHA"
           else
             unavailable "unsupported-event"
             exit 1
@@ -204,6 +203,10 @@ jobs:
             exit 1
           fi
           if [ "$sha" = "0000000000000000000000000000000000000000" ]; then
+            if [ "$GITHUB_EVENT_NAME" != "push" ]; then
+              unavailable "only-initial-push-may-omit-baseline"
+              exit 1
+            fi
             unavailable "initial-push-has-no-before-commit"
             exit 0
           fi
@@ -211,10 +214,42 @@ jobs:
             unavailable "object-not-present"
             exit 1
           fi
+          if ! printf '%s' "$head" | grep -Eq '^[0-9a-f]{40}$'; then
+            unavailable "untrusted-or-missing-head-sha"
+            exit 1
+          fi
+          if ! git cat-file -e "$head^{commit}" 2>/dev/null; then
+            unavailable "head-object-not-present"
+            exit 1
+          fi
+          if ! git diff --no-renames --name-only -z "$sha" "$head" -- > "$RUNNER_TEMP/can-decode-paths.txt"; then
+            unavailable "changed-paths-unavailable"
+            exit 1
+          fi
+          relevant=no
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              scripts/__init__.py|scripts/ingest/__init__.py|scripts/ingest/can/*|\
+              tools/__init__.py|tools/benchmark_can_decode.py|tools/benchmark-requirements.txt|\
+              tests/__init__.py|tests/test_can*|.github/workflows/compose.yml)
+                relevant=yes; break ;;
+            esac
+          done < "$RUNNER_TEMP/can-decode-paths.txt"
+          if [ "$relevant" != "yes" ]; then
+            printf '{"baseline_available": true, "status": "not-applicable", "cases": {}, "max_slowdown": 0.25, "mismatch": [], "note": "synthetic fixture only; no CAN benchmark dependencies changed; no regression gate claimed", "regressions": [], "synthetic": true}\n' > "$RUNNER_TEMP/can-decode-perf.json"
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          unavailable "baseline-archive-failed"
           rm -rf "$RUNNER_TEMP/can-decode-baseline"
           mkdir -p "$RUNNER_TEMP/can-decode-baseline"
           git archive "$sha" | tar -x -C "$RUNNER_TEMP/can-decode-baseline"
           echo "available=true" >> "$GITHUB_OUTPUT"
+      - name: Install pinned synthetic CAN decode dependencies
+        if: steps.baseline.outputs.available == 'true'
+        run: |
+          python -m pip install --only-binary=:all: cantools==40.7.1 \
+            opentelemetry-proto==1.38.0 protobuf==6.33.6
       - name: Run synthetic CAN decode regression gate
         if: steps.baseline.outputs.available == 'true'
         run: |
