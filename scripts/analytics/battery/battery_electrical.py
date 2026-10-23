@@ -1363,7 +1363,7 @@ def analyze(signals, events, config):
                                         window, ALGORITHM_VERSION)))
         return rows
     decision = bc.to_ns(cfg_all.get("decision_time_ns"))
-    rows_all = bc.normalize_signals(signals)
+    rows_all = bc.analysis_signals(signals)
     excluded_unknown = excluded_late = 0
     if decision is not None:
         kept = []

@@ -862,7 +862,7 @@ def test_no_alert_fetch_does_not_spend_cap_on_unrelated_signals():
             raise AssertionError("required alert context must never be truncated")
 
 
-def test_chunked_fetch_preserves_context_exclusions_and_caps():
+def test_merged_fetch_preserves_context_exclusions_and_caps():
     from contextlib import ExitStack
     from unittest.mock import patch
     hour = br.HOUR_NS
@@ -870,7 +870,7 @@ def test_chunked_fetch_preserves_context_exclusions_and_caps():
     end = start + hour + 7
     old = (40 * hour + 17, 40 * hour + 29)
     context_start = start - br.SIGNAL_CONTEXT_NS
-    # Include both sides of an exact chunk boundary and disjoint context.
+    # Include both sides of the former hour split and disjoint context.
     times = [context_start, context_start + hour - 1,
              context_start + hour, start, end,
              old[0] - br.SIGNAL_CONTEXT_NS, old[1]]
@@ -890,7 +890,7 @@ def test_chunked_fetch_preserves_context_exclusions_and_caps():
                 event_time=br.ns_to_sql_ts(timestamp), vehicle="v",
                 source="fleet", decode_epoch="e", path="Vehicle.Battery.Soc",
                 source_field="Soc", quality="valid", value_num=50 + index)
-        # Excluded rows would exceed the entire cap even in one chunk.
+        # Excluded rows would exceed the entire cap even in one request.
         for offset in range(50):
             put(br.SIGNAL_TABLE, br.SIGNAL_COLS,
                 event_time=br.ns_to_sql_ts(start + offset), vehicle="v",
@@ -929,7 +929,7 @@ def test_chunked_fetch_preserves_context_exclusions_and_caps():
             assert {(r["source"], r["decode_epoch"]) for r in events} == {
                 ("fleet", None), ("can", None)}
             assert tags == {scope}
-            assert all(0 <= upper - lower < hour for lower, upper in bounds)
+            assert len(bounds) == 6  # two disjoint intervals, three query types
             assert not any(lower <= 70 * hour <= upper for lower, upper in bounds)
             # Source exclusion also covers unregistered/NULL-epoch CAN.
             legacy_signals, legacy_events, legacy_tags = br._fetch_plan(
@@ -1055,6 +1055,93 @@ def test_retention_warning_uses_table_metadata_and_fails_closed():
             else:
                 raise AssertionError("metadata errors must propagate")
         assert writes == []
+
+
+def test_default_fetch_plan_has_three_queries_and_reads_late_rows():
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    windows = [(100 * hour + i * hour, 101 * hour + i * hour - 1)
+               for i in range(6)]
+    scope = ("v", "fleet", "e1")
+    raw = [_sig(*scope, windows[0][0], field="Soc", value=50.0,
+                unit="%", quality="valid")]
+    calls = []
+
+    def signals(_url, _auth, _db, start, end, *_args, **_kwargs):
+        calls.append(("signals", start, end))
+        return [r for r in raw if start <= r["event_time_ns"] <= end]
+
+    def events(_url, _auth, _db, start, end, *_args, **_kwargs):
+        calls.append(("events", start, end))
+        return []
+
+    def tags(_url, _auth, _db, start, end, *_args, **_kwargs):
+        calls.append(("tags", start, end))
+        return {scope}
+
+    with patch.object(br, "fetch_signals", signals), \
+            patch.object(br, "fetch_events", events), \
+            patch.object(br, "fetch_signal_scopes", tags):
+        def fetch():
+            return br._fetch_plan("", "", "", windows, set(), windows[0][0],
+                                  windows[-1][1], "", 100, {"Soc"})[0]
+        assert fetch() == raw
+        assert len(calls) == 3
+        assert calls == [
+            ("events", windows[0][0], windows[-1][1]),
+            ("signals", windows[0][0] - br.SIGNAL_CONTEXT_NS, windows[-1][1]),
+            ("tags", windows[0][0] - br.SIGNAL_CONTEXT_NS, windows[-1][1])]
+        # A late input inside the previous pass's first window must be read
+        # again; no producer generation or dirty marker is assumed.
+        raw.append(_sig(*scope, windows[0][0] + 1, field="Soc", value=None,
+                        unit="%", quality="invalid"))
+        calls.clear()
+        assert fetch() == raw
+        assert len(calls) == 3
+
+
+def test_all_analyzers_reuse_prepared_rows_with_exact_raw_oracle():
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    start = 100 * hour
+    scope = ("v", "fleet", "e1")
+    # Both sides of the exact window boundary, duplicates, and a quality
+    # barrier all retain their original order and provenance.
+    raw = [_sig(*scope, stamp, field=field, value=value,
+                unit=unit, quality="valid")
+           for stamp in (start - 1, start, start + hour - 1, start + hour)
+           for field, value, unit in (
+               ("Soc", 60.0, "%"), ("BrickVoltageMax", 4.1, "V"),
+               ("BrickVoltageMin", 4.0, "V"), ("PackCurrent", 1.0, "A"),
+               ("PackVoltage", 400.0, "V"))]
+    raw.append(dict(raw[0]))
+    analyzers = [br._named(key, fn) for key, _suffix, fn in br.get_analyzers()
+                 if fn is not None]
+    assert len(analyzers) == len(br.MODULE_FILES)
+    configs = [{"window_start_ns": ws, "window_end_ns": ws + hour - 1,
+                "scope_hint": scope}
+               for ws in (start, start + hour)]
+    before_late = None
+    for late in (False, True):
+        if late:
+            raw.append(_sig(*scope, start + 1, field="Soc", value=None,
+                            unit="%", quality="invalid"))
+        expected = [bc.run_analyses(raw, [], cfg, analyzers) for cfg in configs]
+        with patch.object(bc, "normalize_signal", wraps=bc.normalize_signal) as normalize:
+            prepared = bc.prepare_by_scope(raw)[scope]
+            assert normalize.call_count == len(raw)
+            snapshot = [dict(row) for row in prepared]
+            with patch.object(bc, "normalize_signals",
+                              side_effect=AssertionError("prepared rows recopied")):
+                actual = [bc.run_analyses(prepared, [], cfg, analyzers)
+                          for cfg in configs]
+            assert normalize.call_count == len(raw)
+            assert prepared == snapshot
+        assert actual == expected
+        if late:
+            assert actual != before_late
+        else:
+            before_late = actual
 
 
 if __name__ == "__main__":

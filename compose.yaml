@@ -113,8 +113,9 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles:
     - server
+    cpus: ${AGG_CPUS:-1.0}
     labels:
-      datalake.aggregate-revision: '41'
+      datalake.aggregate-revision: '43'
     depends_on:
       greptimedb:
         condition: service_started
@@ -246,7 +247,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.trace-privacy-revision: '2'
+      datalake.trace-privacy-revision: '3'
     user: 65534:65534
     cap_drop:
     - ALL
@@ -832,7 +833,7 @@ services:
     - fleet
     restart: unless-stopped
     labels:
-      datalake.recorder-revision: '7'
+      datalake.recorder-revision: '8'
     stop_grace_period: 30s
     depends_on:
       fleet-deps:
@@ -5810,24 +5811,32 @@ configs:
           return isinstance(scope, tuple) and len(scope) == 3 and scope[1] in CAN_SOURCES
 
 
-      def _load_dirty(ctx, cfg, cutoff_ns, seal_ns):
-          """{(scope, hour_ns): generation} observed BEFORE recomputation."""
+      def _load_pending_dirty(ctx, cfg, seal_ns):
+          """Return at most one work batch, excluding completed history in SQL.
+
+          GreptimeDB 1.2 supports LEFT JOIN (reference/sql/join). Join the full
+          immutable key AND generation: a concurrent newer dirty generation cannot
+          be hidden by an older checkpoint. Per-hour rechecks still fence writes.
+          No cursor/time cutoff: late changes to any historical hour stay eligible.
+          """
           base_url, auth, db = ctx
           filt = ""
           if cfg.get("vehicle"):
-              filt = " AND vehicle = " + str_lit(cfg["vehicle"])
-          try:
-              cols, rows = guarded_fetch(
-                  base_url, auth, db,
-                  "SELECT window_start, vehicle, source, decode_epoch, generation"
-                  " FROM " + DIRTY_TABLE
-                  + " WHERE window_start >= " + ns_to_sql_lit(cutoff_ns)
-                  + " AND window_start < " + ns_to_sql_lit(seal_ns) + filt
-                  + " ORDER BY window_start", cfg["max_rows"])
-          except SqlError as e:
-              if is_missing_table(e):
-                  return {}
-              raise
+              filt = " AND d.vehicle = " + str_lit(cfg["vehicle"])
+          # Both tables are initialized by db-init. Missing coordination state is
+          # a section failure, never evidence that the dirty backlog is empty.
+          cols, rows = fetch_rows(
+              base_url, auth, db,
+              "SELECT d.window_start, d.vehicle, d.source, d.decode_epoch, d.generation"
+              " FROM " + DIRTY_TABLE + " d LEFT JOIN " + CHECKPOINT_TABLE + " c"
+              " ON d.window_start = c.window_start AND d.vehicle = c.vehicle"
+              " AND d.source = c.source AND d.decode_epoch = c.decode_epoch"
+              " AND d.generation = c.applied_generation"
+              " WHERE c.applied_generation IS NULL AND d.source = 'can'"
+              " AND d.generation IS NOT NULL AND d.generation <> ''"
+              " AND d.window_start < " + ns_to_sql_lit(seal_ns) + filt
+              + " ORDER BY d.window_start, d.vehicle, d.source, d.decode_epoch"
+              + " LIMIT " + str(DIRTY_MAX_WINDOWS))
           idx = {c: i for i, c in enumerate(cols)}
           out = {}
           for r in rows:
@@ -5844,49 +5853,6 @@ configs:
           return out
 
 
-      def _load_checkpoints(ctx, cfg, cutoff_ns, seal_ns):
-          """Applied generation and historical revision; fingerprint is legacy metadata."""
-          base_url, auth, db = ctx
-          filt = ""
-          if cfg.get("vehicle"):
-              filt = " AND vehicle = " + str_lit(cfg["vehicle"])
-          try:
-              cols, rows = guarded_fetch(
-                  base_url, auth, db,
-                  "SELECT window_start, vehicle, source, decode_epoch,"
-                  " applied_generation, config_revision, raw_fingerprint FROM "
-                  + CHECKPOINT_TABLE
-                  + " WHERE window_start >= " + ns_to_sql_lit(cutoff_ns)
-                  + " AND window_start < " + ns_to_sql_lit(seal_ns) + filt
-                  + " ORDER BY window_start", cfg["max_rows"])
-          except SqlError as e:
-              if is_missing_table(e):
-                  return {}
-              raise
-          idx = {c: i for i, c in enumerate(cols)}
-          out = {}
-          for r in rows:
-              def col(name):
-                  return r[idx[name]] if name in idx else None
-              hour = parse_ts_ns(col("window_start"))
-              scope = _scope_tuple((col("vehicle"), col("source"), col("decode_epoch")))
-              if hour is None or scope is None:
-                  continue
-              gen = col("applied_generation")
-              rev = col("config_revision")
-              if not isinstance(gen, str) or not isinstance(rev, str):
-                  continue
-              fp = col("raw_fingerprint")
-              if not isinstance(fp, str):
-                  fp = ""
-              out[(scope, floor_hour_ns(hour))] = (gen, rev, fp)
-          return out
-
-
-      def _pending_dirty(dirty, checkpoints):
-          """Only new generations need work; code changes do not replay history."""
-          return {key: gen for key, gen in dirty.items()
-                  if key not in checkpoints or checkpoints[key][0] != gen}
 
 
       def _dirty_scope_predicate(scopes):
@@ -5937,9 +5903,9 @@ configs:
       def _registered_scopes(ctx, cfg):
           """CAN scopes from dirty/checkpoint metadata only; never discover raw."""
           base_url, auth, db = ctx
-          filt = ""
+          filt = " WHERE source = 'can'"
           if cfg.get("vehicle"):
-              filt = " WHERE vehicle = " + str_lit(cfg["vehicle"])
+              filt += " AND vehicle = " + str_lit(cfg["vehicle"])
           out = set()
           for table in (DIRTY_TABLE, CHECKPOINT_TABLE):
               try:
@@ -6311,9 +6277,7 @@ configs:
           now_ns = dt_to_ns(now or utcnow())
           seal_ns = floor_hour_ns(now_ns)
           revision = _config_revision(cfg)
-          dirty = _load_dirty(ctx, cfg, 0, seal_ns)
-          checkpoints = _load_checkpoints(ctx, cfg, 0, seal_ns)
-          pending = _pending_dirty(dirty, checkpoints)
+          pending = _load_pending_dirty(ctx, cfg, seal_ns)
           committed = 0
           eligible = {}
           for key in sorted(pending)[:DIRTY_MAX_WINDOWS]:
@@ -6908,6 +6872,10 @@ configs:
               self.limit = limit
               self.directory = tempfile.TemporaryDirectory(prefix="ai-recovery-")
               self.db = sqlite3.connect(self.directory.name + "/snapshot.sqlite")
+              # Disposable snapshot only: a failed pass discards this directory, while
+              # the durable Greptime fence is committed after every output succeeds.
+              self.db.execute("PRAGMA journal_mode=OFF")
+              self.db.execute("PRAGMA synchronous=OFF")
               self.db.execute("PRAGMA cache_size=-8192")
               self.db.execute("PRAGMA temp_store=FILE")
               self.db.executescript("""
@@ -6918,7 +6886,8 @@ configs:
                       payload BLOB, trace BLOB, span BLOB, parent BLOB, scope BLOB,
                       call BLOB, turn BLOB, billed INTEGER, money INTEGER DEFAULT 1,
                       tool INTEGER DEFAULT 0, phase INTEGER DEFAULT 0,
-                      eligible INTEGER, billed_source TEXT, native_usage INTEGER);
+                      eligible INTEGER, billed_source TEXT, native_usage INTEGER,
+                      has_tool INTEGER);
                   CREATE INDEX span_parent ON spans(trace,parent);
                   CREATE INDEX span_scope ON spans(scope);
                   CREATE INDEX span_call ON spans(call);
@@ -6995,7 +6964,8 @@ configs:
                               call = self.call(rec) if rec.get("native") not in ("tool", "codex_cost") else None
                               self.db.execute("INSERT OR IGNORE INTO logs(identity,payload,call) VALUES(?,?,?)",
                                               (packed(identity), packed(rec), call))
-                  self.db.commit()
+                  # Keep the bounded page cache across Flight chunks instead of
+                  # flushing the same index/state pages at every sink callback.
               return consume
 
           @staticmethod
@@ -7013,12 +6983,12 @@ configs:
               billing = self.billing(row)
               self.db.execute("""INSERT OR IGNORE INTO spans
                   (identity,payload,trace,span,parent,scope,call,turn,billed,
-                   eligible,billed_source,native_usage)
-                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                   eligible,billed_source,native_usage,has_tool)
+                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                       identity, packed(row), packed(row.get("trace")), packed(row.get("span")),
                       packed(row.get("parent")), packed((row.get("client"), row.get("session"))),
                       self.call(row), packed((row.get("client"), row.get("session"), row.get("turn"))),
-                      billing[0], *billing))
+                      billing[0], *billing, int(bool(row.get("tool")))))
 
           def rows(self, sql="SELECT ordinal,payload FROM spans ORDER BY phase,ordinal", args=()):
               for ordinal, payload in self.db.execute(sql, args):
@@ -7055,7 +7025,10 @@ configs:
               # billable() before native merge also applies native-sourced span precedence.
               self.native_filter()
               self.db.execute("UPDATE spans SET phase=1 WHERE billed=1")
-              merge_rows = self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal") if self.db.execute(
+              merge_rows = self.rows("""
+                  SELECT ordinal,payload FROM spans WHERE billed=1 AND EXISTS (
+                      SELECT 1 FROM logs WHERE logs.call=spans.call)
+                  ORDER BY ordinal""") if self.db.execute(
                   "SELECT 1 FROM logs WHERE call IS NOT NULL LIMIT 1").fetchone() else ()
               for ordinal, row in merge_rows:
                   call = self.call(row)
@@ -7070,10 +7043,11 @@ configs:
                       continue
                   merged = a._override_span(row, pickle.loads(hit[0]))
                   self.db.execute("""UPDATE spans SET payload=?,scope=?,call=?,turn=?,
-                                     eligible=?,billed_source=?,native_usage=? WHERE ordinal=?""",
+                                     eligible=?,billed_source=?,native_usage=?,has_tool=? WHERE ordinal=?""",
                                   (packed(merged), packed((merged.get("client"), merged.get("session"))),
                                    self.call(merged), packed((merged.get("client"), merged.get("session"),
-                                                            merged.get("turn"))), *self.billing(merged), ordinal))
+                                                            merged.get("turn"))), *self.billing(merged),
+                                   int(bool(merged.get("tool"))), ordinal))
               for _, payload, call in self.db.execute("SELECT ordinal,payload,call FROM logs ORDER BY ordinal"):
                   if call is not None and self.db.execute(
                           "SELECT 1 FROM winners WHERE kind='merge' AND identity=?", (call,)).fetchone():
@@ -7083,7 +7057,7 @@ configs:
                   self.db.execute("UPDATE spans SET phase=? WHERE ordinal=last_insert_rowid()",
                                   (3 if log.get("native") == "tool" else 2,))
               # Re-evaluate the post-merge billing rules exactly as the summary oracle does.
-              self.db.execute("UPDATE spans SET billed=eligible")
+              self.db.execute("UPDATE spans SET billed=eligible WHERE billed IS NOT eligible")
               self.parent_filter()
               self.native_filter()
               for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY phase,ordinal"):
@@ -7091,9 +7065,8 @@ configs:
                       self.db.execute("INSERT OR IGNORE INTO winners VALUES('turn',?,?)", (packed((row["client"], row["session"], row["turn"])), ordinal))
               self.db.execute("""UPDATE spans SET money=0 WHERE billed=1 AND EXISTS
                   (SELECT 1 FROM winners w WHERE w.kind='turn' AND w.identity=spans.turn AND w.ordinal!=spans.ordinal)""")
-              for ordinal, row in self.rows():
-                  if not row.get("tool"):
-                      continue
+              for ordinal, row in self.rows(
+                      "SELECT ordinal,payload FROM spans WHERE has_tool=1 ORDER BY phase,ordinal"):
                   identity = packed((row.get("client"), row.get("session"), row["call_id"])) if row.get("call_id") else packed(("anonymous", ordinal))
                   hit = self.db.execute("SELECT ordinal FROM winners WHERE kind='tool' AND identity=?", (identity,)).fetchone()
                   if hit is None:
@@ -7524,7 +7497,10 @@ configs:
               packed = self.store.pack(value)
               value = pickle.dumps(packed)
               try:
-                  ident = self._entry(key)[0]
+                  entry = self._entry(key)
+                  if entry[1] == value:
+                      return
+                  ident = entry[0]
               except KeyError:
                   ident = self.store.connection.execute(
                       "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",
@@ -8809,6 +8785,17 @@ configs:
               if sig is not None:
                   normed.append(sig)
           return normed
+
+
+      def analysis_signals(signals):
+          """Read-only canonical input for built-in analyzers; never mutate rows.
+
+          Prepared collections belong to this pass, not a cross-pass cache.
+          Keep normalize_signals' detached-copy contract for other callers.
+          """
+          if isinstance(signals, _PreparedSignals):
+              return signals
+          return normalize_signals(signals)
 
 
       def normalize_event(raw):
@@ -10958,7 +10945,7 @@ configs:
 
           rows_all = []
           after_decision = 0
-          for sig in bc.normalize_signals(signals if isinstance(signals, list) else []):
+          for sig in bc.analysis_signals(signals if isinstance(signals, list) else []):
               if decision is not None:
                   if sig["event_time_ns"] > decision:
                       after_decision += 1
@@ -12620,7 +12607,7 @@ configs:
               uncertainties = {"soc_uncertainty_pct": None,
                                "energy_uncertainty_kwh": None}
               unc_error = str(exc)
-          rows_all = bc.normalize_signals(signals)
+          rows_all = bc.analysis_signals(signals)
           if decision is not None:
               rows_all = [r for r in rows_all
                           if r["event_time_ns"] <= decision
@@ -14883,7 +14870,7 @@ configs:
                                               window, ALGORITHM_VERSION)))
               return rows
           decision = bc.to_ns(cfg_all.get("decision_time_ns"))
-          rows_all = bc.normalize_signals(signals)
+          rows_all = bc.analysis_signals(signals)
           excluded_unknown = excluded_late = 0
           if decision is not None:
               kept = []
@@ -16521,7 +16508,7 @@ configs:
                   for m in SUPPORTED_METRICS]
           _ = events
           scoped = set()
-          for sig in bc.normalize_signals(
+          for sig in bc.analysis_signals(
                   signals if isinstance(signals, list) else []):
               scoped.add((sig["vehicle"], sig["source"],
                           sig["decode_epoch"]))
@@ -17430,7 +17417,7 @@ configs:
           decision_time = _decision_time(config)  # raises on malformed bound
 
           adm_sig, exc_sig = [], {}
-          for s in bc.normalize_signals(signals if isinstance(signals, list) else []):
+          for s in bc.analysis_signals(signals if isinstance(signals, list) else []):
               status = _ingest_status(s, decision_time)
               if status == "admitted":
                   adm_sig.append(s)
@@ -19112,9 +19099,9 @@ configs:
                       analysis_cfg=None, exclude_sources=()):
           """Bounded disjoint fetches: no envelope over unrelated gaps.
 
-          Requests partition merged inclusive intervals into at most one hour,
-          retaining each interval's full >=24h signal context. Cumulative raw
-          rows and unique discovered scope identities fail closed at max_rows.
+          Each merged inclusive interval uses one request per table, retaining
+          its full >=24h signal context. Cumulative raw rows and unique
+          discovered scope identities fail closed at max_rows.
           Exact exclusions apply in SQL before LIMIT, including union mode.
           The source_field predicate narrows fetched ROWS (exact required set),
           never scopes: a parallel field-independent DISTINCT tag query per
@@ -19142,17 +19129,14 @@ configs:
           else:
               context_cover = []
 
-          def _chunks(queries):
+          def _intervals(queries):
               by_scope = {}
               for start, end, scopes in queries:
                   key = tuple(scopes) if scopes else None
                   by_scope.setdefault(key, []).append((start, end))
               for scopes, intervals in by_scope.items():
                   for start, end in _merge_intervals(intervals):
-                      while start <= end:
-                          stop = min(end, start + HOUR_NS - 1)
-                          yield start, stop, scopes
-                          start = stop + 1
+                      yield start, end, scopes
           signals = []
           events = []
           tag_scopes = set()
@@ -19173,7 +19157,7 @@ configs:
               tag_scopes.update(tags)
 
           source_filter = {"exclude_sources": exclude_sources} if exclude_sources else {}
-          for start, end, scopes in _chunks(event_q):
+          for start, end, scopes in _intervals(event_q):
               events.extend(_take(fetch_events(
                   base_url, auth, db, start, end, vehicle, max_rows,
                   scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
@@ -19184,7 +19168,7 @@ configs:
                         if (e["vehicle"], e["source"], e.get("decode_epoch"))
                         not in exclude_scopes]
               fields = _required_signal_fields(analysis_cfg, events=proven)
-          for cstart, cend, scopes in _chunks(signal_q):
+          for cstart, cend, scopes in _intervals(signal_q):
               signals.extend(_take(fetch_signals(
                   base_url, auth, db, cstart, cend, vehicle, max_rows,
                   fields=fields, scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
@@ -19556,12 +19540,50 @@ configs:
       import urllib.error
       import time
       import urllib.request
+      import threading
+      from socketserver import ThreadingMixIn
       from http.server import BaseHTTPRequestHandler, HTTPServer
 
       MAX_BODY = 16 * 1024 * 1024
       UPSTREAM = "http://alloy:4319/v1/traces"
       CLIENTS = frozenset({"codex", "omp", "opencode2", "claude-code", "agy", "hermes"})
       LAST_RECEIVED = {}
+      RECEIPT_LOCK = threading.Lock()
+      UPSTREAM_TIMEOUT = 10
+
+
+      class PrivacyServer(ThreadingMixIn, HTTPServer):
+          """Bound sockets and forwarding separately, leaving room for metrics/health."""
+          daemon_threads = True
+          block_on_close = True
+          request_queue_size = 16
+
+          def __init__(self, address, handler=None, *, workers=16, forwards=8):
+              self.slots = threading.BoundedSemaphore(workers)
+              self.forwards = threading.BoundedSemaphore(forwards)
+              super().__init__(address, handler or Handler)
+
+          def process_request(self, request, client_address):
+              if not self.slots.acquire(blocking=False):
+                  try:
+                      request.settimeout(1)
+                      request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                  except OSError:
+                      pass
+                  finally:
+                      self.shutdown_request(request)
+                  return
+              try:
+                  super().process_request(request, client_address)
+              except BaseException:
+                  self.slots.release()
+                  raise
+
+          def process_request_thread(self, request, client_address):
+              try:
+                  super().process_request_thread(request, client_address)
+              finally:
+                  self.slots.release()
 
 
       def redact(envelope):
@@ -19587,13 +19609,15 @@ configs:
                                     if a.get("key") == "coding_agent.client"), fallback)
                       clients.add(label if label in CLIENTS else "other")
           now = time.time()
-          LAST_RECEIVED.update({client: now for client in clients})
+          with RECEIPT_LOCK:
+              LAST_RECEIVED.update({client: max(now, LAST_RECEIVED.get(client, 0)) for client in clients})
 
 
       def receipt_metrics():
-          return "".join(
-              'datalake_trace_last_received_timestamp_seconds{client="%s"} %s\n' % (client, stamp)
-              for client, stamp in sorted(LAST_RECEIVED.items())).encode()
+          with RECEIPT_LOCK:
+              return "".join(
+                  'datalake_trace_last_received_timestamp_seconds{client="%s"} %s\n' % (client, stamp)
+                  for client, stamp in sorted(LAST_RECEIVED.items())).encode()
 
 
       class Handler(BaseHTTPRequestHandler):
@@ -19631,6 +19655,16 @@ configs:
               if self.headers.get_content_type() != "application/json":
                   self.respond(415)
                   return
+              capacity = self.server.forwards
+              if not capacity.acquire(blocking=False):
+                  self.respond(503)
+                  return
+              try:
+                  self.forward_trace(authorization)
+              finally:
+                  capacity.release()
+
+          def forward_trace(self, authorization):
               try:
                   length = int(self.headers.get("Content-Length", "-1"))
                   if length < 0 or length > MAX_BODY:
@@ -19660,7 +19694,7 @@ configs:
                   headers={"Content-Type": "application/json", "Authorization": authorization},
               )
               try:
-                  with urllib.request.urlopen(request, timeout=10) as response:
+                  with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT) as response:
                       status = response.status
                       result = response.read(65537)
                       content_type = response.headers.get_content_type()
@@ -19685,9 +19719,8 @@ configs:
 
 
       if __name__ == "__main__":
-          # ponytail: one in-flight trace request. Remove this hop when pinned Alloy
-          # supports native typed-array clearing; keep the wire-level privacy check.
-          with HTTPServer(("0.0.0.0", 4320), Handler) as server:
+          # Remove this hop once pinned Alloy supports native typed-array clearing.
+          with PrivacyServer(("0.0.0.0", 4320)) as server:
               print("Trace privacy filter listening on internal port 4320", flush=True)
               server.serve_forever()
   alloy_config:
@@ -31922,7 +31955,10 @@ configs:
 
       def envelope_id(topic, payload_bytes):
           """Stable envelope over the exact received bytes (topic + payload)."""
-          return hashlib.sha256(topic.encode("utf-8") + b"\x1f" + bytes(payload_bytes)).hexdigest()
+          digest = hashlib.sha256(topic.encode("utf-8"))
+          digest.update(b"\x1f")
+          digest.update(bytes(payload_bytes))
+          return digest.hexdigest()
 
 
       def parse_zmq_frames(frames, topics=DEFAULT_TOPICS):
@@ -32318,6 +32354,8 @@ configs:
               return 0  # Non-matching VIN filtered out
           _stats_bump(stats, "messages_received")
           stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
+          if not raw_signals:
+              return 0
           envelope = envelope_id(topic, payload_bytes)
           built = []
           for source_field, raw_val in raw_signals:
@@ -32369,6 +32407,8 @@ configs:
               return 0  # Non-matching VIN filtered out
           _stats_bump(stats, "messages_received")
           stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
+          if not items:
+              return 0
           envelope = envelope_id(topic, payload_bytes)
           built = [_build_event_row(meta_env, topic, metadata["event_type"], item,
                                     metadata, ingest_time_ns, envelope)

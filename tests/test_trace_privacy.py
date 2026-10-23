@@ -2,7 +2,7 @@
 import json
 from pathlib import Path
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 import threading
 import urllib.error
 import urllib.request
@@ -66,7 +66,7 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
             self.wfile.write(self.response)
 
     backend = HTTPServer(("127.0.0.1", 0), Backend)
-    front = HTTPServer(("127.0.0.1", 0), trace_privacy.Handler)
+    front = trace_privacy.PrivacyServer(("127.0.0.1", 0))
     threads = [threading.Thread(target=server.serve_forever, daemon=True)
                for server in (backend, front)]
     for thread in threads:
@@ -326,8 +326,95 @@ def check_native_performance_projection(project):
     assert attrs["coding_agent.interaction.latency.kind"] == "hook_submit_to_display_ready"
 
 
+def test_bounded_parallel_forwarding_keeps_metrics_live_and_times_out():
+    entered = threading.Event()
+    release = threading.Event()
+    lock = threading.Lock()
+    bodies = []
+    active = 0
+    peak = 0
+
+    class Backend(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            pass
+
+        def do_POST(self):
+            nonlocal active, peak
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            with lock:
+                bodies.append(body)
+                active += 1
+                peak = max(peak, active)
+                if active == 2:
+                    entered.set()
+            try:
+                release.wait(5)
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"{}")
+            except OSError:
+                pass
+            finally:
+                with lock:
+                    active -= 1
+
+    backend = ThreadingHTTPServer(("127.0.0.1", 0), Backend)
+    front = trace_privacy.PrivacyServer(("127.0.0.1", 0), workers=4, forwards=2)
+    threads = [threading.Thread(target=s.serve_forever, daemon=True) for s in (backend, front)]
+    for thread in threads:
+        thread.start()
+    url = "http://127.0.0.1:%d" % front.server_port
+    payload = json.dumps({"resourceSpans": [{"scopeSpans": [{"spans": [{
+        "events": [{"name": "private"}], "links": [{"traceId": "private"}]
+    }]}]}]}).encode()
+
+    def post(authorized=True):
+        headers = {"Content-Type": "application/json"}
+        if authorized:
+            headers["Authorization"] = "Basic synthetic"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url + "/v1/traces", data=payload, headers=headers), timeout=3) as response:
+                return response.status
+        except urllib.error.HTTPError as error:
+            error.close()
+            return error.code
+
+    results = []
+    clients = [threading.Thread(target=lambda: results.append(post())) for _ in range(2)]
+    try:
+        with patch.object(trace_privacy, "UPSTREAM", "http://127.0.0.1:%d/v1/traces" % backend.server_port), \
+                patch.object(trace_privacy, "UPSTREAM_TIMEOUT", 1):
+            for client in clients:
+                client.start()
+            assert entered.wait(2), "two upstream requests must overlap"
+            assert post(False) == 401
+            assert post() == 503, "forwarding capacity must reject, not queue"
+            with urllib.request.urlopen(url + "/metrics", timeout=.5) as response:
+                assert response.status == 200
+            for client in clients:
+                client.join(3)
+                assert not client.is_alive()
+            assert results == [503, 503], "slow upstream must time out"
+            assert peak == 2
+            assert len(bodies) == 2
+            assert all("events" not in body["resourceSpans"][0]["scopeSpans"][0]["spans"][0]
+                       and "links" not in body["resourceSpans"][0]["scopeSpans"][0]["spans"][0] for body in bodies)
+    finally:
+        release.set()
+        for client in clients:
+            if client.ident is not None:
+                client.join(3)
+        for server in (front, backend):
+            server.shutdown()
+            server.server_close()
+        for thread in threads:
+            thread.join(3)
+
+
 if __name__ == "__main__":
     test_private_arrays_removed_without_losing_usage()
     test_invalid_json_is_rejected()
     test_receipt_requires_ack_and_never_labels_private_clients()
+    test_bounded_parallel_forwarding_keeps_metrics_live_and_times_out()
     print("test_trace_privacy: ok (private arrays removed; usage preserved; invalid JSON rejected)")

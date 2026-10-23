@@ -511,6 +511,25 @@ class SpanEventTest(unittest.TestCase):
 
 
 class SpooledActivityTest(unittest.TestCase):
+    def test_unchanged_hot_state_skips_sql_writes(self):
+        with sqlite3.connect(":memory:") as connection:
+            store = act._ActivityStore(connection)
+            state = store.container("dict")
+            state["counter"] = 0
+            changes = connection.total_changes
+            statements = []
+            connection.set_trace_callback(statements.append)
+            for _ in range(1000):
+                state["counter"] = 0
+                self.assertEqual(state["counter"], 0)
+            self.assertEqual(connection.total_changes, changes)
+            self.assertEqual(statements, [])
+            state["counter"] = None
+            self.assertIsNone(state["counter"])
+            self.assertEqual(connection.total_changes, changes + 1)
+            state["counter"] = False
+            self.assertIs(state["counter"], False)
+
     def compare(self, traces=(), logs=(), metrics=()):
         expected_sessions, expected_days = act.summarize_activity(traces, logs, metrics)
         for chunk_size in (1, 3):

@@ -487,6 +487,38 @@ class EnvelopeBatchCommitTest(unittest.TestCase):
                      for i in range(5)],
         }).encode()
 
+    def test_empty_envelopes_preserve_receipt_and_pending_rows(self):
+        conn = fr.open_outbox(self.db_path)
+        try:
+            fr.process_message(conn, self._multi_payload(), self.META,
+                               fr.default_stats())
+            before = {table: conn.execute("SELECT * FROM " + table).fetchall()
+                      for table in ("outbox", "outbox_events", "seen_ids")}
+            receipt = 1790427600123456789
+            for topic, field, items in (
+                    ("tesla_V", "data", []),
+                    ("tesla_V", "data", [{"key": "UnlistedSynthetic",
+                                         "value": {"intValue": 1}}]),
+                    ("tesla_alerts", "alerts", []),
+                    ("tesla_errors", "errors", [{}])):
+                with self.subTest(topic=topic, items=items):
+                    payload = json.dumps({
+                        "vin": "V1", "createdAt": "2026-09-26T13:00:00Z",
+                        field: items}).encode()
+                    stats = fr.default_stats()
+                    with patch.object(fr, "now_ns", return_value=receipt):
+                        self.assertEqual(fr.process_frame(
+                            conn, topic, payload, self.META, stats), 0)
+                    expected = fr.default_stats()
+                    expected["messages_received"] = 1
+                    expected["last_receive_" + topic] = receipt / 1e9
+                    self.assertEqual(stats, expected)
+                    for table, rows in before.items():
+                        self.assertEqual(conn.execute(
+                            "SELECT * FROM " + table).fetchall(), rows)
+        finally:
+            conn.close()
+
     def test_multi_signal_envelope_is_one_commit(self):
         conn = fr.open_outbox(self.db_path)
         stats = fr.default_stats()

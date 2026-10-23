@@ -14,12 +14,50 @@ import socket
 import urllib.error
 import time
 import urllib.request
+import threading
+from socketserver import ThreadingMixIn
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 MAX_BODY = 16 * 1024 * 1024
 UPSTREAM = "http://alloy:4319/v1/traces"
 CLIENTS = frozenset({"codex", "omp", "opencode2", "claude-code", "agy", "hermes"})
 LAST_RECEIVED = {}
+RECEIPT_LOCK = threading.Lock()
+UPSTREAM_TIMEOUT = 10
+
+
+class PrivacyServer(ThreadingMixIn, HTTPServer):
+    """Bound sockets and forwarding separately, leaving room for metrics/health."""
+    daemon_threads = True
+    block_on_close = True
+    request_queue_size = 16
+
+    def __init__(self, address, handler=None, *, workers=16, forwards=8):
+        self.slots = threading.BoundedSemaphore(workers)
+        self.forwards = threading.BoundedSemaphore(forwards)
+        super().__init__(address, handler or Handler)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            try:
+                request.settimeout(1)
+                request.sendall(b"HTTP/1.0 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            except OSError:
+                pass
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self.slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
 
 
 def redact(envelope):
@@ -45,13 +83,15 @@ def record_received(envelope):
                               if a.get("key") == "coding_agent.client"), fallback)
                 clients.add(label if label in CLIENTS else "other")
     now = time.time()
-    LAST_RECEIVED.update({client: now for client in clients})
+    with RECEIPT_LOCK:
+        LAST_RECEIVED.update({client: max(now, LAST_RECEIVED.get(client, 0)) for client in clients})
 
 
 def receipt_metrics():
-    return "".join(
-        'datalake_trace_last_received_timestamp_seconds{client="%s"} %s\n' % (client, stamp)
-        for client, stamp in sorted(LAST_RECEIVED.items())).encode()
+    with RECEIPT_LOCK:
+        return "".join(
+            'datalake_trace_last_received_timestamp_seconds{client="%s"} %s\n' % (client, stamp)
+            for client, stamp in sorted(LAST_RECEIVED.items())).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -89,6 +129,16 @@ class Handler(BaseHTTPRequestHandler):
         if self.headers.get_content_type() != "application/json":
             self.respond(415)
             return
+        capacity = self.server.forwards
+        if not capacity.acquire(blocking=False):
+            self.respond(503)
+            return
+        try:
+            self.forward_trace(authorization)
+        finally:
+            capacity.release()
+
+    def forward_trace(self, authorization):
         try:
             length = int(self.headers.get("Content-Length", "-1"))
             if length < 0 or length > MAX_BODY:
@@ -118,7 +168,7 @@ class Handler(BaseHTTPRequestHandler):
             headers={"Content-Type": "application/json", "Authorization": authorization},
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            with urllib.request.urlopen(request, timeout=UPSTREAM_TIMEOUT) as response:
                 status = response.status
                 result = response.read(65537)
                 content_type = response.headers.get_content_type()
@@ -143,8 +193,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    # ponytail: one in-flight trace request. Remove this hop when pinned Alloy
-    # supports native typed-array clearing; keep the wire-level privacy check.
-    with HTTPServer(("0.0.0.0", 4320), Handler) as server:
+    # Remove this hop once pinned Alloy supports native typed-array clearing.
+    with PrivacyServer(("0.0.0.0", 4320)) as server:
         print("Trace privacy filter listening on internal port 4320", flush=True)
         server.serve_forever()

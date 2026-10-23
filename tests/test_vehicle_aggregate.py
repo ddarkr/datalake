@@ -284,13 +284,63 @@ class ExactNsTest(unittest.TestCase):
 
 
 class CoordinatorLogicTest(unittest.TestCase):
-    def test_pending_dirty_skips_same_generation_across_revisions(self):
-        key = (("v", "can", "e"), 100)
-        dirty = {key: "gen1"}
-        self.assertEqual(agg._pending_dirty({}, {}), {})
-        self.assertEqual(agg._pending_dirty(dirty, {key: ("gen1", "old")}), {})
-        self.assertEqual(agg._pending_dirty(dirty, {key: ("gen0", "rev")}), dirty)
-        self.assertEqual(agg._pending_dirty(dirty, {}), dirty)
+    def test_pending_query_bounds_completed_history_and_keeps_old_late_updates(self):
+        import sqlite3
+        from unittest.mock import patch
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE vehicle_signal_dirty (window_start TEXT,"
+                       " vehicle TEXT, source TEXT, decode_epoch TEXT, generation TEXT)")
+            db.execute("CREATE TABLE vehicle_aggregate_checkpoint (window_start TEXT,"
+                       " vehicle TEXT, source TEXT, decode_epoch TEXT, applied_generation TEXT)")
+            stamp = "2020-01-01 00:00:00.000000000"
+            db.executemany("INSERT INTO vehicle_signal_dirty VALUES (?,?,'can','e','g')",
+                           ((stamp, str(i)) for i in range(200001)))
+            db.execute("INSERT INTO vehicle_aggregate_checkpoint SELECT * FROM vehicle_signal_dirty")
+            db.execute("UPDATE vehicle_signal_dirty SET generation='late' WHERE vehicle='7'")
+            for i in range(agg.DIRTY_MAX_WINDOWS + 1):
+                db.execute("INSERT INTO vehicle_signal_dirty VALUES (? ,?,'can','e','new')",
+                           ("2021-01-01 00:00:00.000000000", "pending" + str(i)))
+            sizes = []
+            def fetch(base, auth, database, sql):
+                self.assertNotIn("vehicle_signal ", sql)
+                cur = db.execute(sql)
+                rows = cur.fetchall()
+                sizes.append(len(rows))
+                return [c[0] for c in cur.description], rows
+            seal = agg.parse_ts_ns("2026-01-01 00:00:00")
+            with patch.object(agg, "fetch_rows", fetch):
+                first = agg._load_pending_dirty(("", "", ""), {"max_rows": 1}, seal)
+                key = (("7", "can", "e"), agg.parse_ts_ns(stamp))
+                self.assertEqual(first[key], "late")
+                self.assertEqual(len(first), agg.DIRTY_MAX_WINDOWS)
+                for (scope, hour), generation in first.items():
+                    db.execute("DELETE FROM vehicle_aggregate_checkpoint WHERE vehicle=?",
+                               (scope[0],))
+                    db.execute("INSERT INTO vehicle_aggregate_checkpoint VALUES (?,?,?,?,?)",
+                               (agg.ns_to_sql_lit(hour)[1:-1], *scope, generation))
+                second = agg._load_pending_dirty(("", "", ""), {}, seal)
+                self.assertEqual(len(second), 2)
+                # A generation changing behind the previous batch is rediscovered.
+                db.execute("UPDATE vehicle_signal_dirty SET generation='later' WHERE vehicle='7'")
+                self.assertEqual(agg._load_pending_dirty(("", "", ""), {}, seal)[key], "later")
+            self.assertLessEqual(max(sizes), agg.DIRTY_MAX_WINDOWS)
+
+    def test_missing_coordination_state_fails_before_work_or_checkpoint(self):
+        from unittest.mock import patch
+        for table in (agg.DIRTY_TABLE, agg.CHECKPOINT_TABLE):
+            with self.subTest(table=table), \
+                    patch.object(agg, "fetch_rows",
+                                 side_effect=agg.SqlError("Table not found: " + table)), \
+                    patch.object(agg, "_config_revision", return_value="rev"), \
+                    patch.object(agg, "_rollup_hour_windows") as rollup, \
+                    patch.object(agg, "_trip_charge_scope_windows") as trip, \
+                    patch.object(agg, "_commit_checkpoint") as commit:
+                with self.assertRaises(agg.SqlError):
+                    agg.vehicle_history_section(("", "", ""), {},
+                                                datetime(2026, 9, 20, 14))
+                rollup.assert_not_called()
+                trip.assert_not_called()
+                commit.assert_not_called()
 
     def test_scope_predicate_and_tuple_are_exact(self):
         pred = agg._dirty_scope_predicate([("v", "can", "e")])
@@ -364,8 +414,7 @@ class DirtyBatchTest(unittest.TestCase):
     def test_generation_changed_during_batch_is_not_checkpointed(self):
         from unittest.mock import patch
         key = (("v", "can", "e"), agg.parse_ts_ns("2026-09-20 10:00:00"))
-        with patch.object(agg, "_load_dirty", return_value={key: "g"}), \
-                patch.object(agg, "_load_checkpoints", return_value={}), \
+        with patch.object(agg, "_load_pending_dirty", return_value={key: "g"}), \
                 patch.object(agg, "_read_dirty_generation", side_effect=["g", "new"]), \
                 patch.object(agg, "_config_revision", return_value="rev"), \
                 patch.object(agg, "_rollup_hour_windows", return_value={key[1]}), \
@@ -474,8 +523,7 @@ class RollupV2SqlTest(unittest.TestCase):
                 # The coordinator must invoke real SQL rollups for a notification.
                 key = scopes[0]
                 committed = []
-                with patch.object(agg, "_load_dirty", return_value={key: "new"}), \
-                        patch.object(agg, "_load_checkpoints", return_value={}), \
+                with patch.object(agg, "_load_pending_dirty", return_value={key: "new"}), \
                         patch.object(agg, "_read_dirty_generation", return_value="new"), \
                         patch.object(agg, "_config_revision", return_value="rev"), \
                         patch.object(agg, "_trip_charge_scope_windows", return_value={}), \

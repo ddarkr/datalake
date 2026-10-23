@@ -23,6 +23,10 @@ class Recovery:
         self.limit = limit
         self.directory = tempfile.TemporaryDirectory(prefix="ai-recovery-")
         self.db = sqlite3.connect(self.directory.name + "/snapshot.sqlite")
+        # Disposable snapshot only: a failed pass discards this directory, while
+        # the durable Greptime fence is committed after every output succeeds.
+        self.db.execute("PRAGMA journal_mode=OFF")
+        self.db.execute("PRAGMA synchronous=OFF")
         self.db.execute("PRAGMA cache_size=-8192")
         self.db.execute("PRAGMA temp_store=FILE")
         self.db.executescript("""
@@ -33,7 +37,8 @@ class Recovery:
                 payload BLOB, trace BLOB, span BLOB, parent BLOB, scope BLOB,
                 call BLOB, turn BLOB, billed INTEGER, money INTEGER DEFAULT 1,
                 tool INTEGER DEFAULT 0, phase INTEGER DEFAULT 0,
-                eligible INTEGER, billed_source TEXT, native_usage INTEGER);
+                eligible INTEGER, billed_source TEXT, native_usage INTEGER,
+                has_tool INTEGER);
             CREATE INDEX span_parent ON spans(trace,parent);
             CREATE INDEX span_scope ON spans(scope);
             CREATE INDEX span_call ON spans(call);
@@ -110,7 +115,8 @@ class Recovery:
                         call = self.call(rec) if rec.get("native") not in ("tool", "codex_cost") else None
                         self.db.execute("INSERT OR IGNORE INTO logs(identity,payload,call) VALUES(?,?,?)",
                                         (packed(identity), packed(rec), call))
-            self.db.commit()
+            # Keep the bounded page cache across Flight chunks instead of
+            # flushing the same index/state pages at every sink callback.
         return consume
 
     @staticmethod
@@ -128,12 +134,12 @@ class Recovery:
         billing = self.billing(row)
         self.db.execute("""INSERT OR IGNORE INTO spans
             (identity,payload,trace,span,parent,scope,call,turn,billed,
-             eligible,billed_source,native_usage)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (
+             eligible,billed_source,native_usage,has_tool)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 identity, packed(row), packed(row.get("trace")), packed(row.get("span")),
                 packed(row.get("parent")), packed((row.get("client"), row.get("session"))),
                 self.call(row), packed((row.get("client"), row.get("session"), row.get("turn"))),
-                billing[0], *billing))
+                billing[0], *billing, int(bool(row.get("tool")))))
 
     def rows(self, sql="SELECT ordinal,payload FROM spans ORDER BY phase,ordinal", args=()):
         for ordinal, payload in self.db.execute(sql, args):
@@ -170,7 +176,10 @@ class Recovery:
         # billable() before native merge also applies native-sourced span precedence.
         self.native_filter()
         self.db.execute("UPDATE spans SET phase=1 WHERE billed=1")
-        merge_rows = self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal") if self.db.execute(
+        merge_rows = self.rows("""
+            SELECT ordinal,payload FROM spans WHERE billed=1 AND EXISTS (
+                SELECT 1 FROM logs WHERE logs.call=spans.call)
+            ORDER BY ordinal""") if self.db.execute(
             "SELECT 1 FROM logs WHERE call IS NOT NULL LIMIT 1").fetchone() else ()
         for ordinal, row in merge_rows:
             call = self.call(row)
@@ -185,10 +194,11 @@ class Recovery:
                 continue
             merged = a._override_span(row, pickle.loads(hit[0]))
             self.db.execute("""UPDATE spans SET payload=?,scope=?,call=?,turn=?,
-                               eligible=?,billed_source=?,native_usage=? WHERE ordinal=?""",
+                               eligible=?,billed_source=?,native_usage=?,has_tool=? WHERE ordinal=?""",
                             (packed(merged), packed((merged.get("client"), merged.get("session"))),
                              self.call(merged), packed((merged.get("client"), merged.get("session"),
-                                                      merged.get("turn"))), *self.billing(merged), ordinal))
+                                                      merged.get("turn"))), *self.billing(merged),
+                             int(bool(merged.get("tool"))), ordinal))
         for _, payload, call in self.db.execute("SELECT ordinal,payload,call FROM logs ORDER BY ordinal"):
             if call is not None and self.db.execute(
                     "SELECT 1 FROM winners WHERE kind='merge' AND identity=?", (call,)).fetchone():
@@ -198,7 +208,7 @@ class Recovery:
             self.db.execute("UPDATE spans SET phase=? WHERE ordinal=last_insert_rowid()",
                             (3 if log.get("native") == "tool" else 2,))
         # Re-evaluate the post-merge billing rules exactly as the summary oracle does.
-        self.db.execute("UPDATE spans SET billed=eligible")
+        self.db.execute("UPDATE spans SET billed=eligible WHERE billed IS NOT eligible")
         self.parent_filter()
         self.native_filter()
         for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY phase,ordinal"):
@@ -206,9 +216,8 @@ class Recovery:
                 self.db.execute("INSERT OR IGNORE INTO winners VALUES('turn',?,?)", (packed((row["client"], row["session"], row["turn"])), ordinal))
         self.db.execute("""UPDATE spans SET money=0 WHERE billed=1 AND EXISTS
             (SELECT 1 FROM winners w WHERE w.kind='turn' AND w.identity=spans.turn AND w.ordinal!=spans.ordinal)""")
-        for ordinal, row in self.rows():
-            if not row.get("tool"):
-                continue
+        for ordinal, row in self.rows(
+                "SELECT ordinal,payload FROM spans WHERE has_tool=1 ORDER BY phase,ordinal"):
             identity = packed((row.get("client"), row.get("session"), row["call_id"])) if row.get("call_id") else packed(("anonymous", ordinal))
             hit = self.db.execute("SELECT ordinal FROM winners WHERE kind='tool' AND identity=?", (identity,)).fetchone()
             if hit is None:

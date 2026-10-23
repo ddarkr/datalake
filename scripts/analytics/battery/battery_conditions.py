@@ -1183,7 +1183,7 @@ def analyze(signals, events, config):
 
     rows_all = []
     after_decision = 0
-    for sig in bc.normalize_signals(signals if isinstance(signals, list) else []):
+    for sig in bc.analysis_signals(signals if isinstance(signals, list) else []):
         if decision is not None:
             if sig["event_time_ns"] > decision:
                 after_decision += 1

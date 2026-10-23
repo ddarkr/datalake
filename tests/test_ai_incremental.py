@@ -1952,6 +1952,63 @@ def test_bounded_long_session_prefix_failure_and_late_retry():
         _restore(saved)
 
 
+def test_failed_full_snapshot_discards_scratch_and_preserves_fence():
+    import os
+    from unittest.mock import patch
+    from scripts.analytics import ai_recovery
+
+    saved = _guard()
+    real = install_fence()
+    _reset()
+    traces, logs = base_history()
+    FakeGreptime.store.append("traces", traces)
+    FakeGreptime.store.append("logs", logs)
+    srv = serve()
+    try:
+        ctx, cfg = _ctx(srv), _cfg(max_rows=2)
+        agg.ai_section(ctx, cfg)
+        _, checkpoint = require_fence()
+        late = span(DAY2, "failed-snapshot", "late", "late-session",
+                    "codex", 13, 7, call="late-call")
+        FakeGreptime.store.append("traces", [late])
+        forced = dict(cfg, ai_full_rebuild=True)
+        for owner, method in (
+                (ai_recovery.Recovery, "add_span"),
+                (ai_recovery.Recovery, "prepare"),
+                (ai_recovery, "write_batch")):
+            original = getattr(owner, method)
+            close = ai_recovery.Recovery.close
+            directories = []
+
+            def fail_after_work(*args, **kwargs):
+                original(*args, **kwargs)
+                raise RuntimeError("injected snapshot failure")
+
+            def discard(recovery):
+                directories.append(recovery.directory.name)
+                close(recovery)
+
+            with patch.object(owner, method, fail_after_work), patch.object(
+                    ai_recovery.Recovery, "close", discard):
+                try:
+                    agg.ai_section(ctx, forced)
+                except RuntimeError as exc:
+                    assert str(exc) == "injected snapshot failure"
+                else:
+                    raise AssertionError("expected snapshot failure: " + method)
+            assert directories and all(not os.path.exists(p) for p in directories)
+            assert require_fence()[1] == checkpoint, method
+        agg.ai_section(ctx, forced)
+        result = snapshot()
+        # Keep the same fixed clock and price table for recovery and oracle.
+        _assert_oracle(result, traces + [late], logs, _cfg())
+    finally:
+        srv.shutdown()
+        srv.server_close()
+        restore_fence(real)
+        _restore(saved)
+
+
 def test_disk_reducer_matches_global_merge_oracle_across_chunks():
     from scripts.analytics.ai_recovery import Recovery
     traces, logs = base_history()
@@ -1980,6 +2037,16 @@ def test_disk_reducer_matches_global_merge_oracle_across_chunks():
         span(DAY1, "orphan-trace", "orphan", "zero-session", "codex", 5, 1),
         span(DAY1, "other-client", "other", "zero-session", "oh-my-pi", 6, 3)]
     logs += [clog(DAY2, "zero-session", "codex", "zero-call", 0, 0)]
+    # Sparse matches keep ordinal-first duplicate merging inside the exact
+    # client/session, without dropping unrelated spans sharing a call ID.
+    traces += [
+        span(DAY1, "sparse", "first", "sparse-session", "codex", 9, 2,
+             call="shared-call"),
+        span(DAY1, "sparse", "duplicate", "sparse-session", "codex", 4, 1,
+             call="shared-call"),
+        span(DAY1, "sparse", "other", "other-session", "codex", 7, 3,
+             call="shared-call")]
+    logs += [clog(DAY2, "sparse-session", "codex", "shared-call", 0, 0)]
     # More tool/session/day keys than the shared 128-state cache, then late
     # revisits: evicted totals must reload without changing null/zero rules.
     tool_rows = []
@@ -2259,6 +2326,7 @@ def test_dimension_normalization_matches_sql_scalar_strings():
 
 
 TESTS = (
+    test_failed_full_snapshot_discards_scratch_and_preserves_fence,
     test_scalar_dimensions_merge_and_v3_checkpoint_repairs_without_input,
     test_dimension_normalization_matches_sql_scalar_strings,
     test_late_model_reconciliation_retries_without_advancing_fence,

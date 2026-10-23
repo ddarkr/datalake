@@ -779,7 +779,7 @@ def analyze(signals, events, config):
         uncertainties = {"soc_uncertainty_pct": None,
                          "energy_uncertainty_kwh": None}
         unc_error = str(exc)
-    rows_all = bc.normalize_signals(signals)
+    rows_all = bc.analysis_signals(signals)
     if decision is not None:
         rows_all = [r for r in rows_all
                     if r["event_time_ns"] <= decision

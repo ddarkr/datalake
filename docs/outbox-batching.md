@@ -6,6 +6,13 @@ one Fleet envelope, one VSS snapshot fetch, or one subscribe update.
 No cross-message micro-batch or timer: at low input rates nothing waits
 for a commit, and shutdown/error recovery needs no extra flush.
 
+Valid Fleet envelopes with no extracted signals/events update receive counts
+and receipt timestamps, then return without envelope hashing, pending-count queries or
+a commit call. Invalid fields in the allowlist still produce tombstones;
+they are not empty messages. Envelope identity remains SHA256 over the exact
+topic UTF-8 bytes, separator `0x1f`, and received payload bytes, fed incrementally
+without concatenating a payload-sized buffer.
+
 Durable boundary: a row counts as stored only after the batch `commit`
 returns. Success counters (`signals_stored`, `events_stored`, `stored`)
 and dedupe state (`last`, `seen_ids`) land only on commit; a failed

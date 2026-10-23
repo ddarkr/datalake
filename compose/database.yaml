@@ -65,8 +65,9 @@ services:
   aggregate:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
+    cpus: ${AGG_CPUS:-1.0}
     labels:
-      datalake.aggregate-revision: "41"
+      datalake.aggregate-revision: "43"
     depends_on:
       greptimedb:
         condition: service_started

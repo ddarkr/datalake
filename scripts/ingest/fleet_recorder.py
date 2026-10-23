@@ -1088,7 +1088,10 @@ def resolve_topics(raw=""):
 
 def envelope_id(topic, payload_bytes):
     """Stable envelope over the exact received bytes (topic + payload)."""
-    return hashlib.sha256(topic.encode("utf-8") + b"\x1f" + bytes(payload_bytes)).hexdigest()
+    digest = hashlib.sha256(topic.encode("utf-8"))
+    digest.update(b"\x1f")
+    digest.update(bytes(payload_bytes))
+    return digest.hexdigest()
 
 
 def parse_zmq_frames(frames, topics=DEFAULT_TOPICS):
@@ -1484,6 +1487,8 @@ def process_message(conn, payload_bytes, meta_env, stats, max_rows=50000,
         return 0  # Non-matching VIN filtered out
     _stats_bump(stats, "messages_received")
     stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
+    if not raw_signals:
+        return 0
     envelope = envelope_id(topic, payload_bytes)
     built = []
     for source_field, raw_val in raw_signals:
@@ -1535,6 +1540,8 @@ def process_envelope(conn, topic, payload_bytes, meta_env, stats,
         return 0  # Non-matching VIN filtered out
     _stats_bump(stats, "messages_received")
     stats["last_receive_" + topic] = ingest_time_ns / 1_000_000_000
+    if not items:
+        return 0
     envelope = envelope_id(topic, payload_bytes)
     built = [_build_event_row(meta_env, topic, metadata["event_type"], item,
                               metadata, ingest_time_ns, envelope)

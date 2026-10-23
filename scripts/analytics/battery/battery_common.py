@@ -196,6 +196,17 @@ def normalize_signals(signals):
     return normed
 
 
+def analysis_signals(signals):
+    """Read-only canonical input for built-in analyzers; never mutate rows.
+
+    Prepared collections belong to this pass, not a cross-pass cache.
+    Keep normalize_signals' detached-copy contract for other callers.
+    """
+    if isinstance(signals, _PreparedSignals):
+        return signals
+    return normalize_signals(signals)
+
+
 def normalize_event(raw):
     """Canonical event dict, or None when envelope time/identity is missing.
 

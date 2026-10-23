@@ -209,7 +209,10 @@ class _ActivityMap(MutableMapping):
         packed = self.store.pack(value)
         value = pickle.dumps(packed)
         try:
-            ident = self._entry(key)[0]
+            entry = self._entry(key)
+            if entry[1] == value:
+                return
+            ident = entry[0]
         except KeyError:
             ident = self.store.connection.execute(
                 "INSERT INTO activity_entries(owner,hash,key,value) VALUES (?,?,?,?)",

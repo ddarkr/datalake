@@ -773,7 +773,7 @@ def analyze(signals, events, config):
             for m in SUPPORTED_METRICS]
     _ = events
     scoped = set()
-    for sig in bc.normalize_signals(
+    for sig in bc.analysis_signals(
             signals if isinstance(signals, list) else []):
         scoped.add((sig["vehicle"], sig["source"],
                     sig["decode_epoch"]))

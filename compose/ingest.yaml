@@ -38,11 +38,12 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.trace-privacy-revision: "2"
+      datalake.trace-privacy-revision: "3"
     user: "65534:65534"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]
-    # Internal only; it forwards Alloy's private auth without storing credentials.
+    # Internal only; 16 socket workers / 8 forwards, 503 on capacity, 10s I/O timeout.
+    # Forwards Alloy's private auth without storing credentials.
     working_dir: /app
     command: ["python", "-m", "scripts.telemetry.trace_privacy"]
     configs:

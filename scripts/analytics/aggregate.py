@@ -3616,24 +3616,32 @@ def _is_can_scope(scope):
     return isinstance(scope, tuple) and len(scope) == 3 and scope[1] in CAN_SOURCES
 
 
-def _load_dirty(ctx, cfg, cutoff_ns, seal_ns):
-    """{(scope, hour_ns): generation} observed BEFORE recomputation."""
+def _load_pending_dirty(ctx, cfg, seal_ns):
+    """Return at most one work batch, excluding completed history in SQL.
+
+    GreptimeDB 1.2 supports LEFT JOIN (reference/sql/join). Join the full
+    immutable key AND generation: a concurrent newer dirty generation cannot
+    be hidden by an older checkpoint. Per-hour rechecks still fence writes.
+    No cursor/time cutoff: late changes to any historical hour stay eligible.
+    """
     base_url, auth, db = ctx
     filt = ""
     if cfg.get("vehicle"):
-        filt = " AND vehicle = " + str_lit(cfg["vehicle"])
-    try:
-        cols, rows = guarded_fetch(
-            base_url, auth, db,
-            "SELECT window_start, vehicle, source, decode_epoch, generation"
-            " FROM " + DIRTY_TABLE
-            + " WHERE window_start >= " + ns_to_sql_lit(cutoff_ns)
-            + " AND window_start < " + ns_to_sql_lit(seal_ns) + filt
-            + " ORDER BY window_start", cfg["max_rows"])
-    except SqlError as e:
-        if is_missing_table(e):
-            return {}
-        raise
+        filt = " AND d.vehicle = " + str_lit(cfg["vehicle"])
+    # Both tables are initialized by db-init. Missing coordination state is
+    # a section failure, never evidence that the dirty backlog is empty.
+    cols, rows = fetch_rows(
+        base_url, auth, db,
+        "SELECT d.window_start, d.vehicle, d.source, d.decode_epoch, d.generation"
+        " FROM " + DIRTY_TABLE + " d LEFT JOIN " + CHECKPOINT_TABLE + " c"
+        " ON d.window_start = c.window_start AND d.vehicle = c.vehicle"
+        " AND d.source = c.source AND d.decode_epoch = c.decode_epoch"
+        " AND d.generation = c.applied_generation"
+        " WHERE c.applied_generation IS NULL AND d.source = 'can'"
+        " AND d.generation IS NOT NULL AND d.generation <> ''"
+        " AND d.window_start < " + ns_to_sql_lit(seal_ns) + filt
+        + " ORDER BY d.window_start, d.vehicle, d.source, d.decode_epoch"
+        + " LIMIT " + str(DIRTY_MAX_WINDOWS))
     idx = {c: i for i, c in enumerate(cols)}
     out = {}
     for r in rows:
@@ -3650,49 +3658,6 @@ def _load_dirty(ctx, cfg, cutoff_ns, seal_ns):
     return out
 
 
-def _load_checkpoints(ctx, cfg, cutoff_ns, seal_ns):
-    """Applied generation and historical revision; fingerprint is legacy metadata."""
-    base_url, auth, db = ctx
-    filt = ""
-    if cfg.get("vehicle"):
-        filt = " AND vehicle = " + str_lit(cfg["vehicle"])
-    try:
-        cols, rows = guarded_fetch(
-            base_url, auth, db,
-            "SELECT window_start, vehicle, source, decode_epoch,"
-            " applied_generation, config_revision, raw_fingerprint FROM "
-            + CHECKPOINT_TABLE
-            + " WHERE window_start >= " + ns_to_sql_lit(cutoff_ns)
-            + " AND window_start < " + ns_to_sql_lit(seal_ns) + filt
-            + " ORDER BY window_start", cfg["max_rows"])
-    except SqlError as e:
-        if is_missing_table(e):
-            return {}
-        raise
-    idx = {c: i for i, c in enumerate(cols)}
-    out = {}
-    for r in rows:
-        def col(name):
-            return r[idx[name]] if name in idx else None
-        hour = parse_ts_ns(col("window_start"))
-        scope = _scope_tuple((col("vehicle"), col("source"), col("decode_epoch")))
-        if hour is None or scope is None:
-            continue
-        gen = col("applied_generation")
-        rev = col("config_revision")
-        if not isinstance(gen, str) or not isinstance(rev, str):
-            continue
-        fp = col("raw_fingerprint")
-        if not isinstance(fp, str):
-            fp = ""
-        out[(scope, floor_hour_ns(hour))] = (gen, rev, fp)
-    return out
-
-
-def _pending_dirty(dirty, checkpoints):
-    """Only new generations need work; code changes do not replay history."""
-    return {key: gen for key, gen in dirty.items()
-            if key not in checkpoints or checkpoints[key][0] != gen}
 
 
 def _dirty_scope_predicate(scopes):
@@ -3743,9 +3708,9 @@ def _commit_checkpoint(ctx, scope, hour_ns, generation, revision, now_ns):
 def _registered_scopes(ctx, cfg):
     """CAN scopes from dirty/checkpoint metadata only; never discover raw."""
     base_url, auth, db = ctx
-    filt = ""
+    filt = " WHERE source = 'can'"
     if cfg.get("vehicle"):
-        filt = " WHERE vehicle = " + str_lit(cfg["vehicle"])
+        filt += " AND vehicle = " + str_lit(cfg["vehicle"])
     out = set()
     for table in (DIRTY_TABLE, CHECKPOINT_TABLE):
         try:
@@ -4117,9 +4082,7 @@ def vehicle_history_section(ctx, cfg, now=None):
     now_ns = dt_to_ns(now or utcnow())
     seal_ns = floor_hour_ns(now_ns)
     revision = _config_revision(cfg)
-    dirty = _load_dirty(ctx, cfg, 0, seal_ns)
-    checkpoints = _load_checkpoints(ctx, cfg, 0, seal_ns)
-    pending = _pending_dirty(dirty, checkpoints)
+    pending = _load_pending_dirty(ctx, cfg, seal_ns)
     committed = 0
     eligible = {}
     for key in sorted(pending)[:DIRTY_MAX_WINDOWS]:

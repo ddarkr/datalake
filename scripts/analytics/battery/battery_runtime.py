@@ -1366,9 +1366,9 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
                 analysis_cfg=None, exclude_sources=()):
     """Bounded disjoint fetches: no envelope over unrelated gaps.
 
-    Requests partition merged inclusive intervals into at most one hour,
-    retaining each interval's full >=24h signal context. Cumulative raw
-    rows and unique discovered scope identities fail closed at max_rows.
+    Each merged inclusive interval uses one request per table, retaining
+    its full >=24h signal context. Cumulative raw rows and unique
+    discovered scope identities fail closed at max_rows.
     Exact exclusions apply in SQL before LIMIT, including union mode.
     The source_field predicate narrows fetched ROWS (exact required set),
     never scopes: a parallel field-independent DISTINCT tag query per
@@ -1396,17 +1396,14 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
     else:
         context_cover = []
 
-    def _chunks(queries):
+    def _intervals(queries):
         by_scope = {}
         for start, end, scopes in queries:
             key = tuple(scopes) if scopes else None
             by_scope.setdefault(key, []).append((start, end))
         for scopes, intervals in by_scope.items():
             for start, end in _merge_intervals(intervals):
-                while start <= end:
-                    stop = min(end, start + HOUR_NS - 1)
-                    yield start, stop, scopes
-                    start = stop + 1
+                yield start, end, scopes
     signals = []
     events = []
     tag_scopes = set()
@@ -1427,7 +1424,7 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
         tag_scopes.update(tags)
 
     source_filter = {"exclude_sources": exclude_sources} if exclude_sources else {}
-    for start, end, scopes in _chunks(event_q):
+    for start, end, scopes in _intervals(event_q):
         events.extend(_take(fetch_events(
             base_url, auth, db, start, end, vehicle, max_rows,
             scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
@@ -1438,7 +1435,7 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
                   if (e["vehicle"], e["source"], e.get("decode_epoch"))
                   not in exclude_scopes]
         fields = _required_signal_fields(analysis_cfg, events=proven)
-    for cstart, cend, scopes in _chunks(signal_q):
+    for cstart, cend, scopes in _intervals(signal_q):
         signals.extend(_take(fetch_signals(
             base_url, auth, db, cstart, cend, vehicle, max_rows,
             fields=fields, scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))

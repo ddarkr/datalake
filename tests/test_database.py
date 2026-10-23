@@ -1206,16 +1206,16 @@ def _vehicle_cfg(**over):
 
 def _fake_db(dirty_rows=(), checkpoint_rows=(), generations=None):
     committed = []
-    def dirty(ctx, cfg, cutoff, seal):
-        return {(s, h): g for s, h, g in dirty_rows if cutoff <= h < seal}
-    def checkpoints(ctx, cfg, cutoff, seal):
-        return {(r[0], r[1]): tuple(r[2:]) for r in checkpoint_rows
-                if cutoff <= r[1] < seal}
+    def dirty(ctx, cfg, seal):
+        applied = {(r[0], r[1]): r[2] for r in checkpoint_rows}
+        pending = {(s, h): g for s, h, g in dirty_rows
+                   if h < seal and applied.get((s, h)) != g}
+        return dict(sorted(pending.items())[:agg.DIRTY_MAX_WINDOWS])
     def read(ctx, scope, hour):
         return (generations or {}).get((scope, hour))
     def commit(ctx, scope, hour, gen, rev, now):
         committed.append((scope, hour, gen, rev, ""))
-    return dirty, checkpoints, read, commit, committed
+    return dirty, checkpoint_rows, read, commit, committed
 
 
 def _patch_coordinator(monkey, fakes, fail_at=None):
@@ -1228,7 +1228,7 @@ def _patch_coordinator(monkey, fakes, fail_at=None):
                 raise agg.SqlError("work failed")
             return {hour for _, hour in pending}
         return apply
-    for name, fn in (("_load_dirty", dirty), ("_load_checkpoints", checkpoints),
+    for name, fn in (("_load_pending_dirty", dirty),
                      ("_read_dirty_generation", read), ("_commit_checkpoint", commit),
                      ("_rollup_hour_windows", work("rollup")),
                      ("_trip_charge_scope_windows", work("trip"))):
@@ -1368,8 +1368,7 @@ def test_coordinator_sst_hull_batch_only_checkpoints_completed_hours():
     gap = now - dt.timedelta(hours=3)
     files = [("sst-" + str(i), gap, gap + dt.timedelta(minutes=1)) for i in range(400)]
     cfg = _vehicle_cfg(paths=dict.fromkeys(agg._VEHICLE_ATTRS, ""))
-    with patch.object(agg, "_load_dirty", fakes[0]), \
-            patch.object(agg, "_load_checkpoints", fakes[1]), \
+    with patch.object(agg, "_load_pending_dirty", fakes[0]), \
             patch.object(agg, "_read_dirty_generation", fakes[2]), \
             patch.object(agg, "_commit_checkpoint", fakes[3]), \
             patch.object(agg, "guarded_fetch", return_value=(["file_id", "min_ts", "max_ts"], files)), \

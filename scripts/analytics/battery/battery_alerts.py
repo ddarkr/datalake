@@ -582,7 +582,7 @@ def analyze(signals, events, config):
     decision_time = _decision_time(config)  # raises on malformed bound
 
     adm_sig, exc_sig = [], {}
-    for s in bc.normalize_signals(signals if isinstance(signals, list) else []):
+    for s in bc.analysis_signals(signals if isinstance(signals, list) else []):
         status = _ingest_status(s, decision_time)
         if status == "admitted":
             adm_sig.append(s)
