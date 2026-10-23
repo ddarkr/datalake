@@ -253,6 +253,8 @@ node plugins/install.mjs agy --config "$DATALAKE_OTEL_CONFIG" --apply
 
 `PreToolUse`는 시작 메타데이터를 기록하고, `PostToolUse`와 `Stop`은 훅 프로세스 안에서 직접 HTTP 전송을 시도합니다. 훅 응답은 도구 동작을 바꾸지 않는 중립 응답(`PreToolUse`의 `allow`, 나머지 `{}`)입니다. 설정·코드를 갱신했다면 AGY를 다시 시작해 새 훅을 로드하세요.
 
+`PreToolUse`·`PreInvocation`처럼 시작 checkpoint만 기록하는 경로에서는 Git을 조회하지 않습니다. 전송할 이벤트를 구성할 때 저장소·브랜치를 조회하며 프로세스 사이에 메타데이터를 캐시하지 않습니다.
+
 도구 오류는 원문 대신 고정 분류 `error.type=tool_error`만 전송합니다. transcript cursor와 도구·Stop 관측 상태는 중복 시도를 막기 위한 소스 checkpoint이며 수집기 ACK가 아닙니다. HTTP 실패 때문에 같은 구간이나 완료 이벤트를 자동 재전송하지 않습니다.
 
 AGY는 토큰·캐시 사용량을 문자 수로 추정하지 않습니다. 보고된 사용량이 없는 invocation에는 토큰·tier·TTFT·첫 텍스트 필드를 보내지 않습니다. 새 `PreInvocation`·`PostInvocation` 훅을 등록하려면 같은 홈·설정으로 설치기를 다시 실행한 뒤 AGY를 재시작하세요.

@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, writeFile, rm, stat, mkdir, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, stat, mkdir, symlink, readdir } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -56,6 +56,67 @@ async function wireFixture(t, respond = null, timeoutMs = 30_000) {
   t.after(async () => { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); });
   return { bodies, endpoint: `http://127.0.0.1:${server.address().port}`, timeoutMs };
 }
+
+test('AGY defers Git metadata until event paths while preserving pre-hook checkpoints', async t => {
+  const box = await sandbox(t, steps());
+  const gitLog = join(box.path, 'git-calls');
+  await writeFile(gitLog, '');
+  const bin = join(box.path, 'bin');
+  await mkdir(bin);
+  await writeFile(join(bin, 'git'), '#!/bin/sh\nprintf "call\\n" >> "$AGY_GIT_LOG"\ncase "$3" in\nrev-parse) printf "/synthetic/repository\\n";;\nsymbolic-ref) printf "fixture-branch\\n";;\nesac\n', { mode: 0o700 });
+  const hookUrl = new URL('../plugins/agy/hook.mjs', import.meta.url).href;
+  const invoke = async (payload, options = {}) => {
+    const source = `import { handleHook } from ${JSON.stringify(hookUrl)};
+      const events = await handleHook(${JSON.stringify(payload)}, {
+        telemetry: { send: async () => true, flush: async () => {} },
+        cwd: ${JSON.stringify(box.path)}, now: () => 1500, ...${JSON.stringify(options)}
+      });
+      console.log(JSON.stringify(events));`;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', source], {
+      env: { ...process.env, PATH: `${bin}:${process.env.PATH}`, AGY_GIT_LOG: gitLog },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    t.after(() => { if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL'); });
+    const closed = once(child, 'close');
+    let stdout = '', stderr = '';
+    child.stdout.on('data', chunk => { stdout += chunk; });
+    child.stderr.on('data', chunk => { stderr += chunk; });
+    const [code] = await closed;
+    assert.equal(code, 0, stderr);
+    return JSON.parse(stdout);
+  };
+  const payload = { conversationId: box.sessionId, transcriptPath: box.transcript, toolName: 'Read', modelName: 'fixture-model' };
+  for (let stepIdx = 0; stepIdx < 20; stepIdx++) {
+    assert.deepEqual(await invoke({ ...payload, stepIdx }, { isPreTool: true }), []);
+  }
+  const checkpoints = (await readdir(box.state)).filter(name => /^tool-.*\.json$/.test(name));
+  assert.equal(checkpoints.length, 20);
+  for (const name of checkpoints) {
+    const state = JSON.parse(await readFile(join(box.state, name), 'utf8'));
+    assert.equal(state.startTimeMs, 1500);
+    assert.equal(state.toolName, 'Read');
+    assert.equal(state.attempted, undefined);
+  }
+  assert.deepEqual(await invoke({ ...payload, invocationNum: 0 }, { isPreInvocation: true }), []);
+  assert.deepEqual(await invoke({ ...payload, invocationNum: -1 }, { isPostInvocation: true }), []);
+  assert.deepEqual(await invoke({ ...payload, invocationNum: 1 }, { isPostInvocation: true }), []);
+  assert.equal(await readFile(gitLog, 'utf8'), '', 'checkpoint-only paths never launch Git');
+  const events = [
+    ...await invoke({ ...payload, stepIdx: 0 }),
+    ...await invoke({ ...payload, terminationReason: 'model_stop' }),
+    ...await invoke({ ...payload, invocationNum: 0 }, { isPostInvocation: true }),
+  ];
+  assert.deepEqual(events.map(event => event.kind), ['tool.call', 'subagent', 'subagent', 'session', 'llm.turn']);
+  const repositoryId = createHash('sha256').update('/synthetic/repository').digest('hex');
+  for (const event of events) {
+    assert.equal(event.attributes['coding_agent.repository.id'], repositoryId);
+    assert.equal(event.attributes['vcs.ref.head.name'], 'fixture-branch');
+    assert.equal(event.attributes['gen_ai.request.model'], 'fixture-model');
+  }
+  assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
+  assert.deepEqual(await invoke({ ...payload, invocationNum: 0 }, { isPostInvocation: true }), []);
+  assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
+});
 
 for (const failure of ['false', 'throw']) {
   test(`AGY failed ${failure} on subagent still sends later children once without estimated turns`, async t => {

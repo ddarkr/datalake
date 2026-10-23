@@ -203,14 +203,8 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
   if (!sessionId) return [];
 
   const clock = now();
-  const repoAttrs = await repositoryContext(cwd);
   const model = payload.modelName;
   const events = [];
-
-  const baseAttrs = {
-    ...repoAttrs,
-    ...(model ? { 'gen_ai.request.model': String(model).slice(0, 128) } : {}),
-  };
 
   const isStop = Boolean(payload.terminationReason) || process.argv.includes('--stop');
   const preToolFlag = isPreTool || process.argv.includes('--pre-tool');
@@ -243,7 +237,8 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
       kind: 'llm.turn', sessionId: String(sessionId), eventId,
       startTimeMs: state.startTimeMs, endTimeMs: clock,
       attributes: {
-        ...baseAttrs,
+        ...await repositoryContext(cwd),
+        ...(model ? { 'gen_ai.request.model': String(model).slice(0, 128) } : {}),
         'coding_agent.request.duration_ms': clock - state.startTimeMs,
         'coding_agent.duration.kind': 'hook_invocation',
       },
@@ -267,6 +262,11 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     }
     return [];
   }
+
+  const baseAttrs = {
+    ...await repositoryContext(cwd),
+    ...(model ? { 'gen_ai.request.model': String(model).slice(0, 128) } : {}),
+  };
 
   // 트랜스크립트 경로 안전 해결
   const transcriptPath = await resolveTranscriptPath(payload);
