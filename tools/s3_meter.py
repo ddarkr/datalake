@@ -781,7 +781,8 @@ class S3Meter:
                         "S3 meter snapshot incomplete: %d active requests"
                         % self._active_requests)
                 self._idle.wait(remaining)
-            reqs = [dict(r) for r in self.requests]
+            retained = len(self.requests)
+            reqs = [dict(r) for r in self.requests[-5000:]]
             counters = dict(self.counters)
             dropped = self.dropped_requests
             breakdown = [dict(group) for group in
@@ -791,8 +792,8 @@ class S3Meter:
         return {"counters": counters, "op_requests": ops,
                 "response_bytes_by_object": response_classes,
                 "client_error_breakdown": breakdown,
-                "requests": reqs[-5000:],
-                "truncated_requests": max(0, len(reqs) - 5000) + dropped}
+                "requests": reqs,
+                "truncated_requests": max(0, retained - 5000) + dropped}
 
 
 def main(argv=None):
