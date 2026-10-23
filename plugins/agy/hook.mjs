@@ -98,8 +98,9 @@ async function resolveTranscriptPath(payload) {
 }
 
 // 커서 기반 증분(Incremental) 턴 및 서브에이전트 이벤트 전송
-async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock) {
-  if (!transcriptPath) return { turns: [], subagents: [] };
+async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock, includeSummary = false) {
+  const summary = { startTimeMs: clock, durationMs: 0, subagentCalls: 0 };
+  if (!transcriptPath) return { turns: [], subagents: [], summary };
 
   const dir = stateDir(sessionId);
   await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -132,9 +133,25 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
     const raw = await readFile(transcriptPath, 'utf8');
     const lines = raw.split('\n').filter(Boolean);
     const steps = [];
-
+    let earliestTimestamp;
     for (const line of lines) {
-      try { steps.push(JSON.parse(line)); } catch {}
+      try {
+        const step = JSON.parse(line);
+        steps.push(step);
+        if (includeSummary && step.created_at) {
+          const timestamp = new Date(step.created_at).getTime();
+          earliestTimestamp = Math.min(earliestTimestamp ?? Infinity, timestamp);
+        }
+        if (includeSummary && Array.isArray(step.tool_calls)) {
+          for (const tc of step.tool_calls) {
+            if (tc.name === 'invoke_subagent') summary.subagentCalls++;
+          }
+        }
+      } catch {}
+    }
+    if (earliestTimestamp !== undefined) {
+      summary.startTimeMs = earliestTimestamp;
+      summary.durationMs = Math.max(0, clock - earliestTimestamp);
     }
 
     for (let i = 0; i < steps.length; i++) {
@@ -187,7 +204,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
 
   } catch {}
 
-  return { turns, subagents };
+  return { turns, subagents, summary };
 }
 
 export async function handleHook(payload, options = {}) {
@@ -274,37 +291,11 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
   // 2. Stop 이벤트: 최종 세션 요약 및 남은 턴 증분 마감 전송
   if (isStop) {
     // 세션 종료 전 아직 전송되지 않은 증분 턴들 모두 전송
-    const { turns, subagents } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock);
-    events.push(...turns, ...subagents);
-
-    let durationMs = 0;
-    let startTime = clock;
-    let subagentCount = subagents.length;
-
-    if (transcriptPath) {
-      try {
-        const content = await readFile(transcriptPath, 'utf8');
-        const lines = content.split('\n').filter(Boolean);
-        const timestamps = [];
-
-        for (const line of lines) {
-          try {
-            const step = JSON.parse(line);
-            if (step.created_at) timestamps.push(new Date(step.created_at).getTime());
-            if (step.tool_calls && Array.isArray(step.tool_calls)) {
-              for (const tc of step.tool_calls) {
-                if (tc.name === 'invoke_subagent') subagentCount++;
-              }
-            }
-          } catch {}
-        }
-
-        if (timestamps.length > 0) {
-          startTime = Math.min(...timestamps);
-          durationMs = Math.max(0, clock - startTime);
-        }
-      } catch {}
-    }
+    const { turns, subagents, summary } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock, true);
+    for (const event of turns) events.push(event);
+    for (const event of subagents) events.push(event);
+    const { startTimeMs: startTime, durationMs } = summary;
+    const subagentCount = subagents.length + summary.subagentCalls;
 
     const sessionEvent = {
       kind: 'session',
@@ -376,7 +367,8 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
 
     // 실시간 증분 턴 전송 (세션 중 강제 종료 방지)
     const { turns, subagents } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock);
-    events.push(...turns, ...subagents);
+    for (const event of turns) events.push(event);
+    for (const event of subagents) events.push(event);
   }
 
   await telemetry.flush().catch(() => {});

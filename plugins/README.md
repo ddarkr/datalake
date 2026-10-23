@@ -255,6 +255,8 @@ node plugins/install.mjs agy --config "$DATALAKE_OTEL_CONFIG" --apply
 
 `PreToolUse`·`PreInvocation`처럼 시작 checkpoint만 기록하는 경로에서는 Git을 조회하지 않습니다. 전송할 이벤트를 구성할 때 저장소·브랜치를 조회하며 프로세스 사이에 메타데이터를 캐시하지 않습니다.
 
+`Stop`은 한 번 읽은 transcript에서 증분 이벤트와 세션 요약을 함께 계산합니다. 가장 이른 시각은 순회 중 누적하므로 큰 이력을 함수 인자로 펼치지 않습니다. 커서 이전 기록도 세션 시간·서브에이전트 호출 수에 포함하며, `PostToolUse`에서는 이 요약 계산을 하지 않습니다.
+
 도구 오류는 원문 대신 고정 분류 `error.type=tool_error`만 전송합니다. transcript cursor와 도구·Stop 관측 상태는 중복 시도를 막기 위한 소스 checkpoint이며 수집기 ACK가 아닙니다. HTTP 실패 때문에 같은 구간이나 완료 이벤트를 자동 재전송하지 않습니다.
 
 AGY는 토큰·캐시 사용량을 문자 수로 추정하지 않습니다. 보고된 사용량이 없는 invocation에는 토큰·tier·TTFT·첫 텍스트 필드를 보내지 않습니다. 새 `PreInvocation`·`PostInvocation` 훅을 등록하려면 같은 홈·설정으로 설치기를 다시 실행한 뒤 AGY를 재시작하세요.

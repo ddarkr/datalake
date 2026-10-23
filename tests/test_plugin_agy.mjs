@@ -328,6 +328,37 @@ test('AGY treats legacy sent IDs as attempted without replaying historical turns
   assert.equal(cursor.lastProcessedIndex, 2);
 });
 
+test('AGY Stop summarizes all 200000 timestamps behind an advanced cursor', async t => {
+  const history = Array.from({ length: 200000 }, (_, step_index) => ({
+    type: 'PLANNER_RESPONSE', step_index, created_at: new Date(1000 + step_index * 3).toISOString(),
+  }));
+  history[0].tool_calls = steps()[1].tool_calls;
+  const box = await sandbox(t, history), { telemetry, accepted } = direct();
+  await mkdir(box.state, { recursive: true, mode: 0o700 });
+  await writeFile(join(box.state, 'cursor.json'), JSON.stringify({ version: 3, lastProcessedIndex: 199999 }));
+  await writeFile(box.transcript, '{malformed\n', { flag: 'a' });
+  await handleHook({ conversationId: box.sessionId, transcriptPath: box.transcript, terminationReason: 'model_stop' }, {
+    telemetry, cwd: box.path, now: () => 601000,
+  });
+  assert.deepEqual(accepted.map(event => event.kind), ['session']);
+  assert.equal(accepted[0].startTimeMs, 1000);
+  assert.equal(accepted[0].attributes['coding_agent.session.duration_ms'], 600000);
+  assert.equal(accepted[0].attributes['coding_agent.session.subagent_count'], 1);
+});
+
+test('AGY Stop skips malformed lines and counts new children plus all invoke calls', async t => {
+  const box = await sandbox(t), { telemetry, accepted } = direct();
+  await writeFile(box.transcript, ['{malformed', JSON.stringify(steps()[0]), '{broken', ...steps().slice(1).map(step => JSON.stringify(step))].join('\n'));
+  await handleHook({ conversationId: box.sessionId, transcriptPath: box.transcript, terminationReason: 'model_stop' }, {
+    telemetry, cwd: box.path, now: () => 1500,
+  });
+  assert.deepEqual(accepted.map(event => event.kind), ['subagent', 'subagent', 'session']);
+  const session = accepted.at(-1);
+  assert.equal(session.startTimeMs, 1000);
+  assert.equal(session.attributes['coding_agent.session.duration_ms'], 500);
+  assert.equal(session.attributes['coding_agent.session.subagent_count'], 3);
+});
+
 for (const failure of ['false', 'throw']) {
   test(`AGY Stop keeps its first body and timestamp through ${failure} without replay`, async t => {
     const box = await sandbox(t, steps()), attempts = [];
