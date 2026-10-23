@@ -461,8 +461,21 @@ def _physical_query(configs, dashboard_name, panel_id, start=1000, end=2000):
     dashboard = json.loads(configs[dashboard_name]["content"])
     panel = next(p for p in _all_battery_panels(dashboard["panels"])
                  if p["id"] == panel_id)
+    target = panel["targets"][0]
+    if "panelId" in target:
+        source = next(p for p in _all_battery_panels(dashboard["panels"])
+                      if p["id"] == target["panelId"])
+        target = source["targets"][0]
+    raw_sql = target["rawSql"]
+    if dashboard_name == "grafana-dash-battery" and panel_id in (51, 52):
+        side = "max" if panel_id == 51 else "min"
+        # Match each card's pre-rowsToFields field projection, not the other
+        # card's provenance from the shared raw frame.
+        raw_sql = (f"SELECT vehicle, source, decode_epoch, pack_max, pack_min, "
+                   f"{side}_observed_at AS observed_at, {side}_basis AS basis, "
+                   f"scope_label FROM ({raw_sql}) AS shared_temperature")
     import re as _re
-    query = (panel["targets"][0]["rawSql"].replace("$$", "$")
+    query = (raw_sql.replace("$$", "$")
             .replace("$__timeFilter(window_start)", f"window_start BETWEEN {start} AND {end}")
             .replace("$__timeFilter(mx.event_time)", f"mx.event_time BETWEEN {start} AND {end}")
             .replace("$__timeFilter(mn.event_time)", f"mn.event_time BETWEEN {start} AND {end}")
@@ -816,6 +829,60 @@ def test_calibrated_graphs_render_hourly_samples_beside_verified_raw():
              'calibrated domain=d scope=v/fleet/fleet-v1',
              'fleet-v1', 1700)""")
         assert db.execute(cal).fetchone()[2] is None
+
+
+def test_shared_pack_temperature_preserves_independent_provenance():
+    configs = _grafana_configs()
+    queries = {}
+    for panel in (51, 52):
+        queries[panel], ns, display = _native_ts_query(
+            configs, "grafana-dash-battery", panel)
+    with _battery_db() as db:
+        db.create_function("CONCAT", -1, lambda *parts: "".join(map(str, parts)))
+        db.create_function("NS_TIMESTAMP", 1, ns)
+        db.create_function("TS_DISPLAY", 1, display)
+        for field, time, value in (("ModuleTempMax", 1100, 30),
+                                   ("ModuleTempMin", 1900, 0)):
+            db.execute("""INSERT INTO vehicle_signal
+                (path, event_time, vehicle, source, decode_epoch, source_field,
+                 value_num, unit, quality, ingest_time, envelope_id)
+                VALUES (?, ?, 'v', 'fleet', 'fleet-v1', ?, ?, 'celsius',
+                        'ok', ?, 'raw')""",
+                       (f"Vehicle.Powertrain.TractionBattery.{field}",
+                        time, field, value, time))
+        maximum = db.execute(queries[51]).fetchone()
+        minimum = db.execute(queries[52]).fetchone()
+        assert maximum[3:7] == (30, 0, display(1100), "raw")
+        assert minimum[3:7] == (30, 0, display(1900), "raw")
+        db.execute("UPDATE vehicle_signal SET quality = 'invalid' "
+                   "WHERE source_field = 'ModuleTempMax'")
+        assert db.execute(queries[51]).fetchone()[3:7] == (None, 0, None, None)
+        assert db.execute(queries[52]).fetchone()[3:7] == (None, 0, display(1900), "raw")
+        db.execute("DELETE FROM vehicle_signal WHERE source_field = 'ModuleTempMax'")
+        assert db.execute(queries[51]).fetchone()[3:7] == (None, 0, None, None)
+        assert db.execute(queries[52]).fetchone()[3:7] == (None, 0, display(1900), "raw")
+        db.execute("DELETE FROM vehicle_signal")
+        for metric, identity, value, observed in (
+                ("module_temp_max_c", "a", 31, "1970-01-01 00:00:00.000001100"),
+                ("module_temp_max_c", "b", 32, "1970-01-01 00:00:00.000001200"),
+                ("module_temp_min_c", "a", 2, "1970-01-01 00:00:00.000001900")):
+            db.execute("""INSERT INTO vehicle_analysis
+                (window_start, window_end, vehicle, metric, source, analysis_id,
+                 revision, value, value_text, unit, status, decode_epoch, computed_at)
+                VALUES (1500, 1500, 'v', ?, 'fleet', ?, 'r1', ?, ?,
+                        'celsius', 'derived', 'fleet-v1', 1600)""",
+                       ("battery.conditions." + metric, identity, value, observed))
+        maximum = db.execute(queries[51]).fetchall()
+        minimum = db.execute(queries[52]).fetchall()
+        assert sorted(row[3] for row in maximum) == [31, 32]
+        assert {row[5:7] for row in maximum} == {
+            (display(time), time) for time in (
+                "1970-01-01 00:00:00.000001100",
+                "1970-01-01 00:00:00.000001200")}
+        assert len(minimum) == 2
+        assert {row[4:7] for row in minimum} == {
+            (2, display("1970-01-01 00:00:00.000001900"),
+             "1970-01-01 00:00:00.000001900")}
 
 
 def test_calibrated_extrema_fallback_and_frontier():
@@ -2522,6 +2589,7 @@ if __name__ == "__main__":
     test_physical_cards_latest_analysis_and_new_raw_barriers()
     test_physical_graphs_keep_signed_samples_and_latest_invalid_revision()
     test_raw_physical_cards_never_treat_fleet_scope_as_unit_calibration()
+    test_shared_pack_temperature_preserves_independent_provenance()
     test_calibrated_extrema_fallback_and_frontier()
     test_calibrated_extrema_retained_without_raw_join()
     test_calibrated_graphs_render_hourly_samples_beside_verified_raw()
