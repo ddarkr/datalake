@@ -81,6 +81,111 @@ def daily_limits(path):
         pass
 
 
+def monthly_limits(path):
+    start = g.datetime(2026, 10, 1, 12, tzinfo=g.KST).timestamp()
+    state = dict(version=2, project="monthly-regression", used_bytes=0,
+                 last=None, blocked=False, day=g.day_at(start),
+                 day_used_bytes=0, alerted=[])
+    # Individually safe days must still exhaust the month.
+    with patch.object(g.time, "time", return_value=start):
+        assert not g.observe(state, {"s3": 199_000_000_000})
+    for day in range(1, 12):
+        with patch.object(g.time, "time", return_value=start + day * 86400):
+            assert not g.observe(state, {"s3": (day + 1) * 199_000_000_000})
+    with patch.object(g.time, "time", return_value=start + 12 * 86400):
+        assert g.observe(state, {"s3": 13 * 199_000_000_000})
+        assert state["day_used_bytes"] < g.HARD_BYTES
+        g.latch(path, state, "monthly hard download limit reached")
+        with patch.object(g, "telegram") as sent:
+            g.alert(path, path / "telegram.json", True)
+            assert "월간 다운로드 한도 초과" in sent.call_args.args[1]
+        try:
+            g.main(["--state-dir", str(path), "unblock"])
+            raise AssertionError("monthly limit bypassed")
+        except SystemExit as exc:
+            assert exc.code == 2
+    with patch.object(g.time, "time", return_value=g.datetime(2026, 11, 1, tzinfo=g.KST).timestamp()):
+        g.main(["--state-dir", str(path), "unblock"])
+        restored = g.load(path)
+        assert restored["month"] == "2026-11"
+        assert restored["month_used_bytes"] == restored["day_used_bytes"] == 0
+        assert restored["used_bytes"] == 13 * 199_000_000_000
+        # The first new sample is charged conservatively after a rebind.
+        assert not g.observe(restored, {"s3": 123})
+        assert restored["month_used_bytes"] == 123
+    # Legacy adoption charges known lifetime usage rather than claiming zero.
+    legacy = dict(version=2, project="legacy-month", used_bytes=1234,
+                  last={"s3": 1234}, blocked=False, day="2026-10-01",
+                  day_used_bytes=12, alerted=[])
+    with patch.object(g.time, "time", return_value=start):
+        assert not g.observe(legacy, {"s3": 1235})
+    assert legacy["month_used_bytes"] == 1235
+    g.save(path, legacy)
+    assert g.load(path)["month_used_bytes"] == 1235
+    legacy["month_used_bytes"] = -1
+    g.save(path, legacy)
+    try:
+        g.load(path)
+        raise AssertionError("invalid monthly ledger accepted")
+    except ValueError:
+        pass
+
+
+def storage_limits(path):
+    state = dict(storage_used_bytes=800, storage_limit_bytes=1000)
+    assert not g.observe_storage(state, {"write": 100})
+    assert state["storage_used_bytes"] == 900
+    assert not g.observe_storage(state, {"write": 100})
+    assert g.observe_storage(state, {"write": 200})
+    assert state["storage_used_bytes"] == 1000
+    for bad in ({}, {"write": 199}):
+        try:
+            g.observe_storage(state, bad)
+            raise AssertionError("lost storage accounting accepted")
+        except ValueError:
+            pass
+        assert state["storage_used_bytes"] == 1000
+    try:
+        g.observe_storage({}, {"write": 1})
+        raise AssertionError("unknown inventory accepted")
+    except ValueError:
+        pass
+    g.disk_room({"Mounts": [{"Destination": "/data", "Source": str(path)}]}, 0)
+    try:
+        g.disk_room({"Mounts": [{"Destination": "/data", "Source": str(path)}]}, 2**63)
+        raise AssertionError("free-space floor ignored")
+    except ValueError:
+        pass
+    # Legacy states may be inspected, but never receive a new lease without
+    # an explicit measured baseline.
+    legacy = dict(version=2, project="storage-regression", used_bytes=0,
+                  last=None, blocked=False, day=g.day_at(time.time()),
+                  day_used_bytes=0, alerted=[])
+    g.save(path, legacy)
+    with patch.object(g, "stop") as stopped, patch.object(g, "telegram"), patch.object(g, "notify"), patch.object(g.time, "sleep", side_effect=LookupError):
+        try:
+            g.main(["--state-dir", str(path), "run", "--metrics-url", "http://127.0.0.1:4000/metrics",
+                    "--telegram-config", str(path / "telegram.json")])
+        except LookupError:
+            pass
+        stopped.assert_called_once()
+    assert g.load(path)["blocked"] and (path / "lease").read_text() == "0\n"
+    g.main(["--state-dir", str(path), "unblock", "--storage-used-bytes", "800",
+            "--storage-limit-bytes", "1000"])
+    assert g.load(path)["storage_used_bytes"] == 800
+    # Known disk exhaustion must stop immediately even inside startup grace.
+    instance = {"Id": "synthetic", "State": {"StartedAt": "first"}}
+    with patch.object(g, "docker", return_value=""), patch.object(g, "database", return_value=instance), patch.object(g, "disk_room", side_effect=ValueError("disk full")), patch.object(g, "metrics") as fetched, patch.object(g, "stop") as stopped, patch.object(g, "telegram"), patch.object(g, "notify"), patch.object(g.time, "sleep", side_effect=LookupError):
+        try:
+            g.main(["--state-dir", str(path), "run", "--metrics-url", "http://127.0.0.1:4000/metrics",
+                    "--telegram-config", str(path / "telegram.json")])
+        except LookupError:
+            pass
+        stopped.assert_called_once()
+        fetched.assert_not_called()
+    assert g.load(path)["blocked"] and (path / "lease").read_text() == "0\n"
+
+
 def blocked_alerts(path):
     state = dict(version=2, project="blocked-regression", used_bytes=1000,
                  last=None, blocked=False, day=g.day_at(1000),
@@ -212,7 +317,8 @@ from pathlib import Path
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         body = ('opendal_operation_bytes_sum{scheme="s3",operation="read"} '
-                + Path('/probe/counter').read_text() + '\\n').encode()
+                + Path('/probe/counter').read_text()
+                + '\\nopendal_operation_bytes_sum{scheme="s3",operation="write"} 0\\n').encode()
         self.send_response(200)
         self.end_headers()
         self.wfile.write(body)
@@ -226,6 +332,7 @@ HTTPServer(('0.0.0.0', 4000), Handler).serve_forever()
                  "--label", "com.docker.compose.project=" + project,
                  "--label", "com.docker.compose.service=greptimedb",
                  "-p", "127.0.0.1::4000", "-v", str(path) + ":/probe:ro",
+                 "-v", str(path) + ":/data:ro",
                  "python:3.12.8-slim-bookworm", "python", "-c", server)
         port = json.loads(g.docker("inspect", project))[0]["NetworkSettings"]["Ports"]["4000/tcp"][0]["HostPort"]
         url = "http://127.0.0.1:" + port + "/metrics"
@@ -238,7 +345,8 @@ HTTPServer(('0.0.0.0', 4000), Handler).serve_forever()
                 if time.time() >= deadline:
                     raise
                 time.sleep(0.1)
-        g.main(["--state-dir", str(path), "arm", "--project", project])
+        g.main(["--state-dir", str(path), "arm", "--project", project,
+                "--storage-used-bytes", "0"])
         worker = subprocess.Popen([sys.executable, str(SCRIPT), "--state-dir", str(path),
                                    "run", "--metrics-url", url, "--interval", "0.1",
                                    "--timeout", "1", "--grace", "1",
@@ -278,6 +386,12 @@ def main():
         daily_path = path / "daily"
         daily_path.mkdir(mode=0o700)
         daily_limits(daily_path)
+        monthly_path = path / "monthly"
+        monthly_path.mkdir(mode=0o700)
+        monthly_limits(monthly_path)
+        storage_path = path / "storage"
+        storage_path.mkdir(mode=0o700)
+        storage_limits(storage_path)
         blocked_path = path / "blocked"
         blocked_path.mkdir(mode=0o700)
         blocked_alerts(blocked_path)
@@ -326,7 +440,7 @@ def main():
         assert result.returncode != 0
         assert g.load(path)["used_bytes"] == 60 and g.load(path)["blocked"]
         subprocess.run([sys.executable, str(SCRIPT), "--state-dir", tmp, "unblock",
-                        "--startup-seconds", "1"],
+                        "--startup-seconds", "1", "--storage-used-bytes", "0"],
                        stdout=subprocess.DEVNULL, check=True)
         assert g.load(path)["used_bytes"] == 60 and g.load(path)["instance"] is None
         if "--docker" in sys.argv:
@@ -345,7 +459,8 @@ def main():
                                        "--label", "com.docker.compose.service=greptimedb",
                                        "-e", "GREPTIME_EGRESS_GUARD_ENABLED=" + mode,
                                        "-p", "127.0.0.1::4000", "--entrypoint", entrypoint[0],
-                                       "-v", tmp + ":/egress-guard:ro", image,
+                                       "-v", tmp + ":/egress-guard:ro",
+                                       "-v", tmp + ":/data:ro", image,
                                        *entrypoint[1:], *command], check=True,
                                       stdout=subprocess.DEVNULL)
             g.atomic(path / "lease", str(int(time.time() + 30)) + "\n")

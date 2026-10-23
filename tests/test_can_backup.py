@@ -878,7 +878,61 @@ def test_can_failed_put_persists_cost_report():
         restore_env()
 
 
+def test_can_manifest_loader_boundaries():
+    from tests.test_backup import check_manifest_loader_boundaries
+
+    tmp, _db, _defs, bdir, _rr, _rd, _before, env = fresh_layout("File")
+    try:
+        setenv(env)
+        assert cb.cmd_backup() == 0
+        check_manifest_loader_boundaries(newest_tar(bdir), cb.load_can_archive,
+                                         cb.CAN_MANIFEST)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_can_local_failure_budget_preserves_retained_archive():
+    tmp, _db, _defs, bdir, _rr, _rd, _before, env = fresh_layout("File")
+    try:
+        env["CAN_BACKUP_KEEP"] = "1"
+        setenv(env)
+        path = os.path.join(bdir, cb.CAN_PREFIX + "failed" + cb.CAN_SUFFIX)
+        with open(path, "wb") as stream:
+            stream.write(b"retained failure")
+        assert cb.cmd_backup() == 3
+        with open(path, "rb") as stream:
+            assert stream.read() == b"retained failure"
+        assert [name for name in os.listdir(bdir) if name.endswith(cb.CAN_SUFFIX)] == [os.path.basename(path)]
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_first_run_creates_directory_before_writer_lock():
+    from unittest.mock import patch
+    tmp, _db, _defs, bdir, _rr, _rd, _before, env = fresh_layout("File")
+    real_flock = bk.fcntl.flock
+    acquired = []
+    try:
+        os.rmdir(bdir)
+        setenv(env)
+        def capture(fd, operation):
+            assert os.path.isdir(bdir), "directory must exist before writer locking"
+            acquired.append(fd)
+            return real_flock(fd, operation)
+        with patch.object(bk.fcntl, "flock", side_effect=capture):
+            assert cb.cmd_backup() == 0
+        assert acquired, "first-run backup must not bypass local writer lock"
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
 if __name__ == "__main__":
+    test_first_run_creates_directory_before_writer_lock()
+    test_can_local_failure_budget_preserves_retained_archive()
+    test_can_manifest_loader_boundaries()
     test_file_mode_roundtrip_exact()
     test_uncommitted_write_excluded_and_source_kept()
     test_concurrent_commits_stay_manifest_exact()

@@ -426,18 +426,16 @@ def disk_ok(spool, min_free):
 
 def spool_stats(spool):
     nfiles, nbytes = 0, 0
-    for d in seg_dirs(spool).values():
-        try:
-            names = os.listdir(d)
-        except OSError:
-            continue
-        for name in names:
-            p = os.path.join(d, name)
+    def unreadable(error):
+        raise error
+    for root, dirs, files in os.walk(spool, onerror=unreadable):
+        for name in files:
+            p = os.path.join(root, name)
             try:
                 nbytes += os.path.getsize(p)
                 nfiles += 1
-            except OSError:
-                pass
+            except FileNotFoundError:
+                pass  # uploader acknowledged and removed this file
     return nfiles, nbytes
 
 
@@ -447,6 +445,7 @@ class SegWriter:
     def __init__(self, spool, vehicle, chunk_sec, chunk_bytes,
                  fsync_n, fsync_sec):
         self.dirs = seg_dirs(spool)
+        self.spool = spool
         self.vehicle = vehicle
         self.chunk_sec = chunk_sec
         self.chunk_bytes = chunk_bytes
@@ -464,6 +463,12 @@ class SegWriter:
         self.capture_id = uuid.uuid4().hex[:8]
 
     def _open(self):
+        limit = ei("RAW_SPOOL_MAX_BYTES", 20 << 30)
+        # Reserve the admitted ingress plus its complete finalization headroom.
+        segment = self.chunk_bytes + _LINE_MAX_BYTES
+        reserve = 3 * segment + 2 * _tmp_max_bytes() + (1 << 20)
+        if limit <= 0 or spool_stats(self.spool)[1] + reserve > limit:
+            raise NoSpace("raw spool budget reached; retained history is not deleted")
         adir = self.dirs["active"]
         while True:  # same-second rotations/restarts must not share a stem
             self.nseg += 1
@@ -1165,6 +1170,11 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
             os.unlink(out)
         except OSError:
             pass
+    limit = ei("RAW_SPOOL_MAX_BYTES", 20 << 30)
+    # Workspace, sealed MF4, and gzip sidecar coexist with retained ingress.
+    reserve = 2 * int(tmp_max_bytes) + 2 * os.path.getsize(closed_path) + (1 << 20)
+    if limit <= 0 or spool_stats(spool)[1] + reserve > limit:
+        raise NoSpace("raw spool budget reached; closed ingress retained")
     try:
         store = SortedFrameStore(sealed_dir, stem, mem_frames, tmp_max_bytes)
     except NoSpace:

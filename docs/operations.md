@@ -77,13 +77,15 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 #### 호스트 다운로드 차단기
 
-`scripts/storage/egress_guard.py`는 Compose 밖에서 실행하는 선택적 안전장치입니다. 한국 시간 하루의 DB native S3 read가 **50 GB 이상이면 Telegram 경고만**, **200 GB 이상이면 프로젝트 전체 정지와 긴급 알림**을 실행합니다. GB는 1,000,000,000 byte입니다. 정상 조회와 비정상 반복 다운로드는 구분하지 않습니다. 계측 중단·카운터 초기화·DB 인스턴스 변경도 프로젝트를 중지하고 잠급니다. `backup`, `can-backup`, `raw-uploader`, `redecode`는 DB 계측에 포함되지 않으므로 감시 중 실행하면 프로젝트를 중지합니다. 해당 작업에는 별도로 승인하고 계측하는 유지보수 창이 필요합니다.
+`scripts/storage/egress_guard.py`는 Compose 밖에서 실행하는 선택적 안전장치입니다. 한국 시간 하루의 DB native S3 read가 **50 GB 이상이면 Telegram 경고만**, **200 GB 이상이면 프로젝트 전체 정지와 긴급 알림**을 실행합니다. **KST 달력월 2400 GiB**에 도달해도 정지하며 다음 날 수동 재개로 우회할 수 없습니다. GB는 1,000,000,000 byte, GiB는 1,073,741,824 byte입니다. 정상 조회와 반복 다운로드는 구분하지 않습니다. 계측 중단·카운터 초기화·DB 인스턴스 변경도 프로젝트를 중지하고 잠급니다. `backup`, `can-backup`, `raw-uploader`, `redecode`는 DB 계측에 포함되지 않으므로 감시 중 실행하면 프로젝트를 중지합니다. 해당 작업에는 별도로 승인하고 계측하는 유지보수 창이 필요합니다.
 
 계측 실패의 예외 종류와 메시지는 `state.json`의 `reason`에 함께 보존합니다. `/metrics` 응답 시간은 실제 집계 부하에서 확인하세요. 아래 예시는 timeout 10초를 사용하며, timeout을 늘리면 계측 실패 감지와 정지도 그만큼 늦어집니다. 재시도하거나 계측 공백을 정상으로 간주하지는 않습니다.
 
 **이 장치는 사업자 청구액이나 엄격한 네트워크 바이트 상한을 보장하지 않습니다.** 감지·종료 지연과 호스트/Docker 장애 동안 추가 다운로드가 가능합니다. 월간 합성 CI 예산을 실제 계정의 허용량으로 사용하지 마세요. 자동 GitOps 동기화도 별도로 중지해야 하며, `redeployAfterSync=false`만으로 재기동을 막을 수는 없습니다.
 
-Linux Docker 호스트에서 검증된 스크립트를 `/usr/local/libexec/datalake-egress-guard.py`에 설치하고, root 소유 `0700` 영속 디렉터리를 준비합니다. 사용량·날짜·알림 성공 기록은 프로세스 재시작에도 유지됩니다. 가동 중에는 KST 자정 이후 첫 관측에서 일일 사용량만 초기화하며, 자정을 걸친 관측 증가분은 새 날짜에 전부 합산합니다. 전체 누적값은 보존합니다. 정지된 프로젝트는 자정이 지나도 자동 재개하지 않습니다.
+원본 TTL은 자동으로 줄이지 않습니다. 저장 예산은 `arm` 또는 차단된 상태의 `unblock`에 **새로 측정한 버킷 inventory 바이트**를 `--storage-used-bytes`로 전달해야 시작됩니다. 미확인 값을 0으로 입력하지 마세요. 기존 SDK의 `bucket_inventory()`로 측정할 수 있으며 LIST 비용·동시 쓰기 여부를 먼저 확인하세요. 이 기준값에 native S3 write 증가량을 보수적으로 더하고 삭제량은 빼지 않습니다. 첫 관측·명시적 재바인딩에서는 현재 write counter 전체를 더하므로 기존 객체와 중복 계산될 수 있습니다. 기본 `--storage-limit-bytes`는 1200 GiB이며, 실제 남은 계정 용량이 아닙니다. 저장 예산 도달·write 계측 누락·미확인 기준값은 lease 발급을 막습니다. DB `/data` 볼륨의 여유 공간도 매 관측 확인하며 기본 `--min-free-bytes`는 1 GiB입니다. 폴링·종료 지연 중 초과 쓰기가 가능하고, 외부 비협조 writer·버킷 과거 버전·사업자 청구량은 이 장치의 보장 범위 밖입니다.
+
+Linux Docker 호스트에 스크립트를 설치하고 root 소유 `0700` 영속 디렉터리를 준비합니다. 사용량·날짜·알림 성공 기록은 재시작에도 유지됩니다. KST 자정 이후 첫 관측은 일일 사용량만, 월초 첫 관측은 월간 사용량도 초기화하며 경계를 걸친 증가분은 새 기간에 전부 합산합니다. 전체 누적값은 보존합니다. 정지된 프로젝트는 날짜가 바뀌어도 자동 재개하지 않습니다. 월간 ledger가 없는 기존 version 2 상태는 알려진 lifetime 사용량을 해당 월에 보수적으로 이관합니다. 저장 기준값은 별도로 측정·입력해야 합니다.
 
 Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600` JSON 파일 `/etc/datalake-egress-telegram.json`에 `token`(문자열), `chat_id`(정수)로 저장합니다. 혼동을 막기 위해 설정 확인용 테스트 문자는 보내지 않습니다. 사용량 경고는 단계별 하루 한 번이며, 보호 차단은 사용량과 무관하게 별도의 긴급 알림을 보냅니다. 소프트 경고를 이미 보냈어도 차단 알림은 생략하지 않으며, 정지 미확인에서 정지 확인으로 바뀌면 다시 알립니다. 같은 상태의 전송 실패는 60초 뒤 재시도하고, 수동 재개 뒤 새 차단은 새로 알립니다. 정지는 알림보다 먼저 실행하므로 Telegram 장애가 차단을 지연시키지 않습니다. 원인은 고정된 분류만 전송하며 상세 예외는 호스트의 `state.json`에 남깁니다. 전송 성공 직후 상태 저장 전에 프로세스가 죽으면 중복 알림이 발생할 수 있습니다.
 
@@ -99,12 +101,14 @@ Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600
 install -d -m 700 /var/lib/datalake-egress
 python3 /usr/local/libexec/datalake-egress-guard.py \
   --state-dir /var/lib/datalake-egress arm \
-  --project datalake
+  --project datalake --storage-used-bytes "${STORAGE_USED_BYTES:?측정한 버킷 바이트를 설정하세요}"
 python3 /usr/local/libexec/datalake-egress-guard.py \
   --state-dir /var/lib/datalake-egress trip --project datalake
 ```
 
 실제 Compose 프로젝트 이름을 사용하세요. `.env`에는 `GREPTIME_EGRESS_GUARD_ENABLED=true`, `GREPTIME_EGRESS_GUARD_DIR=/var/lib/datalake-egress`를 설정합니다. 활성화하면 `db-init`뿐 아니라 DB의 매 시작·재생성 때 호스트 감시기가 갱신한 lease를 확인합니다. 유효한 lease가 없으면 DB를 실행하지 않습니다.
+
+기존 설치를 전환할 때는 프로젝트를 차단한 상태에서 fresh inventory를 측정하고 `unblock --storage-used-bytes "$STORAGE_USED_BYTES"`로 저장 ledger를 초기화하세요. 한도에 도달한 저장 ledger는 단순 재개로 지울 수 없습니다. 알려진 기존 데이터를 보존한 채 용량을 확보하거나 승인된 예산을 조정한 후에만 재측정합니다. 월간 사용량은 이 저장 ledger 갱신으로 초기화되지 않습니다. `STORAGE_COST_MAX_MONTHLY_OVERAGE_USD=0`은 여전히 대시보드 정책이며 무료 잔여량의 증명이 아닙니다.
 
 호스트 systemd unit 예시는 다음과 같습니다. URL의 포트는 해당 프로젝트 DB의 실제 loopback 공개 포트여야 합니다.
 
@@ -585,7 +589,7 @@ docker compose --env-file .env up -d
 - S3 SST는 소스 identity로 주소화한 공유 pool에 HEAD → 조건부 서버 측 COPY → HEAD 검증으로 보관합니다. 비교 가능한 서버 checksum은 대조하지만 primary SST의 checksum 부재는 조건부 identity COPY를 허용하며 내용 digest 증명은 아닙니다. 새 per-SST `.json` 없이 검증된 COMPLETE inventory를 guard당 한 번 읽어 재사용하고, 정규 pool 키로 orphan·GC 재시도를 발견합니다. 원본/복사본 전체 GET은 하지 않습니다. archive·sidecar·manifest·완료 표식 PUT은 응답과 HEAD의 명시적 `ChecksumSHA256` 일치를 요구하며 미지원은 로컬을 보존하고 실패합니다(GET fallback 없음). live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
 - backup/retention은 `_locks/` claim으로 직렬화하고 복원은 세대 `refs/`로 참조를 보호합니다. 승인된 retention만 남은 세대가 참조하지 않는 pool 객체를 정리합니다. 강제 종료 시 남은 claim/ref는 자동 만료시키지 않으며, 소유 작업의 종료를 확인하기 전에는 제거하지 마세요. 공급자의 강한 LIST/GET 일관성이 전제입니다.
 - inventory JSON(`manifest.json`의 archive 내/원격 사본과 `COMPLETE`)은 **각각 비압축 UTF-8 64 MiB 이하**여야 합니다. 백업 생성과 로컬·원격 복원에 같은 한도를 적용하며 초과한 백업은 성공으로 보고하지 않습니다. 8,000개 이상의 SST도 이 바이트 한도 안이면 복원할 수 있습니다. checksum sidecar는 1 MiB 이하입니다. JSON 읽기는 한도와 chunk 크기로 제한하고 원격 응답 스트림은 성공·실패 모두 닫습니다. **archive 전체나 SST 데이터 총량에는 이 JSON 한도를 적용하지 않습니다.**
-- `BACKUP_KEEP=7`은 로컬 세대 수입니다. 원격 보존은 기본 `off`이고 별도 승인된 `enforce`만 세대 retirement와 미참조 pool GC를 수행합니다. 강한 LIST 일관성에 의존하는 고유 claim 직렬화에 TTL 탈취는 없으며, unknown/unreadable inventory와 검증 불가 legacy 참조는 삭제를 차단합니다. pin·reader 참조는 보존합니다. [원격 보존 정책](backup-retention.md)을 확인하고 복구 prefix에 임의 만료 lifecycle을 설정하지 마세요.
+- `BACKUP_KEEP=7`과 `CAN_BACKUP_KEEP=7`은 실패 업로드를 포함한 **로컬 보관 세대의 하드 상한**입니다. 성공 뒤 기존 archive를 자동 삭제하지 않고 다음 생성을 거절합니다. 로컬 바이트는 각각 기본 100 GiB, 원격 prefix는 각각 기본 1 TiB이며 `BACKUP_LOCAL_MAX_BYTES`/`BACKUP_REMOTE_MAX_BYTES`, `CAN_BACKUP_LOCAL_MAX_BYTES`/`CAN_BACKUP_REMOTE_MAX_BYTES`로 조정합니다. 원격 publication은 버킷 단위 잠금과 prefix 잠금 아래 inventory·추가 바이트를 검증하고 미확인은 거절합니다. 같은 버킷을 사용하는 publisher는 버킷 잠금을 공유하지만 각 prefix 예산은 별개이므로 총량을 합쳐 용량을 계획하세요. 잠깐 생성하는 lock claim은 제어 오버헤드입니다. 자동 retention 평가·삭제는 없고 별도 승인된 명시적 `retention enforce`만 세대 retirement·미참조 pool GC를 수행합니다. [원격 보존 정책](backup-retention.md)을 확인하고 복구 prefix에 임의 만료 lifecycle을 설정하지 마세요.
 - `storage-cost-budget`은 합성 backup+RAW 비용 모델의 CI 게이트이며 운영 청구·배포 승인이 아닙니다. 정책(`config/cost-budget.json`)은 1200GiB, 월 4회, RAW 200GiB/월을 가정합니다. 가격은 decimal GB(1GB=10^9 bytes)로 계산하고 저장료는 `max($6/월, GB-month×$0.006)`, egress는 고정 1200GiB 기준 3배 allowance 뒤 `$0.01/GB`를 가정합니다. query·restore·other egress=0은 관측된 0이 아닌 모델 입력이며 CAN은 별도 게이트입니다. 계정의 다른 사용량과 실제 요금제·무료 allowance 범위를 확인해야 합니다([가격 출처](https://www.idrive.com/s3-storage-e2/faq-pricing#egress-policy), 정책 확인일 2026-10-14).
 
 ### 새 프로젝트로 복원

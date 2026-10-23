@@ -57,7 +57,7 @@ Behavioral checks (each fails against the named defect, passes fixed):
   only own writes), restore copy-failure own-write rollback, HTTPS-only
   object endpoints, legacy-record refusal, nonempty-target preservation,
   dead force flag, subset/traversal/symlink/torn(sidecar mismatch/identity/
-  prune rules, overlap and missing-S3 fail-closed, incomplete prefixes
+  preserve-all storage limits, overlap and missing-S3 fail-closed, incomplete prefixes
   ignored.
 
 Real S3/MinIO runs are the parent's job (native loopback MinIO + Greptime);
@@ -700,9 +700,14 @@ def test_restore_destination_claim_blocks_reuse_until_rollback():
             else:
                 raise AssertionError("second restore reused uncommitted live SST")
             assert fake.objects["live/a.sst"] == b"a"
-            # A different root does not contend, even while A is rolling back.
-            bk.s3_restore_snapshot(fake, "bucket", "independent/",
-                                   {"snap_prefix": "other-snapshot/"}, records[:1])
+            # Bucket-wide quota reservations serialize even different restore roots.
+            try:
+                bk.s3_restore_snapshot(fake, "bucket", "independent/",
+                                       {"snap_prefix": "other-snapshot/"}, records[:1])
+            except IOError:
+                pass
+            else:
+                raise AssertionError("different root bypassed bucket publication lock")
             raise IOError("second copy failed")
         return copy(**kw)
 
@@ -715,8 +720,10 @@ def test_restore_destination_claim_blocks_reuse_until_rollback():
     else:
         raise AssertionError("copy failure was ignored")
     assert refused == [True]
-    assert fake.objects == dict(original, **{"independent/a.sst": b"a"})
+    assert fake.objects == original
     fake.copy_object = copy
+    bk.s3_restore_snapshot(fake, "bucket", "independent/",
+                           {"snap_prefix": "other-snapshot/"}, records[:1])
     bk.s3_restore_snapshot(fake, "bucket", "live/",
                            {"snap_prefix": "snapshot/"}, records)
     assert fake.objects["live/a.sst"] == b"a"
@@ -1065,7 +1072,7 @@ def test_restore_rejects_identity_change():
         restore_env()
 
 
-def test_prune_never_deletes_just_written():
+def test_full_local_budget_preserves_every_archive():
     tmp, _src, _tgt, bdir, env = fresh_layout("File")
     try:
         env["BACKUP_KEEP"] = "2"
@@ -1074,15 +1081,9 @@ def test_prune_never_deletes_just_written():
                     "greptime-backup-20000102T000000Z.tar.gz"):
             with open(os.path.join(bdir, old), "wb") as f:
                 f.write(b"old")
-        assert bk.cmd_backup() == 0
-        tars = sorted(f for f in os.listdir(bdir) if f.endswith(".tar.gz"))
-        assert len(tars) == 2, tars
-        assert not os.path.isfile(os.path.join(bdir, "greptime-backup-20000101T000000Z.tar.gz"))
-        fresh = [f for f in tars if f not in (
-            "greptime-backup-20000101T000000Z.tar.gz",
-            "greptime-backup-20000102T000000Z.tar.gz")]
-        assert len(fresh) == 1, tars
-        assert os.path.isfile(os.path.join(bdir, fresh[0] + ".sha256"))
+        before = hash_tree(bdir)
+        assert bk.cmd_backup() == 3
+        assert hash_tree(bdir) == before
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
         restore_env()
@@ -2927,8 +2928,15 @@ def test_original_lock_tokens_and_restore_during_writer():
         del fake.objects["test-backups/_locks/stale"]
         fake.objects = {k: v for k, v in fake.objects.items() if not k.startswith("test-root/")}
         with bk.shared_pool_lock(fake, "test-bucket", "test-backups/", token="writer"):
-            assert bk.cmd_restore() == 0
-            assert hash_tree(tgt) == hash_tree(os.path.join(tmp, "src"))
+            held_remote = dict(fake.objects)
+            held_targets = hash_tree(tgt)
+            source_files = hash_tree(os.path.join(tmp, "src"))
+            assert bk.cmd_restore() == 3
+            assert fake.objects == held_remote
+            assert hash_tree(tgt) == held_targets
+            assert hash_tree(os.path.join(tmp, "src")) == source_files
+        assert bk.cmd_restore() == 0
+        assert hash_tree(tgt) == hash_tree(os.path.join(tmp, "src"))
         assert {k: v for k, v in fake.objects.items() if k.startswith("test-root/")} == {
             k: v for k, v in before.items() if k.startswith("test-root/")}
         gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
@@ -3268,7 +3276,183 @@ def test_download_inventory_exception_releases_reader():
         end_retention_run(tmp)
 
 
+def check_manifest_loader_boundaries(path, loader, manifest_name):
+    import gzip
+    import io
+
+    expected, expected_raw, _members, error, code = loader(path)
+    assert error is None and code == 0
+    with tarfile.open(path, "r:gz") as tar:
+        entries = [(m, tar.extractfile(m).read() if m.isfile() else None)
+                   for m in tar]
+    control = next(entry for entry in entries if entry[0].name == manifest_name)
+    others = [entry for entry in entries if entry[0].name != manifest_name]
+    candidate = path + ".boundary"
+    old_cap = bk.CONTROL_CAP
+
+    def write(entries, torn=False):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w:") as tar:
+            for info, payload in entries:
+                tar.addfile(info, io.BytesIO(payload) if payload is not None else None)
+            if torn:
+                offset = tar.offset
+                tail = tarfile.TarInfo(others[0][0].name + "/torn")
+                tail.size = 2048
+                tar.addfile(tail, io.BytesIO(b"x" * tail.size))
+        raw = buffer.getvalue()
+        if torn:
+            raw = raw[:offset + 512 + 10]
+        with open(candidate, "wb") as stream:
+            stream.write(gzip.compress(raw))
+
+    try:
+        for ordered in ([control] + others, others + [control]):
+            write(ordered)
+            manifest, raw, members, error, code = loader(candidate)
+            assert (manifest, raw, error, code) == (expected, expected_raw, None, 0)
+            assert [(m.name, m.size, m.mode, m.type, m.uid, m.gid)
+                    for m in members] == [
+                        (m.name, m.size, m.mode, m.type, m.uid, m.gid)
+                        for m, _ in ordered]
+        write([control] + others, torn=True)
+        result = loader(candidate)
+        assert result[4] == 3 and "torn archive" in result[3]
+        for payload, cap in ((b"{", old_cap), (expected_raw, len(expected_raw) - 1)):
+            info = tarfile.TarInfo(manifest_name)
+            info.size = len(payload)
+            invalid = [(info, payload)] + others
+            bk.CONTROL_CAP = cap
+            write(invalid)
+            result = loader(candidate)
+            assert result[4] == 2 and result[0:3] == (None, None, None)
+            assert ("size limit" if cap < len(payload) else "manifest unreadable") in result[3]
+            write(invalid, torn=True)
+            result = loader(candidate)
+            assert result[4] == 3 and "torn archive" in result[3]
+            for name, kind, text in (
+                    (manifest_name, tarfile.REGTYPE, "duplicate"),
+                    ("../" + manifest_name, tarfile.REGTYPE, "traversal"),
+                    (manifest_name, tarfile.SYMTYPE, "link")):
+                unsafe = tarfile.TarInfo(name)
+                unsafe.type = kind
+                unsafe.linkname = manifest_name
+                write(invalid + [(unsafe, b"" if kind == tarfile.REGTYPE else None)])
+                result = loader(candidate)
+                assert result[4] == 2 and text in result[3], result
+        bk.CONTROL_CAP = len(expected_raw)
+        write(others + [control])
+        assert loader(candidate)[4] == 0  # The exact cap remains valid.
+    finally:
+        bk.CONTROL_CAP = old_cap
+        if os.path.exists(candidate):
+            os.unlink(candidate)
+
+
+def test_manifest_loader_boundaries():
+    tmp, _src, _tgt, bdir, env = fresh_layout("File")
+    try:
+        setenv(env)
+        assert bk.cmd_backup() == 0
+        check_manifest_loader_boundaries(newest_tar(bdir), bk.load_manifest,
+                                         bk.MANIFEST_NAME)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        restore_env()
+
+
+def test_storage_budgets_preserve_history_and_allow_replay():
+    from unittest.mock import patch
+    fake = FakeS3({"backups/old": b"history"})
+    token = bk._POOL_INVENTORY.set({})
+    try:
+        with patch.dict(os.environ, {"BACKUP_REMOTE_MAX_BYTES": "7"}):
+            bk.remote_budget(fake, "bucket", "backups", {"backups/old": 7})
+            before = dict(fake.objects)
+            try:
+                bk.remote_budget(fake, "bucket", "backups", {"backups/new": 1})
+                assert False, "additional bytes must be refused"
+            except IOError:
+                pass
+            assert fake.objects == before
+        bk._POOL_INVENTORY.set({})
+        with patch.object(fake, "list_objects_v2",
+                          return_value={"Contents": [{"Key": "backups/unknown"}]}):
+            try:
+                bk.remote_budget(fake, "bucket", "backups", {})
+                assert False, "unknown Size must fail closed"
+            except IOError:
+                pass
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, bk.BACKUP_PREFIX + "failed" + bk.BACKUP_SUFFIX)
+            with open(path, "wb") as stream:
+                stream.write(b"retained failure")
+            try:
+                bk.local_budget(directory, 1, 1)
+                assert False, "retained failures must consume generation slots"
+            except IOError:
+                pass
+            with open(path, "rb") as stream:
+                assert stream.read() == b"retained failure"
+            with patch.dict(os.environ, {"BACKUP_LOCAL_MAX_BYTES": "8192"}):
+                tmp = os.path.join(directory, "bounded.tmp")
+                try:
+                    with bk.bounded_local_tar(tmp) as tar:
+                        payload = os.urandom(16384)
+                        info = tarfile.TarInfo("payload")
+                        info.size = len(payload)
+                        tar.addfile(info, io.BytesIO(payload))
+                    assert False, "compressed output must be capped before write"
+                except IOError:
+                    pass
+                assert os.path.getsize(tmp) <= 8192 - len(b"retained failure") - 4096
+    finally:
+        bk._POOL_INVENTORY.reset(token)
+
+
+def test_bucket_publication_lock_excludes_different_prefixes():
+    fake = FakeS3({})
+    with bk.shared_pool_lock(fake, "bucket", "backups"):
+        before = dict(fake.objects)
+        try:
+            with bk.shared_pool_lock(fake, "bucket", "_raw_budget"):
+                assert False, "whole-bucket quota must exclude other prefix publishers"
+        except IOError:
+            pass
+        assert fake.objects == before
+    assert fake.objects == {}
+
+
+def test_unpublished_pool_replacement_reserves_growth():
+    from unittest.mock import patch
+    source = b"larger source"
+    fake = FakeS3({"live/a": source})
+    head = bk.s3_head_checksum(fake, "bucket", "live/a")
+    key = bk.shared_sst_key("bucket", "live", "backups", "a", len(source), head["ETag"])
+    fake.objects[key] = b"x"
+    before = dict(fake.objects)
+    guard = bk._POOL_GUARD.set(("bucket", "backups/"))
+    cache = bk._POOL_INVENTORY.set({"pool": {key.rsplit("/", 1)[1]}, "records": {}})
+    try:
+        with patch.dict(os.environ, {"BACKUP_REMOTE_MAX_BYTES": "1"}), \
+                patch.object(fake, "copy_object", wraps=fake.copy_object) as copy:
+            try:
+                bk.shared_sst_record(fake, "bucket", "live", "backups", "a", head, [])
+                assert False, "larger orphan replacement must reserve growth before COPY"
+            except IOError:
+                pass
+            copy.assert_not_called()
+        assert fake.objects == before
+    finally:
+        bk._POOL_INVENTORY.reset(cache)
+        bk._POOL_GUARD.reset(guard)
+
+
 if __name__ == "__main__":
+    test_bucket_publication_lock_excludes_different_prefixes()
+    test_unpublished_pool_replacement_reserves_growth()
+    test_storage_budgets_preserve_history_and_allow_replay()
+    test_manifest_loader_boundaries()
     test_restore_target_locks_alias_overlap_and_process()
     test_restore_owns_targets_before_precheck_and_through_rollback()
     test_ref_acquire_exception_cleanup_preserves_other_readers()
@@ -3312,7 +3496,7 @@ if __name__ == "__main__":
     test_restore_rejects_torn_archive()
     test_restore_rejects_sidecar_mismatch()
     test_restore_rejects_identity_change()
-    test_prune_never_deletes_just_written()
+    test_full_local_budget_preserves_every_archive()
     test_unreadable_live_sst_is_never_overwritten_or_deleted()
     test_restore_destination_claim_blocks_reuse_until_rollback()
     test_restore_claim_partial_put_failure_cleans_up_for_retry()

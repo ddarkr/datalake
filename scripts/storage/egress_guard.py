@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host-only, fail-closed Greptime S3 daily read guard.
+"""Host-only, fail-closed Greptime S3 daily and monthly read guard.
 
 Native counters measure observed OpenDAL reads, not provider billing. Helpers'
 s3_cost retained reports are incomplete lower bounds and are NOT included.
@@ -29,6 +29,9 @@ import uuid
 COVERAGE = "native Greptime OpenDAL S3 read bytes only; helper/account egress NOT covered"
 SOFT_BYTES = 50_000_000_000
 HARD_BYTES = 200_000_000_000
+MONTH_BYTES = 2400 * 1024**3
+STORAGE_BYTES = 1200 * 1024**3
+MIN_FREE_BYTES = 1024**3
 KST = timezone(timedelta(hours=9))
 
 
@@ -37,11 +40,20 @@ def day_at(timestamp):
 
 
 def daily(state, now):
+    # Older v2 states have no monthly ledger. Charge lifetime usage rather than
+    # inventing an unobserved zero balance during migration.
+    state.setdefault("month", state["day"][:7])
+    state.setdefault("month_used_bytes", state["used_bytes"])
     day = day_at(now)
     if day < state["day"]:
         raise ValueError("guard clock moved to an earlier day")
     if day != state["day"]:
         state.update(day=day, day_used_bytes=0, alerted=[], alert_attempt_at=0)
+    month = day[:7]
+    if month < state["month"]:
+        raise ValueError("guard clock moved to an earlier month")
+    if month != state["month"]:
+        state.update(month=month, month_used_bytes=0)
 
 def notify():
     """Notify only after a completed loop; a stalled worker misses watchdog."""
@@ -100,6 +112,20 @@ def load(directory):
             or any(v not in ("soft", "hard") for v in state["alerted"])):
         raise ValueError("invalid persistent guard state")
     datetime.strptime(state["day"], "%Y-%m-%d")
+    if ("month" in state) != ("month_used_bytes" in state):
+        raise ValueError("incomplete persistent monthly ledger")
+    if "month" in state:
+        datetime.strptime(state["month"], "%Y-%m")
+        if (type(state["month_used_bytes"]) is not int
+                or not 0 <= state["month_used_bytes"] <= state["used_bytes"]
+                or state["month"] != state["day"][:7]):
+            raise ValueError("invalid persistent monthly ledger")
+    storage_keys = ("storage_used_bytes", "storage_limit_bytes")
+    if any(k in state for k in storage_keys):
+        if any(type(state.get(k)) is not int or state[k] < 0 for k in storage_keys):
+            raise ValueError("invalid persistent storage budget")
+        if not state["storage_limit_bytes"]:
+            raise ValueError("storage budget must be positive")
     if state["blocked"] and "block_episode" not in state:
         state["block_episode"] = uuid.uuid4().hex
         save(directory, state)
@@ -137,12 +163,37 @@ def observe(state, values):
     state["used_bytes"] += delta
     # Charge a sample straddling midnight to the new day, never discard bytes.
     state["day_used_bytes"] += delta
+    state["month_used_bytes"] += delta
     state["last"] = values
     state["sample_at"] = now
-    return state["day_used_bytes"] >= HARD_BYTES
+    return state["day_used_bytes"] >= HARD_BYTES or state["month_used_bytes"] >= MONTH_BYTES
 
 
-def metrics(url, timeout):
+def observe_storage(state, values):
+    """Conservative storage ceiling: baseline plus writes, never deletion credit."""
+    if "storage_used_bytes" not in state:
+        raise ValueError("storage inventory unknown; provide --storage-used-bytes on arm/unblock")
+    before = state.get("last_write")
+    if not values or (before is not None and (
+            not before.keys() <= values.keys()
+            or any(values[k] < v for k, v in before.items()))):
+        raise ValueError("native S3 write metrics missing or reset")
+    state["storage_used_bytes"] += sum(v - (before or {}).get(k, 0)
+                                       for k, v in values.items())
+    state["last_write"] = values
+    return state["storage_used_bytes"] >= state["storage_limit_bytes"]
+
+
+def disk_room(container, minimum):
+    mounts = [m for m in container.get("Mounts", ()) if m["Destination"] == "/data"]
+    if len(mounts) != 1:
+        raise ValueError("Greptime data volume unknown")
+    usage = os.statvfs(mounts[0]["Source"])
+    if usage.f_bavail * usage.f_frsize < minimum:
+        raise ValueError("Greptime data volume free-space floor reached")
+
+
+def metrics(url, timeout, *, include_writes=False):
     request = urllib.request.Request(url, headers={"Cache-Control": "no-cache"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
         if response.headers.get("Age") not in (None, "0"):
@@ -156,7 +207,8 @@ def metrics(url, timeout):
         if not match:
             continue
         labels = dict(re.findall(r'(\w+)="([^"]*)"', match[2]))
-        if labels.get("operation") != "read" or labels.get("scheme") != "s3":
+        if (labels.get("operation") not in (("read", "write") if include_writes else ("read",))
+                or labels.get("scheme") != "s3"):
             continue
         value = float(match[3])
         if not math.isfinite(value) or value < 0 or not value.is_integer():
@@ -268,6 +320,8 @@ def alert(directory, config, stopped):
         reason = state.get("reason", "")
         cause = {
             "daily hard download limit reached": "일일 다운로드 한도 초과",
+            "monthly hard download limit reached": "월간 다운로드 한도 초과",
+            "storage hard limit reached": "저장 용량 예산 초과",
             "Greptime instance changed": "Greptime 인스턴스 변경",
             "unaccounted S3 helper running": "계측 외 S3 작업 감지",
             "explicit trip / monitor stopped": "명시적 차단 / 모니터 종료",
@@ -276,7 +330,9 @@ def alert(directory, config, stopped):
             action = f"보호 차단: {cause}\n{action}"
         text = (f"[Datalake {'긴급' if blocked or level == 'hard' else '주의'}]\n"
                 f"{day} KST S3 다운로드 {state['day_used_bytes'] / 1e9:.3f} GB\n"
-                f"소프트 50 GB / 하드 200 GB (일일)\n{action}\n"
+                f"소프트 50 GB / 하드 200 GB (일일)\n"
+                f"월간 {state.get('month_used_bytes', state['used_bytes']) / 1024**3:.3f}"
+                f" / {MONTH_BYTES / 1024**3:.0f} GiB\n{action}\n"
                 "Greptime 계측 기준이며 공급자 청구량과 다를 수 있습니다.")
     try:
         telegram(config, text)
@@ -301,6 +357,9 @@ def main(argv=None):
     for name in ("arm", "unblock"):
         p = sub.add_parser(name)
         p.add_argument("--startup-seconds", type=int, default=30)
+        p.add_argument("--storage-used-bytes", type=int,
+                       help="fresh measured bucket inventory; required before the first run")
+        p.add_argument("--storage-limit-bytes", type=int, default=STORAGE_BYTES)
         if name == "arm":
             p.add_argument("--project", required=True)
     sub.add_parser("status")
@@ -316,6 +375,7 @@ def main(argv=None):
     run.add_argument("--timeout", type=float, default=3)
     run.add_argument("--grace", type=int, default=10)
     run.add_argument("--telegram-config", required=True, type=Path)
+    run.add_argument("--min-free-bytes", type=int, default=MIN_FREE_BYTES)
     args = parser.parse_args(argv)
     directory = args.state_dir.resolve()
     if hasattr(args, "grace") and not 0 <= args.grace <= 60:
@@ -356,8 +416,21 @@ def main(argv=None):
             state = load(directory)
         if args.command in ("arm", "unblock"):
             daily(state, time.time())
-            if state["day_used_bytes"] >= HARD_BYTES or not 1 <= args.startup_seconds <= 120:
-                parser.error("daily hard limit reached or startup seconds outside 1..120")
+            if args.storage_used_bytes is not None:
+                if (args.storage_used_bytes < 0 or args.storage_limit_bytes <= 0
+                        or args.storage_used_bytes >= args.storage_limit_bytes):
+                    parser.error("storage inventory must be nonnegative and below its positive budget")
+                if args.command == "unblock" and not state["blocked"]:
+                    parser.error("storage baseline may only change while blocked")
+                state.update(storage_used_bytes=args.storage_used_bytes,
+                             storage_limit_bytes=args.storage_limit_bytes, last_write=None)
+            if ("storage_used_bytes" in state
+                    and state["storage_used_bytes"] >= state["storage_limit_bytes"]):
+                parser.error("storage hard limit reached; fresh inventory required")
+            if (state["day_used_bytes"] >= HARD_BYTES
+                    or state["month_used_bytes"] >= MONTH_BYTES
+                    or not 1 <= args.startup_seconds <= 120):
+                parser.error("daily/monthly hard limit reached or startup seconds outside 1..120")
             if args.command == "unblock" and not state["blocked"]:
                 parser.error("not blocked")
             # Explicit authorization after reset starts a new baseline, charging
@@ -365,6 +438,7 @@ def main(argv=None):
             revoke(directory)
             state.update(blocked=False, reason="authorized",
                          last=None, instance=None, startup_until=time.time() + args.startup_seconds)
+            state["last_write"] = None
             for key in ("block_episode", "block_alerted", "block_alert_attempt_at", "block_alert_attempt_level"):
                 state.pop(key, None)
             save(directory, state)
@@ -373,8 +447,9 @@ def main(argv=None):
             print(json.dumps(dict(state, coverage=COVERAGE), sort_keys=True))
     if args.command != "run":
         return
-    if args.interval <= 0 or args.timeout <= 0 or args.interval + args.timeout > 30:
-        parser.error("positive polling/timeout, combined maximum 30 seconds")
+    if (args.interval <= 0 or args.timeout <= 0 or args.interval + args.timeout > 30
+            or args.min_free_bytes < MIN_FREE_BYTES):
+        parser.error("positive polling/timeout, combined maximum 30 seconds; minimum free space 1 GiB")
     # Separate process lock prevents two monitor instances without blocking trip.
     with (directory / "monitor.lock").open("a") as worker:
         fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -382,6 +457,8 @@ def main(argv=None):
             with locked(directory):
                 state = load(directory)
                 containers = []
+                if not state["blocked"] and "storage_used_bytes" not in state:
+                    latch(directory, state, "storage inventory unknown")
                 if not state["blocked"]:
                     ids = docker("ps", "-q", "--filter",
                                  "label=com.docker.compose.project=" + state["project"]).split()
@@ -401,11 +478,30 @@ def main(argv=None):
                         except ValueError:
                             latch(directory, state, "Greptime instance changed")
                             raise
-                        values = metrics(args.metrics_url, args.timeout)
+                        try:
+                            disk_room(container, args.min_free_bytes)
+                        except (OSError, ValueError):
+                            # Startup grace permits missing metrics, never an
+                            # already-known full or uninspectable data volume.
+                            latch(directory, state, "local storage unavailable or full")
+                            raise
+                        all_values = metrics(args.metrics_url, args.timeout, include_writes=True)
+                        values = {k: v for k, v in all_values.items()
+                                  if json.loads(k)["operation"] == "read"}
+                        writes = {k: v for k, v in all_values.items()
+                                  if json.loads(k)["operation"] == "write"}
+                        if not values:
+                            raise ValueError("native S3 read metrics missing")
                         if state.get("sample_at") and state.get("last") is not None and time.time() - state["sample_at"] > args.interval + args.timeout + 5:
                             raise ValueError("monitor observation gap")
-                        if observe(state, values):
-                            latch(directory, state, "daily hard download limit reached")
+                        storage_full = observe_storage(state, writes)
+                        download_full = observe(state, values)
+                        if storage_full or download_full:
+                            reason = ("storage hard limit reached" if storage_full else
+                                      "monthly hard download limit reached"
+                                      if state["month_used_bytes"] >= MONTH_BYTES
+                                      else "daily hard download limit reached")
+                            latch(directory, state, reason)
                         else:
                             save(directory, state)
                     except Exception as exc:

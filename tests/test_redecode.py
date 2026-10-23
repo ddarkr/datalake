@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 import urllib.request
+from unittest import mock
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from scripts.vehicle import vss_recorder as vr
@@ -321,13 +322,153 @@ class RedecodeTest(unittest.TestCase):
                         "s3.invalid", "http://127.0.0.1:9000"):
                 os.environ["RAW_S3_ENDPOINT_URL"] = bad
                 with self.assertRaises(SystemExit, msg=bad):
-                    rd.fetch_bytes("s3://b/k")
+                    rd.fetch_file("s3://b/k", os.path.join(self._tmp.name, "download"))
         finally:
             for k, v in old.items():
                 if v is None:
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    def test_remote_stream_verified_triple_and_failed_downloads_preserve_workdir(self):
+        import contextlib
+        import http.server
+        import io
+        import threading
+
+        root = os.path.dirname(self.mf4)
+        class Handler(http.server.SimpleHTTPRequestHandler):
+            overstate_length = False
+
+            def send_header(self, keyword, value):
+                if (self.overstate_length and keyword.lower() == "content-length"
+                        and self.path.split("?")[0].endswith(".mf4")):
+                    value = str(int(value) + 1)
+                super().send_header(keyword, value)
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, directory=root, **kwargs)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(thread.join)
+        self.addCleanup(server.shutdown)
+        url = f"http://127.0.0.1:{server.server_port}/in.mf4"
+        work = os.path.join(self._tmp.name, "remote-work")
+        os.mkdir(work)
+        existing = {}
+        for name in ("in.mf4", "in.mf4.manifest.json", "in.ingress.jsonl.gz"):
+            path = os.path.join(work, name)
+            existing[path] = b"keep existing " + name.encode()
+            with open(path, "wb") as fh:
+                fh.write(existing[path])
+        env = {"REDECODE_INPUT_URL": url + "?signature=secret",
+               "REDECODE_INPUT_SHA256": sha_file(self.mf4),
+               "REDECODE_INPUT_MANIFEST_URL": "",
+               "REDECODE_INPUT_SIDECAR_URL": ""}
+        with mock.patch.dict(os.environ, env):
+            [(path, frames)] = rd.resolve_inputs(work)
+            self.assertEqual(frames, self.frames)
+            self.assertEqual(sha_file(path), sha_file(self.mf4))
+            self.assertEqual(list(rd.iter_frames(path, frames)),
+                             list(rd.iter_frames(self.mf4, self.frames)))
+            baseline = sorted(os.listdir(work))
+            real_open = urllib.request.urlopen
+
+            class BrokenRead:
+                reads = 0
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    pass
+
+                def read(self, size):
+                    self.reads += 1
+                    if self.reads == 1:
+                        return b"{"
+                    raise OSError("read failed at " + env["REDECODE_INPUT_URL"])
+
+            def read_failure(source, **kwargs):
+                if ".manifest.json" in source:
+                    return BrokenRead()
+                return real_open(source, **kwargs)
+
+            for failure in ("read", "short-header", "truncated", "checksum", "manifest", "sidecar"):
+                with self.subTest(failure=failure), contextlib.ExitStack() as stack:
+                    if failure == "read":
+                        stack.enter_context(mock.patch.object(
+                            rd.urllib.request, "urlopen", side_effect=read_failure))
+                    elif failure == "short-header":
+                        Handler.overstate_length = True
+                        stack.callback(setattr, Handler, "overstate_length", False)
+                    elif failure == "truncated":
+                        def truncated(source, **kwargs):
+                            if source.split("?")[0].endswith(".mf4"):
+                                return io.BytesIO(b"truncated MF4")
+                            return real_open(source, **kwargs)
+                        stack.enter_context(mock.patch.object(
+                            rd.urllib.request, "urlopen", side_effect=truncated))
+                    elif failure == "checksum":
+                        stack.enter_context(mock.patch.dict(
+                            os.environ, {"REDECODE_INPUT_SHA256": "0" * 64}))
+                    elif failure == "manifest":
+                        bad = os.path.join(root, "bad.manifest.json")
+                        with open(self.mf4 + ".manifest.json", encoding="utf-8") as fh:
+                            manifest = json.load(fh)
+                        manifest["mf4_sha256"] = "0" * 64
+                        with open(bad, "w", encoding="utf-8") as fh:
+                            json.dump(manifest, fh)
+                        stack.enter_context(mock.patch.dict(os.environ, {
+                            "REDECODE_INPUT_MANIFEST_URL":
+                            url.rsplit("/", 1)[0] + "/bad.manifest.json"}))
+                    else:
+                        stack.enter_context(mock.patch.dict(os.environ, {
+                            "REDECODE_INPUT_SIDECAR_URL": url}))
+                    stderr = stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+                    with self.assertRaises(SystemExit):
+                        rd.resolve_inputs(work)
+                    self.assertNotIn("signature=secret", stderr.getvalue())
+                    self.assertEqual(sorted(os.listdir(work)), baseline)
+                    for old_path, content in existing.items():
+                        with open(old_path, "rb") as fh:
+                            self.assertEqual(fh.read(), content)
+            outbox = os.path.join(self._tmp.name, "remote-outbox.sqlite")
+            cli_env = {
+                "REDECODE_VEHICLE_ID": "smoke-veh",
+                "REDECODE_DECODE_EPOCH": EPOCH1,
+                "REDECODE_WORKDIR": work,
+                "REDECODE_OUTBOX_PATH": outbox,
+                "MANIFEST_PATH": self.manifest, "MAPPING_PATH": self.mapping,
+                "DBC_PRIMARY_PATH": self.dbcs[0],
+                "DBC_SUPPLEMENTAL_PATH": self.dbcs[1],
+                "GREPTIME_HTTP_URL": url.rsplit("/", 1)[0],
+                "GREPTIME_DB": "synthetic", "GREPTIME_USER": "synthetic",
+                "GREPTIME_PASSWORD": "synthetic"}
+            with mock.patch.dict(os.environ, cli_env), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                # This HTTP server rejects SQL POSTs: cleanup must not discard
+                # decoded rows awaiting a real database acknowledgment.
+                self.assertEqual(rd.main(), 1)
+                self.assertEqual(sorted(os.listdir(work)), baseline)
+                conn = vr.open_outbox(outbox)
+                try:
+                    pending = rows_by_path(conn)
+                    self.assertEqual(sum(map(len, pending.values())), 8)
+                    self.assertEqual(sorted({row[0] for rows in pending.values()
+                                             for row in rows}), self.twall)
+                finally:
+                    conn.close()
+                with mock.patch.dict(os.environ, {
+                        "REDECODE_DECODE_EPOCH": "wrong-generation"}):
+                    with self.assertRaises(SystemExit):
+                        rd.main()
+                self.assertEqual(sorted(os.listdir(work)), baseline)
 
     def test_resolve_spool_verifies_and_returns_exact_times(self):
         import shutil

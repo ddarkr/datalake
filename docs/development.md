@@ -108,6 +108,42 @@ Node suite는 임시 private home/state와 합성 loopback HTTP를 사용합니�
 - OMP·OpenCode의 이벤트 처리는 HTTP를 기다리지 않고, 정상 cleanup은 진행 중 요청을 기다립니다. 단기 Codex·Claude·AGY 훅은 전송 완료나 timeout 뒤 종료합니다.
 - 관측 checkpoint·숫자 사용량 baseline과 중복 시도 방지를 확인합니다. checkpoint는 collector 저장 증거가 아닙니다. 기존 큐는 재생·변경하지 않고 새 전송 큐를 만들지 않아야 합니다.
 - 메타데이터 checkpoint 잠금의 live owner 보존·죽은 owner 회수·symlink/hardlink 거부를 확인합니다. PID 재사용 fixture는 실제 OS PID 재사용을 강제한 검사가 아닙니다.
+- Claude 직접 전송은 최대 4개씩 진행하고, 훅 시작부터 monotonic 3초 HTTP 예산을
+  남은 wave에 나눕니다. 설정 timeout이 30초여도 wave 상한을 넘지 않습니다.
+  예산 소진으로 시작하지 못한 이벤트에는 attempt receipt를 쓰지 않고 transcript
+  checkpoint를 전진시키지 않습니다. 이미 시도한 이벤트는 재전송하지 않습니다.
+- Trace privacy 서버는 socket worker 16개·동시 forward 8개로 제한하며 초과 요청은
+  503으로 거절합니다. 기존 body 제한·이벤트/link 제거·인증 전달을 유지합니다.
+  upstream과 socket의 10초는 I/O timeout이지 전체 요청의 절대 deadline이 아닙니다.
+  느린 forward 중 metrics용 worker 여유는 두지만 모든 socket의 slow-client 점유까지
+  무응답이 없다고 보장하지 않습니다.
+
+Lightweight 회귀는 다음 실행 경로를 포함합니다.
+
+```bash
+python -m tests.test_egress_guard
+python -m tests.test_ai_incremental
+python -m tests.test_activity
+python -m tests.test_battery_runtime
+python -m tests.test_vehicle_aggregate
+python -m tests.test_trace_privacy
+python -m tests.test_backup
+python -m tests.test_can_backup
+python -m tests.test_raw
+python -m tests.test_storage_cost_budget
+python -m tests.test_storage_cost_benchmark
+node --test tests/test_plugin_*.mjs
+# Docker가 실행 중인 Linux 호스트: 실제 lease/정지 경로까지 검사
+python -m tests.test_egress_guard --docker
+```
+
+수정된 전체 복구 검사는 수집·정규화·출력 중 실패 뒤 임시 SQLite 폐기와 fence 보존,
+재시도한 네 파생 출력의 oracle 일치를 확인합니다. CAN은 200,001개 완료 이력 뒤의
+오래된 새 generation·500개 배치·coordination table 누락 실패를 검사합니다.
+배터리는 기본 30개 창의 fetch 3회와 늦은 입력 재조회, 다섯 분석기의 준비된 신호
+재사용 결과를 확인합니다. 새 바이트 예산은 기존 데이터 보존·미확인 inventory 거절·
+실패 archive 슬롯·orphan COPY 증가·버킷 잠금·RAW finalization 여유를 검증합니다.
+합성 모델은 실제 provider 청구·운영 배포 증거가 아닙니다.
 
 callback/installer fixture와 실제 native host smoke는 별도 gate입니다. 이전 macOS native host smoke에서 ACK 전에 부모가 종료하고 별도 sender가 나중에 전달한 결과는 구 영속 전송 구현의 기록이며 현재 직접 전송의 증거가 아닙니다. 현재 직접 전송의 회귀·loopback 검증도 사용자 설치·재시작, 운영 DB 저장·집계, provider 청구, 모든 native host 경로를 증명하지 않습니다.
 

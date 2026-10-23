@@ -40,6 +40,8 @@ import hashlib
 import json
 import os
 import sys
+import shutil
+import tempfile
 import time
 import urllib.request
 
@@ -61,9 +63,8 @@ def fail(msg, code=2):
     raise SystemExit(code)
 
 
-def fetch_bytes(url):
-    """Actual fetch: s3:// via boto3 with explicit RAW_S3_* credentials
-    (HTTPS endpoint gate, same policy as raw_upload.make_client), else plain HTTPS GET."""
+def fetch_file(url, path):
+    """Stream one remote object to a file; callers own partial-file cleanup."""
     if url.startswith("s3://"):
         import boto3  # noqa: pinned dep, lazy so import errors stay local
         import urllib.parse as _up
@@ -75,19 +76,22 @@ def fetch_bytes(url):
         rest = url[len("s3://"):]
         bucket, _, key = rest.partition("/")
         if not bucket or not key:
-            fail("bad s3 url: " + url)
-        import io
+            fail("bad s3 input URL")
         cli = boto3.client(
             "s3", endpoint_url=endpoint,
             region_name=e("RAW_S3_REGION") or None,
             aws_access_key_id=e("RAW_S3_ACCESS_KEY_ID") or None,
             aws_secret_access_key=e("RAW_S3_SECRET_ACCESS_KEY") or None,
             config=Config(connect_timeout=10, read_timeout=60))
-        buf = io.BytesIO()
-        cli.download_fileobj(bucket, key, buf)
-        return buf.getvalue()
-    with urllib.request.urlopen(url, timeout=120) as r:
-        return r.read()
+        with open(path, "wb") as fh:
+            cli.download_fileobj(bucket, key, fh)
+        return
+    with urllib.request.urlopen(url, timeout=120) as response:
+        with open(path, "wb") as fh:
+            shutil.copyfileobj(response, fh, length=1 << 20)
+            # Bounded HTTPResponse.read() does not raise on a short body.
+            if getattr(response, "length", None):
+                raise OSError("incomplete HTTP download")
 
 
 def sha256_file(path):
@@ -200,19 +204,6 @@ def verify_sealed_triple(mf4_path):
     return man, frames
 
 
-def fetch_all(urls):
-    """Download each URL or fail closed naming the leg."""
-    blobs = []
-    for url in urls:
-        try:
-            blobs.append(fetch_bytes(url))
-        except SystemExit:
-            raise
-        except Exception as ex:
-            fail(f"input download failed ({url}): {ex}")
-    return blobs
-
-
 def resolve_inputs(workdir):
     """Return [(mf4_path, frames)]: every input hash-verified against
     its capture manifest + raw-ingress sidecar before decode.
@@ -232,28 +223,37 @@ def resolve_inputs(workdir):
             or derived_man
         car_url = e("REDECODE_INPUT_SIDECAR_URL", "").strip() \
             or derived_car
-        mf4_blob, man_blob, car_blob = fetch_all([url, man_url, car_url])
-        got = hashlib.sha256(mf4_blob).hexdigest()
-        if got.lower() != want.lower():
-            fail(f"input SHA256 mismatch: want {want} got {got}")
         os.makedirs(workdir, exist_ok=True)
-        dest = os.path.join(workdir, stem + ".mf4")
-        sidecar_dest = os.path.join(workdir, stem + ".ingress.jsonl.gz")
         try:
-            with open(dest, "wb") as f:
-                f.write(mf4_blob)
-            with open(dest + ".manifest.json", "wb") as f:
-                f.write(man_blob)
-            with open(sidecar_dest, "wb") as f:
-                f.write(car_blob)
+            with tempfile.TemporaryDirectory(prefix=".redecode-", dir=workdir) as stage:
+                triple = os.path.join(stage, "triple")
+                os.mkdir(triple, mode=0o700)
+                dest = os.path.join(triple, stem + ".mf4")
+                sidecar = os.path.join(triple, stem + ".ingress.jsonl.gz")
+                for leg, source, target in (
+                        ("MF4", url, dest),
+                        ("manifest", man_url, dest + ".manifest.json"),
+                        ("sidecar", car_url, sidecar)):
+                    try:
+                        fetch_file(source, target)
+                    except SystemExit:
+                        raise
+                    except Exception as ex:
+                        # Exception text can contain presigned URL credentials.
+                        fail(f"input {leg} download failed ({type(ex).__name__})")
+                got = sha256_file(dest)
+                if got.lower() != want.lower():
+                    fail(f"input SHA256 mismatch: want {want} got {got}")
+                man, frames = verify_sealed_triple(dest)
+                if man["mf4_sha256"].lower() != want.lower():
+                    fail("capture manifest pin differs from REDECODE_INPUT_SHA256")
+                # Publish the complete verified directory, never overwrite a
+                # caller's existing triple or expose a partly promoted one.
+                published = stage + ".verified"
+                os.rename(triple, published)
+                return [(os.path.join(published, stem + ".mf4"), frames)]
         except OSError as ex:
-            fail(f"cannot stage remote triple in {workdir}: {ex}")
-        man, frames = verify_sealed_triple(dest)
-        # Pin the manifest to the caller checksum too: a swapped manifest
-        # claiming another MF4 must not pass on hash equality alone.
-        if man["mf4_sha256"].lower() != want.lower():
-            fail("capture manifest pin differs from REDECODE_INPUT_SHA256")
-        return [(dest, frames)]
+            fail(f"cannot stage remote triple ({type(ex).__name__})")
     spool = e("REDECODE_SPOOL_DIR", "/spool/raw")
     cands = sorted(glob.glob(os.path.join(spool, "sealed", "*.mf4")))
     if not cands:
@@ -429,55 +429,63 @@ def main(argv=None):
     batch = vr._positive_int(
         "REDECODE_BATCH_N", e("REDECODE_BATCH_N", "500"), 500)
     inputs = resolve_inputs(e("REDECODE_WORKDIR", "/tmp/redecode"))
-    manifest = check_vehicle_artifacts(manifest_path, mapping_path, dbc_files)
-    if manifest.get("decode_epoch") != epoch:
-        fail("selected generation differs from REDECODE_DECODE_EPOCH")
-    # Decode only against verified provenance: read the meta pins now
-    # that the bytes are known good (a stale reader must not label rows
-    # the hashes just rejected).
+    remote_dir = os.path.dirname(inputs[0][0]) if e("REDECODE_INPUT_URL", "").strip() else None
     try:
-        meta = vr.load_manifest(manifest_path)
-    except Exception as ex:
-        fail(f"cannot read manifest {manifest_path}: {ex}")
-    if not isinstance(meta, dict):
-        fail(f"cannot read manifest {manifest_path}: not a mapping")
-    # The immutable generation supplies the epoch, never relabel its bytes.
-    meta["collector_version"] = (
-        e("REDECODE_COLLECTOR_VERSION", "").strip()
-        or ((e("COLLECTOR_VERSION", "vss-recorder-1").strip()
-             or "vss-recorder-1") + "-redecode"))
-    try:
-        _, units = vr.mapped_paths(mapping_path)
-    except Exception as ex:
-        fail(f"cannot read mapping {mapping_path}: {ex}")
-    mapper = load_mapper(mapping_path, dbc_files)
-    if not mapper.has_dbc2vss_mapping():
-        fail(f"mapping defines no dbc2vss signals: {mapping_path}")
-    outbox_path = e("REDECODE_OUTBOX_PATH", "/data/redecode-outbox.sqlite")
-    conn = vr.open_outbox(outbox_path)
-    last = {}
-    total, skipped = 0, 0
-    for path, capture_frames in inputs:
-        n, s = redecode_mf4(path, mapper, vehicle, epoch, meta, units,
-                             conn, last, capture_frames)
-        total, skipped = total + n, skipped + s
-        print(f"redecode: file={os.path.basename(path)} "
-              f"stored={n} skipped={s} epoch={epoch}")
-    uploaded = 0
-    while True:
+        manifest = check_vehicle_artifacts(manifest_path, mapping_path, dbc_files)
+        if manifest.get("decode_epoch") != epoch:
+            fail("selected generation differs from REDECODE_DECODE_EPOCH")
+        # Decode only against verified provenance: read the meta pins now
+        # that the bytes are known good (a stale reader must not label rows
+        # the hashes just rejected).
         try:
-            n = vr.upload_once(conn, "vehicle_signal", base_url, db,
-                               user, password, batch)
+            meta = vr.load_manifest(manifest_path)
         except Exception as ex:
-            print(f"redecode: upload failed, outbox kept at {outbox_path}: "
-                  f"{ex}")
-            return 1
-        if not n:
-            break
-        uploaded += n
-    print(f"redecode: done files={len(inputs)} stored={total} "
-          f"uploaded={uploaded} skipped={skipped} epoch={epoch}")
-    return 0
+            fail(f"cannot read manifest {manifest_path}: {ex}")
+        if not isinstance(meta, dict):
+            fail(f"cannot read manifest {manifest_path}: not a mapping")
+        # The immutable generation supplies the epoch, never relabel its bytes.
+        meta["collector_version"] = (
+            e("REDECODE_COLLECTOR_VERSION", "").strip()
+            or ((e("COLLECTOR_VERSION", "vss-recorder-1").strip()
+                 or "vss-recorder-1") + "-redecode"))
+        try:
+            _, units = vr.mapped_paths(mapping_path)
+        except Exception as ex:
+            fail(f"cannot read mapping {mapping_path}: {ex}")
+        mapper = load_mapper(mapping_path, dbc_files)
+        if not mapper.has_dbc2vss_mapping():
+            fail(f"mapping defines no dbc2vss signals: {mapping_path}")
+        outbox_path = e("REDECODE_OUTBOX_PATH", "/data/redecode-outbox.sqlite")
+        conn = vr.open_outbox(outbox_path)
+        last = {}
+        total, skipped = 0, 0
+        for path, capture_frames in inputs:
+            n, s = redecode_mf4(path, mapper, vehicle, epoch, meta, units,
+                                 conn, last, capture_frames)
+            total, skipped = total + n, skipped + s
+            print(f"redecode: file={os.path.basename(path)} "
+                  f"stored={n} skipped={s} epoch={epoch}")
+        uploaded = 0
+        while True:
+            try:
+                n = vr.upload_once(conn, "vehicle_signal", base_url, db,
+                                   user, password, batch)
+            except Exception as ex:
+                print(f"redecode: upload failed, outbox kept at {outbox_path}: "
+                      f"{ex}")
+                return 1
+            if not n:
+                break
+            uploaded += n
+        print(f"redecode: done files={len(inputs)} stored={total} "
+              f"uploaded={uploaded} skipped={skipped} epoch={epoch}")
+        return 0
+    finally:
+        if remote_dir is not None:
+            try:
+                shutil.rmtree(remote_dir)
+            except OSError as ex:
+                sys.stderr.write(f"redecode: temporary input cleanup failed ({type(ex).__name__})\n")
 
 
 if __name__ == "__main__":

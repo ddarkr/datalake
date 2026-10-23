@@ -478,24 +478,16 @@ def check_member_set(members, manifest):
 def load_can_archive(path):
     """Returns (manifest, raw_bytes, members, errmsg, errcode)."""
     try:
-        with tarfile.open(path, "r:gz") as tar:
-            members = tar.getmembers()
+        members, raw, error, code = bk.scan_archive_manifest(path, CAN_MANIFEST)
     except Exception as e:
         return None, None, None, "backup unreadable (torn archive?): " \
             + str(e)[:200], 3
     problem = validate_members_structural(members)
     if problem is not None:
         return None, None, None, problem, 2
+    if error is not None:
+        return None, None, None, error, code
     try:
-        with tarfile.open(path, "r:gz") as tar:
-            info = tar.getmember(CAN_MANIFEST)
-            if info.size > bk.CONTROL_CAP:
-                return None, None, None, \
-                    "manifest exceeds control size limit (refusing)", 2
-            with tar.extractfile(CAN_MANIFEST) as stream:
-                raw = bk.read_control(stream, bk.CONTROL_CAP, CAN_MANIFEST)
-            if len(raw) != info.size:
-                return None, None, None, "manifest short read (torn archive?)", 3
         manifest = json.loads(raw.decode("utf-8"))
     except Exception as e:
         return None, None, None, "backup manifest unreadable: " \
@@ -546,7 +538,7 @@ def write_can_tar(d, name, db_copy, staged_defs, manifest):
     path = os.path.join(d, name)
     tmp = path + ".tmp"
     try:
-        with tarfile.open(tmp, "w:gz", format=tarfile.PAX_FORMAT) as tar:
+        with bk.bounded_local_tar(tmp, var="CAN_BACKUP_LOCAL_MAX_BYTES") as tar:
             info = tarfile.TarInfo(CAN_ARCHIVE)
             info.size = os.path.getsize(db_copy)
             info.mode = 0o600
@@ -584,11 +576,6 @@ def write_can_tar(d, name, db_copy, staged_defs, manifest):
             pass
         raise IOError("backup write failed: " + str(e)[:200])
     return path, digest, raw_manifest
-
-
-def prune_local(d, path, keep):
-    return bk.prune_local(d, path, keep, prefix=CAN_PREFIX,
-                          suffix=CAN_SUFFIX, sidecar_suffix=CAN_SIDECAR)
 
 
 def cmd_backup():
@@ -632,10 +619,14 @@ def cmd_backup():
         bp = bk.norm_prefix(ident["backup_prefix"])
         try:
             s3 = make_client()
+            bk.remote_budget(s3, bucket, bp, {}, var="CAN_BACKUP_REMOTE_MAX_BYTES")
         except Exception as e:
             return bk.fail("S3 client failed: " + str(e)[:200], code=3)
     try:
         est = _source_estimate(src, ddefs)
+        bk.local_budget(d, 2 * est + 2 * bk.CONTROL_CAP, keep,
+                        prefix=CAN_PREFIX, suffix=CAN_SUFFIX,
+                        var="CAN_BACKUP_LOCAL_MAX_BYTES")
         need = 2 * est + reserve
         if _free(d) < need:
             return bk.fail("backup refused: insufficient space in %s (need %d)"
@@ -734,6 +725,10 @@ def cmd_backup():
             if len(complete) > bk.CONTROL_CAP:
                 raise IOError("COMPLETE exceeds control size limit (%d bytes)"
                               % bk.CONTROL_CAP)
+            bk.remote_budget(s3, bucket, bp, {
+                rbase + name: tar_size, rbase + name + CAN_SIDECAR: len(sidecar),
+                rbase + CAN_MANIFEST: len(raw_manifest), rbase + CAN_COMPLETE: len(complete)},
+                var="CAN_BACKUP_REMOTE_MAX_BYTES")
             owned.append(rbase + name)
             bk.s3_put_file_verified(s3, bucket, rbase + name, path, digest,
                                     tar_size)
@@ -749,10 +744,8 @@ def cmd_backup():
             bk.rollback_owned(s3, bucket, owned)
             return bk.fail("off-host upload failed (local tar kept, remote rolled"
                            " back including COMPLETE): " + str(e)[:200], code=3)
-        prune_local(d, path, keep)
         sys.stdout.write("can-backup: ok: %s (off-host verified)\n" % name)
     else:
-        prune_local(d, path, keep)
         sys.stdout.write("can-backup: ok: " + name + " (File mode, local only)\n")
     return 0
 

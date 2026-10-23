@@ -2,7 +2,7 @@
 """Offline backup / restore for GreptimeDB (local tar + S3 SST snapshot).
 
 Commands (operator runs only these; `.env` holds all settings):
-  backup    offline snapshot -> local tar -> verified S3 upload -> prune
+  backup    offline snapshot -> local tar -> verified S3 upload (bounded, never pruned)
   restore   fetch archive (local or S3) -> verify -> restore SST + volumes
   list      local archives (+ remote COMPLETE backup ids when S3 configured)
   retention evaluate remote generations (dry-run default; explicit approve to delete)
@@ -72,8 +72,8 @@ miss with CopySourceIfMatch + checksum verification; failure rolls back only
 newly owned keys, never reused pool keys) -> write local tar (0600) +
 .sha256 sidecar -> upload tar + sidecar + manifest copy (PUT ChecksumSHA256,
 echo + HEAD verified) -> write COMPLETE marker (tracked, checksum verified)
--> only then prune old LOCAL generations (never the file just written; remote
-objects are never pruned). Overlapping live/backup prefixes fail closed.
+-> retain every LOCAL generation. Count and byte budgets refuse additional
+archives; overlapping live/backup prefixes fail closed. Remote retention is manual only.
 Missing S3 settings fail closed: a local-only S3 tar is unrestorable, so it
 is not written.
 
@@ -287,16 +287,20 @@ def s3_list_all(client, bucket, prefix):
     """All objects under prefix, following pagination (truncation loses SSTs)."""
     out = []
     token = None
+    tokens = set()
     while True:
         kw = {"Bucket": bucket, "Prefix": prefix}
         if token:
             kw["ContinuationToken"] = token
         resp = client.list_objects_v2(**kw)
+        if type(resp.get("IsTruncated")) is not bool:
+            raise IOError("s3 inventory completeness unknown")
         out.extend(resp.get("Contents") or [])
         if resp.get("IsTruncated"):
             token = resp.get("NextContinuationToken")
-            if not token:
-                raise IOError("s3 listing truncated without continuation token")
+            if not token or token in tokens:
+                raise IOError("s3 listing truncated without fresh continuation token")
+            tokens.add(token)
         else:
             return out
 
@@ -442,6 +446,18 @@ _POOL_INVENTORY = ContextVar("backup_pool_inventory", default=None)
 
 @contextmanager
 def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
+    """Serialize all cooperating bucket publishers, then own the prefix inventory."""
+    if reentrant and _POOL_GUARD.get() == (bucket, norm_prefix(bp)):
+        yield
+        return
+    with _prefix_pool_lock(client, bucket, "_storage_budget", verify_claim=False):
+        with _prefix_pool_lock(client, bucket, bp, token=token,
+                               reentrant=reentrant, verify_claim=verify_claim):
+            yield
+
+
+@contextmanager
+def _prefix_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
     """Exclusive unique claims require strongly consistent LIST/PUT.
 
     ponytail: serialize this backup prefix; per-object guards only if measured
@@ -468,7 +484,9 @@ def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_clai
         if verify_claim:
             s3_put_bytes_verified(client, bucket, key, payload)
         else:
-            client.put_object(Bucket=bucket, Key=key, Body=payload)
+            client.put_object(Bucket=bucket, Key=key, Body=payload,
+                              ContentLength=len(payload), Metadata={},
+                              ChecksumSHA256=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"))
         if {o["Key"] for o in s3_list_all(client, bucket, locks)} != {key}:
             raise IOError("pool writer/GC claim collision (refusing)")
         token = _POOL_GUARD.set(identity)
@@ -508,7 +526,11 @@ def pool_inventory(client, bucket, bp, excluding=None):
     """
     bp = norm_prefix(bp)
     pp = pool_prefix(bp)
-    scope = s3_list_all(client, bucket, bp)
+    cache = _POOL_INVENTORY.get()
+    if cache is not None and cache.get("budget_scope") == (bucket, bp):
+        scope = [{"Key": key, "Size": size} for key, size in cache["budget_sizes"].items()]
+    else:
+        scope = s3_list_all(client, bucket, bp)
     sizes = {o["Key"]: o.get("Size") for o in scope}
     names = {key[len(pp):] for key in sizes if key.startswith(pp)}
     if any(not re.fullmatch(r"[0-9a-f]{64}(?:\.json)?", key) for key in names):
@@ -590,6 +612,7 @@ def shared_sst_record(client, bucket, root_pfx, bp, rel, source, owned):
         # Re-copy the captured source version, but never roll back an unowned key.
     else:
         owned.append(dst)  # BEFORE COPY; reused/unpublished existing keys are not owned.
+    remote_budget(client, bucket, bp, {dst: size})
     try:
         copied = s3_copy_head_verified(client, bucket, norm_prefix(root_pfx) + rel,
                                        dst, source=source)
@@ -660,6 +683,11 @@ def open_s3_client(component="backup"):
             guard = shared_pool_lock(client, env("S3_BUCKET"), current_identity()["backup_prefix"])
             guard.__enter__()
             run["guard"] = guard
+        elif run["operation"] == "cmd_backup" and component == "can-backup":
+            guard = shared_pool_lock(client, env("S3_BUCKET"),
+                                     env("CAN_S3_BACKUP_PREFIX"), verify_claim=False)
+            guard.__enter__()
+            run["guard"] = guard
         elif run["operation"] == "cmd_restore" and component == "backup":
             bp = norm_prefix(current_identity()["backup_prefix"])
             if bp.startswith(RESTORE_LOCK_ROOT) or RESTORE_LOCK_ROOT.startswith(bp):
@@ -677,7 +705,20 @@ def costed_command(fn, component, directory_var):
     def run(*args, **kwargs):
         state = {"clients": [], "guard": None, "operation": fn.__name__}
         token = _COST_RUN.set(state)
+        local_fd = None
         try:
+            directory = env(directory_var, "/backup")
+            if fn.__name__ == "cmd_backup" and component == "can-backup":
+                try:
+                    os.makedirs(directory, mode=0o700, exist_ok=True)
+                except OSError as error:
+                    return fail("cannot create local backup directory: " + str(error)[:200], code=2)
+            if fn.__name__ == "cmd_backup" and os.path.isdir(directory):
+                local_fd = os.open(directory, os.O_RDONLY)
+                try:
+                    fcntl.flock(local_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return fail("local backup writer already active", code=2)
             return fn(*args, **kwargs)
         finally:
             try:
@@ -685,6 +726,8 @@ def costed_command(fn, component, directory_var):
                     state["guard"].__exit__(None, None, None)
             finally:
                 _COST_RUN.reset(token)
+                if local_fd is not None:
+                    os.close(local_fd)
                 if state["clients"]:
                     run_id = fn.__name__ + "-" + uuid.uuid4().hex
                     for i, client in enumerate(state["clients"]):
@@ -719,6 +762,30 @@ def cmd_list():
     return 0
 
 
+@contextmanager
+def bounded_local_tar(tmp, var="BACKUP_LOCAL_MAX_BYTES", **kwargs):
+    remaining = positive_budget(var, 100 << 30) - tree_bytes([os.path.dirname(tmp)]) - 4096
+    class LimitedWriter:
+        def __init__(self, output):
+            self.output = output
+            self.written = 0
+
+        def write(self, data):
+            if self.written + len(data) > remaining:
+                raise IOError("local backup byte budget exceeded")
+            result = self.output.write(data)
+            self.written += result
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.output, name)
+
+    with open(tmp, "wb") as output:
+        with tarfile.open(fileobj=LimitedWriter(output), mode="w:gz",
+                          format=tarfile.PAX_FORMAT, **kwargs) as tar:
+            yield tar
+
+
 def write_local_tar(d, name, srcs, manifest):
     raw_manifest = json.dumps(manifest, separators=(",", ":"), sort_keys=True).encode("utf-8")
     if len(raw_manifest) > CONTROL_CAP:
@@ -726,7 +793,7 @@ def write_local_tar(d, name, srcs, manifest):
     path = os.path.join(d, name)
     tmp = path + ".tmp"
     try:
-        with tarfile.open(tmp, "w:gz", format=tarfile.PAX_FORMAT, dereference=True) as tar:
+        with bounded_local_tar(tmp, dereference=True) as tar:
             for s in srcs:
                 tar.add(s, arcname=os.path.basename(s.rstrip("/")), recursive=True)
             info = tarfile.TarInfo(MANIFEST_NAME)
@@ -750,21 +817,6 @@ def write_local_tar(d, name, srcs, manifest):
     return path, digest, raw_manifest
 
 
-def prune_local(d, path, keep, prefix=BACKUP_PREFIX, suffix=BACKUP_SUFFIX,
-                sidecar_suffix=SIDECAR_SUFFIX):
-    """Delete generations beyond keep, never the file just written."""
-    files = sorted(glob.glob(os.path.join(d, prefix + "*" + suffix)))
-    for old in files[:-keep]:
-        if old != path:
-            for victim in (old, old + sidecar_suffix):
-                try:
-                    os.unlink(victim)
-                except FileNotFoundError:
-                    pass
-                except OSError as e:
-                    sys.stderr.write("backup: warning: prune failed: " + victim + ": "
-                                     + str(e)[:100] + "\n")
-
 
 def claim_backup_id(d, s3, bucket, bp, prefix=BACKUP_PREFIX,
                     suffix=BACKUP_SUFFIX, sidecar_suffix=SIDECAR_SUFFIX):
@@ -783,6 +835,51 @@ def claim_backup_id(d, s3, bucket, bp, prefix=BACKUP_PREFIX,
                 continue
         return bid, stamp
     raise IOError("could not claim a fresh backup namespace (collision)")
+
+
+def positive_budget(var, default):
+    try:
+        value = int(env(var, str(default)))
+    except ValueError:
+        raise IOError(var + " must be a positive integer")
+    if value <= 0:
+        raise IOError(var + " must be a positive integer")
+    return value
+
+
+def local_budget(d, estimate, keep, prefix=BACKUP_PREFIX, suffix=BACKUP_SUFFIX,
+                 var="BACKUP_LOCAL_MAX_BYTES"):
+    # Retained failures and successes both consume slots; never delete history.
+    if len(glob.glob(os.path.join(d, prefix + "*" + suffix))) >= keep:
+        raise IOError("local backup generation budget reached (existing archives retained)")
+    if tree_bytes([d]) + estimate > positive_budget(var, 100 << 30):
+        raise IOError("local backup byte budget exceeded (existing files retained)")
+
+
+def remote_budget(client, bucket, bp, additions, var="BACKUP_REMOTE_MAX_BYTES"):
+    """LIST sizes only; one inventory per guarded publication, including shared SSTs."""
+    cache = _POOL_INVENTORY.get()
+    if cache is None:
+        raise IOError("remote budget requires publication guard")
+    limit = positive_budget(var, 1 << 40)
+    scope = (bucket, norm_prefix(bp) if bp else "")
+    if cache.get("budget_scope") != scope:
+        objects = s3_list_all(client, bucket, scope[1])
+        sizes = {}
+        for obj in objects:
+            key, size = obj.get("Key"), obj.get("Size")
+            if not isinstance(key, str) or type(size) is not int or size < 0 or key in sizes:
+                raise IOError("remote storage inventory unknown")
+            sizes[key] = size
+        cache.update(budget_scope=scope, budget_sizes=sizes, budget_total=sum(sizes.values()))
+    sizes = cache["budget_sizes"]
+    growth = sum(max(0, size - sizes.get(key, 0)) for key, size in additions.items())
+    projected = cache["budget_total"] + growth
+    if projected > limit and growth:
+        raise IOError("remote storage byte budget exceeded (existing objects retained)")
+    for key, size in additions.items():
+        sizes[key] = max(size, sizes.get(key, 0))
+    cache["budget_total"] = projected
 
 
 def read_reserve(var="BACKUP_RESERVE_BYTES"):
@@ -835,6 +932,7 @@ def cmd_backup():
         return fail(rerr, code=1)
     try:
         source_bytes = tree_bytes(srcs)
+        local_budget(d, 2 * source_bytes + (2 * CONTROL_CAP), keep)
         need = 2 * source_bytes + reserve
         if shutil.disk_usage(d).free < need:
             return fail("backup refused: insufficient space in %s (need %d bytes)"
@@ -882,6 +980,7 @@ def cmd_backup():
     snap_objects = []
     if s3 is not None:
         try:
+            remote_budget(s3, bucket, bp, {})
             seen = set()
             for obj in s3_list_all(s3, bucket, root_pfx):
                 rel = obj["Key"][len(root_pfx):]
@@ -929,6 +1028,9 @@ def cmd_backup():
             }, separators=(",", ":"), sort_keys=True).encode("utf-8")
             if len(complete) > CONTROL_CAP:
                 raise IOError("COMPLETE exceeds control size limit (%d bytes)" % CONTROL_CAP)
+            remote_budget(s3, bucket, bp, {
+                rbase + name: tar_size, rbase + name + SIDECAR_SUFFIX: len(sidecar),
+                rbase + MANIFEST_NAME: len(raw_manifest), rbase + COMPLETE_NAME: len(complete)})
             owned.append(rbase + name)  # BEFORE each write
             s3_put_file_verified(s3, bucket, rbase + name, path, digest, tar_size)
             owned.append(rbase + name + SIDECAR_SUFFIX)
@@ -941,19 +1043,9 @@ def cmd_backup():
             rollback_owned(s3, bucket, owned)
             return fail("off-host upload failed (local tar kept, remote rolled back"
                         " including COMPLETE): " + str(e)[:200], code=3)
-        prune_local(d, path, keep)
-        # Retention is a separate pool operation, after publication releases its claim.
-        state = _COST_RUN.get()
-        guard, state["guard"] = state["guard"], None
-        guard.__exit__(None, None, None)
-        try:
-            cmd_retention(current_bid=bid)  # off/dry-run/enforce; warnings never fail backup
-        except Exception as e:
-            sys.stderr.write("backup: warning: retention skipped: " + str(e)[:150] + "\n")
         sys.stdout.write("backup: ok: %s (sst %d, off-host verified)\n"
                          % (name, len(snap_objects)))
     else:
-        prune_local(d, path, keep)
         sys.stdout.write("backup: ok: " + name + " (File mode, local only)\n")
     return 0
 
@@ -1198,26 +1290,52 @@ def read_sidecar_digest(path):
         return None, "backup sidecar unreadable or oversized: " + sidecar
 
 
+def scan_archive_manifest(path, manifest_name):
+    """Collect metadata and bounded control bytes without rewinding gzip.
+
+    Defer control errors until callers have checked the complete member shape.
+    Archive iteration errors still take precedence over policy refusals.
+    """
+    raw = None
+    error = "backup manifest unreadable: " + str(
+        KeyError("filename %r not found" % manifest_name))
+    code = 2
+    with tarfile.open(path, "r:gz") as tar:
+        for info in tar:
+            if info.name != manifest_name:
+                continue
+            if info.size > CONTROL_CAP:
+                error = "manifest exceeds control size limit (refusing)"
+                continue
+            if not info.isfile():
+                continue  # Structural validation rejects links and special files.
+            try:
+                with tar.extractfile(info) as stream:
+                    raw = read_control(stream, CONTROL_CAP, manifest_name)
+                if len(raw) != info.size:
+                    error, code = "manifest short read (torn archive?)", 3
+                else:
+                    error, code = None, 0
+            except Exception as e:
+                error = "backup manifest unreadable: " + str(e)[:150]
+                code = 2
+        members = tar.getmembers()
+    return members, raw, error, code
+
+
 def load_manifest(path):
     """Returns (manifest, raw_bytes, members, errmsg, errcode): torn archives
     are code 3, policy refusals are code 2."""
     try:
-        with tarfile.open(path, "r:gz") as tar:
-            members = tar.getmembers()
+        members, raw, error, code = scan_archive_manifest(path, MANIFEST_NAME)
     except Exception as e:
         return None, None, None, "backup unreadable (torn archive?): " + str(e)[:200], 3
     problem = validate_members(members)
     if problem is not None:
         return None, None, None, problem, 2
+    if error is not None:
+        return None, None, None, error, code
     try:
-        with tarfile.open(path, "r:gz") as tar:
-            info = tar.getmember(MANIFEST_NAME)
-            if info.size > CONTROL_CAP:
-                return None, None, None, "manifest exceeds control size limit (refusing)", 2
-            with tar.extractfile(MANIFEST_NAME) as stream:
-                raw = read_control(stream, CONTROL_CAP, MANIFEST_NAME)
-            if len(raw) != info.size:
-                return None, None, None, "manifest short read (torn archive?)", 3
         manifest = json.loads(raw.decode("utf-8"))
     except Exception as e:
         return None, None, None, "backup manifest unreadable: " + str(e)[:150], 2

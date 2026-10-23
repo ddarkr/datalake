@@ -26,7 +26,7 @@ services:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
     labels:
-      datalake.raw-recorder-revision: "3"
+      datalake.raw-recorder-revision: "4"
     working_dir: /app
     command: [/opt/venv/bin/python, -m, scripts.vehicle.raw.raw_recorder]
     depends_on:
@@ -50,6 +50,7 @@ services:
       VEHICLE_ID: ${VEHICLE_ID:-}
       CAN_INTERFACE: ${CAN_INTERFACE:-can0}
       RAW_SPOOL_DIR: /spool/raw
+      RAW_SPOOL_MAX_BYTES: ${RAW_SPOOL_MAX_BYTES:-21474836480}
       RAW_CHUNK_SECONDS: ${RAW_CHUNK_SECONDS:-600}
       RAW_CHUNK_BYTES: ${RAW_CHUNK_BYTES:-67108864}
       RAW_FINALIZE_MEM_FRAMES: ${RAW_FINALIZE_MEM_FRAMES:-20000}
@@ -72,7 +73,7 @@ services:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
     labels:
-      datalake.raw-uploader-revision: "2"
+      datalake.raw-uploader-revision: "3"
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully
@@ -86,12 +87,19 @@ services:
       - source: raw_s3_cost_py
         target: /app/scripts/storage/s3_cost.py
         mode: 0444
+      - source: raw_backup_budget_py
+        target: /app/scripts/storage/backup.py
+        mode: 0444
+      - source: raw_greptime_preflight_py
+        target: /app/scripts/database/greptime_preflight.py
+        mode: 0444
     volumes:
       - vehicle-venv:/opt/venv:ro
       - raw-spool:/spool/raw
     environment:
       VEHICLE_ID: ${VEHICLE_ID:-}
       RAW_SPOOL_DIR: /spool/raw
+      RAW_REMOTE_MAX_BYTES: ${RAW_REMOTE_MAX_BYTES:-1099511627776}
       RAW_BUCKET: ${RAW_BUCKET:-}
       RAW_S3_ENDPOINT_URL: ${RAW_S3_ENDPOINT_URL:-}
       RAW_S3_REGION: ${RAW_S3_REGION:-us-west-004}
@@ -119,6 +127,10 @@ configs:
     x-source: scripts/storage/storage_metrics.py
   raw_s3_cost_py:
     x-source: scripts/storage/s3_cost.py
+  raw_backup_budget_py:
+    x-source: scripts/storage/backup.py
+  raw_greptime_preflight_py:
+    x-source: scripts/database/greptime_preflight.py
 
 volumes:
   vehicle-venv:

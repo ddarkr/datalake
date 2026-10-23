@@ -138,6 +138,15 @@ class StorageCostBudgetTest(unittest.TestCase):
         assert not any("read ratio exceeds" in failure for failure in result["failures"])
 
 
+    def test_raw_replay_archive_put_cannot_hide_in_control_claims(self):
+        meas = measurements()
+        replay = meas["current"]["auxiliary"]["raw_replay"]
+        replay["archive_puts"] = 1
+        replay["archive_put_bytes"] = 1
+        result = checker.check_measurements(meas, policy())
+        assert result["status"] == "fail"
+        assert any("RAW replay" in failure for failure in result["failures"])
+
     def test_negative_savings_are_valid_even_with_negative_comparison_deltas(self):
         meas = measurements()
         old = meas["before"]["cases"][1]

@@ -4,6 +4,21 @@ Finalize (`finalize_segment`) and upload preflight (`fail_closed_check`
 via `gunzip_compare`) never build proportional bytes/frame objects.
 
 ## Budgets
+- `RAW_SPOOL_MAX_BYTES` (default 20 GiB, positive): recursive spool bytes,
+  including quarantine and finalization files. Segment admission reserves
+  the ingress and its finalization headroom before accepting another segment.
+  Existing files are never removed to make room; at the limit new capture is
+  refused/counted as dropped until an operator or verified upload frees room.
+- `RAW_REMOTE_MAX_BYTES` (default 1 TiB, positive): budget for the configured
+  RAW bucket. Pending uploads acquire the cooperating bucket/prefix publication
+  locks, LIST sizes once, and reserve growth before PUT. Unknown inventory or
+  excess growth retains all local files; verified replay needs no extra quota.
+  A refused triple does not stop the sweep: later zero-growth replays can still
+  verify their remote copies and release their local spool files.
+  Empty sweeps issue no S3 request. `RAW_INVENTORY_INTERVAL_SEC=0` still disables
+  the separate periodic metrics inventory, not the upload budget preflight.
+  Transient lock claims are control overhead, not data quota. External writers,
+  versioned-object history and account billing are outside this budget.
 
 - `RAW_FINALIZE_MEM_FRAMES` (default 20000, must be > 0): max resident
   decoded frames across sort AND identity match staging (match batches
@@ -102,5 +117,22 @@ Application frame staging stayed at 50 in every case. Lower memory costs
 additional SQLite IO and CPU; these results do not claim a speedup or a
 hard whole-process RSS limit. Peak temporary storage includes the match
 database, not just sort spills.
+
+## Remote redecode inputs
+
+`REDECODE_INPUT_URL` downloads the MF4, manifest and sidecar into an owned
+staging directory rather than retaining the complete triple as byte strings.
+HTTPS copies in 1 MiB chunks; S3 writes to disk through the existing SDK
+transfer buffers. The caller checksum, manifest pins and sealed-frame check
+must all pass before the complete directory is published.
+
+Failed downloads or validation remove only that staging directory. Existing
+workdir files are not overwritten. The CLI removes its verified download
+directory on exit, including decode/upload failures; the durable outbox is
+kept for retry. Direct `resolve_inputs` callers own the returned directory.
+This bounds download buffering, not the whole redecode process: sidecar
+decompression, the decoded frame list and identity matching still consume
+memory proportional to the capture.
+
 
 Related: [vehicle operations](operations.md) for spool layout and ACK rules.

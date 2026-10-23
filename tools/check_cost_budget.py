@@ -221,6 +221,9 @@ def validate_run(run, where):
     for name in ("raw_fresh", "raw_replay"):
         raw = aux[name]
         require_numbers(raw, ("acknowledged", "triples_seen"), where + ".auxiliary." + name)
+        require_numbers(raw, ("archive_puts", "archive_put_bytes"), where + ".auxiliary." + name)
+        if raw["archive_puts"] > raw["puts"] or raw["archive_put_bytes"] > raw["put_bytes"]:
+            raise ValueError("RAW archive writes exceed measured total writes")
         if raw.get("acknowledged") != 1 or raw.get("triples_seen") != 1 or raw.get("locals_validated") is not True:
             raise ValueError("missing/failed RAW local integrity oracle at %s" % where)
     if aux["can_big"]["input_bytes"] <= aux["can_small"]["input_bytes"]:
@@ -383,8 +386,9 @@ def check_measurements(meas, budget, base=None):
             if case["get_bytes"] / case["input_bytes"] > gate:
                 failures.append("%s read ratio exceeds gate" % name)
         replay = current["auxiliary"]["raw_replay"]
-        if replay["put_bytes"] != 0 or replay["new_remote_bytes"] != 0:
-            failures.append("RAW replay must PUT and retain zero bytes")
+        if (replay["archive_puts"] != 0 or replay["archive_put_bytes"] != 0
+                or replay["io"]["payload"]["put_bytes"] != 0 or replay["new_remote_bytes"] != 0):
+            failures.append("RAW replay must PUT zero archive bytes and retain zero bytes")
         monthly = monthly_cost(meas, budget)
         if not all(num(v) for v in monthly.values() if isinstance(v, (int, float))):
             raise ValueError("monthly projection must remain finite")

@@ -37,6 +37,7 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from scripts.storage.s3_cost import CountingS3
+from scripts.storage import backup as storage
 
 try:
     from scripts.storage.storage_metrics import bucket_inventory as _bucket_inventory
@@ -515,6 +516,19 @@ def run_once(client, bucket, spool, vehicle, max_retries):
             pass
     mset("pending_files", len(triples))
     mset("pending_bytes", nbytes)
+    if not triples:
+        return 0
+    try:
+        with storage.shared_pool_lock(client, bucket, "_raw_budget", verify_claim=False):
+            storage.remote_budget(client, bucket, "", {}, var="RAW_REMOTE_MAX_BYTES")
+            return _run_once(client, bucket, spool, vehicle, max_retries, triples)
+    except Exception as ex:
+        minc("failed")
+        print("raw storage guard refused: %s" % type(ex).__name__, file=sys.stderr)
+        return len(triples)
+
+
+def _run_once(client, bucket, spool, vehicle, max_retries, triples):
     for mf4_path, sidecar_path, manifest_path, closed_path in triples:
         ok, reason, snap = fail_closed_check(mf4_path, sidecar_path,
                                             manifest_path, closed_path)
@@ -534,6 +548,13 @@ def run_once(client, bucket, spool, vehicle, max_retries):
                  snap["sizes"][1]),
                 (manifest_key(key), manifest_path, snap["manifest_digest"],
                  snap["sizes"][2])]
+        try:
+            storage.remote_budget(client, bucket, "", {k: size for k, _, _, size in legs},
+                                  var="RAW_REMOTE_MAX_BYTES")
+        except OSError as ex:
+            minc("failed")
+            print("raw storage guard refused: %s" % type(ex).__name__, file=sys.stderr)
+            continue
         acked = True
         for k, p, digest, size in legs:
             if not upload_verified(client, bucket, k, p, digest, max_retries,

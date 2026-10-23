@@ -71,6 +71,8 @@ services:
   redecode:
     image: ${REDECODE_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [redecode]
+    labels:
+      datalake.redecode-revision: "1"
     depends_on:
       redecode-deps:
         condition: service_completed_successfully

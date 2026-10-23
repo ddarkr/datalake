@@ -1,8 +1,10 @@
 # 원격 백업 보존(Remote retention)
 
-기존 `BACKUP_KEEP`은 **로컬 archive 세대 수**이며 원격 정리와 무관합니다.
-원격 보존은 기본 비활성(`off`)이며, `backup` 성공 뒤 자동 평가됩니다.
-삭제는 `retention enforce` + `BACKUP_REMOTE_RETENTION_APPROVE=1`에서만 일어납니다.
+`BACKUP_KEEP`은 실패 업로드를 포함한 **로컬 archive 세대의 하드 상한**입니다.
+기존 archive는 자동 삭제하지 않으며 상한에 도달하면 다음 생성을 거절합니다.
+로컬 바이트 예산 기본값은 100 GiB, 원격 prefix 바이트 예산은 1 TiB입니다.
+원격 보존은 기본 비활성(`off`)이며 `backup` 성공 뒤 자동 평가하지 않습니다.
+삭제는 명시적 `retention enforce` + `BACKUP_REMOTE_RETENTION_APPROVE=1`에서만 일어납니다.
 운영 삭제는 검증된 dry-run 검토와 별도 명시적 승인 뒤에만 진행하세요.
 
 관련 문서: [설치와 운영](operations.md)의 백업/복원 절차와 Compose `backup` 서비스.
@@ -18,6 +20,16 @@
 | `BACKUP_REMOTE_PINNED` | `` | 쉼표 구분 보존 ID (`/`·`..` 거부) |
 | `BACKUP_REMOTE_INCOMPLETE_GRACE_SEC` | `86400` | 미완료 유예(동시 실행 보호) |
 | `BACKUP_REMOTE_RETENTION_APPROVE` | `` | `enforce` 삭제에 `1` 필요 |
+
+생성 예산은 `BACKUP_LOCAL_MAX_BYTES`·`BACKUP_REMOTE_MAX_BYTES`로 조정합니다.
+CAN 백업에는 같은 기본값의 `CAN_BACKUP_LOCAL_MAX_BYTES`·`CAN_BACKUP_REMOTE_MAX_BYTES`가
+적용됩니다. 로컬 count·byte 한도는 실패해 보존된 archive도 포함합니다.
+압축 출력도 바이트 한도를 검증하고 기존 파일은 보존합니다.
+원격 inventory는 버킷 단위 publisher 잠금과 prefix 잠금 아래 읽고 공유 pool·제어 객체를
+포함해 양의 증가량을 예약합니다. 미확인 inventory나 예산 초과에서는 추가 COPY/PUT을
+거절합니다. 잠깐 생성하는 lock claim은 제어 오버헤드이며,
+강한 LIST 일관성과 같은 잠금을 따르는 writer가 전제입니다.
+서로 다른 prefix 예산은 계정 전체의 공통 예산이 아닙니다.
 
 ## 복구 세대
 
@@ -35,6 +47,11 @@ manifest는 전체 목록과 무결성 필드를 유지한 compact JSON으로 �
 이전 백업을 차례대로 적용하는 증분 체인이 아니므로, 이전 세대의 archive를
 삭제해도 보존 세대가 참조하는 SST만 남아 있으면 복원할 수 있습니다.
 기존 `<prefix>/<id>/sst/` 형식의 HEAD/SHA256 백업도 그대로 복원·보존합니다.
+
+Greptime·CAN 복원은 정상 tar.gz를 한 번 순회하며 멤버 목록과 크기 제한 안의
+manifest를 함께 읽습니다. 전체 멤버의 중복·링크·경로 검사를 마치기 전에는
+manifest 오류를 확정하지 않으며, 잘린 archive의 실패 분류도 유지합니다.
+archive hash 검증과 이후 격리 추출·설치·rollback은 별도 단계로 그대로 수행합니다.
 
 - 이미 retirement이 시작된 세대(RETIRING + COMPLETE 부재 → `incomplete/created_ns=None`)
   는 grace gate 대상이 아닙니다. 재개 전 마커 본문이 해당 세대를 정확히 가리키는지
