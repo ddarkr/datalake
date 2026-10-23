@@ -164,6 +164,30 @@ test('Claude failed sends are attempted once and checkpoints still advance witho
   assert.deepEqual(attempts.filter(id => id === 'message:retry').length, 1, 'failed send is attempted once, never replayed');
 });
 
+test('Claude bounds transcript send bursts and never replays failed attempts', async t => {
+  const path = await sandbox(t), stateRoot = join(path, 'state'), transcript = join(path, 'active.jsonl');
+  let active = 0, peak = 0;
+  const attempts = [];
+  const telemetry = { send: async event => {
+    attempts.push(event.eventId);
+    peak = Math.max(peak, ++active);
+    try { await delay(15); return false; }
+    finally { active--; }
+  } };
+  const invoke = hook_event_name => handleHook({ session_id: 'session_1', hook_event_name, transcript_path: transcript },
+    { stateRoot, now: 1000, context: async () => ({}), telemetry });
+  await writeFile(transcript, '');
+  await invoke('SessionStart');
+  attempts.length = 0;
+  await appendFile(transcript, Array.from({ length: 13 }, (_, i) => JSON.stringify(record(`bounded_${i}`))).join('\n') + '\n');
+  await invoke('Stop');
+  assert.equal(attempts.length, 13);
+  assert.equal(peak, 4);
+  await invoke('Stop');
+  assert.equal(attempts.length, 13);
+  assert.equal(active, 0);
+});
+
 test('Claude honors legacy receipts as attempted and writes attempted markers only after direct sends', async t => {
   const path = await sandbox(t), stateRoot = join(path, 'state'), transcript = join(path, 'active.jsonl');
   const directory = join(stateRoot, hash('session_1')), attempts = [];
@@ -284,6 +308,78 @@ test('Claude loopback timeout bounds the hook and duplicate hooks do not resend'
   await telemetry.flush().catch(() => {});
   await invoke('Stop');
   assert.equal(requests, 1, 'Duplicate hooks do not retry the timed-out event');
+});
+
+test('Claude shares a sub-five-second send budget across slow waves despite a 30s exporter timeout', async t => {
+  const path = await sandbox(t);
+  let requests = 0, active = 0, peak = 0;
+  const server = createServer(async request => {
+    for await (const chunk of request) { /* Drain without acknowledging. */ }
+    requests++;
+  });
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  server.listen(0, '127.0.0.1');
+  await once(server, 'listening');
+  const configPath = join(path, 'otel.json');
+  await writeFile(configPath, JSON.stringify({ endpoint: `http://127.0.0.1:${server.address().port}`, timeoutMs: 30_000 }), { mode: 0o600 });
+  const exporter = createDirectTelemetry('claude-code', { configPath });
+  const telemetry = {
+    send: async (event, options) => {
+      peak = Math.max(peak, ++active);
+      try { return await exporter.send(event, options); }
+      finally { active--; }
+    },
+    flush: () => exporter.flush(),
+  };
+  const stateRoot = join(path, 'state'), transcript = join(path, 'active.jsonl');
+  const invoke = hook_event_name => handleHook({ session_id: 'session_1', hook_event_name, transcript_path: transcript },
+    { stateRoot, now: 1000, context: async () => ({}), telemetry });
+  await writeFile(transcript, '');
+  await invoke('SessionStart');
+  await appendFile(transcript, Array.from({ length: 13 }, (_, i) => JSON.stringify(record(`deadline_${i}`))).join('\n') + '\n');
+  const started = Date.now();
+  await invoke('Stop');
+  await telemetry.flush();
+  assert.ok(Date.now() - started < 4500, 'all waves and receipts finish before the installed 5s hook deadline');
+  assert.equal(requests, 13);
+  assert.ok(peak <= 4);
+  const directory = join(stateRoot, hash('session_1'));
+  for (let i = 0; i < 13; i++) {
+    assert.deepEqual(JSON.parse(await readFile(join(directory, `attempted-${hash(`message:deadline_${i}`)}.json`), 'utf8')), {});
+  }
+  await invoke('Stop');
+  assert.equal(requests, 13, 'timed-out attempts must never replay');
+});
+
+test('Claude leaves deferred events eligible without advancing a partial transcript checkpoint', async t => {
+  let clock = 0, exhaust = false;
+  t.mock.method(performance, 'now', () => clock);
+  const path = await sandbox(t), stateRoot = join(path, 'state'), transcript = join(path, 'active.jsonl');
+  const attempts = [];
+  const telemetry = { send: async event => {
+    attempts.push(event.eventId);
+    if (exhaust) clock = 4000;
+    return false;
+  } };
+  const invoke = hook_event_name => handleHook({ session_id: 'session_1', hook_event_name, transcript_path: transcript },
+    { stateRoot, now: 1000, context: async () => ({}), telemetry });
+  await writeFile(transcript, '');
+  await invoke('SessionStart');
+  await appendFile(transcript, Array.from({ length: 9 }, (_, i) => JSON.stringify(record(`deferred_${i}`))).join('\n') + '\n');
+  exhaust = true;
+  await invoke('Stop');
+  const partial = attempts.length;
+  assert.ok(partial > 0 && partial < 9);
+  exhaust = false;
+  clock = 0;
+  await invoke('Stop');
+  assert.equal(attempts.length, 9);
+  assert.equal(new Set(attempts).size, 9, 'only unattempted work remains eligible');
+  await invoke('Stop');
+  assert.equal(attempts.length, 9);
 });
 
 test('Claude direct mode leaves legacy runtime queue data byte-unchanged', async t => {

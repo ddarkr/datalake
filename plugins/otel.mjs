@@ -222,12 +222,12 @@ export function serializeEvent(client, event) {
   }
 }
 
-export async function sendPayload(config, body) {
+export async function sendPayload(config, body, timeoutMs = config.timeoutMs) {
   try {
     const response = await fetch(config.endpoint, {
       method: 'POST', redirect: 'error',
       headers: { ...config.headers, 'Content-Type': 'application/json' },
-      body, signal: AbortSignal.timeout(config.timeoutMs),
+      body, signal: AbortSignal.timeout(Math.min(config.timeoutMs, timeoutMs)),
     });
     if (!response.ok) {
       await response.body?.cancel();
@@ -279,7 +279,7 @@ export function createDirectTelemetry(client, options = {}) {
   const active = new Set();
   return {
     get enabled() { return Boolean(selected?.config); },
-    send(event) {
+    send(event, { timeoutMs = selected?.config?.timeoutMs } = {}) {
       if (!selected?.config) return Promise.resolve(false);
       let serialized;
       try { serialized = serializeEvent(client, event); }
@@ -287,7 +287,7 @@ export function createDirectTelemetry(client, options = {}) {
         diagnostic('Invalid telemetry event; event not delivered');
         return Promise.resolve(false);
       }
-      const operation = sendPayload(selected.config, serialized.body);
+      const operation = sendPayload(selected.config, serialized.body, timeoutMs);
       active.add(operation);
       operation.then(() => active.delete(operation), () => active.delete(operation));
       return operation;

@@ -99,6 +99,8 @@ async function transcriptEvents(path, options, stateDir) {
 }
 
 export async function handleHook(input, { telemetry, stateRoot, now = Date.now(), context = repositoryContext, source = 'plugin' } = {}) {
+  // Leave time for attempt receipts/checkpoint and process exit before Claude's 5s kill.
+  const deadline = performance.now() + 3000;
   const sessionId = identifier(input?.session_id);
   const hook = input?.hook_event_name;
   if (!sessionId || !events.has(hook)) return;
@@ -130,10 +132,10 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
       await save(path, { ...pending, observed: true });
     });
   }
-  return withStateLock(stateDir, () => handleSerialized(input, { telemetry, stateDir, now, context, source }, sessionId, hook));
+  return withStateLock(stateDir, () => handleSerialized(input, { telemetry, stateDir, now, context, source, deadline }, sessionId, hook));
 }
 
-async function handleSerialized(input, { telemetry, stateDir, now, context, source }, sessionId, hook) {
+async function handleSerialized(input, { telemetry, stateDir, now, context, source, deadline }, sessionId, hook) {
   const sessionPath = join(stateDir, 'session.json');
   let session = await json(sessionPath);
   if (hook === 'SessionStart') {
@@ -165,19 +167,33 @@ async function handleSerialized(input, { telemetry, stateDir, now, context, sour
     await save(eventPath, { kind: isTool ? 'tool.call' : 'subagent', sessionId, eventId, parentEventId: isTool && agentId ? `subagent:${agentId}` : session?.eventId, startTimeMs: now, attributes }, true);
     return;
   }
+  let deferred = false;
+  let remainingWaves = 1;
+  const settledEvents = new Set();
   async function attemptOnce(event) {
     // Existing sent receipts prove collector ACK; legacy queued-v2 proves only durable
     // local acceptance. Both are treated as attempted: no automatic replay on failure.
     const legacy = join(stateDir, `sent-${hash(event.eventId)}.json`);
     const queued = join(stateDir, `queued-v2-${hash(event.eventId)}.json`);
     const attempted = join(stateDir, `attempted-${hash(event.eventId)}.json`);
-    if ((await json(legacy)) !== undefined || (await json(queued)) !== undefined || (await json(attempted)) !== undefined) return true;
+    if ((await json(legacy)) !== undefined || (await json(queued)) !== undefined || (await json(attempted)) !== undefined) {
+      settledEvents.add(event.eventId);
+      return true;
+    }
+    const remaining = Math.floor(deadline - performance.now());
+    if (remaining < 1) {
+      deferred = true;
+      return false; // No attempt/receipt: leave the transcript checkpoint for a later hook.
+    }
+    const timeoutMs = Math.max(1, Math.floor(remaining / remainingWaves));
     let ok = false;
-    try { ok = await telemetry.send(event); } catch {}
+    try { ok = await telemetry.send(event, { timeoutMs }); } catch {}
     await save(attempted, {});
+    settledEvents.add(event.eventId);
     return ok === true;
   }
   const completed = [];
+  let displayReady;
   if (!agentId) {
     const observationDir = join(stateDir, 'display');
     await mkdir(observationDir, { recursive: true, mode: 0o700 });
@@ -186,7 +202,7 @@ async function handleSerialized(input, { telemetry, stateDir, now, context, sour
       const ready = await json(readyPath);
       if (ready) {
         completed.push({ ...ready, parentEventId: session?.eventId });
-        await unlink(readyPath);
+        displayReady = { path: readyPath, eventId: ready.eventId, directory: observationDir };
       }
       if (['Stop', 'StopFailure', 'SessionEnd'].includes(hook)) {
         await unlink(join(observationDir, 'pending.json')).catch(error => { if (error.code !== 'ENOENT') throw error; });
@@ -231,9 +247,19 @@ async function handleSerialized(input, { telemetry, stateDir, now, context, sour
     }
     completed.unshift(session);
   }
-  // Every direct send settles before releasing serialization, even a mixed false/throw batch.
-  const outcome = await Promise.allSettled(completed.map(attemptOnce));
-  if (checkpoint && outcome.every(result => result.status === 'fulfilled')) {
+  // Divide one invocation-wide budget across bounded waves, including configured
+  // exporter timeouts up to 30s. No retries, queues, or receipts for deferred work.
+  const outcome = [];
+  for (let offset = 0; offset < completed.length; offset += 4) {
+    remainingWaves = Math.ceil((completed.length - offset) / 4);
+    outcome.push(...await Promise.allSettled(completed.slice(offset, offset + 4).map(attemptOnce)));
+  }
+  if (displayReady && settledEvents.has(displayReady.eventId)) {
+    await withStateLock(displayReady.directory, async () => {
+      if ((await json(displayReady.path))?.eventId === displayReady.eventId) await unlink(displayReady.path);
+    });
+  }
+  if (checkpoint && !deferred && outcome.every(result => result.status === 'fulfilled')) {
     await save(checkpoint.path, checkpoint.value);
   }
   const failure = outcome.find(result => result.status === 'rejected');

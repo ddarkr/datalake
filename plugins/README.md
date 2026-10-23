@@ -241,6 +241,11 @@ claude plugin list --json
 
 현재 세션 transcript는 관측 checkpoint와 시도한 identity로 중복을 막습니다. 전송 실패도 자동 재처리하지 않으며 checkpoint는 수집기 ACK를 뜻하지 않습니다. 병행 훅은 세션별로 직렬화하며 살아 있는 프로세스의 lock을 시간만으로 빼앗지 않습니다. `SessionStart`는 기존 transcript의 EOF에서 시작하므로 재개한 과거 대화는 수집하지 않습니다.
 
+직접 전송은 최대 4개씩 진행하며, 훅 시작부터 3초 HTTP 예산을 남은 wave에 나눕니다.
+개별 설정 timeout이 더 길어도 이 상한을 따릅니다. 예산이 없어 시작하지 못한 이벤트는
+시도한 것으로 기록하지 않고 checkpoint를 유지합니다. 이후 훅이 없으면 이 미시도
+이벤트가 전달된다고 보장하지 않으며, 이미 시도한 이벤트의 자동 재전송도 없습니다.
+
 `--source plugin|native`는 사용량 소유자를 명시적으로 선택합니다(기본 `plugin`). `native`는 transcript LLM 사용량을 보내지 않고 상호작용 훅은 유지합니다. 선택은 `OTEL_*` 환경 변수가 제거되어도 남는 설치본 `config-path.json`에 저장되며, 재설치 때 생략하면 기존 선택을 유지합니다. 네이티브 OTel 활성화·인증 설정은 사용자가 별도로 해야 하며 설치기가 대신 켜지 않습니다. 새 `UserPromptSubmit`·`MessageDisplay` 훅은 같은 홈·설정으로 **재설치한 뒤 재시작 또는 `/reload-plugins`**해야 등록됩니다.
 
 ### AGY CLI (Antigravity)
