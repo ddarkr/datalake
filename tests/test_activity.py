@@ -557,6 +557,22 @@ class SpooledActivityTest(unittest.TestCase):
         ]
         self.compare(metrics=metrics)
 
+    def test_unselected_openlit_poison_does_not_materialize_days(self):
+        base = {"instrument": "coding_agent.commit.count", "client": "c",
+                "client_explicit": True, "session_id": "s", "temporality": 2,
+                "start_ns": ns(dt(2026, 9, 19)), "stream": (("counter", "one"),)}
+        metrics = [
+            dict(base, timestamp=dt(2026, 9, 20, 1), value=5),
+            dict(base, instrument="claude_code.commit.count",
+                 start_ns=ns(dt(2026, 9, 22)),
+                 timestamp=dt(2026, 9, 22, 1), value=0),
+        ]
+        sessions, days = act.summarize_activity([], [], metrics)
+        self.assertEqual(sessions[("c", "s")]["commit_count"], 0)
+        self.assertEqual([day["day_start"] for day in days], [dt(2026, 9, 22)])
+        self.assertEqual(days[0]["commit_count"], 0)
+        self.compare(metrics=metrics)
+
     def test_stable_id_dedupe_wall_union_and_null_zero_provenance(self):
         def trace(ident, name, session, start, end, **attrs):
             return {"trace_id": "t", "span_id": ident, "span_name": name,

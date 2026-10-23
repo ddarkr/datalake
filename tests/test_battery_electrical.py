@@ -250,6 +250,54 @@ def test_resting_eligibility():
     assert not be.is_resting_at(chg[:1], T0, 1800, 2.0, HOUR)  # no coverage
 
 
+def test_rested_voltage_window_boundaries():
+    second = 10**9
+    # Repeated baseline samples count once; all interior samples must qualify.
+    cases = [
+        ([(0, 2), (0, 2), (5, -2), (10, 0)], [], 10, 5, True),
+        ([(0, 9), (0, 9), (5, 0), (10, 0)], [], 10, 5, False),
+        ([(0, 0), (5, 9), (5, 0), (10, 0)], [], 10, 5, False),
+        ([(0, 0), (5, float("nan")), (10, 0)], [], 10, 5, False),
+        ([(-5, 0), (0, 0), (5, 0), (10, 0)], [-5], 10, 5, True),
+        ([(0, 0), (5, 0), (10, 0)], [0], 10, 5, False),
+        ([(0, 0), (5, 0), (10, 0)], [10], 10, 5, False),
+        ([(-5, 0), (5, 0), (10, 0)], [], 10, 5, False),
+        ([(0, 0), (5, 0)], [], 10, 5, True),
+        ([(-6, 0), (0, 0), (5, 0), (10, 0)], [], 10, 5, True),
+        ([(-6, 0), (5, 0), (10, 0)], [], 10, 5, False),
+        ([(-5, float("inf")), (0, 0), (5, 0), (10, 0)],
+         [], 10, 5, True),
+        ([(0, 0), (4, 0)], [], 10, 5, False),
+        ([(0, 0)], [], 10, 10, False),
+        ([(1, 0), (5, 0), (10, 0)], [], 10, 5, False),
+    ]
+    for pairs, barriers, end, gap, expected in cases:
+        currents = [(T0 + t * second, value) for t, value in pairs]
+        stamp = T0 + end * second
+        assert be.is_resting_at(currents, stamp, 10, 2, gap * second) \
+            == (expected if not barriers else True)
+        for barrier_field in ("current", "voltage"):
+            cur = [(t, v, True, None) for t, v in currents]
+            vol = [(stamp, 400.0, True, None)]
+            target = cur if barrier_field == "current" else vol
+            target.extend((T0 + t * second, None, False, None)
+                          for t in barriers)
+            cur.sort(key=lambda row: row[0])
+            vol.sort(key=lambda row: row[0])
+            for sign in (-1, 1):
+                assert be._rested_voltages(
+                    cur, vol, sign, 10, 2, gap * second, stamp
+                ) == ([(stamp, 400.0)] if expected else [])
+                assert be._rested_voltages(
+                    cur, vol, sign, 10, 2, gap * second, stamp - 1) == []
+    for stamp in (0, 2**63):
+        cur = [(stamp - 10 * second, 0.0, True, None),
+               (stamp, 0.0, True, None)]
+        assert be._rested_voltages(
+            cur, [(stamp, 400.0, True, None)], 1, 10, 2,
+            10 * second, stamp) == []
+
+
 def test_ekf_corrects_toward_voltage():
     # Synthetic 1RC circuit: true SOC 0.5, R0 voltage drop 0.05 V at 10 A.
     # EKF starts low at 0.3 with tight voltage noise; after one 60 s step

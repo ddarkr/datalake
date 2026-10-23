@@ -1129,6 +1129,7 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
     out_sessions = mapping()
     daily_cells = mapping()
     global_poison = mapping()
+    selected_poison = unique()
     for session in sessions.values():
         for poison_key, days in session["cpoison"].items():
             bucket, field = poison_key
@@ -1163,6 +1164,7 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
                 bucket, (total, cprov) = csum_entry
                 record[field] = total
                 prov[field] = cprov
+                selected_poison.add((client, bucket, field))
                 inc_entry = session["inc"][bucket].get(field)
                 if inc_entry:
                     for day, amount in inc_entry[0].items():
@@ -1173,9 +1175,6 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
                         entry = cell.setdefault(field, [0, set()])
                         entry[0] += amount
                         entry[1].add(inc_entry[1])
-                for (c, day, b, f) in global_poison:
-                    if c == client and b == bucket and f == field:
-                        daily_cells.setdefault((client, day), {})
                 continue
             native = session["inc"]["n_metric"].get(field) or session["inc"]["n_event"].get(field)
             if native and native[0]:
@@ -1215,6 +1214,7 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
             if csum_total is not None:
                 record[field] = csum_total
                 prov[field] = _NATIVE_ACTIVE
+                selected_poison.add((client, "active", field))
                 slot = session["active"][field]
                 for day, amount in slot.items():
                     if poisoned_day("active", field, day):
@@ -1224,9 +1224,6 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
                     entry = cell.setdefault(field, [0, set()])
                     entry[0] += amount
                     entry[1].add(_NATIVE_ACTIVE)
-                for (c, day, b, f) in global_poison:
-                    if c == client and b == "active" and f == field:
-                        daily_cells.setdefault((client, day), {})
                 continue
             slot = session["active"][field]
             if slot:
@@ -1256,6 +1253,10 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
             prov["outcome"] = "openlit:coding_agent.session.outcome"
         record["activity_sources"] = prov
         out_sessions[key] = record
+
+    for client, day, bucket, field in global_poison:
+        if (client, bucket, field) in selected_poison:
+            daily_cells.setdefault((client, day), {})
 
     for client, intervals in wall_pool.items():
         for day, seconds in _clip_union_by_day(intervals).items():

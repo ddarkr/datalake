@@ -2003,16 +2003,18 @@ def test_disk_reducer_matches_global_merge_oracle_across_chunks():
     cols, lcols = list(agg.SPAN_COLS), list(agg.LOG_COLS)
     rows = [[row.get(c) for c in cols] for row in traces]
     lrows = [[row.get(c) for c in lcols] for row in logs]
-    for prices in (None, {}):
+    for prices, selected_logs in (
+            (None, lrows), ({}, lrows), ({}, []),
+            ({}, [[receipt.get(c) for c in lcols]])):
         recovery = Recovery(agg, 2)
         try:
             for offset in range(0, len(rows), 2):
                 recovery.sink("opentelemetry_traces")(cols, rows[offset:offset + 2])
-            for offset in range(0, len(lrows), 2):
-                recovery.sink("opentelemetry_logs")(lcols, lrows[offset:offset + 2])
+            for offset in range(0, len(selected_logs), 2):
+                recovery.sink("opentelemetry_logs")(lcols, selected_logs[offset:offset + 2])
             recovery.prepare()
             recovery.reduce(prices)
-            merged = agg._ai_merge(cols, rows, agg.dedupe_logs(lcols, lrows))
+            merged = agg._ai_merge(cols, rows, agg.dedupe_logs(lcols, selected_logs))
             expected = {
                 "session": [((r["client"], r["session_id"]), r)
                             for r in agg.summarize_sessions(merged, prices)],

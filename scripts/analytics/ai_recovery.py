@@ -170,7 +170,9 @@ class Recovery:
         # billable() before native merge also applies native-sourced span precedence.
         self.native_filter()
         self.db.execute("UPDATE spans SET phase=1 WHERE billed=1")
-        for ordinal, row in self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal"):
+        merge_rows = self.rows("SELECT ordinal,payload FROM spans WHERE billed=1 ORDER BY ordinal") if self.db.execute(
+            "SELECT 1 FROM logs WHERE call IS NOT NULL LIMIT 1").fetchone() else ()
+        for ordinal, row in merge_rows:
             call = self.call(row)
             if call is None:
                 continue

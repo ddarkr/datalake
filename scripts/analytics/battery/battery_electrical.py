@@ -418,13 +418,7 @@ def is_resting_at(currents_sorted, end_ns, rest_seconds,
     exceeds max_gap_ns. currents_sorted: ascending [(ns, amps_charge)]."""
     if bc.to_ns(end_ns) is None:
         return False
-    rest = _finite(rest_seconds)
-    thr = _finite(threshold_a)
-    if rest is None or rest <= 0.0 or thr is None or thr < 0.0:
-        raise ElectricalError("rest_seconds > 0 and threshold >= 0")
-    if isinstance(max_gap_ns, bool) or not isinstance(max_gap_ns, int) \
-            or max_gap_ns < 0:
-        raise ElectricalError("max_gap_ns must be a non-negative int")
+    rest, thr = _rest_parameters(rest_seconds, threshold_a, max_gap_ns)
     start = end_ns - int(rest * 1e9)
     prior = [p for p in currents_sorted if p[0] <= start]
     if not prior or start - prior[-1][0] > max_gap_ns:
@@ -443,6 +437,17 @@ def is_resting_at(currents_sorted, end_ns, rest_seconds,
         if t1 - t0 > max_gap_ns:
             return False
     return True
+
+
+def _rest_parameters(rest_seconds, threshold_a, max_gap_ns):
+    rest = _finite(rest_seconds)
+    thr = _finite(threshold_a)
+    if rest is None or rest <= 0.0 or thr is None or thr < 0.0:
+        raise ElectricalError("rest_seconds > 0 and threshold >= 0")
+    if isinstance(max_gap_ns, bool) or not isinstance(max_gap_ns, int) \
+            or max_gap_ns < 0:
+        raise ElectricalError("max_gap_ns must be a non-negative int")
+    return rest, thr
 
 
 def ekf_1rc_soc(steps, ocv_curve, r0_ohm, r1_ohm, c1_f, capacity_ah,
@@ -1171,8 +1176,10 @@ def _rested_voltages(cur_timeline, vol_timeline, sign, rest_seconds,
     may sit strictly inside the window or between its last sample and the
     voltage stamp. Never bridges an invalid row."""
     chg = sorted((t, sign * v) for t, v in _usable_pairs(cur_timeline))
-    cur_barriers = [t for t, _, ok, _ in cur_timeline if not ok]
-    vol_barriers = [t for t, _, ok, _ in vol_timeline if not ok]
+    times = [t for t, _ in chg]
+    barriers = sorted(t for timeline in (cur_timeline, vol_timeline)
+                      for t, _, ok, _ in timeline if not ok)
+    bad = gaps = None
     out = []
     for tstamp, val, ok, _ in vol_timeline:
         if not ok:
@@ -1180,13 +1187,30 @@ def _rested_voltages(cur_timeline, vol_timeline, sign, rest_seconds,
         if window_end_ns is not None and tstamp > window_end_ns:
             break
         start = tstamp - int(rest_seconds * 1e9)
-        if not is_resting_at(chg, tstamp, rest_seconds, threshold_a,
-                             max_gap_ns):
+        if bc.to_ns(tstamp) is None:
             continue
-        prior = [t for t, _ in chg if t <= start]
-        lower = prior[-1]
-        if any(lower <= t <= tstamp for t in cur_barriers) \
-                or any(lower <= t <= tstamp for t in vol_barriers):
+        if bad is None:
+            _, threshold = _rest_parameters(
+                rest_seconds, threshold_a, max_gap_ns)
+            bad, gaps = [0], [0]
+            for i, (t, amps) in enumerate(chg):
+                value = _finite(amps)
+                bad.append(bad[-1] + (
+                    value is None or abs(value) > threshold))
+                gaps.append(gaps[-1] + (
+                    i > 0 and t - times[i - 1] > max_gap_ns))
+        left = bisect.bisect_right(times, start) - 1
+        right = bisect.bisect_right(times, tstamp)
+        if left < 0 or right - left < 2:
+            continue
+        if start - times[left] > max_gap_ns \
+                or tstamp - times[right - 1] > max_gap_ns:
+            continue
+        # Exclude the leg into the baseline; include every later leg/sample.
+        if bad[right] != bad[left] or gaps[right] != gaps[left + 1]:
+            continue
+        bidx = bisect.bisect_left(barriers, times[left])
+        if bidx < len(barriers) and barriers[bidx] <= tstamp:
             continue
         out.append((tstamp, val))
     return out
