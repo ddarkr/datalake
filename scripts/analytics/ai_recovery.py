@@ -244,6 +244,12 @@ class Recovery:
         # Fixed-width accumulators only; distinct models/sessions stay in SQLite.
         pending = OrderedDict()
 
+        def retain(kind, identity, key, state):
+            pending[(kind, identity)] = (key, state)
+            if len(pending) > 128:
+                (old_kind, _), (old_key, old_state) = pending.popitem(last=False)
+                self.save(old_kind, old_key, old_state)
+
         def bump(kind, key, row, billed, money, tool):
             identity = packed(key)
             cache_key = (kind, identity)
@@ -289,14 +295,11 @@ class Recovery:
                 add("tool_calls", 1)
             if row["error"] and (not row.get("tool") or tool):
                 add("errors", 1)
-            if row.get("model"):
+            if kind == "session" and row.get("model"):
                 self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "model", identity, packed(row["model"])))
-            if row.get("session"):
+            if kind == "daily" and row.get("session"):
                 self.db.execute("INSERT OR IGNORE INTO distincts VALUES(?,?,?)", (kind + "session", identity, packed(row["session"])))
-            pending[cache_key] = (key, state)
-            if len(pending) > 128:
-                (old_kind, _), (old_key, old_state) = pending.popitem(last=False)
-                self.save(old_kind, old_key, old_state)
+            retain(kind, identity, key, state)
 
         for ordinal, payload, billed, money, tool in self.db.execute(
                 "SELECT ordinal,payload,billed,money,tool FROM spans ORDER BY phase,ordinal"):
@@ -308,15 +311,22 @@ class Recovery:
                 bump("daily", (day, row["client"] or "unknown", row["provider"] or "unknown", row["model"] or "unknown"), row, billed, money, tool)
                 if tool:
                     key = (day, row["tool"], row["client"] or "unknown")
-                    hit = self.db.execute("SELECT payload FROM output WHERE kind='tool' AND identity=?", (packed(key),)).fetchone()
-                    state = pickle.loads(hit[0]) if hit else {"day": day, "tool": key[1], "client": key[2], "calls": 0, "errors": None, "duration": 0, "durations": 0}
+                    identity = packed(key)
+                    cached = pending.pop(("tool", identity), None)
+                    if cached is not None:
+                        _, state = cached
+                    else:
+                        hit = self.db.execute("SELECT payload FROM output WHERE kind='tool' AND identity=?", (identity,)).fetchone()
+                        state = pickle.loads(hit[0]) if hit else {"day": day, "tool": key[1], "client": key[2], "calls": 0, "errors": None, "duration": 0, "durations": 0}
+                        if hit is None:
+                            self.save("tool", key, state)
                     state["calls"] += 1
                     if row["error"]:
                         state["errors"] = (state["errors"] or 0) + 1
                     if row["duration_ms"] is not None:
                         state["duration"] += row["duration_ms"]
                         state["durations"] += 1
-                    self.save("tool", key, state)
+                    retain("tool", identity, key, state)
         for (kind, _), (key, state) in pending.items():
             self.save(kind, key, state)
         for kind in ("session", "daily"):

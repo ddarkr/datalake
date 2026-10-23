@@ -338,6 +338,17 @@ def test_latest_physical_invalid_unmatched_conflicting_and_stale_never_fallback(
     assert one(en.analyze(pair(T0, 0), [], cal()), 'latest_power_kw')['value'] == 0
 
 
+def test_asof_boundaries_and_duplicate_order():
+    pairs = [(0, 1.0), (10, 2.0), (10, 3.0), (20, None), (30, 4.0)]
+    for stamp, skew, expected in (
+            (-1, 10, None), (9, 9, 1.0), (9, 8, None),
+            (10, 0, 3.0), (19, 9, 3.0), (19, 8, None),
+            (20, 100, None), (29, 100, None), (30, 0, 4.0),
+            (30, -1, None)):
+        assert en._asof(pairs, stamp, skew) == expected
+    assert en._asof([], 0, 10) is None
+
+
 if __name__ == '__main__':
     names = sorted(n for n in globals() if n.startswith('test_'))
     for name in names:

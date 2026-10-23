@@ -1120,6 +1120,8 @@ def _synchronized_steps(cur_timeline, vol_timeline, max_skew_ns,
     unbroken (barrier/ambiguity/gap ends the run, never bridged)."""
     cur_by_t = {t: v for t, v in _usable_pairs(cur_timeline)}
     cur_usable = sorted(cur_by_t)
+    cur_barriers = sorted(t for t, _, ok, _ in cur_timeline if not ok)
+    vol_barriers = sorted(t for t, _, ok, _ in vol_timeline if not ok)
     steps = []
     prev_t = None
     started = False
@@ -1132,19 +1134,13 @@ def _synchronized_steps(cur_timeline, vol_timeline, max_skew_ns,
             if started:
                 break
             continue
-        match = None
-        for cstamp in reversed(cur_usable):
-            if cstamp > tstamp:
-                continue
-            if tstamp - cstamp > max_skew_ns:
-                break
-            match = (cstamp, cur_by_t[cstamp])
-            break
-        if match is None:
+        idx = bisect.bisect_right(cur_usable, tstamp) - 1
+        if idx < 0 or tstamp - cur_usable[idx] > max_skew_ns:
             if started:
                 break
             continue
-        cstamp, cval = match
+        cstamp = cur_usable[idx]
+        cval = cur_by_t[cstamp]
         if not started:
             if tstamp != anchor_ns:
                 return [], "anchor_outside_history"
@@ -1153,19 +1149,13 @@ def _synchronized_steps(cur_timeline, vol_timeline, max_skew_ns,
             break
         # A barrier/ambiguous stamp strictly between the joined current
         # time and the voltage time invalidates the step.
-        gap_ok = True
-        for b_t, _, b_ok, _ in cur_timeline:
-            lower = min(cstamp, prev_t) if prev_t is not None else cstamp
-            if lower < b_t <= tstamp and not b_ok:
-                gap_ok = False
-                break
-        if not gap_ok:
+        lower = min(cstamp, prev_t) if prev_t is not None else cstamp
+        bidx = bisect.bisect_right(cur_barriers, lower)
+        if bidx < len(cur_barriers) and cur_barriers[bidx] <= tstamp:
             break
-        for b_t, _, b_ok, _ in vol_timeline:
-            if prev_t is not None and prev_t < b_t < tstamp and not b_ok:
-                gap_ok = False
-                break
-        if not gap_ok:
+        if prev_t is not None and bisect.bisect_right(
+                vol_barriers, prev_t) < bisect.bisect_left(
+                vol_barriers, tstamp):
             break
         steps.append((tstamp, cval, val))
         prev_t = tstamp

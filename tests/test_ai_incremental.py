@@ -1980,6 +1980,26 @@ def test_disk_reducer_matches_global_merge_oracle_across_chunks():
         span(DAY1, "orphan-trace", "orphan", "zero-session", "codex", 5, 1),
         span(DAY1, "other-client", "other", "zero-session", "oh-my-pi", 6, 3)]
     logs += [clog(DAY2, "zero-session", "codex", "zero-call", 0, 0)]
+    # More tool/session/day keys than the shared 128-state cache, then late
+    # revisits: evicted totals must reload without changing null/zero rules.
+    tool_rows = []
+    for visit in range(3):
+        for i in range(140):
+            row = span(DAY1 + dt.timedelta(seconds=visit * 140 + i),
+                       "tools", "tool-%d-%d" % (visit, i),
+                       "tool-session-%d" % i, "codex", None, None,
+                       call="tool-call-%d-%d" % (visit, i), op="execute_tool",
+                       tool="tool-%d" % i, model="tool-model-%d" % i)
+            row["duration_nano"] = (None, 0, 2_000_000)[(i + visit) % 3]
+            row["span_status_code"] = "ERROR" if i % 7 == visit else "OK"
+            tool_rows.append(row)
+    traces += tool_rows
+    # Same logical IDs on later spans: fill unknown duration and merge errors,
+    # but never count the duplicate call or overwrite a known zero duration.
+    for i in (0, 1, 139):
+        repeat = dict(tool_rows[i], span_id="tool-repeat-%d" % i,
+                      duration_nano=9_000_000, span_status_code="ERROR")
+        traces.append(repeat)
     cols, lcols = list(agg.SPAN_COLS), list(agg.LOG_COLS)
     rows = [[row.get(c) for c in cols] for row in traces]
     lrows = [[row.get(c) for c in lcols] for row in logs]

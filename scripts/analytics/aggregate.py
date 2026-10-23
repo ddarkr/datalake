@@ -3320,18 +3320,17 @@ def log_section(ctx, cfg):
         "SELECT timestamp, severity_text, severity_number, scope_name"
         " FROM opentelemetry_logs WHERE timestamp >= '" +
         cutoff.strftime("%Y-%m-%d %H:%M:%S") + "'", cfg["max_rows"])
-    total = 0
+    pending = []
     bound = retention_boundary(ctx, "otel", cfg.get("otel_ttl", ""), utcnow())
     for g in summarize_logs(cols, rows):
         if not fully_retained(g["day"], cfg.get("otel_ttl", ""), boundary=bound):
             continue
-        insert_rows(base_url, auth, db, "ai_log_daily",
-                    ["day_start", "scope_name", "severity_text", "log_count",
-                     "error_count"],
-                    [[ts_lit(g["day"]), str_lit(g["scope"]), str_lit(g["severity"]),
-                      num_lit(g["count"]), num_lit(g["errors"])]])
-        total += 1
-    return total
+        pending.append([ts_lit(g["day"]), str_lit(g["scope"]), str_lit(g["severity"]),
+                        num_lit(g["count"]), num_lit(g["errors"])])
+    insert_rows(base_url, auth, db, "ai_log_daily",
+                ["day_start", "scope_name", "severity_text", "log_count",
+                 "error_count"], pending)
+    return len(pending)
 
 
 def _fetch_vehicle_raw(base_url, auth, db, stmt, max_rows):

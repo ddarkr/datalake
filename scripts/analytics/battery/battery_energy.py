@@ -54,6 +54,7 @@ EnergyRemaining/SOC is separately labelled BMS-circular, never independent.
 Supplied endpoint uncertainty propagates against a fixed reference only.
 """
 
+from bisect import bisect_right
 import math
 from datetime import datetime, timezone
 
@@ -706,13 +707,11 @@ def _calibration_scope_note(scope, field_cals, field):
 
 
 def _asof(pairs, tst, skew_ns):
-    best = None
-    for ptime, val in pairs:
-        if ptime <= tst and tst - ptime <= skew_ns:
-            best = (ptime, val)
-        elif ptime > tst:
-            break
-    return best[1] if best is not None else None
+    """Latest sorted point within skew; last same-time value (even None) wins."""
+    idx = bisect_right(pairs, tst, key=lambda point: point[0]) - 1
+    if idx < 0 or tst - pairs[idx][0] > skew_ns:
+        return None
+    return pairs[idx][1]
 
 
 def analyze(signals, events, config):

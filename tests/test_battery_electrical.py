@@ -733,6 +733,29 @@ def test_explicit_current_voltage_mapping_skips_uncalibrated_first_field():
     out2 = {r["metric"]: r for r in be.analyze(rows, [], cfg2)}
     assert out2["battery.electrical.soc_coulomb_pct"]["value"] is None
 
+def test_synchronized_steps_interval_boundaries():
+    current = [(0, 1.0, True, False), (10, 2.0, True, False)]
+    voltage = [(0, 100.0, True, False), (10, 110.0, True, False)]
+    full = [(0, 1.0, 100.0), (10, 2.0, 110.0)]
+    for barrier, expected in ((-1, full), (0, full), (5, full[:1]),
+                              (10, full[:1]), (11, full)):
+        cur = sorted(current + [(barrier, None, False, True)],
+                     key=lambda point: point[0])
+        assert be._synchronized_steps(cur, voltage, 10, 10, 0, 10) == (
+            expected, None)
+    for skew, gap, end, expected in (
+            (10, 10, 10, full), (9, 10, 10, full[:1]),
+            (10, 9, 10, full[:1]), (10, 10, 9, full[:1])):
+        # A later current is outside the bounded voltage interval.
+        cur = [current[0], (11, 2.0, True, False)]
+        expected = [(t, 1.0, v) for t, _, v in expected]
+        assert be._synchronized_steps(cur, voltage, skew, gap, 0, end) == (
+            expected, None)
+    duplicate = current + [(10, 3.0, True, False)]
+    assert be._synchronized_steps(duplicate, voltage, 10, 10, 0, 10) == (
+        [full[0], (10, 3.0, 110.0)], None)
+
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:

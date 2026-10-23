@@ -106,6 +106,7 @@ Public numerical helpers (pure, stdlib):
 """
 
 
+from bisect import bisect_right
 from datetime import datetime, timezone
 from scripts.analytics.battery import battery_common as bc
 
@@ -923,17 +924,14 @@ def _calibrated_points(ordered, field, apply_fn):
 
 
 def _asof_points(points, tstamp, skew_ns):
-    """Latest calibrated point value at t <= tstamp within skew_ns;
-    None when missing or stale (never filled forward)."""
-    best = None
-    for tprev, vprev in points:
-        if tprev > tstamp:
-            break
-        if tstamp - tprev <= skew_ns:
-            best = vprev
-        # ponytail: points are short change-gated series; linear scan
-        # keeps the join boring and order-independent via sorted input.
-    return best
+    """Latest sorted calibrated point at t <= tstamp within skew_ns.
+
+    Equal timestamps retain input order: the last point wins.
+    """
+    idx = bisect_right(points, tstamp, key=lambda point: point[0]) - 1
+    if idx < 0 or tstamp - points[idx][0] > skew_ns:
+        return None
+    return points[idx][1]
 
 
 def required_fields(config=None):
