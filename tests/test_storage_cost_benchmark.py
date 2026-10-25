@@ -303,12 +303,10 @@ class RealCollectorTest(unittest.TestCase):
                 self.assertIs(case["locals_validated"], True)
                 self.assertEqual(case["input_objects"], 3)
             self.assertEqual(fresh["input_bytes"], replay["input_bytes"])
-            self.assertEqual(fresh["archive_puts"], 3)
+            self.assertEqual(fresh["puts"], 3)
             self.assertEqual(fresh["new_remote_bytes"], fresh["input_bytes"])
-            for metric in ("archive_puts", "archive_put_bytes", "get_bytes", "new_remote_bytes"):
+            for metric in ("puts", "put_bytes", "get_bytes", "new_remote_bytes"):
                 self.assertEqual(replay[metric], 0)
-            self.assertEqual(replay["payload"]["put_bytes"], 0)
-            self.assertGreaterEqual(replay["put_bytes"], replay["control"]["put_bytes"])
             small, big = auxiliary["can_small"], auxiliary["can_big"]
             self.assertEqual(small["input_objects"], 3)
             self.assertEqual(big["input_objects"], 3)

@@ -2,7 +2,7 @@
 
 `BACKUP_KEEP`은 실패 업로드를 포함한 **로컬 archive 세대의 하드 상한**입니다.
 기존 archive는 자동 삭제하지 않으며 상한에 도달하면 다음 생성을 거절합니다.
-로컬 바이트 예산 기본값은 100 GiB, 원격 prefix 바이트 예산은 1 TiB입니다.
+로컬 바이트 예산 기본값은 100 GiB입니다. 원격 저장량을 기준으로 업로드를 차단하지 않습니다.
 원격 보존은 기본 비활성(`off`)이며 `backup` 성공 뒤 자동 평가하지 않습니다.
 삭제는 명시적 `retention enforce` + `BACKUP_REMOTE_RETENTION_APPROVE=1`에서만 일어납니다.
 운영 삭제는 검증된 dry-run 검토와 별도 명시적 승인 뒤에만 진행하세요.
@@ -21,23 +21,14 @@
 | `BACKUP_REMOTE_INCOMPLETE_GRACE_SEC` | `86400` | 미완료 유예(동시 실행 보호) |
 | `BACKUP_REMOTE_RETENTION_APPROVE` | `` | `enforce` 삭제에 `1` 필요 |
 
-생성 예산은 `BACKUP_LOCAL_MAX_BYTES`·`BACKUP_REMOTE_MAX_BYTES`로 조정합니다.
-CAN 백업에는 같은 기본값의 `CAN_BACKUP_LOCAL_MAX_BYTES`·`CAN_BACKUP_REMOTE_MAX_BYTES`가
-적용됩니다. 로컬 count·byte 한도는 실패해 보존된 archive도 포함합니다.
-압축 출력도 바이트 한도를 검증하고 기존 파일은 보존합니다.
-원격 inventory는 하나의 버킷 단위 publisher 잠금 아래 읽고 공유 pool·제어 객체를
-포함해 양의 증가량을 예약합니다. 잠금 검증 뒤 받은 prefix inventory는 세대 이름
-충돌 검사와 예산 검사에 재사용하며 CAN 백업 때문에 무관한 버킷 전체를 열거하지 않습니다.
-미확인 inventory나 예산 초과에서는 추가 COPY/PUT을 거절합니다. 모든 협조 writer는
-중지한 상태에서 함께 갱신해야 합니다. 새 전역 claim은 중복 prefix claim을 대체하지만,
-기존 prefix claim이 남아 있으면 거절하며 소유자 종료 확인 없이 회수하지 않습니다.
-강한 LIST 일관성이 전제입니다.
-서로 다른 prefix 예산은 계정 전체의 공통 예산이 아닙니다.
+로컬 생성 예산은 `BACKUP_LOCAL_MAX_BYTES`와 `CAN_BACKUP_LOCAL_MAX_BYTES`로
+조정합니다. count·byte 한도는 실패해 보존된 archive도 포함하며, 압축 출력도
+바이트 한도를 검사하고 기존 파일은 보존합니다.
 
-동일 합성 입력의 요청 수는 RAW 신규 18→10회, 재생 12→3회,
-CAN 백업 18→12회로 줄었습니다. 잠금 PUT/검증 LIST/DELETE와 데이터 HEAD 검증은
-유지합니다. CAN은 예산 기능 이전 9회보다 33% 많아 기존 20% 상대 게이트를
-여전히 넘습니다. 기준값을 바꾸거나 최신 커밋을 새 기준으로 삼아 이 증가를 숨기지 마세요.
+공유 SST 백업과 retention은 같은 backup prefix의 `_locks/` claim으로 보호합니다.
+서로 다른 prefix의 작업이나 RAW·CAN 업로드를 버킷 단위로 직렬화하지 않습니다.
+이 잠금은 원격 저장량의 하드 상한을 보장하지 않습니다. 강한 LIST 일관성이
+전제이며, 남은 claim은 소유자의 종료를 확인하기 전까지 회수하지 마세요.
 
 ## 복구 세대
 

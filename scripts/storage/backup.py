@@ -445,60 +445,44 @@ _POOL_INVENTORY = ContextVar("backup_pool_inventory", default=None)
 
 
 @contextmanager
-def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True,
-                     *, inventory_prefix=None):
-    """Serialize bucket publishers and capture only the required inventory.
+def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
+    """Exclusive unique claims require strongly consistent LIST/PUT.
 
-    All publishers must use this bucket-wide protocol. A crashed claim requires
-    independently proving its owner exited before manual removal.
+    ponytail: serialize this backup prefix; per-object guards only if measured
+    contention justifies a more complex publication/GC protocol. A crashed claim
+    requires independently proving its owner exited before manual removal.
     """
-    inventory_prefix = norm_prefix(bp) if inventory_prefix is None else inventory_prefix
     identity = (bucket, norm_prefix(bp))
     if reentrant and _POOL_GUARD.get() == identity:
-        yield _POOL_INVENTORY.get()["inventory_sizes"]
+        yield
         return
+    locks = norm_prefix(bp) + POOL_LOCK_DIR
+    if s3_list_all(client, bucket, locks):
+        raise IOError("pool writer/GC already active (claim present)")
     claim_token = token or uuid.uuid4().hex
     if not isinstance(claim_token, str) or "/" in claim_token or claim_token in (".", ".."):
         raise IOError("unsafe shared SST pool lock token")
-    locks = "_storage_budget/" + POOL_LOCK_DIR
     key = locks + claim_token
-    guard_token = inventory_token = None
+    token = None
+    inventory_token = None
     try:
-        claim = {"claim": claim_token, "pid": os.getpid(),
+        claim = {"claim": key.rsplit("/", 1)[-1], "pid": os.getpid(),
                  "host": socket.gethostname(), "created_ns": time.time_ns()}
         payload = json.dumps(claim).encode()
         if verify_claim:
             s3_put_bytes_verified(client, bucket, key, payload)
         else:
-            client.put_object(Bucket=bucket, Key=key, Body=payload,
-                              ContentLength=len(payload), Metadata={},
-                              ChecksumSHA256=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"))
-        # PUT before LIST is safe with strong consistency: any contender sees
-        # the current owner, or both contenders refuse. Never steal a claim.
-        if inventory_prefix:
-            if {obj["Key"] for obj in s3_list_all(client, bucket, locks)} != {key}:
-                raise IOError("pool writer/GC claim collision (refusing)")
-        sizes = {}
-        for obj in s3_list_all(client, bucket, inventory_prefix):
-            name, size = obj.get("Key"), obj.get("Size")
-            if not isinstance(name, str) or type(size) is not int or size < 0 or name in sizes:
-                raise IOError("remote storage inventory unknown")
-            sizes[name] = size
-        if not inventory_prefix and {name for name in sizes if name.startswith(locks)} != {key}:
+            client.put_object(Bucket=bucket, Key=key, Body=payload)
+        if {o["Key"] for o in s3_list_all(client, bucket, locks)} != {key}:
             raise IOError("pool writer/GC claim collision (refusing)")
-        if any(name.startswith(norm_prefix(bp) + POOL_LOCK_DIR) for name in sizes):
-            raise IOError("legacy pool writer/GC claim present (refusing)")
-        sizes.pop(key, None)  # Transient ownership controls are not retained data.
-        guard_token = _POOL_GUARD.set(identity)
-        inventory_token = _POOL_INVENTORY.set({
-            "inventory_bucket": bucket, "inventory_prefix": inventory_prefix,
-            "inventory_sizes": sizes})
-        yield sizes
+        token = _POOL_GUARD.set(identity)
+        inventory_token = _POOL_INVENTORY.set({})
+        yield
     finally:
         if inventory_token is not None:
             _POOL_INVENTORY.reset(inventory_token)
-        if guard_token is not None:
-            _POOL_GUARD.reset(guard_token)
+        if token is not None:
+            _POOL_GUARD.reset(token)
         s3_delete_keys(client, bucket, [key])
 
 
@@ -528,11 +512,7 @@ def pool_inventory(client, bucket, bp, excluding=None):
     """
     bp = norm_prefix(bp)
     pp = pool_prefix(bp)
-    cache = _POOL_INVENTORY.get()
-    if cache is not None and cache.get("budget_scope") == (bucket, bp):
-        scope = [{"Key": key, "Size": size} for key, size in cache["budget_sizes"].items()]
-    else:
-        scope = s3_list_all(client, bucket, bp)
+    scope = s3_list_all(client, bucket, bp)
     sizes = {o["Key"]: o.get("Size") for o in scope}
     names = {key[len(pp):] for key in sizes if key.startswith(pp)}
     if any(not re.fullmatch(r"[0-9a-f]{64}(?:\.json)?", key) for key in names):
@@ -614,7 +594,6 @@ def shared_sst_record(client, bucket, root_pfx, bp, rel, source, owned):
         # Re-copy the captured source version, but never roll back an unowned key.
     else:
         owned.append(dst)  # BEFORE COPY; reused/unpublished existing keys are not owned.
-    remote_budget(client, bucket, bp, {dst: size})
     try:
         copied = s3_copy_head_verified(client, bucket, norm_prefix(root_pfx) + rel,
                                        dst, source=source)
@@ -683,11 +662,6 @@ def open_s3_client(component="backup"):
         run["clients"].append(client)
         if run["operation"] == "cmd_backup" and component == "backup":
             guard = shared_pool_lock(client, env("S3_BUCKET"), current_identity()["backup_prefix"])
-            guard.__enter__()
-            run["guard"] = guard
-        elif run["operation"] == "cmd_backup" and component == "can-backup":
-            guard = shared_pool_lock(client, env("S3_BUCKET"),
-                                     env("CAN_S3_BACKUP_PREFIX"), verify_claim=False)
             guard.__enter__()
             run["guard"] = guard
         elif run["operation"] == "cmd_restore" and component == "backup":
@@ -833,14 +807,7 @@ def claim_backup_id(d, s3, bucket, bp, prefix=BACKUP_PREFIX,
                 or os.path.exists(os.path.join(d, bid + suffix + sidecar_suffix))):
             continue
         if s3 is not None:
-            cache = _POOL_INVENTORY.get()
-            base = remote_base(bp, bid)
-            if (cache is not None and cache.get("inventory_bucket") == bucket
-                    and base.startswith(cache["inventory_prefix"])):
-                occupied = any(key.startswith(base) for key in cache["inventory_sizes"])
-            else:
-                occupied = bool(s3_list_all(s3, bucket, base))
-            if occupied:
+            if s3_list_all(s3, bucket, remote_base(bp, bid)):
                 continue
         return bid, stamp
     raise IOError("could not claim a fresh backup namespace (collision)")
@@ -865,34 +832,6 @@ def local_budget(d, estimate, keep, prefix=BACKUP_PREFIX, suffix=BACKUP_SUFFIX,
         raise IOError("local backup byte budget exceeded (existing files retained)")
 
 
-def remote_budget(client, bucket, bp, additions, var="BACKUP_REMOTE_MAX_BYTES"):
-    """LIST sizes only; one inventory per guarded publication, including shared SSTs."""
-    cache = _POOL_INVENTORY.get()
-    if cache is None:
-        raise IOError("remote budget requires publication guard")
-    limit = positive_budget(var, 1 << 40)
-    scope = (bucket, norm_prefix(bp) if bp else "")
-    if cache.get("budget_scope") != scope:
-        if (cache.get("inventory_bucket") == bucket
-                and scope[1].startswith(cache["inventory_prefix"])):
-            sizes = {key: size for key, size in cache["inventory_sizes"].items()
-                     if key.startswith(scope[1])}
-        else:
-            sizes = {}
-            for obj in s3_list_all(client, bucket, scope[1]):
-                key, size = obj.get("Key"), obj.get("Size")
-                if not isinstance(key, str) or type(size) is not int or size < 0 or key in sizes:
-                    raise IOError("remote storage inventory unknown")
-                sizes[key] = size
-        cache.update(budget_scope=scope, budget_sizes=sizes, budget_total=sum(sizes.values()))
-    sizes = cache["budget_sizes"]
-    growth = sum(max(0, size - sizes.get(key, 0)) for key, size in additions.items())
-    projected = cache["budget_total"] + growth
-    if projected > limit and growth:
-        raise IOError("remote storage byte budget exceeded (existing objects retained)")
-    for key, size in additions.items():
-        sizes[key] = max(size, sizes.get(key, 0))
-    cache["budget_total"] = projected
 
 
 def read_reserve(var="BACKUP_RESERVE_BYTES"):
@@ -993,7 +932,6 @@ def cmd_backup():
     snap_objects = []
     if s3 is not None:
         try:
-            remote_budget(s3, bucket, bp, {})
             seen = set()
             for obj in s3_list_all(s3, bucket, root_pfx):
                 rel = obj["Key"][len(root_pfx):]
@@ -1041,9 +979,6 @@ def cmd_backup():
             }, separators=(",", ":"), sort_keys=True).encode("utf-8")
             if len(complete) > CONTROL_CAP:
                 raise IOError("COMPLETE exceeds control size limit (%d bytes)" % CONTROL_CAP)
-            remote_budget(s3, bucket, bp, {
-                rbase + name: tar_size, rbase + name + SIDECAR_SUFFIX: len(sidecar),
-                rbase + MANIFEST_NAME: len(raw_manifest), rbase + COMPLETE_NAME: len(complete)})
             owned.append(rbase + name)  # BEFORE each write
             s3_put_file_verified(s3, bucket, rbase + name, path, digest, tar_size)
             owned.append(rbase + name + SIDECAR_SUFFIX)

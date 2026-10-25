@@ -422,17 +422,6 @@ class FakeS3:
         self.puts = 0
         self.gets = 0
 
-    def list_objects_v2(self, Bucket, Prefix="", **kw):
-        return {"Contents": [{"Key": key, "Size": len(value[0])}
-                             for (bucket, key), value in self.store.items()
-                             if bucket == Bucket and key.startswith(Prefix)],
-                "IsTruncated": False}
-
-    def delete_objects(self, Bucket, Delete):
-        for obj in Delete["Objects"]:
-            self.store.pop((Bucket, obj["Key"]), None)
-        return {}
-
     @staticmethod
     def _b64(data):
         import base64 as _b64
@@ -441,9 +430,6 @@ class FakeS3:
 
     def put_object(self, Bucket, Key, Body, ContentLength=None, Metadata=None,
                    ChecksumSHA256=None):
-        if Key.startswith(("_raw_budget/_locks/", "_storage_budget/_locks/")):
-            self.store[(Bucket, Key)] = (Body, {}, self._b64(Body))
-            return {}
         if self.fail_put > 0:
             self.fail_put -= 1
             raise ConnectionError("boom")
@@ -783,25 +769,6 @@ class UploadTest(unittest.TestCase):
             self.assertEqual(cli.puts, puts)  # identical: reused, no PUT
             for gone in (p, s, m, cp):
                 self.assertFalse(os.path.exists(gone))
-
-    def test_over_budget_triple_does_not_block_later_verified_replay(self):
-        with tempfile.TemporaryDirectory() as spool:
-            replay = self._triple(spool)
-            cli = FakeS3()
-            with mock.patch.object(upl.os, "unlink"):
-                upl.run_once(cli, "b", spool, "m3", 0)
-            blocked = self._triple(
-                spool, name="m3_20260921T130000Z_deadbeef_000")
-            before = dict(cli.store)
-            limit = sum(len(value[0]) for value in before.values())
-            with mock.patch.dict(os.environ, {"RAW_REMOTE_MAX_BYTES": str(limit)}):
-                self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 2)
-            self.assertEqual(cli.store, before)
-            self.assertEqual(cli.puts, 3)
-            for path in blocked:
-                self.assertTrue(os.path.exists(path))
-            for path in replay:
-                self.assertFalse(os.path.exists(path))
 
     def test_same_stem_changed_triple_new_key_old_archive_kept(self):
         with tempfile.TemporaryDirectory() as spool:
@@ -1497,21 +1464,6 @@ class StorageBudgetTest(unittest.TestCase):
         self.assertEqual(client.mock_calls, [])
         self.assertEqual(upl._M["pending_files"], 0)
         self.assertEqual(upl._M["pending_bytes"], 0)
-
-    def test_unknown_and_full_remote_inventory_preserve_locals(self):
-        client = FakeS3()
-        client.store[("bucket", "old")] = (b"history", {}, "")
-        with tempfile.TemporaryDirectory() as spool, mock.patch.dict(
-                os.environ, {"RAW_REMOTE_MAX_BYTES": "1"}):
-            paths, blobs = RawBindingTest()._triple(spool)
-            self.assertEqual(upl.run_once(client, "bucket", spool, "v", 1), 1)
-            self.assertEqual(client.store, {("bucket", "old"): (b"history", {}, "")})
-            self.assertEqual(client.puts, 0)
-            with mock.patch.object(client, "list_objects_v2", side_effect=IOError("unknown")):
-                self.assertEqual(upl.run_once(client, "bucket", spool, "v", 1), 1)
-            for path in paths:
-                with open(path, "rb") as stream:
-                    self.assertEqual(stream.read(), blobs[path])
 
     def test_spool_counts_quarantine_and_refuses_new_segment(self):
         with tempfile.TemporaryDirectory() as spool:

@@ -73,7 +73,7 @@ services:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
     labels:
-      datalake.raw-uploader-revision: "4"
+      datalake.raw-uploader-revision: "5"
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully
@@ -87,19 +87,12 @@ services:
       - source: raw_s3_cost_py
         target: /app/scripts/storage/s3_cost.py
         mode: 0444
-      - source: raw_backup_budget_py
-        target: /app/scripts/storage/backup.py
-        mode: 0444
-      - source: raw_greptime_preflight_py
-        target: /app/scripts/database/greptime_preflight.py
-        mode: 0444
     volumes:
       - vehicle-venv:/opt/venv:ro
       - raw-spool:/spool/raw
     environment:
       VEHICLE_ID: ${VEHICLE_ID:-}
       RAW_SPOOL_DIR: /spool/raw
-      RAW_REMOTE_MAX_BYTES: ${RAW_REMOTE_MAX_BYTES:-1099511627776}
       RAW_BUCKET: ${RAW_BUCKET:-}
       RAW_S3_ENDPOINT_URL: ${RAW_S3_ENDPOINT_URL:-}
       RAW_S3_REGION: ${RAW_S3_REGION:-us-west-004}
@@ -127,10 +120,6 @@ configs:
     x-source: scripts/storage/storage_metrics.py
   raw_s3_cost_py:
     x-source: scripts/storage/s3_cost.py
-  raw_backup_budget_py:
-    x-source: scripts/storage/backup.py
-  raw_greptime_preflight_py:
-    x-source: scripts/database/greptime_preflight.py
 
 volumes:
   vehicle-venv:

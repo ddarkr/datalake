@@ -141,8 +141,8 @@ python -m tests.test_egress_guard --docker
 재시도한 네 파생 출력의 oracle 일치를 확인합니다. CAN은 200,001개 완료 이력 뒤의
 오래된 새 generation·500개 배치·coordination table 누락 실패를 검사합니다.
 배터리는 기본 30개 창의 fetch 3회와 늦은 입력 재조회, 다섯 분석기의 준비된 신호
-재사용 결과를 확인합니다. 새 바이트 예산은 기존 데이터 보존·미확인 inventory 거절·
-실패 archive 슬롯·orphan COPY 증가·버킷 잠금·RAW finalization 여유를 검증합니다.
+재사용 결과를 확인합니다. 로컬 바이트 예산은 기존 데이터 보존·실패 archive 슬롯·
+RAW finalization 여유를 검증하며, prefix 잠금은 같은 prefix만 직렬화합니다.
 합성 모델은 실제 provider 청구·운영 배포 증거가 아닙니다.
 
 callback/installer fixture와 실제 native host smoke는 별도 gate입니다. 이전 macOS native host smoke에서 ACK 전에 부모가 종료하고 별도 sender가 나중에 전달한 결과는 구 영속 전송 구현의 기록이며 현재 직접 전송의 증거가 아닙니다. 현재 직접 전송의 회귀·loopback 검증도 사용자 설치·재시작, 운영 DB 저장·집계, provider 청구, 모든 native host 경로를 증명하지 않습니다.

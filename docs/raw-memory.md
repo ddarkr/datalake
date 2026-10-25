@@ -9,20 +9,11 @@ via `gunzip_compare`) never build proportional bytes/frame objects.
   the ingress and its finalization headroom before accepting another segment.
   Existing files are never removed to make room; at the limit new capture is
   refused/counted as dropped until an operator or verified upload frees room.
-- `RAW_REMOTE_MAX_BYTES` (default 1 TiB, positive): budget for the configured
-  RAW bucket. New uploads acquire one cooperating bucket-wide publication lock
-  and reuse its complete LIST inventory to reserve growth before PUT. Verified
-  read-only replays use HEAD checks without a lock or inventory. Unknown
-  inventory or excess growth retains every unacknowledged local file.
-  A refused triple does not stop the sweep: later zero-growth replays can still
-  verify their remote copies and release their local spool files.
-  Empty sweeps issue no S3 request. `RAW_INVENTORY_INTERVAL_SEC=0` still disables
-  the separate periodic metrics inventory, not the upload budget preflight.
-  Transient lock claims are control overhead, not data quota. External writers,
-  versioned-object history and account billing are outside this budget.
-  All publishers sharing a bucket must be upgraded together while stopped.
-  The new global claim replaces the redundant per-prefix claim; legacy claims
-  in the target prefix still refuse publication and are never stolen.
+RAW 업로드에는 원격 저장 예산 차단이나 버킷 전역 잠금이 없습니다.
+서로 독립적인 업로더와 백업은 병행할 수 있습니다. 각 업로더는 동일한
+content-addressed 객체를 HEAD로 검증한 뒤 재사용하며, 새 객체의 PUT 응답과
+서버 checksum을 확인합니다. 확인하지 못한 로컬 파일은 보존합니다.
+`RAW_INVENTORY_INTERVAL_SEC=0`은 선택적 저장량 통계용 LIST를 끕니다.
 
 - `RAW_FINALIZE_MEM_FRAMES` (default 20000, must be > 0): max resident
   decoded frames across sort AND identity match staging (match batches

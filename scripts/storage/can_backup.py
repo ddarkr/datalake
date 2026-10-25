@@ -619,7 +619,6 @@ def cmd_backup():
         bp = bk.norm_prefix(ident["backup_prefix"])
         try:
             s3 = make_client()
-            bk.remote_budget(s3, bucket, bp, {}, var="CAN_BACKUP_REMOTE_MAX_BYTES")
         except Exception as e:
             return bk.fail("S3 client failed: " + str(e)[:200], code=3)
     try:
@@ -725,10 +724,6 @@ def cmd_backup():
             if len(complete) > bk.CONTROL_CAP:
                 raise IOError("COMPLETE exceeds control size limit (%d bytes)"
                               % bk.CONTROL_CAP)
-            bk.remote_budget(s3, bucket, bp, {
-                rbase + name: tar_size, rbase + name + CAN_SIDECAR: len(sidecar),
-                rbase + CAN_MANIFEST: len(raw_manifest), rbase + CAN_COMPLETE: len(complete)},
-                var="CAN_BACKUP_REMOTE_MAX_BYTES")
             owned.append(rbase + name)
             bk.s3_put_file_verified(s3, bucket, rbase + name, path, digest,
                                     tar_size)

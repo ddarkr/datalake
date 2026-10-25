@@ -700,14 +700,9 @@ def test_restore_destination_claim_blocks_reuse_until_rollback():
             else:
                 raise AssertionError("second restore reused uncommitted live SST")
             assert fake.objects["live/a.sst"] == b"a"
-            # Bucket-wide quota reservations serialize even different restore roots.
-            try:
-                bk.s3_restore_snapshot(fake, "bucket", "independent/",
-                                       {"snap_prefix": "other-snapshot/"}, records[:1])
-            except IOError:
-                pass
-            else:
-                raise AssertionError("different root bypassed bucket publication lock")
+            # Independent restore roots must remain concurrent, even during rollback.
+            bk.s3_restore_snapshot(fake, "bucket", "independent/",
+                                   {"snap_prefix": "other-snapshot/"}, records[:1])
             raise IOError("second copy failed")
         return copy(**kw)
 
@@ -720,10 +715,8 @@ def test_restore_destination_claim_blocks_reuse_until_rollback():
     else:
         raise AssertionError("copy failure was ignored")
     assert refused == [True]
-    assert fake.objects == original
+    assert fake.objects == dict(original, **{"independent/a.sst": b"a"})
     fake.copy_object = copy
-    bk.s3_restore_snapshot(fake, "bucket", "independent/",
-                           {"snap_prefix": "other-snapshot/"}, records[:1])
     bk.s3_restore_snapshot(fake, "bucket", "live/",
                            {"snap_prefix": "snapshot/"}, records)
     assert fake.objects["live/a.sst"] == b"a"
@@ -2931,15 +2924,10 @@ def test_original_lock_tokens_and_restore_during_writer():
         del fake.objects["test-backups/_locks/stale"]
         fake.objects = {k: v for k, v in fake.objects.items() if not k.startswith("test-root/")}
         with bk.shared_pool_lock(fake, "test-bucket", "test-backups/", token="writer"):
-            held_remote = dict(fake.objects)
-            held_targets = hash_tree(tgt)
             source_files = hash_tree(os.path.join(tmp, "src"))
-            assert bk.cmd_restore() == 3
-            assert fake.objects == held_remote
-            assert hash_tree(tgt) == held_targets
+            assert bk.cmd_restore() == 0
+            assert hash_tree(tgt) == source_files
             assert hash_tree(os.path.join(tmp, "src")) == source_files
-        assert bk.cmd_restore() == 0
-        assert hash_tree(tgt) == hash_tree(os.path.join(tmp, "src"))
         assert {k: v for k, v in fake.objects.items() if k.startswith("test-root/")} == {
             k: v for k, v in before.items() if k.startswith("test-root/")}
         gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
@@ -3364,109 +3352,56 @@ def test_manifest_loader_boundaries():
         restore_env()
 
 
-def test_storage_budgets_preserve_history_and_allow_replay():
+def test_local_storage_budgets_preserve_history():
     from unittest.mock import patch
-    fake = FakeS3({"backups/old": b"history"})
-    token = bk._POOL_INVENTORY.set({})
-    try:
-        with patch.dict(os.environ, {"BACKUP_REMOTE_MAX_BYTES": "7"}):
-            bk.remote_budget(fake, "bucket", "backups", {"backups/old": 7})
-            before = dict(fake.objects)
+    with tempfile.TemporaryDirectory() as directory:
+        path = os.path.join(directory, bk.BACKUP_PREFIX + "failed" + bk.BACKUP_SUFFIX)
+        with open(path, "wb") as stream:
+            stream.write(b"retained failure")
+        try:
+            bk.local_budget(directory, 1, 1)
+            assert False, "retained failures must consume generation slots"
+        except IOError:
+            pass
+        with open(path, "rb") as stream:
+            assert stream.read() == b"retained failure"
+        with patch.dict(os.environ, {"BACKUP_LOCAL_MAX_BYTES": "8192"}):
+            tmp = os.path.join(directory, "bounded.tmp")
             try:
-                bk.remote_budget(fake, "bucket", "backups", {"backups/new": 1})
-                assert False, "additional bytes must be refused"
+                with bk.bounded_local_tar(tmp) as tar:
+                    payload = os.urandom(16384)
+                    info = tarfile.TarInfo("payload")
+                    info.size = len(payload)
+                    tar.addfile(info, io.BytesIO(payload))
+                assert False, "compressed output must be capped before write"
             except IOError:
                 pass
-            assert fake.objects == before
-        bk._POOL_INVENTORY.set({})
-        with patch.object(fake, "list_objects_v2",
-                          return_value={"Contents": [{"Key": "backups/unknown"}]}):
-            try:
-                bk.remote_budget(fake, "bucket", "backups", {})
-                assert False, "unknown Size must fail closed"
-            except IOError:
-                pass
-        with tempfile.TemporaryDirectory() as directory:
-            path = os.path.join(directory, bk.BACKUP_PREFIX + "failed" + bk.BACKUP_SUFFIX)
-            with open(path, "wb") as stream:
-                stream.write(b"retained failure")
-            try:
-                bk.local_budget(directory, 1, 1)
-                assert False, "retained failures must consume generation slots"
-            except IOError:
-                pass
-            with open(path, "rb") as stream:
-                assert stream.read() == b"retained failure"
-            with patch.dict(os.environ, {"BACKUP_LOCAL_MAX_BYTES": "8192"}):
-                tmp = os.path.join(directory, "bounded.tmp")
-                try:
-                    with bk.bounded_local_tar(tmp) as tar:
-                        payload = os.urandom(16384)
-                        info = tarfile.TarInfo("payload")
-                        info.size = len(payload)
-                        tar.addfile(info, io.BytesIO(payload))
-                    assert False, "compressed output must be capped before write"
-                except IOError:
-                    pass
-                assert os.path.getsize(tmp) <= 8192 - len(b"retained failure") - 4096
-    finally:
-        bk._POOL_INVENTORY.reset(token)
+            assert os.path.getsize(tmp) <= 8192 - len(b"retained failure") - 4096
 
 
-def test_bucket_publication_lock_excludes_different_prefixes():
+def test_publication_locks_allow_independent_prefixes():
     fake = FakeS3({})
-    with bk.shared_pool_lock(fake, "bucket", "backups"):
-        before = dict(fake.objects)
-        try:
-            with bk.shared_pool_lock(fake, "bucket", "_raw_budget"):
-                assert False, "whole-bucket quota must exclude other prefix publishers"
-        except IOError:
-            pass
-        assert fake.objects == before
-    assert fake.objects == {}
-    from unittest.mock import patch
-    fake = FakeS3({"backups/kept": b"x", "outside": b"x" * 2048})
-    before = dict(fake.objects)
-    with patch.dict(os.environ, {"BACKUP_REMOTE_MAX_BYTES": "1024"}), \
-            bk.shared_pool_lock(fake, "bucket", "backups"):
-        bk.remote_budget(fake, "bucket", "backups", {"backups/new": 1})
-        try:
-            bk.remote_budget(fake, "bucket", "", {"backups/new": 1})
-            assert False, "prefix inventory cannot prove a whole-bucket budget"
-        except IOError:
-            pass
-    assert fake.objects == before
-
-
-def test_unpublished_pool_replacement_reserves_growth():
-    from unittest.mock import patch
-    source = b"larger source"
-    fake = FakeS3({"live/a": source})
-    head = bk.s3_head_checksum(fake, "bucket", "live/a")
-    key = bk.shared_sst_key("bucket", "live", "backups", "a", len(source), head["ETag"])
-    fake.objects[key] = b"x"
-    before = dict(fake.objects)
-    guard = bk._POOL_GUARD.set(("bucket", "backups/"))
-    cache = bk._POOL_INVENTORY.set({"pool": {key.rsplit("/", 1)[1]}, "records": {}})
-    try:
-        with patch.dict(os.environ, {"BACKUP_REMOTE_MAX_BYTES": "1"}), \
-                patch.object(fake, "copy_object", wraps=fake.copy_object) as copy:
+    first = "first/_locks/owner"
+    second = "second/_locks/owner"
+    with bk.shared_pool_lock(fake, "bucket", "first", token="owner"):
+        with bk.shared_pool_lock(fake, "bucket", "second", token="owner"):
+            held = dict(fake.objects)
+            assert set(held) == {first, second}
             try:
-                bk.shared_sst_record(fake, "bucket", "live", "backups", "a", head, [])
-                assert False, "larger orphan replacement must reserve growth before COPY"
+                with bk.shared_pool_lock(fake, "bucket", "first", token="contender"):
+                    assert False, "same-prefix publishers must remain excluded"
             except IOError:
                 pass
-            copy.assert_not_called()
-        assert fake.objects == before
-    finally:
-        bk._POOL_INVENTORY.reset(cache)
-        bk._POOL_GUARD.reset(guard)
+            assert fake.objects == held
+        assert set(fake.objects) == {first}
+    assert fake.objects == {}
+
+
 
 
 if __name__ == "__main__":
-    test_bucket_publication_lock_excludes_different_prefixes()
-    test_unpublished_pool_replacement_reserves_growth()
-    test_storage_budgets_preserve_history_and_allow_replay()
+    test_publication_locks_allow_independent_prefixes()
+    test_local_storage_budgets_preserve_history()
     test_manifest_loader_boundaries()
     test_restore_target_locks_alias_overlap_and_process()
     test_restore_owns_targets_before_precheck_and_through_rollback()

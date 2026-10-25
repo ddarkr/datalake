@@ -26,7 +26,7 @@
 #   embeds manifest.json with the full recovery inventory) + .sha256 -> tar + sidecar +
 #   manifest uploaded to s3://BUCKET/S3_BACKUP_PREFIX/<backup-id>/ and
 #   HEAD size/digest-metadata verified -> COMPLETE marker written -> claim released.
-#   Local count/byte and remote byte budgets stop new backups without deleting history.
+#   Local count/byte budgets stop new backups without deleting history.
 #   Explicit retention requires reviewed dry-run + approval; GC preserves surviving SST refs.
 #   Overlapping live/backup prefixes fail closed. File mode keeps the same offline/tar/restore
 #   contract with no S3 at all.
@@ -115,7 +115,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "7"
+      datalake.backup-revision: "8"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -123,7 +123,6 @@ services:
       BACKUP_DIR: /backup
       BACKUP_KEEP: ${BACKUP_KEEP:-7}
       BACKUP_LOCAL_MAX_BYTES: ${BACKUP_LOCAL_MAX_BYTES:-107374182400}
-      BACKUP_REMOTE_MAX_BYTES: ${BACKUP_REMOTE_MAX_BYTES:-1099511627776}
       BACKUP_REMOTE_RETENTION_MODE: ${BACKUP_REMOTE_RETENTION_MODE:-off}
       BACKUP_REMOTE_RETAIN_COUNT: ${BACKUP_REMOTE_RETAIN_COUNT:-7}
       BACKUP_REMOTE_RETAIN_DAYS: ${BACKUP_REMOTE_RETAIN_DAYS:-0}
@@ -174,7 +173,7 @@ services:
     image: ${BACKUP_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [backup]
     labels:
-      datalake.backup-revision: "7"
+      datalake.backup-revision: "8"
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -188,7 +187,6 @@ services:
       CAN_BACKUP_FILE: ${CAN_BACKUP_FILE:-}
       CAN_BACKUP_KEEP: ${CAN_BACKUP_KEEP:-7}
       CAN_BACKUP_LOCAL_MAX_BYTES: ${CAN_BACKUP_LOCAL_MAX_BYTES:-107374182400}
-      CAN_BACKUP_REMOTE_MAX_BYTES: ${CAN_BACKUP_REMOTE_MAX_BYTES:-1099511627776}
       CAN_BACKUP_RESERVE_BYTES: ${CAN_BACKUP_RESERVE_BYTES:-67108864}
       BACKUP_OFFLINE_CONFIRMED: ${BACKUP_OFFLINE_CONFIRMED:-}
       CAN_STORAGE_TYPE: ${CAN_STORAGE_TYPE:-File}

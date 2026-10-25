@@ -801,15 +801,11 @@ def run_raw_once(raw, client, bucket, spool, vehicle, label, fresh=True):
     after = listed_sizes(client, bucket, prefix)
     out = measured_case(measured, label, before, after, input_bytes, len(paths))
     out.update(triples_seen=processed, acknowledged=acknowledged, replay=not fresh, locals_validated=True)
-    archive_put_keys = [key for op, key, ok in client._log[mark[1]:]
-                        if op == "puts" and key.startswith(prefix)]
-    archive_put_bytes = sum(after.get(key, 0) for key in archive_put_keys)
-    out.update(archive_puts=len(archive_put_keys), archive_put_bytes=archive_put_bytes)
     if fresh:
-        if out["archive_puts"] != 3 or len(after) != 3 or out["new_remote_bytes"] != input_bytes:
+        if out["puts"] != 3 or len(after) != 3 or out["new_remote_bytes"] != input_bytes:
             raise AssertionError("fresh RAW must upload exactly the immutable triple")
-    elif out["archive_puts"] != 0 or archive_put_bytes != 0 or out["new_remote_bytes"] != 0:
-        raise AssertionError("RAW replay must add no archive PUTs or retained remote bytes")
+    elif out["puts"] != 0 or out["put_bytes"] != 0 or out["new_remote_bytes"] != 0:
+        raise AssertionError("RAW replay must add no PUTs or remote bytes")
     return out
 
 
