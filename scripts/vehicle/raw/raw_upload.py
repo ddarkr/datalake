@@ -242,13 +242,14 @@ def wrap_client(client):
     return _S3_WRAPPED
 
 
-def upload_verified(client, bucket, key, path, digest, max_retries, *, size=None):
+def upload_verified(client, bucket, key, path, digest, max_retries, *, size=None,
+                    known_missing=False):
     """Verified write to a content-addressed key: never overwrites truth.
 
     Triple uploads pass the preflight size; standalone callers may omit it.
-    Pre-check HEAD first: size + Metadata sha256 + server ChecksumSHA256
-    reuses the live object; any mismatch (including missing checksum or
-    missing digest) is a conflict (kept, never overwritten); any other
+    Pre-check HEAD first, unless a guarded, complete inventory proves absence.
+    Size + Metadata sha256 + server ChecksumSHA256 reuse the live object;
+    any mismatch (including missing checksum/digest) is a conflict, never overwritten.
     HEAD error is unreadable (retried, never mistaken for missing). Only
     genuine missing-key permits PUT with ChecksumSHA256; the PUT response
     must echo the checksum and the post-PUT HEAD must report it. Missing
@@ -265,12 +266,13 @@ def upload_verified(client, bucket, key, path, digest, max_retries, *, size=None
     delay = 2.0
     for attempt in range(max_retries + 1):
         try:
-            try:
-                existing = _head(client, bucket, key)
-            except Exception as hexc:
-                if not _is_missing(hexc):
-                    raise
-                existing = None
+            existing = None
+            if not known_missing or attempt:
+                try:
+                    existing = _head(client, bucket, key)
+                except Exception as hexc:
+                    if not _is_missing(hexc):
+                        raise
             if existing is not None:
                 if _remote_matches(existing, size, digest):
                     return True
@@ -506,6 +508,34 @@ def quarantine(spool, paths):
     minc("dropped_verify")
 
 
+def _triple_legs(paths, vehicle, snap):
+    mf4, sidecar, manifest, _ = paths
+    key = remote_key(mf4, vehicle, snap["manifest_digest"])
+    return ((key, mf4, snap["mf4_digest"], snap["sizes"][0]),
+            (sidecar_key(key), sidecar, snap["sidecar_digest"], snap["sizes"][1]),
+            (manifest_key(key), manifest, snap["manifest_digest"], snap["sizes"][2]))
+
+
+def _acknowledge(spool, paths, snap):
+    # Even read-only replay must not delete locals changed after preflight.
+    ok, reason, _ = fail_closed_check(*paths, snap=snap)
+    if not ok:
+        print("final guard rejected: %s (quarantined, originals kept)"
+              % reason.split(":", 1)[0], file=sys.stderr)
+        quarantine(spool, paths)
+        minc("failed")
+        return
+    for path in paths:
+        if path is not None:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+    minc("uploaded_files")
+    minc("uploaded_bytes", sum(snap["sizes"]))
+    mset("last_upload", int(time.time()))
+
+
 def run_once(client, bucket, spool, vehicle, max_retries):
     triples = pending(spool)
     nbytes = 0
@@ -518,20 +548,40 @@ def run_once(client, bucket, spool, vehicle, max_retries):
     mset("pending_bytes", nbytes)
     if not triples:
         return 0
+    # A fully verified replay cannot grow remote storage: no publisher claim or
+    # inventory is needed. Stop at the first writer; keep only one manifest in RAM.
+    missing = False
+    for start, paths in enumerate(triples):
+        ok, _, snap = fail_closed_check(*paths)
+        if not ok:
+            break
+        try:
+            if not all(_remote_matches(_head(client, bucket, key), size, digest)
+                       for key, _, digest, size in _triple_legs(paths, vehicle, snap)):
+                break
+        except Exception as ex:
+            missing = _is_missing(ex)
+            break  # The guarded upload path retains its configured retries.
+        _acknowledge(spool, paths, snap)
+    else:
+        return len(triples)
     try:
-        with storage.shared_pool_lock(client, bucket, "_raw_budget", verify_claim=False):
+        with storage.shared_pool_lock(client, bucket, "_raw_budget",
+                                      verify_claim=False, inventory_prefix="") as inventory:
             storage.remote_budget(client, bucket, "", {}, var="RAW_REMOTE_MAX_BYTES")
-            return _run_once(client, bucket, spool, vehicle, max_retries, triples)
+            _run_once(client, bucket, spool, vehicle, max_retries, triples[start:],
+                      inventory if missing else None, snap)
+            return len(triples)
     except Exception as ex:
         minc("failed")
         print("raw storage guard refused: %s" % type(ex).__name__, file=sys.stderr)
         return len(triples)
 
 
-def _run_once(client, bucket, spool, vehicle, max_retries, triples):
-    for mf4_path, sidecar_path, manifest_path, closed_path in triples:
-        ok, reason, snap = fail_closed_check(mf4_path, sidecar_path,
-                                            manifest_path, closed_path)
+def _run_once(client, bucket, spool, vehicle, max_retries, triples, inventory, first_snap):
+    for index, (mf4_path, sidecar_path, manifest_path, closed_path) in enumerate(triples):
+        ok, reason, snap = fail_closed_check(mf4_path, sidecar_path, manifest_path,
+                                            closed_path, snap=first_snap if index == 0 else None)
         if not ok:
             print("preflight rejected: %s (quarantined, originals kept)"
                   % reason.split(":", 1)[0], file=sys.stderr)
@@ -542,12 +592,8 @@ def _run_once(client, bucket, spool, vehicle, max_retries, triples):
         # Fixed preflight pins: the key and every PUT checksum reuse the
         # validated digests, never a drifted re-hash (a correct server
         # rejects a drifted body under the pinned ChecksumSHA256).
-        key = remote_key(mf4_path, vehicle, snap["manifest_digest"])
-        legs = [(key, mf4_path, snap["mf4_digest"], snap["sizes"][0]),
-                (sidecar_key(key), sidecar_path, snap["sidecar_digest"],
-                 snap["sizes"][1]),
-                (manifest_key(key), manifest_path, snap["manifest_digest"],
-                 snap["sizes"][2])]
+        legs = _triple_legs((mf4_path, sidecar_path, manifest_path, closed_path),
+                            vehicle, snap)
         try:
             storage.remote_budget(client, bucket, "", {k: size for k, _, _, size in legs},
                                   var="RAW_REMOTE_MAX_BYTES")
@@ -558,35 +604,13 @@ def _run_once(client, bucket, spool, vehicle, max_retries, triples):
         acked = True
         for k, p, digest, size in legs:
             if not upload_verified(client, bucket, k, p, digest, max_retries,
-                                   size=size):
+                                   size=size, known_missing=inventory is not None and k not in inventory):
                 minc("failed")  # any leg fails: ALL locals stay
                 acked = False
                 break
         if not acked:
             continue
-        # Final revalidation (same check, no second convention): drift
-        # after preflight -- including replay reuse with no PUT -- must
-        # never delete changed locals or adopt a replacement manifest.
-        ok, reason, _ = fail_closed_check(mf4_path, sidecar_path,
-                                         manifest_path, closed_path,
-                                         snap=snap)
-        if not ok:
-            print("final guard rejected: %s (quarantined, originals kept)"
-                  % reason.split(":", 1)[0], file=sys.stderr)
-            quarantine(spool, [mf4_path, sidecar_path, manifest_path,
-                               closed_path])
-            minc("failed")
-            continue
-        for p in [mf4_path, sidecar_path, manifest_path, closed_path]:
-            if p is None:
-                continue
-            try:
-                os.unlink(p)
-            except OSError:
-                pass
-        minc("uploaded_files")
-        minc("uploaded_bytes", sum(snap["sizes"]))
-        mset("last_upload", int(time.time()))
+        _acknowledge(spool, (mf4_path, sidecar_path, manifest_path, closed_path), snap)
     return len(triples)
 
 

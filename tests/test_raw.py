@@ -1003,7 +1003,7 @@ class RawBindingTest(unittest.TestCase):
                                        bytes([blobs[target][0] ^ 0xFF]) +
                                        blobs[target][1:])
                             real_check = upl.fail_closed_check
-                            real_upload = upl.upload_verified
+                            real_head = cli.head_object
 
                             def drift():
                                 with open(target, "wb") as fh:
@@ -1015,9 +1015,9 @@ class RawBindingTest(unittest.TestCase):
                                     drift()
                                 return result
 
-                            def upload_then_drift(*args, **kwargs):
-                                result = real_upload(*args, **kwargs)
-                                if result and args[2] == keys[2]:
+                            def head_then_drift(**kwargs):
+                                result = real_head(**kwargs)
+                                if kwargs["Key"] == keys[2]:
                                     drift()
                                 return result
 
@@ -1025,8 +1025,8 @@ class RawBindingTest(unittest.TestCase):
                                 hook = patch.object(upl, "fail_closed_check",
                                                     side_effect=check_then_drift)
                             else:
-                                hook = patch.object(upl, "upload_verified",
-                                                    side_effect=upload_then_drift)
+                                hook = patch.object(cli, "head_object",
+                                                    side_effect=head_then_drift)
                             with hook:
                                 self.assertEqual(upl.run_once(cli, "b", spool, "m3", 0), 1)
                             self.assertEqual(upl._M["uploaded_files"], uploaded)

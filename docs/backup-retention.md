@@ -25,11 +25,19 @@
 CAN 백업에는 같은 기본값의 `CAN_BACKUP_LOCAL_MAX_BYTES`·`CAN_BACKUP_REMOTE_MAX_BYTES`가
 적용됩니다. 로컬 count·byte 한도는 실패해 보존된 archive도 포함합니다.
 압축 출력도 바이트 한도를 검증하고 기존 파일은 보존합니다.
-원격 inventory는 버킷 단위 publisher 잠금과 prefix 잠금 아래 읽고 공유 pool·제어 객체를
-포함해 양의 증가량을 예약합니다. 미확인 inventory나 예산 초과에서는 추가 COPY/PUT을
-거절합니다. 잠깐 생성하는 lock claim은 제어 오버헤드이며,
-강한 LIST 일관성과 같은 잠금을 따르는 writer가 전제입니다.
+원격 inventory는 하나의 버킷 단위 publisher 잠금 아래 읽고 공유 pool·제어 객체를
+포함해 양의 증가량을 예약합니다. 잠금 검증 뒤 받은 prefix inventory는 세대 이름
+충돌 검사와 예산 검사에 재사용하며 CAN 백업 때문에 무관한 버킷 전체를 열거하지 않습니다.
+미확인 inventory나 예산 초과에서는 추가 COPY/PUT을 거절합니다. 모든 협조 writer는
+중지한 상태에서 함께 갱신해야 합니다. 새 전역 claim은 중복 prefix claim을 대체하지만,
+기존 prefix claim이 남아 있으면 거절하며 소유자 종료 확인 없이 회수하지 않습니다.
+강한 LIST 일관성이 전제입니다.
 서로 다른 prefix 예산은 계정 전체의 공통 예산이 아닙니다.
+
+동일 합성 입력의 요청 수는 RAW 신규 18→10회, 재생 12→3회,
+CAN 백업 18→12회로 줄었습니다. 잠금 PUT/검증 LIST/DELETE와 데이터 HEAD 검증은
+유지합니다. CAN은 예산 기능 이전 9회보다 33% 많아 기존 20% 상대 게이트를
+여전히 넘습니다. 기준값을 바꾸거나 최신 커밋을 새 기준으로 삼아 이 증가를 숨기지 마세요.
 
 ## 복구 세대
 

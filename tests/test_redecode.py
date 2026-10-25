@@ -130,7 +130,8 @@ def write_capture(path, records):
     with open(closed, "w", encoding="utf-8") as fh:
         for record in records:
             fh.write(json.dumps(record) + "\n")
-    return rd.rr.finalize_segment(closed, os.path.dirname(path))
+    return rd.rr.finalize_segment(closed, os.path.dirname(path),
+                                  spool=os.path.dirname(path))
 
 
 def sha_file(path):

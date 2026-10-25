@@ -10,15 +10,19 @@ via `gunzip_compare`) never build proportional bytes/frame objects.
   Existing files are never removed to make room; at the limit new capture is
   refused/counted as dropped until an operator or verified upload frees room.
 - `RAW_REMOTE_MAX_BYTES` (default 1 TiB, positive): budget for the configured
-  RAW bucket. Pending uploads acquire the cooperating bucket/prefix publication
-  locks, LIST sizes once, and reserve growth before PUT. Unknown inventory or
-  excess growth retains all local files; verified replay needs no extra quota.
+  RAW bucket. New uploads acquire one cooperating bucket-wide publication lock
+  and reuse its complete LIST inventory to reserve growth before PUT. Verified
+  read-only replays use HEAD checks without a lock or inventory. Unknown
+  inventory or excess growth retains every unacknowledged local file.
   A refused triple does not stop the sweep: later zero-growth replays can still
   verify their remote copies and release their local spool files.
   Empty sweeps issue no S3 request. `RAW_INVENTORY_INTERVAL_SEC=0` still disables
   the separate periodic metrics inventory, not the upload budget preflight.
   Transient lock claims are control overhead, not data quota. External writers,
   versioned-object history and account billing are outside this budget.
+  All publishers sharing a bucket must be upgraded together while stopped.
+  The new global claim replaces the redundant per-prefix claim; legacy claims
+  in the target prefix still refuse publication and are never stolen.
 
 - `RAW_FINALIZE_MEM_FRAMES` (default 20000, must be > 0): max resident
   decoded frames across sort AND identity match staging (match batches

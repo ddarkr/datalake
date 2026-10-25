@@ -474,7 +474,7 @@ services:
     profiles:
     - backup
     labels:
-      datalake.backup-revision: '6'
+      datalake.backup-revision: '7'
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -529,7 +529,7 @@ services:
     profiles:
     - backup
     labels:
-      datalake.backup-revision: '6'
+      datalake.backup-revision: '7'
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -645,7 +645,7 @@ services:
     profiles:
     - vehicle
     labels:
-      datalake.raw-uploader-revision: '3'
+      datalake.raw-uploader-revision: '4'
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully
@@ -21545,40 +21545,26 @@ configs:
 
 
       @contextmanager
-      def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
-          """Serialize all cooperating bucket publishers, then own the prefix inventory."""
-          if reentrant and _POOL_GUARD.get() == (bucket, norm_prefix(bp)):
-              yield
-              return
-          with _prefix_pool_lock(client, bucket, "_storage_budget", verify_claim=False):
-              with _prefix_pool_lock(client, bucket, bp, token=token,
-                                     reentrant=reentrant, verify_claim=verify_claim):
-                  yield
+      def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True,
+                           *, inventory_prefix=None):
+          """Serialize bucket publishers and capture only the required inventory.
 
-
-      @contextmanager
-      def _prefix_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
-          """Exclusive unique claims require strongly consistent LIST/PUT.
-
-          ponytail: serialize this backup prefix; per-object guards only if measured
-          contention justifies a more complex publication/GC protocol. A crashed claim
-          requires independently proving its owner exited before manual removal.
+          All publishers must use this bucket-wide protocol. A crashed claim requires
+          independently proving its owner exited before manual removal.
           """
+          inventory_prefix = norm_prefix(bp) if inventory_prefix is None else inventory_prefix
           identity = (bucket, norm_prefix(bp))
           if reentrant and _POOL_GUARD.get() == identity:
-              yield
+              yield _POOL_INVENTORY.get()["inventory_sizes"]
               return
-          locks = norm_prefix(bp) + POOL_LOCK_DIR
-          if s3_list_all(client, bucket, locks):
-              raise IOError("pool writer/GC already active (claim present)")
           claim_token = token or uuid.uuid4().hex
           if not isinstance(claim_token, str) or "/" in claim_token or claim_token in (".", ".."):
               raise IOError("unsafe shared SST pool lock token")
+          locks = "_storage_budget/" + POOL_LOCK_DIR
           key = locks + claim_token
-          token = None
-          inventory_token = None
+          guard_token = inventory_token = None
           try:
-              claim = {"claim": key.rsplit("/", 1)[-1], "pid": os.getpid(),
+              claim = {"claim": claim_token, "pid": os.getpid(),
                        "host": socket.gethostname(), "created_ns": time.time_ns()}
               payload = json.dumps(claim).encode()
               if verify_claim:
@@ -21587,16 +21573,32 @@ configs:
                   client.put_object(Bucket=bucket, Key=key, Body=payload,
                                     ContentLength=len(payload), Metadata={},
                                     ChecksumSHA256=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"))
-              if {o["Key"] for o in s3_list_all(client, bucket, locks)} != {key}:
+              # PUT before LIST is safe with strong consistency: any contender sees
+              # the current owner, or both contenders refuse. Never steal a claim.
+              if inventory_prefix:
+                  if {obj["Key"] for obj in s3_list_all(client, bucket, locks)} != {key}:
+                      raise IOError("pool writer/GC claim collision (refusing)")
+              sizes = {}
+              for obj in s3_list_all(client, bucket, inventory_prefix):
+                  name, size = obj.get("Key"), obj.get("Size")
+                  if not isinstance(name, str) or type(size) is not int or size < 0 or name in sizes:
+                      raise IOError("remote storage inventory unknown")
+                  sizes[name] = size
+              if not inventory_prefix and {name for name in sizes if name.startswith(locks)} != {key}:
                   raise IOError("pool writer/GC claim collision (refusing)")
-              token = _POOL_GUARD.set(identity)
-              inventory_token = _POOL_INVENTORY.set({})
-              yield
+              if any(name.startswith(norm_prefix(bp) + POOL_LOCK_DIR) for name in sizes):
+                  raise IOError("legacy pool writer/GC claim present (refusing)")
+              sizes.pop(key, None)  # Transient ownership controls are not retained data.
+              guard_token = _POOL_GUARD.set(identity)
+              inventory_token = _POOL_INVENTORY.set({
+                  "inventory_bucket": bucket, "inventory_prefix": inventory_prefix,
+                  "inventory_sizes": sizes})
+              yield sizes
           finally:
               if inventory_token is not None:
                   _POOL_INVENTORY.reset(inventory_token)
-              if token is not None:
-                  _POOL_GUARD.reset(token)
+              if guard_token is not None:
+                  _POOL_GUARD.reset(guard_token)
               s3_delete_keys(client, bucket, [key])
 
 
@@ -21931,7 +21933,14 @@ configs:
                       or os.path.exists(os.path.join(d, bid + suffix + sidecar_suffix))):
                   continue
               if s3 is not None:
-                  if s3_list_all(s3, bucket, remote_base(bp, bid)):
+                  cache = _POOL_INVENTORY.get()
+                  base = remote_base(bp, bid)
+                  if (cache is not None and cache.get("inventory_bucket") == bucket
+                          and base.startswith(cache["inventory_prefix"])):
+                      occupied = any(key.startswith(base) for key in cache["inventory_sizes"])
+                  else:
+                      occupied = bool(s3_list_all(s3, bucket, base))
+                  if occupied:
                       continue
               return bid, stamp
           raise IOError("could not claim a fresh backup namespace (collision)")
@@ -21964,13 +21973,17 @@ configs:
           limit = positive_budget(var, 1 << 40)
           scope = (bucket, norm_prefix(bp) if bp else "")
           if cache.get("budget_scope") != scope:
-              objects = s3_list_all(client, bucket, scope[1])
-              sizes = {}
-              for obj in objects:
-                  key, size = obj.get("Key"), obj.get("Size")
-                  if not isinstance(key, str) or type(size) is not int or size < 0 or key in sizes:
-                      raise IOError("remote storage inventory unknown")
-                  sizes[key] = size
+              if (cache.get("inventory_bucket") == bucket
+                      and scope[1].startswith(cache["inventory_prefix"])):
+                  sizes = {key: size for key, size in cache["inventory_sizes"].items()
+                           if key.startswith(scope[1])}
+              else:
+                  sizes = {}
+                  for obj in s3_list_all(client, bucket, scope[1]):
+                      key, size = obj.get("Key"), obj.get("Size")
+                      if not isinstance(key, str) or type(size) is not int or size < 0 or key in sizes:
+                          raise IOError("remote storage inventory unknown")
+                      sizes[key] = size
               cache.update(budget_scope=scope, budget_sizes=sizes, budget_total=sum(sizes.values()))
           sizes = cache["budget_sizes"]
           growth = sum(max(0, size - sizes.get(key, 0)) for key, size in additions.items())
@@ -27479,13 +27492,14 @@ configs:
           return _S3_WRAPPED
 
 
-      def upload_verified(client, bucket, key, path, digest, max_retries, *, size=None):
+      def upload_verified(client, bucket, key, path, digest, max_retries, *, size=None,
+                          known_missing=False):
           """Verified write to a content-addressed key: never overwrites truth.
 
           Triple uploads pass the preflight size; standalone callers may omit it.
-          Pre-check HEAD first: size + Metadata sha256 + server ChecksumSHA256
-          reuses the live object; any mismatch (including missing checksum or
-          missing digest) is a conflict (kept, never overwritten); any other
+          Pre-check HEAD first, unless a guarded, complete inventory proves absence.
+          Size + Metadata sha256 + server ChecksumSHA256 reuse the live object;
+          any mismatch (including missing checksum/digest) is a conflict, never overwritten.
           HEAD error is unreadable (retried, never mistaken for missing). Only
           genuine missing-key permits PUT with ChecksumSHA256; the PUT response
           must echo the checksum and the post-PUT HEAD must report it. Missing
@@ -27502,12 +27516,13 @@ configs:
           delay = 2.0
           for attempt in range(max_retries + 1):
               try:
-                  try:
-                      existing = _head(client, bucket, key)
-                  except Exception as hexc:
-                      if not _is_missing(hexc):
-                          raise
-                      existing = None
+                  existing = None
+                  if not known_missing or attempt:
+                      try:
+                          existing = _head(client, bucket, key)
+                      except Exception as hexc:
+                          if not _is_missing(hexc):
+                              raise
                   if existing is not None:
                       if _remote_matches(existing, size, digest):
                           return True
@@ -27743,6 +27758,34 @@ configs:
           minc("dropped_verify")
 
 
+      def _triple_legs(paths, vehicle, snap):
+          mf4, sidecar, manifest, _ = paths
+          key = remote_key(mf4, vehicle, snap["manifest_digest"])
+          return ((key, mf4, snap["mf4_digest"], snap["sizes"][0]),
+                  (sidecar_key(key), sidecar, snap["sidecar_digest"], snap["sizes"][1]),
+                  (manifest_key(key), manifest, snap["manifest_digest"], snap["sizes"][2]))
+
+
+      def _acknowledge(spool, paths, snap):
+          # Even read-only replay must not delete locals changed after preflight.
+          ok, reason, _ = fail_closed_check(*paths, snap=snap)
+          if not ok:
+              print("final guard rejected: %s (quarantined, originals kept)"
+                    % reason.split(":", 1)[0], file=sys.stderr)
+              quarantine(spool, paths)
+              minc("failed")
+              return
+          for path in paths:
+              if path is not None:
+                  try:
+                      os.unlink(path)
+                  except OSError:
+                      pass
+          minc("uploaded_files")
+          minc("uploaded_bytes", sum(snap["sizes"]))
+          mset("last_upload", int(time.time()))
+
+
       def run_once(client, bucket, spool, vehicle, max_retries):
           triples = pending(spool)
           nbytes = 0
@@ -27755,20 +27798,40 @@ configs:
           mset("pending_bytes", nbytes)
           if not triples:
               return 0
+          # A fully verified replay cannot grow remote storage: no publisher claim or
+          # inventory is needed. Stop at the first writer; keep only one manifest in RAM.
+          missing = False
+          for start, paths in enumerate(triples):
+              ok, _, snap = fail_closed_check(*paths)
+              if not ok:
+                  break
+              try:
+                  if not all(_remote_matches(_head(client, bucket, key), size, digest)
+                             for key, _, digest, size in _triple_legs(paths, vehicle, snap)):
+                      break
+              except Exception as ex:
+                  missing = _is_missing(ex)
+                  break  # The guarded upload path retains its configured retries.
+              _acknowledge(spool, paths, snap)
+          else:
+              return len(triples)
           try:
-              with storage.shared_pool_lock(client, bucket, "_raw_budget", verify_claim=False):
+              with storage.shared_pool_lock(client, bucket, "_raw_budget",
+                                            verify_claim=False, inventory_prefix="") as inventory:
                   storage.remote_budget(client, bucket, "", {}, var="RAW_REMOTE_MAX_BYTES")
-                  return _run_once(client, bucket, spool, vehicle, max_retries, triples)
+                  _run_once(client, bucket, spool, vehicle, max_retries, triples[start:],
+                            inventory if missing else None, snap)
+                  return len(triples)
           except Exception as ex:
               minc("failed")
               print("raw storage guard refused: %s" % type(ex).__name__, file=sys.stderr)
               return len(triples)
 
 
-      def _run_once(client, bucket, spool, vehicle, max_retries, triples):
-          for mf4_path, sidecar_path, manifest_path, closed_path in triples:
-              ok, reason, snap = fail_closed_check(mf4_path, sidecar_path,
-                                                  manifest_path, closed_path)
+      def _run_once(client, bucket, spool, vehicle, max_retries, triples, inventory, first_snap):
+          for index, (mf4_path, sidecar_path, manifest_path, closed_path) in enumerate(triples):
+              ok, reason, snap = fail_closed_check(mf4_path, sidecar_path, manifest_path,
+                                                  closed_path, snap=first_snap if index == 0 else None)
               if not ok:
                   print("preflight rejected: %s (quarantined, originals kept)"
                         % reason.split(":", 1)[0], file=sys.stderr)
@@ -27779,12 +27842,8 @@ configs:
               # Fixed preflight pins: the key and every PUT checksum reuse the
               # validated digests, never a drifted re-hash (a correct server
               # rejects a drifted body under the pinned ChecksumSHA256).
-              key = remote_key(mf4_path, vehicle, snap["manifest_digest"])
-              legs = [(key, mf4_path, snap["mf4_digest"], snap["sizes"][0]),
-                      (sidecar_key(key), sidecar_path, snap["sidecar_digest"],
-                       snap["sizes"][1]),
-                      (manifest_key(key), manifest_path, snap["manifest_digest"],
-                       snap["sizes"][2])]
+              legs = _triple_legs((mf4_path, sidecar_path, manifest_path, closed_path),
+                                  vehicle, snap)
               try:
                   storage.remote_budget(client, bucket, "", {k: size for k, _, _, size in legs},
                                         var="RAW_REMOTE_MAX_BYTES")
@@ -27795,35 +27854,13 @@ configs:
               acked = True
               for k, p, digest, size in legs:
                   if not upload_verified(client, bucket, k, p, digest, max_retries,
-                                         size=size):
+                                         size=size, known_missing=inventory is not None and k not in inventory):
                       minc("failed")  # any leg fails: ALL locals stay
                       acked = False
                       break
               if not acked:
                   continue
-              # Final revalidation (same check, no second convention): drift
-              # after preflight -- including replay reuse with no PUT -- must
-              # never delete changed locals or adopt a replacement manifest.
-              ok, reason, _ = fail_closed_check(mf4_path, sidecar_path,
-                                               manifest_path, closed_path,
-                                               snap=snap)
-              if not ok:
-                  print("final guard rejected: %s (quarantined, originals kept)"
-                        % reason.split(":", 1)[0], file=sys.stderr)
-                  quarantine(spool, [mf4_path, sidecar_path, manifest_path,
-                                     closed_path])
-                  minc("failed")
-                  continue
-              for p in [mf4_path, sidecar_path, manifest_path, closed_path]:
-                  if p is None:
-                      continue
-                  try:
-                      os.unlink(p)
-                  except OSError:
-                      pass
-              minc("uploaded_files")
-              minc("uploaded_bytes", sum(snap["sizes"]))
-              mset("last_upload", int(time.time()))
+              _acknowledge(spool, (mf4_path, sidecar_path, manifest_path, closed_path), snap)
           return len(triples)
 
 
@@ -30124,40 +30161,26 @@ configs:
 
 
       @contextmanager
-      def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
-          """Serialize all cooperating bucket publishers, then own the prefix inventory."""
-          if reentrant and _POOL_GUARD.get() == (bucket, norm_prefix(bp)):
-              yield
-              return
-          with _prefix_pool_lock(client, bucket, "_storage_budget", verify_claim=False):
-              with _prefix_pool_lock(client, bucket, bp, token=token,
-                                     reentrant=reentrant, verify_claim=verify_claim):
-                  yield
+      def shared_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True,
+                           *, inventory_prefix=None):
+          """Serialize bucket publishers and capture only the required inventory.
 
-
-      @contextmanager
-      def _prefix_pool_lock(client, bucket, bp, token=None, reentrant=True, verify_claim=True):
-          """Exclusive unique claims require strongly consistent LIST/PUT.
-
-          ponytail: serialize this backup prefix; per-object guards only if measured
-          contention justifies a more complex publication/GC protocol. A crashed claim
-          requires independently proving its owner exited before manual removal.
+          All publishers must use this bucket-wide protocol. A crashed claim requires
+          independently proving its owner exited before manual removal.
           """
+          inventory_prefix = norm_prefix(bp) if inventory_prefix is None else inventory_prefix
           identity = (bucket, norm_prefix(bp))
           if reentrant and _POOL_GUARD.get() == identity:
-              yield
+              yield _POOL_INVENTORY.get()["inventory_sizes"]
               return
-          locks = norm_prefix(bp) + POOL_LOCK_DIR
-          if s3_list_all(client, bucket, locks):
-              raise IOError("pool writer/GC already active (claim present)")
           claim_token = token or uuid.uuid4().hex
           if not isinstance(claim_token, str) or "/" in claim_token or claim_token in (".", ".."):
               raise IOError("unsafe shared SST pool lock token")
+          locks = "_storage_budget/" + POOL_LOCK_DIR
           key = locks + claim_token
-          token = None
-          inventory_token = None
+          guard_token = inventory_token = None
           try:
-              claim = {"claim": key.rsplit("/", 1)[-1], "pid": os.getpid(),
+              claim = {"claim": claim_token, "pid": os.getpid(),
                        "host": socket.gethostname(), "created_ns": time.time_ns()}
               payload = json.dumps(claim).encode()
               if verify_claim:
@@ -30166,16 +30189,32 @@ configs:
                   client.put_object(Bucket=bucket, Key=key, Body=payload,
                                     ContentLength=len(payload), Metadata={},
                                     ChecksumSHA256=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"))
-              if {o["Key"] for o in s3_list_all(client, bucket, locks)} != {key}:
+              # PUT before LIST is safe with strong consistency: any contender sees
+              # the current owner, or both contenders refuse. Never steal a claim.
+              if inventory_prefix:
+                  if {obj["Key"] for obj in s3_list_all(client, bucket, locks)} != {key}:
+                      raise IOError("pool writer/GC claim collision (refusing)")
+              sizes = {}
+              for obj in s3_list_all(client, bucket, inventory_prefix):
+                  name, size = obj.get("Key"), obj.get("Size")
+                  if not isinstance(name, str) or type(size) is not int or size < 0 or name in sizes:
+                      raise IOError("remote storage inventory unknown")
+                  sizes[name] = size
+              if not inventory_prefix and {name for name in sizes if name.startswith(locks)} != {key}:
                   raise IOError("pool writer/GC claim collision (refusing)")
-              token = _POOL_GUARD.set(identity)
-              inventory_token = _POOL_INVENTORY.set({})
-              yield
+              if any(name.startswith(norm_prefix(bp) + POOL_LOCK_DIR) for name in sizes):
+                  raise IOError("legacy pool writer/GC claim present (refusing)")
+              sizes.pop(key, None)  # Transient ownership controls are not retained data.
+              guard_token = _POOL_GUARD.set(identity)
+              inventory_token = _POOL_INVENTORY.set({
+                  "inventory_bucket": bucket, "inventory_prefix": inventory_prefix,
+                  "inventory_sizes": sizes})
+              yield sizes
           finally:
               if inventory_token is not None:
                   _POOL_INVENTORY.reset(inventory_token)
-              if token is not None:
-                  _POOL_GUARD.reset(token)
+              if guard_token is not None:
+                  _POOL_GUARD.reset(guard_token)
               s3_delete_keys(client, bucket, [key])
 
 
@@ -30510,7 +30549,14 @@ configs:
                       or os.path.exists(os.path.join(d, bid + suffix + sidecar_suffix))):
                   continue
               if s3 is not None:
-                  if s3_list_all(s3, bucket, remote_base(bp, bid)):
+                  cache = _POOL_INVENTORY.get()
+                  base = remote_base(bp, bid)
+                  if (cache is not None and cache.get("inventory_bucket") == bucket
+                          and base.startswith(cache["inventory_prefix"])):
+                      occupied = any(key.startswith(base) for key in cache["inventory_sizes"])
+                  else:
+                      occupied = bool(s3_list_all(s3, bucket, base))
+                  if occupied:
                       continue
               return bid, stamp
           raise IOError("could not claim a fresh backup namespace (collision)")
@@ -30543,13 +30589,17 @@ configs:
           limit = positive_budget(var, 1 << 40)
           scope = (bucket, norm_prefix(bp) if bp else "")
           if cache.get("budget_scope") != scope:
-              objects = s3_list_all(client, bucket, scope[1])
-              sizes = {}
-              for obj in objects:
-                  key, size = obj.get("Key"), obj.get("Size")
-                  if not isinstance(key, str) or type(size) is not int or size < 0 or key in sizes:
-                      raise IOError("remote storage inventory unknown")
-                  sizes[key] = size
+              if (cache.get("inventory_bucket") == bucket
+                      and scope[1].startswith(cache["inventory_prefix"])):
+                  sizes = {key: size for key, size in cache["inventory_sizes"].items()
+                           if key.startswith(scope[1])}
+              else:
+                  sizes = {}
+                  for obj in s3_list_all(client, bucket, scope[1]):
+                      key, size = obj.get("Key"), obj.get("Size")
+                      if not isinstance(key, str) or type(size) is not int or size < 0 or key in sizes:
+                          raise IOError("remote storage inventory unknown")
+                      sizes[key] = size
               cache.update(budget_scope=scope, budget_sizes=sizes, budget_total=sum(sizes.values()))
           sizes = cache["budget_sizes"]
           growth = sum(max(0, size - sizes.get(key, 0)) for key, size in additions.items())

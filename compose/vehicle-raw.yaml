@@ -73,7 +73,7 @@ services:
     image: ${VEHICLE_RAW_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [vehicle]
     labels:
-      datalake.raw-uploader-revision: "3"
+      datalake.raw-uploader-revision: "4"
     depends_on:
       vehicle-raw-deps:
         condition: service_completed_successfully

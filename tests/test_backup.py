@@ -2901,10 +2901,13 @@ def test_original_lock_tokens_and_restore_during_writer():
         assert bk.cmd_backup() == 0
         before = dict(fake.objects)
         original_put = fake.put_object
+        claims = []
         def racy_put(**kw):
             result = original_put(**kw)
-            if kw["Key"] == "test-backups/_locks/contender":
-                fake.objects["test-backups/_locks/rival"] = b"pool operation"
+            if kw["Key"].endswith("/contender"):
+                rival = kw["Key"].rsplit("/", 1)[0] + "/rival"
+                claims[:] = [kw["Key"], rival]
+                fake.objects[rival] = b"pool operation"
             return result
         fake.put_object = racy_put
         try:
@@ -2912,10 +2915,10 @@ def test_original_lock_tokens_and_restore_during_writer():
                 raise AssertionError("raced lock entered")
         except IOError:
             pass
-        assert "test-backups/_locks/contender" not in fake.objects
-        assert "test-backups/_locks/rival" in fake.objects
+        assert claims and claims[0] not in fake.objects
+        assert claims[1] in fake.objects
         fake.put_object = original_put
-        del fake.objects["test-backups/_locks/rival"]
+        del fake.objects[claims[1]]
         try:
             with bk.shared_pool_lock(fake, "test-bucket", "test-backups/", token="../evil"):
                 raise AssertionError("unsafe token entered")
@@ -3421,6 +3424,18 @@ def test_bucket_publication_lock_excludes_different_prefixes():
             pass
         assert fake.objects == before
     assert fake.objects == {}
+    from unittest.mock import patch
+    fake = FakeS3({"backups/kept": b"x", "outside": b"x" * 2048})
+    before = dict(fake.objects)
+    with patch.dict(os.environ, {"BACKUP_REMOTE_MAX_BYTES": "1024"}), \
+            bk.shared_pool_lock(fake, "bucket", "backups"):
+        bk.remote_budget(fake, "bucket", "backups", {"backups/new": 1})
+        try:
+            bk.remote_budget(fake, "bucket", "", {"backups/new": 1})
+            assert False, "prefix inventory cannot prove a whole-bucket budget"
+        except IOError:
+            pass
+    assert fake.objects == before
 
 
 def test_unpublished_pool_replacement_reserves_growth():
