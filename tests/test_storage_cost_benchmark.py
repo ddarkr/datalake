@@ -377,6 +377,30 @@ class CollectorBoundaryTest(unittest.TestCase):
                 bench.run_raw_once(raw, FailedPut(), "fixture", str(self.tmp_path), "fixture-vehicle", "raw_fresh")
         self.assertEqual(bench.hash_tree(str(self.tmp_path)), original)
 
+    def test_raw_control_publication_is_counted_without_rejecting_ack_or_replay(self):
+        store = bench.CountingStore()
+        bench.make_raw_triple(str(self.tmp_path), "20261014T000000Z-seg", 1024)
+        with bench.implementation(str(ROOT)) as (_, _, raw):
+            actual = raw.run_once
+
+            def with_claim(*args):
+                key = "budget/_locks/run/claim"
+                store.put_object(Bucket="fixture", Key=key, Body=b"claim")
+                try:
+                    return actual(*args)
+                finally:
+                    store.delete_objects(Bucket="fixture", Delete={"Objects": [{"Key": key}]})
+
+            with patch.object(raw, "run_once", with_claim):
+                fresh = bench.run_raw_once(
+                    raw, store, "fixture", str(self.tmp_path), "fixture-vehicle", "raw_fresh")
+                replay = bench.run_raw_once(
+                    raw, store, "fixture", str(self.tmp_path), "fixture-vehicle", "raw_replay", False)
+        self.assertEqual(fresh["puts"], 4)
+        self.assertEqual(replay["puts"], 1)
+        self.assertEqual(replay["new_remote_bytes"], 0)
+        self.assertEqual((fresh["acknowledged"], replay["acknowledged"]), (1, 1))
+
     def test_deterministic_clock_tokens_and_fixture_mtimes_reset(self):
         runs = []
         for index in range(2):

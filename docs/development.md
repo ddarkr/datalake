@@ -259,6 +259,8 @@ python tools/check_cost_budget.py \
   --summary-out /tmp/storage-cost-summary.md
 ```
 
+RAW triple의 파일 PUT과 replay 무변경 검사는 해당 vehicle prefix에 적용합니다. 다른 prefix의 control PUT도 전체 요청·전송량·비용에는 합산합니다.
+
 RAW·CAN archive·백업 control PUT은 명시적 서버 `ChecksumSHA256` 응답/HEAD 검증을 요구하며, 부재·미지원은 로컬을 보존하고 실패합니다(metadata-only 성공·전체 GET fallback 없음). Greptime primary SST의 선택적 checksum 부재는 `CopySourceIfMatch`로 소스 identity를 고정한 COPY를 허용하되 내용 digest 증명은 아닙니다. IDrive/B2 checksum 호환성은 주장하지 않습니다. 월간 전망은 합성 backup+RAW workload(1200GiB, 월 4회, RAW 200GiB/월)에 한정됩니다. 가격은 decimal GB(10^9 bytes), 저장료 `max($6/월, GB-month×$0.006)`, 고정 1200GiB 기준 3배 무료 allowance와 `$0.01/GB` egress를 가정합니다. query·restore·other egress=0은 미측정 모델 입력이며 CAN과 계정의 다른 사용량은 이 전망에 포함되지 않습니다. [정책의 가격 출처](https://www.idrive.com/s3-storage-e2/faq-pricing#egress-policy) 확인일은 2026-10-14이며 실제 청구가 아닙니다.
 
 `greptime-storage-budget`도 고정 status 이름을 유지합니다. 설정·스키마·쿼리·이미지와 harness·정책·해당 workflow 변경이 있는 push·PR에서 native 벤치를 실행하고, 무관한 변경에는 유효한 not-applicable JSON과 Markdown 요약을 남기며 성공합니다. 일반 push·PR은 정책의 `greptime.rows_pr`(기본 200,000행), 매일 03:17 UTC 스케줄은 `rows_nightly`(기본 10,000,000행)를 사용합니다. 수동 rows 입력은 1 이상 10,000,000 이하의 십진 정수만 허용합니다(기본값 10,000,000). 잘못된 입력은 기본값으로 대체하지 않습니다. nightly·수동 실행은 기준을 주장하지 않는 명시적 absolute-only입니다. 스케줄·수동 실행에서는 일반 secrets·validate·synthetic-runtime·CAN·storage-cost-budget job을 다시 실행하지 않습니다.
