@@ -1,4 +1,4 @@
-"""Server-only CAN decoding; the receiver owns the unmodified raw archive."""
+"""Server-only CAN decoding of sequential receiver chunks."""
 
 from functools import lru_cache
 import hashlib
@@ -130,7 +130,7 @@ class Decoder:
 
         event_time is arrival of the chunk completing a frame, not a bus timestamp.
         Oversize records are discarded until their CR, never resynchronized mid-record.
-        All discarded/unknown bytes remain in the receiver's independent raw archive.
+        Discarded/unknown bytes are not represented in the decoded rows.
         """
         rows, state, counts, _done = self._decode_core(meta, chunk, state, None)
         return rows, state, counts

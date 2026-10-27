@@ -9,18 +9,24 @@ invalid-source isolation, and crash replay. No live data, no services.
 import base64
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import unittest
+import sys
+import urllib.parse
+from http.server import HTTPServer
+from unittest.mock import patch
 from decimal import Decimal
 from pathlib import Path
 
+from scripts.ingest.can import can_files
 from scripts.ingest.can.can_files import (
     EMPTY_SHA256, FileImporter, FileStore, _parse_capture,
     _parse_chunk,
 )
-from scripts.ingest.can.can_receiver import Archive, Receiver
-from tests.test_can_receiver import synthetic_decoder
+from scripts.ingest.can.can_receiver import Archive, DownstreamError, Greptime, Receiver
+from tests.test_can_receiver import SQLSink, synthetic_decoder
 
 AUTH = "fixture-user:fixture-password"
 AUTH_HEADER = "Basic " + base64.b64encode(AUTH.encode()).decode()
@@ -481,6 +487,240 @@ class FileImporterBehavior(unittest.TestCase):
         self.assertIsNotNone(state)
         self.assertEqual((state[0], state[2]), (len(body), len(body)))
         self.assertFalse(second.import_once())
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "requires Linux hole punching")
+class FileReclaimBehavior(unittest.TestCase):
+    _session = FileImporterBehavior._session
+    def setUp(self):
+        self.fix = _Fixture(self)
+        self.importer = FileImporter(self.fix.archive)
+        self.lines = [_line(i, str(i).encode()).rstrip(b"\n") + b" " * 100000 + b"\n"
+                      for i in range(4)]
+        self.body = self._session(self.fix, "s1", self.lines, capture=_capture())
+        self.path = self.fix.store.path("s1", SERIAL_FILE)
+        self.events = b'{"event":"synthetic"}\n'
+        self.fix.put("events.jsonl", self.events)
+        self.capture = self.fix.store.path("s1", "capture.json").read_bytes()
+        sink = HTTPServer(("127.0.0.1", 0), SQLSink)
+        sink.mode = "ok"
+        thread = threading.Thread(target=sink.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 3)
+        self.addCleanup(sink.server_close)
+        self.addCleanup(sink.shutdown)
+        self.sink = sink
+        self.greptime = Greptime(f"http://127.0.0.1:{sink.server_port}", "synthetic", "test", "test")
+
+    def decode(self, decoder=None):
+        decoder = decoder or self.fix.decoder
+        while self.fix.archive.decode_once(decoder):
+            pass
+
+    def flush(self):
+        while self.fix.archive.flush_once(self.greptime):
+            pass
+
+    def reclaim(self):
+        for _ in range(20):
+            if not self.importer.reclaim_once():
+                return
+        self.fail("reclaim did not become idle")
+
+    def test_preserves_unfinished_work_and_reclaims_after_all_acks(self):
+        self.reclaim()
+        self.assertEqual(self.path.read_bytes(), self.body)
+        _drain(self.importer)
+        self.reclaim()
+        self.assertEqual(self.path.read_bytes(), self.body)
+        replay = synthetic_decoder(self.fix.tmp.name, revision="synthetic-v2")
+        self.fix.archive.register_epoch(replay, explicit=True)
+        self.decode()
+        self.sink.mode = "partial"
+        with self.assertRaises(DownstreamError):
+            self.fix.archive.flush_once(self.greptime)
+        self.reclaim()
+        self.assertEqual(self.path.read_bytes(), self.body)
+        self.sink.mode = "ok"
+        self.flush()
+        self.reclaim()
+        self.assertEqual(self.path.read_bytes(), self.body)
+        self.decode(replay)
+
+        def fail_dirty(handler):
+            length = int(handler.headers["Content-Length"])
+            payload = handler.rfile.read(length)
+            if b"vehicle_signal_dirty" in payload:
+                handler.send_response(503)
+                response = b"downstream unavailable"
+            else:
+                count = urllib.parse.parse_qs(payload.decode("ascii"))["sql"][0].count("),(") + 1
+                response = json.dumps({"code": 0, "output": [{"affectedrows": count}]}).encode()
+                handler.send_response(200)
+            handler.send_header("Content-Length", str(len(response)))
+            handler.end_headers()
+            handler.wfile.write(response)
+
+        with patch.object(SQLSink, "do_POST", fail_dirty):
+            with self.assertRaises(DownstreamError):
+                self.fix.archive.flush_once(self.greptime)
+        self.reclaim()
+        self.assertEqual(self.path.read_bytes(), self.body)
+        self.flush()
+        before = self.path.stat().st_blocks
+        self.reclaim()
+        self.assertLess(self.path.stat().st_blocks, before)
+        self.assertEqual(self.path.stat().st_size, len(self.body))
+        self.assertEqual(self.path.read_bytes()[-65536:], self.body[-65536:])
+        status = self.fix.store.status("s1", SERIAL_FILE)
+        self.assertEqual((status["offset"], status["tail_sha256"]),
+                         (len(self.body), hashlib.sha256(self.body[-65536:]).hexdigest()))
+        with self.assertRaises(Exception) as conflict:
+            self.fix.put(SERIAL_FILE, self.lines[0])
+        self.assertEqual(conflict.exception.status, 409)
+        extra = _line(4, b"4")
+        self.fix.put(SERIAL_FILE, extra, offset=status["offset"])
+        self.assertEqual(self.fix.store.status("s1", SERIAL_FILE)["tail_sha256"],
+                         hashlib.sha256((self.body + extra)[-65536:]).hexdigest())
+        self.assertEqual(self.fix.store.path("s1", "events.jsonl").read_bytes(), self.events)
+        self.assertEqual(self.fix.store.path("s1", "capture.json").read_bytes(), self.capture)
+
+    def test_concurrent_append_and_reclaim_preserve_new_bytes(self):
+        _drain(self.importer)
+        self.decode()
+        self.flush()
+        start = threading.Barrier(2)
+        errors = []
+        extra = _line(4, b"4")
+
+        def reclaim():
+            try:
+                start.wait()
+                self.reclaim()
+            except BaseException as exc:
+                errors.append(exc)
+
+        thread = threading.Thread(target=reclaim)
+        thread.start()
+        start.wait()
+        self.fix.put(SERIAL_FILE, extra, offset=len(self.body))
+        thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(self.path.read_bytes()[-len(extra):], extra)
+        status = self.fix.store.status("s1", SERIAL_FILE)
+        self.assertEqual(status["offset"], len(self.body) + len(extra))
+        self.assertEqual(status["tail_sha256"], hashlib.sha256((self.body + extra)[-65536:]).hexdigest())
+        _drain(self.importer)
+        self.decode()
+        self.flush()
+
+    def test_restart_after_punch_before_commit(self):
+        _drain(self.importer)
+        self.decode()
+        self.flush()
+        punch = can_files._punch_hole
+        punched = []
+
+        def crash_after_punch(fd, start, length):
+            punch(fd, start, length)
+            punched.append(True)
+            raise OSError("simulated process loss after hole punch")
+
+        with patch.object(can_files, "_punch_hole", crash_after_punch):
+            try:
+                self.importer.reclaim_once()
+            except OSError:
+                pass
+        self.assertEqual(punched, [True])
+        with self.assertRaises(Exception) as conflict:
+            self.fix.put(SERIAL_FILE, self.lines[0])
+        self.assertEqual(conflict.exception.status, 409)
+        self.importer = FileImporter(Archive(self.fix.archive.path, disk_reserve_bytes=0))
+        self.reclaim()
+        status = self.fix.store.status("s1", SERIAL_FILE)
+        self.assertEqual(status["offset"], len(self.body))
+        self.assertEqual(status["tail_sha256"], hashlib.sha256(self.body[-65536:]).hexdigest())
+        extra = _line(4, b"4")
+        self.fix.put(SERIAL_FILE, extra, offset=status["offset"])
+        self.assertEqual(self.path.read_bytes()[-len(extra):], extra)
+
+    def test_hash_mismatch_blocks_reclaim_until_corrected(self):
+        _drain(self.importer)
+        self.decode()
+        self.flush()
+        self.fix.put("capture.json", _capture(raw_hash="0" * 64,
+                                               extra={"chunks": 4, "complete": True}))
+        _drain(self.importer)
+        self.assertEqual(self.importer.errors()[0]["error"], "hash_mismatch")
+        self.reclaim()
+        self.assertEqual(self.path.read_bytes(), self.body)
+        self.fix.put("capture.json", _capture(raw_hash=hashlib.sha256(self.body).hexdigest(),
+                                               extra={"chunks": 4, "complete": True}))
+        _drain(self.importer)
+        self.assertEqual(self.importer.errors(), [])
+        before = self.path.stat().st_blocks
+        self.reclaim()
+        self.assertLess(self.path.stat().st_blocks, before)
+
+    def test_reclaims_only_decoded_prefix_when_import_is_ahead(self):
+        _drain(self.importer)
+        self.assertTrue(self.fix.archive.decode_once(self.fix.decoder, limit=1))
+        self.flush()
+        before = self.path.stat().st_blocks
+        self.reclaim()
+        self.assertLess(self.path.stat().st_blocks, before)
+        self.assertEqual(self.path.read_bytes()[len(self.lines[0]):], self.body[len(self.lines[0]):])
+        self.decode()
+        self.flush()
+        self.reclaim()
+        status = self.fix.store.status("s1", SERIAL_FILE)
+        self.assertEqual(status["tail_sha256"], hashlib.sha256(self.body[-65536:]).hexdigest())
+
+    def test_reclaim_failure_preserves_file_and_reports_error(self):
+        _drain(self.importer)
+        self.decode()
+        self.flush()
+        with patch.object(can_files, "_punch_hole", side_effect=OSError("unsupported")):
+            self.assertFalse(self.importer.reclaim_once())
+        self.assertEqual(self.path.read_bytes(), self.body)
+        self.assertEqual(self.fix.archive.status()["errors"]["file_reclaim_failure"]["count"], 1)
+        before = self.path.stat().st_blocks
+        self.reclaim()
+        self.assertLess(self.path.stat().st_blocks, before)
+
+    def test_final_hash_must_finish_before_reclaim(self):
+        self.fix.put("capture.json", _capture(raw_hash=hashlib.sha256(self.body).hexdigest(),
+                                               extra={"chunks": 4, "complete": True}))
+        self.importer = FileImporter(self.fix.archive, max_bytes=120000)
+        for _ in range(4):
+            self.assertTrue(self.importer.import_once())
+        self.decode()
+        self.flush()
+        self.assertFalse(self.importer.reclaim_once())
+        self.assertEqual(self.path.read_bytes(), self.body)
+        _drain(self.importer)
+        before = self.path.stat().st_blocks
+        self.reclaim()
+        self.assertLess(self.path.stat().st_blocks, before)
+
+    def test_failed_session_does_not_block_other_session(self):
+        self._session(self.fix, "s2", self.lines, capture=_capture())
+        other = self.fix.store.path("s2", SERIAL_FILE)
+        _drain(self.importer)
+        self.decode()
+        self.flush()
+        before = other.stat().st_blocks
+        punch = can_files._punch_hole
+
+        def fail_first(fd, start, length):
+            if os.readlink(f"/proc/self/fd/{fd}").endswith("/s1/" + SERIAL_FILE):
+                raise OSError("synthetic session failure")
+            return punch(fd, start, length)
+
+        with patch.object(can_files, "_punch_hole", fail_first):
+            self.assertTrue(self.importer.reclaim_once())
+        self.assertEqual(self.path.read_bytes(), self.body)
+        self.assertLess(other.stat().st_blocks, before)
 
 if __name__ == "__main__":
     unittest.main()

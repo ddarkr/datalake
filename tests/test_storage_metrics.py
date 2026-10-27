@@ -83,7 +83,8 @@ class ReceiverArchiveTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             archive = make_archive(directory, rows=(("e1", 1_700_000_000_000_000_000, 1_700_000_001_000_000_000),
                                                     ("e2", 1_700_000_002_000_000_000, 1_700_000_003_000_000_000)),
-                                   errors=(("greptime_timeout", 3, 1_700_000_004_000_000_000),))
+                                   errors=(("greptime_timeout", 3, 1_700_000_004_000_000_000),
+                                           ("file_reclaim_failure", 2, 1_700_000_005_000_000_000)))
             metrics = sm.receiver_metrics(archive)
             self.assertEqual(metrics["datalake_receiver_archive_known"], 1)
             self.assertEqual(metrics["datalake_receiver_pending_rows"], 2)
@@ -92,6 +93,7 @@ class ReceiverArchiveTest(unittest.TestCase):
             self.assertAlmostEqual(metrics["datalake_receiver_oldest_pending_ingest_timestamp_seconds"], 1.700000001e9)
             self.assertEqual(metrics['datalake_receiver_errors_total{kind="greptime_timeout"}'], 3)
             self.assertAlmostEqual(metrics['datalake_receiver_error_last_timestamp_seconds{kind="greptime_timeout"}'], 1.700000004e9)
+            self.assertEqual(metrics['datalake_receiver_errors_total{kind="file_reclaim_failure"}'], 2)
             self.assertEqual(metrics['datalake_receiver_errors_total{kind="decode_failure"}'], 0)
             # No raw scan here: totals stay unknown until receiver counters exist.
             self.assertNotIn("datalake_receiver_raw_chunks", metrics)

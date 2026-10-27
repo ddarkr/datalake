@@ -148,7 +148,7 @@ _RECEIVER_KINDS = ("decode_failure", "decode_state_conflict", "decode_partial_co
                    "greptime_failure", "greptime_partial_ack",
                    "greptime_timeout", "greptime_row_too_large", "canonical_serialize_failure",
                    "sqlite_locked", "sqlite_full", "sqlite_corrupt",
-                   "archive_disk_reserve", "dirty_notify_failure")
+                   "archive_disk_reserve", "dirty_notify_failure", "file_reclaim_failure")
 _RECEIVER_FRESHNESS = (("last_receive_ns", "datalake_receiver_last_receive_timestamp_seconds"),
                        ("last_decode_ns", "datalake_receiver_last_decode_timestamp_seconds"),
                        ("last_full_ack_ns", "datalake_receiver_last_full_ack_timestamp_seconds"))

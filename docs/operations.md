@@ -290,13 +290,13 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 마지막 최대 64 KiB의 SHA256을 반환합니다. `PUT`은 `Content-Length`,
 `X-CAN-Offset`, `X-CAN-SHA256`으로 범위를 검증하며 최대 4 MiB입니다.
 `capture.json`은 최대 64 KiB 전체 스냅샷이고, 다른 두 파일은 append-only입니다.
-파일·저장 위치를 동기화한 뒤에만 ACK하며 ACK 유실 재전송은 같은 바이트인지 확인합니다.
+파일·저장 위치를 동기화한 뒤에만 ACK합니다. 보존 중인 범위의 ACK 유실 재전송은 같은 바이트인지 확인하고, 이미 정리된 범위는 `409`로 거절해 uploader가 다시 `GET`으로 재개합니다.
 
-원본과 메타데이터 버전은 기존 raw 볼륨의 `/data/files` 아래에 저장합니다.
+수신 파일과 메타데이터 버전은 기존 raw 볼륨의 `/data/files` 아래에 저장합니다.
 수신 프로세스는 JSONL·CAN을 파싱하지 않습니다. `can-worker`의 importer가 완성된 줄을
 정확한 정수 ns로 읽어 기존 `Archive.accept`에 편입하므로, 이전 OTLP로 받은 같은
-세션/seq는 중복 생성하지 않습니다. 줄 중간 bytes·실패한 수집 원본도 파일로 보존하며,
-시작 시각이 아직 없는 metadata는 해석 준비가 될 때까지 기다립니다.
+세션/seq는 중복 생성하지 않습니다. 미편입 줄과 실패한 입력은 유지하며, 시작 시각이
+아직 없는 metadata는 해석 준비가 될 때까지 기다립니다.
 파일 ACK와 raw DB 편입·디코딩·Greptime ACK는 서로 다른 완료 경계입니다.
 기존 `/status`의 raw counter는 **편입된 청크**이며 파일 수신 bytes의 지표가 아닙니다.
 
@@ -306,8 +306,13 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 `/v1/files`로 바꾸고 기존 batching 옵션을 제거해야 합니다. capture는 재시작하지 않습니다.
 기존 `/v1/logs`는 이전 클라이언트·복구 재전송용 수신 계약으로 계속 지원합니다.
 
-서버 디스크는 전체 원본 JSONL 파일과 제한된 raw DB/outbox를 함께 수용해야 합니다.
-Pi의 protobuf 큐 용량을 JSONL 저장 용량으로 간주하지 마세요. `/data/files`의 수신 원본 파일은 자동 삭제하지 않습니다.
+worker는 파일 편입 cursor와 모든 등록 epoch의 세션별 decode cursor를 확인하고, 전체 outbox가 비어 해당 구간이 만든 signal·dirty 알림이 모두 ACK된 serial prefix만 정리합니다. 신호를 만들지 않는 프레임도 처리된 구간이면 정리됩니다. 완료 metadata가 없는 기존 파일과 수집 중인 파일도 대상입니다. 정리 시 Linux의 hole punching으로 한 번에 최대 1 MiB씩 할당 공간을 회수하므로 논리 파일 크기와 offset은 유지됩니다. 실제 공간은 `stat`의 논리 크기가 아니라 `du` 등 할당량으로 확인하세요.
+
+미편입·미디코드·미ACK 구간과 재전송 검증용 마지막 최대 64 KiB는 남습니다. `capture.json`, metadata snapshot과 Greptime에 적재하지 않는 `events.jsonl`도 유지합니다. 파일 정리는 SQLite 캐시 상한과 별개입니다. 디스크는 장애 중 쌓이는 미처리 파일과 raw DB/outbox를 수용해야 하며, Pi의 protobuf 큐 용량을 서버 JSONL의 최대 크기로 간주하지 마세요.
+
+정리된 CAN 원본은 복구하거나 새 정의로 재해석할 수 없습니다. Greptime에는 디코딩된 신호만 저장되므로 미해석 frame·제어 기록 등은 원본 정리와 함께 사라집니다. 정리 전 최종 SHA256과 청크 수가 이미 도착했다면 전체 검증 완료를 기다리지만, 일부가 정리된 뒤 도착한 최종 SHA256은 전체 원본과 대조할 수 없습니다. 정리 실패나 hole punching 미지원 시 미ACK 구간은 유지하고 `file_reclaim_failure` 오류로 표시합니다.
+
+receiver와 worker는 정리와 수신을 같은 프로세스 간 잠금으로 조정합니다. 이 기능을 배포하거나 되돌릴 때는 두 역할을 모두 정상 종료하고 같은 버전으로 함께 시작하세요. 구버전 receiver와 신버전 worker를 동시에 실행하지 마세요.
 
 #### SQLite 원본 처리 캐시
 
@@ -319,7 +324,7 @@ worker는 signal·dirty 알림의 전체 ACK로 outbox가 비었을 때, 모든 
 
 `status.raw_chunks`는 누적 수신량, `retained_raw_chunks`는 실제 보존 청크, `pruned_chunks`는 정리량, `raw_bytes`는 보존 중인 payload bytes입니다. `max_database_bytes`는 설정된 본체 상한입니다. 정리된 순번의 인증된 재전송은 새로 저장하지 않고 ACK합니다. 해당 원본은 이미 없어 bytes 충돌 비교를 할 수 없으며, 보존 중인 순번의 충돌 검증은 유지합니다.
 
-정리된 과거의 새 epoch 재해석은 `re-decode_requires_unpruned_raw`로 거절합니다. 장기 원본 아카이브가 꼭 필요한 별도 운영만 두 역할에 `--raw-cache-mib 0`을 명시하세요. 이 경우 크기 제한·자동 정리는 꺼집니다. 기본 `re-decode`와 프로그램에서 직접 만든 `Archive`는 명시적 아카이브 작업을 위한 무제한 모드이며, 캐시에서 없어진 과거를 복구하지는 못합니다.
+정리된 과거의 새 epoch 재해석은 `re-decode_requires_unpruned_raw`로 거절합니다. `--raw-cache-mib 0`은 SQLite 캐시의 크기 제한과 자동 정리만 끄며, 위 `serial_chunks.jsonl` 파일 정리를 끄지 않습니다. 기본 `re-decode`와 프로그램에서 직접 만든 `Archive`는 SQLite의 무제한 모드이며, 정리된 원본을 복구하지는 못합니다.
 
 
 CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
@@ -337,10 +342,7 @@ signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신�
 
 DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE는 명시적 `ChecksumSHA256` PUT 응답과 HEAD checksum·크기로 검증합니다. 서버 checksum 부재·불일치·미지원은 로컬 archive를 보존하고 실패하며 metadata-only 성공이나 검증용 전체 GET fallback은 없습니다. 원격 자동 GC는 하지 않으며 복원 다운로드와 로컬 SHA256 검증은 유지합니다.
 
-이 DB/definitions 백업 형식에는 `/data/files`의 직접 수신 원본·메타데이터 버전은 포함되지
-않습니다. 파일 백업까지 필요하면 수신·worker를 정상 종료한 상태의 raw 볼륨 전체 복사나
-일관된 파일시스템 snapshot을 함께 보관하세요. DB 백업 성공만으로 미편입 원본까지
-off-host에 보관했다고 판단하면 안 됩니다. Pi 원본을 지우는 근거로도 사용하지 않습니다.
+이 DB/definitions 백업 형식에는 `/data/files`의 직접 수신 파일·메타데이터 버전은 포함되지 않습니다. raw 볼륨을 일관되게 복사하더라도 이미 정리된 serial 원본은 복구할 수 없습니다. DB 백업 성공만으로 미편입 원본을 off-host에 보관했다고 판단하거나 Pi 원본을 지우는 근거로 사용하지 마세요.
 
 ```bash
 docker compose --env-file .env --profile backup run --rm can-backup backup
@@ -363,7 +365,7 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 실패한 작업이 다른 복원의 결과를 삭제하지 않습니다. receiver/worker의
 offline 확인은 별도 조건이며, 이 잠금을 사용하지 않는 외부 writer는 보호하지 않습니다.
 
-`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 읽기 전용 receiver·worker를 시작합니다. OTLP 영속 ACK·재시작·중복 보존과 파일 수신의 worker 중지·부분 파일 재시작·중복 범위 재전송·정확한 ns의 Greptime 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
+`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 receiver·worker 및 GreptimeDB를 시작합니다. OTLP 영속 ACK·재시작, 파일 수신과 실제 signal·dirty ACK, 정리 후 디스크 회수·offset 및 tail hash 보존, 재전송 충돌과 추가 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver·worker 인계
 

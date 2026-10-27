@@ -361,8 +361,8 @@ def main():
                       "session_id": "fixture-files", "started_ns": START_C + 1_000_000_000,
                       "vehicle_firmware": "synthetic"}
             chunks_d = [{"seq": 0, "offset_ns": 7, "phase": "capture", "data": b"t12320200\r"}]
-            original = b'{"seq":0,"t_s":0.000000007,"phase":"capture","data_b64":"' + \
-                base64.b64encode(chunks_d[0]["data"]) + b'"}\n'
+            original = (b'{"seq":0,"t_s":0.000000007,"phase":"capture","data_b64":"' +
+                        base64.b64encode(chunks_d[0]["data"]) + b'"}' + b" " * 120000 + b"\n")
             capture = json.dumps({
                 "schema_version": 1, "started_utc": time.strftime(
                     "%Y-%m-%dT%H:%M:%SZ", time.gmtime(meta_d["started_ns"] // 1_000_000_000)),
@@ -383,6 +383,20 @@ def main():
                                "offset": len(full),
                                "tail_sha256": hashlib.sha256(full[-65536:]).hexdigest()}, ack
 
+            def get_file(name):
+                url = endpoint.removesuffix("/v1/logs") + "/v1/files/fixture-files/" + name
+                request = urllib.request.Request(url, headers={
+                    "Authorization": status_auth, "X-CAN-Vehicle": "fixture",
+                    "X-CAN-Collector": "fixture"})
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    return json.load(response)
+
+            serial_path = "/data/files/fixture/fixture/fixture-files/serial_chunks.jsonl"
+
+            def allocated():
+                return int(compose("exec", "-T", "can-receiver", "/opt/venv/bin/python", "-c",
+                                   "import os,sys; print(os.stat(sys.argv[1]).st_blocks)", serial_path).strip())
+
             compose("stop", "can-worker")
             put_file("capture.json", 0, capture, capture)
             split = len(original) // 2
@@ -394,7 +408,9 @@ def main():
             # Lost-ACK duplicate and subsequent append must retain exact bytes.
             put_file("serial_chunks.jsonl", 0, original[:split], original[:split])
             put_file("serial_chunks.jsonl", split, original[split:], original)
-            put_file("events.jsonl", 0, b"", b"")
+            events = b'{"event":"synthetic"}\n'
+            put_file("events.jsonl", 0, events, events)
+            before_blocks = allocated()
             assert status()["raw_chunks"] == total_chunks + OUTAGE_CHUNKS
             compose("start", "can-worker")
             file_expected = expect_rows([(meta_d, chunks_d)])
@@ -406,6 +422,30 @@ def main():
                 assert _count(greptime_host, auth, db_name, "vehicle_signal",
                               "event_id='" + event_id + "' AND event_time=" + str(event_ns)
                               + " AND value_num=" + repr(value_num)) == 1
+            wait_for(lambda: allocated() < before_blocks, 120, "worker sparse reclaim")
+            ack = get_file("serial_chunks.jsonl")
+            assert ack["offset"] == len(original)
+            assert ack["tail_sha256"] == hashlib.sha256(original[-65536:]).hexdigest()
+            try:
+                put_file("serial_chunks.jsonl", 0, original[:split], original[:split])
+                raise AssertionError("reclaimed replay unexpectedly accepted")
+            except urllib.error.HTTPError as exc:
+                assert exc.code == 409
+            extra = b'{"seq":1,"t_s":1,"phase":"capture","data_b64":"dDEyMzIwMjAwDQ=="}\n'
+            put_file("serial_chunks.jsonl", ack["offset"], extra, original + extra)
+            appended_chunk = {"seq": 1, "offset_ns": 1_000_000_000,
+                              "phase": "capture", "data": b"t12320200\r"}
+            appended_expected = expect_rows([(meta_d, chunks_d + [appended_chunk])])
+            wait_for(lambda: status()["raw_chunks"] == total_chunks + OUTAGE_CHUNKS + 2
+                     and status()["pending_rows"] == 0
+                     and _count(greptime_host, auth, db_name, "vehicle_signal") ==
+                     len(expected) + len(appended_expected), 120, "post-reclaim append and Greptime ACK")
+            new_id = next(iter(appended_expected.keys() - file_expected.keys()))
+            new_ns = appended_expected[new_id][0]
+            assert _count(greptime_host, auth, db_name, "vehicle_signal",
+                          "event_id='" + new_id + "' AND event_time=" + str(new_ns)) == 1
+            assert get_file("capture.json")["tail_sha256"] == hashlib.sha256(capture).hexdigest()
+            assert get_file("events.jsonl")["tail_sha256"] == hashlib.sha256(events).hexdigest()
             print("direct files: worker-off durable ACK, partial restart/replay, exact ns and real Greptime ACK passed")
 
             print("split receiver+worker: offline durability, %d chunks/%d rows, dense resume,"

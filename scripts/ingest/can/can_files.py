@@ -19,7 +19,10 @@ from __future__ import annotations
 import base64
 import calendar
 import datetime
+import contextlib
+import ctypes
 import errno
+import fcntl
 import hashlib
 import json
 import os
@@ -60,6 +63,13 @@ CREATE TABLE IF NOT EXISTS file_import_errors(
  file TEXT NOT NULL, error TEXT NOT NULL, count INTEGER NOT NULL,
  last_ns INTEGER NOT NULL, fail_offset INTEGER NOT NULL,
  PRIMARY KEY(vehicle,collector_id,session_id,file));
+CREATE TABLE IF NOT EXISTS file_reclaim_state(
+ vehicle TEXT NOT NULL, collector_id TEXT NOT NULL, session_id TEXT NOT NULL,
+ reclaimed INTEGER NOT NULL DEFAULT 0, intent_end INTEGER NOT NULL DEFAULT 0,
+ dev INTEGER NOT NULL DEFAULT 0, ino INTEGER NOT NULL DEFAULT 0,
+ size INTEGER NOT NULL DEFAULT 0, covered INTEGER NOT NULL DEFAULT 0,
+ covered_seq INTEGER NOT NULL DEFAULT 0, intent_seq INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(vehicle,collector_id,session_id));
 """
 
 # Deterministic failures: same cursor offset can never succeed, so later
@@ -349,6 +359,31 @@ def _open_nofollow(path, write=False, create=False):
         raise FileRejection(503, "archive_unavailable") from None
 
 
+@contextlib.contextmanager
+def _file_lock(archive):
+    # ponytail: store-wide process lock; use per-session locks if contention matters.
+    path = str(Path(archive.path).parent / "files.lock")
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def _punch_hole(fd, start, length):
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        fallocate = libc.fallocate
+    except AttributeError:
+        raise OSError(errno.ENOTSUP, "hole punching unavailable") from None
+    fallocate.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_longlong, ctypes.c_longlong)
+    fallocate.restype = ctypes.c_int
+    if fallocate(fd, 3, start, length) != 0:  # PUNCH_HOLE | KEEP_SIZE
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 class FileStore:
     """Receive-side exact-byte store; available as ``receiver.files``."""
 
@@ -365,6 +400,9 @@ class FileStore:
         _private_dir(self.root, True)
         _private_dir(self.root / vehicle, True)
         _private_dir(self.root / vehicle / collector_id, True)
+        with archive.connect() as conn:
+            conn.executescript(_FILE_SCHEMA)
+            conn.commit()
 
     def _namespace(self, session_id, create):
         base = self.root / self.vehicle / self.collector_id / session_id
@@ -482,7 +520,7 @@ class FileStore:
 
     def status(self, session_id, filename):
         _check_names(session_id, filename)
-        with self._lock:
+        with self._lock, _file_lock(self._archive):
             directory = self._namespace(session_id, False)
             if directory is None:
                 return _ack(session_id, filename, 0, EMPTY_SHA256)
@@ -505,13 +543,21 @@ class FileStore:
             raise FileRejection(413, "request_too_large")
         if hashlib.sha256(body).hexdigest() != digest:
             raise FileRejection(409, "sha_mismatch")
-        with self._lock:
+        with self._lock, _file_lock(self._archive):
             directory = self._namespace(session_id, True)
             data = directory / filename
             if filename == CAPTURE_FILE:
                 return self._put_capture(session_id, directory, data, offset, body)
             sidecar = directory / (filename + ".committed")
             committed = self._recover(data, sidecar)
+            if filename == SERIAL_FILE and offset < committed:
+                with self._archive.connect() as conn:
+                    row = conn.execute(
+                        "SELECT MAX(reclaimed,intent_end) FROM file_reclaim_state "
+                        "WHERE vehicle=? AND collector_id=? AND session_id=?",
+                        (self.vehicle, self.collector_id, session_id)).fetchone()
+                if row is not None and offset < row[0]:
+                    raise FileRejection(409, "offset_conflict")
             if not body:
                 if offset != committed:
                     raise FileRejection(409, "offset_conflict")
@@ -630,6 +676,7 @@ class FileImporter:
         self._max_lines, self._max_bytes = max_lines, max_bytes
         self._lock = threading.Lock()
         self._last = None
+        self._last_reclaim = ("", "", "")
         self._verified = {}
         with archive.connect() as conn:
             conn.executescript(_FILE_SCHEMA)
@@ -690,6 +737,175 @@ class FileImporter:
                 if progressed:
                     return True
             return False
+
+    def reclaim_once(self):
+        """Recover one intent or reclaim one bounded acknowledged serial prefix."""
+        with self._lock, _file_lock(self._archive):
+            with self._connect() as conn:
+                pending = conn.execute(
+                    "SELECT vehicle,collector_id,session_id FROM file_reclaim_state "
+                    "WHERE intent_end>reclaimed ORDER BY vehicle,collector_id,session_id LIMIT 1"
+                ).fetchone()
+                keys = [tuple(row) for row in conn.execute(
+                    "SELECT vehicle,collector_id,session_id FROM file_import_state "
+                    "WHERE (vehicle,collector_id,session_id) > (?,?,?) "
+                    "ORDER BY vehicle,collector_id,session_id LIMIT 64", self._last_reclaim)]
+                if not keys:
+                    self._last_reclaim = ("", "", "")
+                    keys = [tuple(row) for row in conn.execute(
+                        "SELECT vehicle,collector_id,session_id FROM file_import_state "
+                        "ORDER BY vehicle,collector_id,session_id LIMIT 64")]
+                if pending:
+                    key = tuple(pending)
+                    keys = [key] + [item for item in keys if item != key]
+            for key in keys:
+                self._last_reclaim = key
+                try:
+                    if self._reclaim_session(*key):
+                        return True
+                except (OSError, FileRejection, _SourceInvalid):
+                    self._archive.record_error("file_reclaim_failure")
+                    try:
+                        self._fail(*key, SERIAL_FILE + ".reclaim", "reclaim_failed", 0)
+                    except _SourceInvalid:
+                        pass
+            return False
+
+    def _reclaim_session(self, vehicle, collector, session):
+        key = (vehicle, collector, session)
+        directory = self.root / vehicle / collector / session
+        if any(path.is_symlink() for path in (self.root, self.root / vehicle,
+                                               self.root / vehicle / collector, directory)):
+            raise _SourceInvalid("unexpected_symlink")
+        data = directory / SERIAL_FILE
+        sidecar = directory / (SERIAL_FILE + ".committed")
+        raw = self._read_at(sidecar, 0, 33)
+        if not re.fullmatch(rb"[0-9]{1,19}", raw):
+            raise _SourceInvalid("unreadable_offset")
+        committed = int(raw)
+        fd = os.open(str(data), os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_size != committed:
+                raise _SourceInvalid("archive_truncated")
+            block = os.fstatvfs(fd).f_frsize
+            if block <= 0:
+                raise _SourceInvalid("reclaim_failed")
+            with self._connect() as conn:
+                conn.execute("BEGIN IMMEDIATE")
+                if conn.execute(
+                        "SELECT 1 FROM file_import_errors WHERE vehicle=? AND collector_id=? "
+                        "AND session_id=? AND file IN (?,?) LIMIT 1",
+                        (*key, CAPTURE_FILE, SERIAL_FILE)).fetchone():
+                    return False
+                state = conn.execute(
+                    "SELECT * FROM file_reclaim_state WHERE vehicle=? AND collector_id=? AND session_id=?", key
+                ).fetchone()
+                if state is None:
+                    capture = _parse_capture(self._read_at(directory / CAPTURE_FILE, 0, MAX_CAPTURE_BYTES + 1))
+                    if capture.get("raw_hash") and capture.get("chunks") is not None:
+                        proof = self._verified.get(key)
+                        if (proof is None or proof[0] != committed or proof[1] != capture["raw_hash"]
+                                or proof[2] != committed or proof[3].hexdigest() != capture["raw_hash"]):
+                            return False
+                start = state["reclaimed"] if state else 0
+                end = state["intent_end"] if state else 0
+                if state and start and (state["dev"], state["ino"]) != (info.st_dev, info.st_ino):
+                    raise _SourceInvalid("archive_changed")
+                if start < 0 or start % block or start > committed:
+                    raise _SourceInvalid("archive_changed")
+                if end > start:
+                    if (state["dev"], state["ino"]) != (info.st_dev, info.st_ino) or committed < state["size"]:
+                        raise _SourceInvalid("archive_changed")
+                    if (end % block or end - start > 1048576
+                            or end > state["size"] - TAIL_HASH_BYTES
+                            or state["covered"] < end or state["covered"] > committed
+                            or state["intent_seq"] < 0):
+                        raise _SourceInvalid("archive_changed")
+                else:
+                    row = conn.execute(
+                        "SELECT f.file_offset,f.next_seq,s.id FROM file_import_state f "
+                        "JOIN sessions s ON s.vehicle=f.vehicle AND s.collector_id=f.collector_id "
+                        "AND s.session_id=f.session_id WHERE f.vehicle=? AND f.collector_id=? AND f.session_id=?", key
+                    ).fetchone()
+                    if (row is None or row["next_seq"] <= 0 or row["file_offset"] > committed
+                            or conn.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()):
+                        return False
+                    epochs = conn.execute(
+                        "SELECT COUNT(*) AS n,COUNT(d.next_seq) AS present,MIN(d.next_seq) AS seq "
+                        "FROM epochs e LEFT JOIN decode_states d ON d.epoch=e.epoch AND d.session=?",
+                        (row["id"],)).fetchone()
+                    if not epochs["n"] or epochs["n"] != epochs["present"]:
+                        return False
+                    covered = state["covered"] if state else 0
+                    covered_seq = state["covered_seq"] if state else 0
+                    if covered < start or covered > row["file_offset"] or covered_seq > epochs["seq"]:
+                        return False
+                    limit = min(row["file_offset"], start + 1048576 + MAX_LINE_BYTES)
+                    window = os.pread(fd, max(0, limit - covered), covered)
+                    if len(window) != max(0, limit - covered):
+                        raise _SourceInvalid("archive_truncated")
+                    for line in window.splitlines(keepends=True):
+                        if not line.endswith(b"\n"):
+                            break
+                        try:
+                            record = _strict_loads(line[:-1])
+                        except ValueError:
+                            raise _SourceInvalid("invalid_chunk") from None
+                        if (not isinstance(record, dict) or type(record.get("seq")) is not int
+                                or record["seq"] != covered_seq):
+                            raise _SourceInvalid("invalid_chunk")
+                        if covered_seq >= min(epochs["seq"], row["next_seq"]):
+                            break
+                        covered += len(line)
+                        covered_seq += 1
+                    end = min(covered, committed - TAIL_HASH_BYTES, start + 1048576)
+                    end -= end % block
+                    if end <= start:
+                        return False
+                    conn.execute(
+                        "INSERT INTO file_reclaim_state VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(vehicle,collector_id,session_id) DO UPDATE SET "
+                        "intent_end=excluded.intent_end,dev=excluded.dev,ino=excluded.ino,size=excluded.size,"
+                        "covered=excluded.covered,covered_seq=excluded.covered_seq,intent_seq=excluded.intent_seq",
+                        (*key, start, end, info.st_dev, info.st_ino, committed, covered, covered_seq, covered_seq))
+                    conn.commit()
+                    conn.execute("BEGIN IMMEDIATE")
+                row = conn.execute(
+                    "SELECT f.file_offset,f.next_seq,s.id FROM file_import_state f "
+                    "JOIN sessions s ON s.vehicle=f.vehicle AND s.collector_id=f.collector_id "
+                    "AND s.session_id=f.session_id WHERE f.vehicle=? AND f.collector_id=? AND f.session_id=?", key
+                ).fetchone()
+                intent = conn.execute(
+                    "SELECT intent_seq FROM file_reclaim_state WHERE vehicle=? AND collector_id=? AND session_id=?", key
+                ).fetchone()
+                if (row is None or intent is None or intent["intent_seq"] > row["next_seq"]
+                        or row["file_offset"] < end or row["file_offset"] > committed
+                        or conn.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                        or conn.execute(
+                            "SELECT 1 FROM file_import_errors WHERE vehicle=? AND collector_id=? "
+                            "AND session_id=? AND file IN (?,?) LIMIT 1",
+                            (*key, CAPTURE_FILE, SERIAL_FILE)).fetchone()
+                        or not conn.execute("SELECT 1 FROM epochs LIMIT 1").fetchone()
+                        or conn.execute(
+                            "SELECT 1 FROM epochs e LEFT JOIN decode_states d ON d.epoch=e.epoch AND d.session=? "
+                            "WHERE d.next_seq IS NULL OR d.next_seq<? LIMIT 1",
+                            (row["id"], intent["intent_seq"])).fetchone()):
+                    return False
+                # The durable intent precedes the irreversible operation; a crash
+                # retries the same range, including a partially completed punch.
+                _punch_hole(fd, start, end - start)
+                os.fsync(fd)
+                if os.fstat(fd).st_size != committed:
+                    raise _SourceInvalid("archive_changed")
+                conn.execute(
+                    "UPDATE file_reclaim_state SET reclaimed=?,intent_end=? "
+                    "WHERE vehicle=? AND collector_id=? AND session_id=?", (end, end, *key))
+                conn.commit()
+            self._clear_error(*key, SERIAL_FILE + ".reclaim")
+            return True
+        finally:
+            os.close(fd)
 
     def _connect(self):
         return self._archive.connect()
@@ -937,6 +1153,14 @@ class FileImporter:
                       capture, committed, cursor):
         """Bounded incremental whole-file verification; one turn, one slice."""
         if not capture.get("raw_hash") or capture.get("chunks") is None:
+            self._verified.pop((vehicle, collector, session), None)
+            return
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT reclaimed,intent_end FROM file_reclaim_state "
+                "WHERE vehicle=? AND collector_id=? AND session_id=?",
+                (vehicle, collector, session)).fetchone()
+        if row is not None and (row["reclaimed"] or row["intent_end"]):
             self._verified.pop((vehicle, collector, session), None)
             return
         if cursor["next_seq"] != capture["chunks"]:
