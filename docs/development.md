@@ -222,6 +222,8 @@ SHA-256, CPU/wall 시간과 전체 child peak RSS를 비교합니다.
 ### 성능·보존 정책 검사
 
 AI 집계의 native Flight 경로는 `grpcio==1.84.0`, `pyarrow==25.0.1`, `protobuf==6.33.6`을 사용합니다. `aggregate-deps`가 Python ABI와 고정 버전을 확인해 전용 venv를 준비하며, 수집기 venv와 공유하지 않습니다. 로컬 AI 회귀에는 같은 버전을 설치하고 `python -m tests.test_ai_incremental`을 실행하세요.
+AI incremental 집계는 네 개의 trace 세션 식별자 별칭에 각각 `IN` 조건을 적용해 여러 세션의 전체 이력을 한 번에 조회합니다. 시간 범위를 자르지 않으므로 날짜를 넘는 세션과 늦게 들어온 이전 이벤트를 유지하며, 행 상한과 실패 시 fence 보존도 기존과 같습니다. 이 변경은 운영 S3 다운로드 감소나 특정 환경의 시간 제한 충족을 보장하지 않습니다.
+
 
 집계 변경 후 스케줄러·DB·배터리 런타임·차량 집계 회귀를 실행합니다.
 

@@ -2355,11 +2355,11 @@ def _ai_session_pred(table, col, values):
     if not seen:
         raise SqlError("ai incremental: empty dirty session set")
     if table == "opentelemetry_traces":
-        ors = [" OR ".join(_ai_quote_ident(c) + " = " + str_lit(v)
-                           for c in AI_SPAN_SESSION_COLS) for v in seen]
+        ids = ", ".join(str_lit(v) for v in seen)
         return ("SELECT " + _ai_projection(table, SPAN_COLS) +
                 " FROM " + table + " WHERE " +
-                " OR ".join("(" + o + ")" for o in ors))
+                " OR ".join(_ai_quote_ident(c) + " IN (" + ids + ")"
+                            for c in AI_SPAN_SESSION_COLS))
     # GreptimeDB 1.2.1 native JSONB: json_get_string(log_attributes,
     # '$."dotted.key"'). Verified: '$."session.id"' reads dotted keys.
     ors = []

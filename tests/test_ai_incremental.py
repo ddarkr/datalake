@@ -271,6 +271,10 @@ def _strip_meta(row):
 
 
 def _session_want(stmt):
+    in_lists = re.findall(r"\bIN\s*\(((?:\s*'(?:''|[^'])*'\s*,?)+)\)", stmt, re.I)
+    if in_lists:
+        return {lit.replace("''", "'") for group in in_lists
+                for lit in re.findall(r"'((?:''|[^'])*)'", group)}
     groups = [g for g in re.findall(r"\(([^()]*)\)", stmt)
               if re.search(r"=\s*'", g)]
     if not groups:
@@ -2325,7 +2329,30 @@ def test_dimension_normalization_matches_sql_scalar_strings():
         assert agg.ai_dimension(value) == value
 
 
+def test_session_history_lookup_matches_all_aliases_without_duplicates():
+    aliases = agg.AI_SPAN_SESSION_COLS
+    with sqlite3.connect(":memory:") as db:
+        db.execute('CREATE TABLE opentelemetry_traces (row_id INTEGER, ' +
+                   ', '.join('"' + col + '" TEXT' for col in aliases) + ')')
+        db.executemany('INSERT INTO opentelemetry_traces VALUES (?, ?, ?, ?, ?)', [
+            (1, "quoted' id", None, None, None),
+            (2, None, 'target', None, None),
+            (3, 'other', None, 'target', None),
+            (4, None, None, None, 'target'),
+            (5, 'target', 'target', None, None),
+            (6, None, None, None, None),
+            (7, 'other', None, None, None),
+        ])
+        query = agg._ai_session_pred('opentelemetry_traces', None,
+                                     ['target', "quoted' id", 'target'])
+        where = query.split(' WHERE ', 1)[1]
+        actual = db.execute('SELECT row_id FROM opentelemetry_traces WHERE ' +
+                            where + ' ORDER BY row_id').fetchall()
+        assert actual == [(1,), (2,), (3,), (4,), (5,)], actual
+
+
 TESTS = (
+    test_session_history_lookup_matches_all_aliases_without_duplicates,
     test_failed_full_snapshot_discards_scratch_and_preserves_fence,
     test_scalar_dimensions_merge_and_v3_checkpoint_repairs_without_input,
     test_dimension_normalization_matches_sql_scalar_strings,
