@@ -223,6 +223,35 @@ class EncodingEquivalence(unittest.TestCase):
             finally:
                 _stop(sink, thread)
 
+    def test_empty_outbox_then_decode_does_not_report_oversize(self):
+        meta = {"schema_version": 1, "vehicle": "synthetic", "collector_id": "fixture",
+                "session_id": "race", "started_ns": 1800000000000000000,
+                "vehicle_firmware": "synthetic"}
+        with tempfile.TemporaryDirectory() as directory:
+            decoder = synthetic_decoder(directory)
+            archive = Archive(Path(directory) / "raw.sqlite", disk_reserve_bytes=0)
+            archive.register_epoch(decoder)
+            archive.accept(meta, [{"seq": 0, "offset_ns": 0, "phase": "capture", "data": b"t12320200\r"}])
+            archive.set_stage_instrumentation(True)
+            sink, thread = _serve()
+            try:
+                def decode_after_empty_read(stage, seconds):
+                    if stage == "sql_prepare":
+                        archive.set_stage_instrumentation(False)
+                        self.assertEqual(archive.decode_once(decoder), 1)
+
+                with patch.object(archive, "observe_stage", side_effect=decode_after_empty_read):
+                    self.assertEqual(archive.flush_once(_greptime(sink)), 0)
+                self.assertEqual(archive.status()["pending_rows"], 1)
+                with archive.connect() as conn:
+                    row = json.loads(conn.execute("SELECT row_json FROM outbox").fetchone()[0])
+                self.assertEqual(archive.flush_once(_greptime(sink)), 1)
+                self.assert_signal_then_dirty(sink.requests, [row])
+                self.assertEqual(archive.status()["pending_rows"], 0)
+                self.assertEqual(archive.status()["counters"]["acked_rows_total"], 1)
+            finally:
+                _stop(sink, thread)
+
     def test_oversize_head_preserved(self):
         big = base_row(event_id="oversized-head", value_text="x" * 4000)
         small = base_row(event_id="after", value_text="kept")

@@ -1054,6 +1054,7 @@ class Archive:
         timing = self._stages.enabled
         total = len(_FORM_PREFIX_BYTES)
         chosen, count, encoded = [], 0, []
+        oversized_head = False
         prep_start = time.monotonic() if timing else 0.0
         with self.connect() as conn:
             for record in conn.execute("SELECT id,row_json FROM outbox ORDER BY id LIMIT ?", (limit,)):
@@ -1062,6 +1063,7 @@ class Archive:
                 cell_enc = _encode_text(_render_cell(row))
                 addition = len(cell_enc) + (0 if count == 0 else _COMMA_ENCODED_LEN)
                 if total + addition > budget:
+                    oversized_head = count == 0
                     break
                 total += addition
                 chosen.append((record["id"], canonical, row))
@@ -1071,12 +1073,11 @@ class Archive:
                     break
         if timing:
             self.observe_stage("sql_prepare", time.monotonic() - prep_start)
-        if not chosen:
-            with self.connect() as conn:
-                if conn.execute("SELECT 1 FROM outbox LIMIT 1").fetchone() is None:
-                    return 0
+        if oversized_head:
             # The oversized head row stays durable; nothing is skipped or deleted.
             raise DownstreamError("greptime_row_too_large")
+        if not chosen:
+            return 0
         rows = [(canonical, row) for _, canonical, row in chosen]
         payload = _FORM_PREFIX_BYTES + _COMMA_ENCODED.join(encoded)
         signal_start = time.monotonic() if timing else 0.0
