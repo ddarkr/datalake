@@ -1,0 +1,7 @@
+[Unit]
+Description=Remove expired closed Greptime file logs
+After=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/libexec/datalake-greptime-log-retention.py datalake-greptimedb-1

@@ -144,6 +144,28 @@ WantedBy=multi-user.target
 
 **사용 중인 볼륨에서 저장소 종류·endpoint·버킷·prefix를 바꾸지 마세요.** 저장소 식별자가 달라지면 preflight가 기동을 거부합니다. 변경은 백업 후 새 볼륨으로 복원하는 방식으로 진행합니다.
 
+#### Greptime 파일 로그 3일 보관
+
+선택적 호스트 타이머는 Greptime 컨테이너의 `/data/logs`에서 시간별 일반·오류·지연 쿼리 파일 중 마지막 수정 후 72시간이 지난 일반 파일만 삭제합니다. 실행 중인 Greptime이 열어 둔 파일, 다른 이름·하위 디렉터리·심볼릭 링크는 보존합니다. Docker 검사나 `/proc` 조회에 실패하면 파일을 삭제하지 않습니다. 과거 파일 삭제는 되돌릴 수 없으므로 설정 전에 보존할 진단 자료를 따로 확보하세요.
+
+5분마다 실행하므로 정상 동작 중에도 72시간 경계 뒤 다음 실행까지 남을 수 있고, 호스트 중단이나 실행 실패 시 더 오래 남습니다. 열린 오래된 파일은 닫힌 뒤에 정리합니다. 이 정책은 파일 크기 상한이 아니며, 호스트 전체가 공유하는 Docker `journald` 로그나 DB 데이터에는 적용되지 않습니다.
+
+호스트에서 기존 파일을 덮어쓰기 전에 내용을 확인하고, 실제 Greptime 컨테이너 이름이 기본값 `datalake-greptimedb-1`과 다르면 설치한 서비스의 인수를 수정하세요.
+
+```bash
+sudo install -m 0644 scripts/storage/greptime_log_retention.py /usr/local/libexec/datalake-greptime-log-retention.py
+sudo install -m 0644 scripts/storage/datalake-greptime-log-retention.service /etc/systemd/system/
+sudo install -m 0644 scripts/storage/datalake-greptime-log-retention.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now datalake-greptime-log-retention.timer
+sudo systemctl start datalake-greptime-log-retention.service
+systemctl list-timers datalake-greptime-log-retention.timer
+journalctl -u datalake-greptime-log-retention.service -n 20
+```
+
+`removed`, `allocated_bytes`, `skipped_open`은 각 실행의 삭제 건수·삭제 대상이 사용하던 블록 바이트·열려 있어 보류한 건수입니다. 다른 프로세스가 삭제된 파일을 열고 있으면 파일 시스템 공간 반환이 지연될 수 있습니다.
+
+
 ### 2. 설정 검사와 기동
 
 `storage-metrics`는 CAN 원본 볼륨을 읽기 전용으로 관찰합니다. 외부 볼륨은 Compose가 만들거나 삭제하지 않으므로 첫 기동 전에 준비하세요. CAN 수집을 사용하지 않으면 빈 볼륨이며 해당 지표는 unknown입니다. 아래는 기본 이름입니다. `.env`에서 `CAN_RECEIVER_RAW_VOLUME`을 바꿨다면 그 이름을 사용하세요.

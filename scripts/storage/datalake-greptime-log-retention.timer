@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Greptime file log retention every five minutes
+
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
