@@ -492,7 +492,8 @@ def test_sparse_runtime_persists_unavailable_first_sighting():
 
         stack.enter_context(patch.object(br, "request_sql", sql_request))
         stack.enter_context(patch.object(
-            br, "fetch_signals", lambda *args, **kwargs: list(signals)))
+            br, "fetch_signals", lambda _u, _a, _d, start, end, *args, **kwargs:
+                [row for row in signals if start <= row["event_time_ns"] <= end]))
         stack.enter_context(patch.object(br, "fetch_signal_scopes", return_value=set()))
         stack.enter_context(patch.object(
             br, "fetch_events", lambda *args, **kwargs: []))
@@ -711,16 +712,16 @@ def test_narrowed_fields_keep_rul_and_previous_scope():
     seen_fields = []
 
     def fake_signals(base_url, auth, db, start, end, vehicle, max_rows,
-                     fields=None, scopes=None, exclude_scopes=None):
+                     fields=None, scopes=None, exclude_scopes=None, raw_observer=None):
         seen_fields.append(None if fields is None else set(fields))
         return []  # every raw row filtered out by the narrow predicate
 
     def fake_events(base_url, auth, db, start, end, vehicle, max_rows,
-                    scopes=None, exclude_scopes=None):
+                    scopes=None, exclude_scopes=None, raw_observer=None):
         return []
 
     def fake_tags(base_url, auth, db, start, end, vehicle, max_rows,
-                  scopes=None, exclude_scopes=None):
+                  scopes=None, exclude_scopes=None, raw_observer=None):
         return {scope}
 
     def fake_prev(base_url, auth, db, scope_arg, windows, max_rows):
@@ -929,7 +930,7 @@ def test_merged_fetch_preserves_context_exclusions_and_caps():
             assert {(r["source"], r["decode_epoch"]) for r in events} == {
                 ("fleet", None), ("can", None)}
             assert tags == {scope}
-            assert len(bounds) == 6  # two disjoint intervals, three query types
+            assert all(upper - lower < 6 * hour for lower, upper in bounds)
             assert not any(lower <= 70 * hour <= upper for lower, upper in bounds)
             # Source exclusion also covers unregistered/NULL-epoch CAN.
             legacy_signals, legacy_events, legacy_tags = br._fetch_plan(
@@ -1057,7 +1058,7 @@ def test_retention_warning_uses_table_metadata_and_fails_closed():
         assert writes == []
 
 
-def test_default_fetch_plan_has_three_queries_and_reads_late_rows():
+def test_default_fetch_plan_has_bounded_queries_and_reads_late_rows():
     from unittest.mock import patch
     hour = br.HOUR_NS
     windows = [(100 * hour + i * hour, 101 * hour + i * hour - 1)
@@ -1086,18 +1087,52 @@ def test_default_fetch_plan_has_three_queries_and_reads_late_rows():
             return br._fetch_plan("", "", "", windows, set(), windows[0][0],
                                   windows[-1][1], "", 100, {"Soc"})[0]
         assert fetch() == raw
-        assert len(calls) == 3
-        assert calls == [
-            ("events", windows[0][0], windows[-1][1]),
-            ("signals", windows[0][0] - br.SIGNAL_CONTEXT_NS, windows[-1][1]),
-            ("tags", windows[0][0] - br.SIGNAL_CONTEXT_NS, windows[-1][1])]
+        assert calls[0] == ("events", windows[0][0], windows[-1][1])
+        for kind in ("signals", "tags"):
+            ranges = [(start, end) for name, start, end in calls if name == kind]
+            assert ranges[0][0] == windows[0][0] - br.SIGNAL_CONTEXT_NS
+            assert ranges[-1][1] == windows[-1][1]
+            assert all(end - start < 6 * hour for start, end in ranges)
+            assert all(a[1] + 1 == b[0] for a, b in zip(ranges, ranges[1:]))
         # A late input inside the previous pass's first window must be read
         # again; no producer generation or dirty marker is assumed.
         raw.append(_sig(*scope, windows[0][0] + 1, field="Soc", value=None,
                         unit="%", quality="invalid"))
         calls.clear()
         assert fetch() == raw
-        assert len(calls) == 3
+
+
+def test_sliced_fetch_counts_invalid_raw_rows_against_original_interval_cap():
+    from unittest.mock import patch
+    hour = br.HOUR_NS
+    with sqlite3.connect(":memory:") as store:
+        for table, cols in ((br.SIGNAL_TABLE, br.SIGNAL_COLS),
+                            (br.EVENT_TABLE, br.EVENT_COLS)):
+            store.execute("CREATE TABLE " + table + " (" + ", ".join(cols) + ")")
+        for index, stamp in enumerate((77 * hour, 84 * hour, 91 * hour)):
+            values = {"event_time": br.ns_to_sql_ts(stamp),
+                      "source": "fleet%d" % index, "decode_epoch": "e"}
+            store.execute("INSERT INTO vehicle_signal VALUES ("
+                          + ",".join("?" for _ in br.SIGNAL_COLS) + ")",
+                          [values.get(c) for c in br.SIGNAL_COLS])
+
+        def request(_url, _auth, _db, statement, timeout=60):
+            cursor = store.execute(statement)
+            return {"output": [{"records": {
+                "schema": {"column_schemas": [
+                    {"name": c[0], "data_type": "String"}
+                    for c in cursor.description]},
+                "rows": cursor.fetchall()}}]}
+
+        with patch.object(br, "request_sql", request):
+            for fields in (None, {"Soc"}):
+                try:
+                    br._fetch_plan("", "", "", [(100 * hour, 106 * hour - 1)],
+                                   set(), 100 * hour, 106 * hour - 1, "", 2, fields)
+                except br.BatteryCapError:
+                    pass
+                else:
+                    raise AssertionError("raw cap must include invalid rows across slices")
 
 
 def test_all_analyzers_reuse_prepared_rows_with_exact_raw_oracle():

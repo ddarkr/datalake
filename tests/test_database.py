@@ -1276,7 +1276,6 @@ def test_coordinator_unnotified_raw_is_not_discovered():
             return _records(["vehicle", "source", "decode_epoch"], [list(scope)])
         return _records(["vehicle", "source", "decode_epoch"], [])
     with patch.object(agg, "request_sql", side_effect=sql):
-        assert agg._distinct_scopes(("", "", ""), _vehicle_cfg()) == set()
         assert agg.vehicle_history_section(("", "", ""), _vehicle_cfg(), now) == 0
         assert not raw_reads
 

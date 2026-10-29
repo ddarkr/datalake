@@ -58,6 +58,7 @@ never printed.
 """
 
 import base64
+import contextvars
 import datetime as dt
 import hashlib
 import json
@@ -2113,10 +2114,7 @@ def activity_metric_rows(ctx, cfg):
     otherwise only source-verified service names map (arbitrary names stay
     provenance, never identity)."""
     base_url, auth, db = ctx
-    _, catalog = fetch_rows(base_url, auth, db,
-        "SELECT table_name, create_options FROM information_schema.tables"
-        " WHERE table_schema = " + str_lit(db) +
-        " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+    catalog = _ai_metric_catalog(ctx)
     out = []
     for table, options in catalog:
         meta = dict(part.split("=", 1) for part in (options or "").split() if "=" in part)
@@ -2193,6 +2191,11 @@ def _ai_state_rows(ctx):
                              " WHERE scope = " + str_lit(AI_STATE_SCOPE))
     except SqlError as e:
         if is_missing_table(e):
+            if _ai_ensure_schema(ctx):
+                _, rows = fetch_rows(base_url, auth, db,
+                    "SELECT fence, price_digest, config_revision, input_digest FROM "
+                    + AI_STATE_TABLE + " WHERE scope = " + str_lit(AI_STATE_SCOPE))
+                return tuple(rows[0][:4]) if rows and rows[0] else None
             return None
         raise
     if not rows or not rows[0]:
@@ -2200,15 +2203,28 @@ def _ai_state_rows(ctx):
     return tuple(rows[0][:4])
 
 
+_AI_CATALOG = contextvars.ContextVar("ai_metric_catalog", default=None)
+
+
+def _ai_metric_catalog(ctx):
+    cached = _AI_CATALOG.get()
+    if cached is not None and "rows" in cached:
+        return cached["rows"]
+    base_url, auth, db = ctx
+    _, catalog = fetch_rows(base_url, auth, db,
+        "SELECT table_name, create_options FROM information_schema.tables"
+        " WHERE table_schema = " + str_lit(db) +
+        " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+    if cached is not None:
+        cached["rows"] = catalog
+    return catalog
+
+
 def _ai_metric_tables(ctx, cfg):
     """[(table, instrument)] backing activity_metric_rows, via catalog."""
-    base_url, auth, db = ctx
     _ = cfg
     try:
-        _, catalog = fetch_rows(base_url, auth, db,
-            "SELECT table_name, create_options FROM information_schema.tables"
-            " WHERE table_schema = " + str_lit(db) +
-            " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+        catalog = _ai_metric_catalog(ctx)
     except SqlError:
         return None
     out = []
@@ -2458,8 +2474,20 @@ def _ai_ensure_schema(ctx):
 
 
 def ai_section(ctx, cfg):
+    token = _AI_CATALOG.set({})
     try:
-        if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
+        return _ai_section(ctx, cfg)
+    finally:
+        _AI_CATALOG.reset(token)
+
+
+def _ai_section(ctx, cfg):
+    try:
+        if not cfg.get("ai_full_rebuild", False):
+            if cfg.get("_ai_schema_ctx") != ctx:
+                if not _ai_ensure_schema(ctx):
+                    return _ai_full(ctx, cfg)
+                cfg["_ai_schema_ctx"] = ctx
             return _ai_incremental(ctx, cfg)
         return _ai_full(ctx, cfg)
     except Exception as exc:
@@ -2712,12 +2740,8 @@ def _ai_delta_metrics(ctx, cfg, tables, fence, upper):
 
 def _ai_metric_metas(ctx):
     """{metric table: create_options meta} for unit translation."""
-    base_url, auth, db = ctx
     try:
-        _, catalog = fetch_rows(base_url, auth, db,
-            "SELECT table_name, create_options FROM information_schema.tables"
-            " WHERE table_schema = " + str_lit(db) +
-            " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+        catalog = _ai_metric_catalog(ctx)
     except SqlError:
         return None
     out = {}
@@ -2754,25 +2778,10 @@ def _ai_dirty_recompute(ctx, cfg, keys, prices, metric_rows=None,
     """Refetch dirty sessions' full event history + whole days; recompute."""
     base_url, auth, db = ctx
     sids = sorted({sid for _, sid in keys})
-    if sids:
-        scols, srows = guarded_fetch(
-            base_url, auth, db,
-            _ai_session_pred("opentelemetry_traces", None, sids), cfg["max_rows"])
-        try:
-            lcols, lrows = guarded_fetch(
-                base_url, auth, db,
-                _ai_session_pred("opentelemetry_logs", None, sids), cfg["max_rows"])
-        except SqlError as e:
-            if not is_missing_table(e):
-                raise
-            lcols, lrows = list(LOG_COLS), []
-        lrows = _ai_filter_logs(lcols, lrows, set(sids))
-    else:
-        # Sessionless delta (valid daily/tool usage, no session key):
-        # skip the session predicate (empty set is an error there) and
-        # let the dirty-day + cohort scans below supply the rows.
-        scols, srows = list(SPAN_COLS), []
-        lcols, lrows = list(LOG_COLS), []
+    scols, srows = _ai_union_session_rows(
+        base_url, auth, db, cfg, "opentelemetry_traces", list(SPAN_COLS), [], sids)
+    lcols, lrows = _ai_union_session_rows(
+        base_url, auth, db, cfg, "opentelemetry_logs", list(LOG_COLS), [], sids)
     days = set()
     for cols, rows, is_log in ((scols, srows, False), (lcols, lrows, True)):
         idx = {c: i for i, c in enumerate(cols)}
@@ -2893,23 +2902,35 @@ def _ai_dirty_recompute(ctx, cfg, keys, prices, metric_rows=None,
 def _ai_union_session_rows(base_url, auth, db, cfg, table, cols, rows,
                            extra):
     """Append full history for cohort session ids to fetched rows."""
-    if not extra:
-        return cols, rows
-    try:
-        ecols, erows = guarded_fetch(
-            base_url, auth, db,
-            _ai_session_pred(table, None, sorted(extra)), cfg["max_rows"])
-    except SqlError as e:
-        if is_missing_table(e) and table == "opentelemetry_logs":
-            return cols, rows
-        raise
-    if table == "opentelemetry_logs":
-        erows = _ai_filter_logs(ecols, erows, set(extra))
-    pos = {c: i for i, c in enumerate(ecols)}
     out = list(rows)
-    for row in erows:
-        out.append([row[pos[c]] if c in pos and pos[c] < len(row) else None
-                    for c in cols])
+    def identity(row):
+        return hashlib.sha256(json.dumps(
+            row, sort_keys=True, default=str).encode()).digest()
+
+    seen = {identity(row) for row in out}
+    ordered = sorted(extra)
+    for start in range(0, len(ordered), 64):
+        batch = ordered[start:start + 64]
+        try:
+            ecols, erows = guarded_fetch(
+                base_url, auth, db,
+                _ai_session_pred(table, None, batch), cfg["max_rows"])
+        except SqlError as e:
+            if is_missing_table(e) and table == "opentelemetry_logs":
+                return cols, out
+            raise
+        if table == "opentelemetry_logs":
+            erows = _ai_filter_logs(ecols, erows, set(batch))
+        pos = {c: i for i, c in enumerate(ecols)}
+        for row in erows:
+            aligned = [row[pos[c]] if c in pos and pos[c] < len(row) else None
+                       for c in cols]
+            key = identity(aligned)
+            if key not in seen:
+                seen.add(key)
+                out.append(aligned)
+        if len(out) > cfg["max_rows"]:
+            raise SqlError("ai session row cap exceeded: refusing partial write")
     return cols, out
 
 
@@ -3000,35 +3021,45 @@ def _ai_scoped_metrics(ctx, cfg, tables=None, keys=None, metric_rows=None,
         cols = _ai_metric_columns(ctx, table)
         if cols is None:
             raise SqlError("ai metric columns unprovable for " + table)
-        where = _ai_metric_where(table, cols, sids, day_list)
-        if not where:
-            continue
-        cols, rows, _marks = flight.flight_query(
-            'SELECT * FROM "' + table.replace('"', '""') + '"' + where,
-            endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
-            password=cfg.get("password") or "", lower=None,
-            max_rows=cfg["max_rows"])
-        for values in rows:
-            raw = dict(zip(cols, values))
-            norm = _ai_norm_metric_row(raw, instrument,
-                                       (metas or {}).get(table))
-            if norm is None:
+        ids = sorted(sids)
+        batches = [(ids[i:i + 64], []) for i in range(0, len(ids), 64)]
+        batches += [([], day_list[i:i + 64])
+                    for i in range(0, len(day_list), 64)]
+        table_rows = set()
+        for batch_ids, batch_days in batches:
+            where = _ai_metric_where(table, cols, batch_ids, batch_days)
+            if not where:
                 continue
-            sid = norm.get("session_id")
-            stamp = norm.get("timestamp")
-            try:
-                day = floor_day(stamp) if stamp is not None else None
-            except Exception:
-                day = None
-            if sid not in sids and day not in day_list:
-                continue
-            key = (norm.get("instrument"), norm.get("client"),
-                   norm.get("session_id"), str(norm.get("timestamp")),
-                   str(norm.get("value")), str(norm.get("stream")))
-            if key in seen:
-                continue
-            seen.add(key)
-            scoped.append(norm)
+            result_cols, rows, _marks = flight.flight_query(
+                'SELECT * FROM "' + table.replace('"', '""') + '"' + where,
+                endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
+                password=cfg.get("password") or "", lower=None,
+                max_rows=cfg["max_rows"])
+            for values in rows:
+                table_rows.add(repr(values))
+                if len(table_rows) > cfg["max_rows"]:
+                    raise SqlError("ai metric row cap exceeded: refusing partial write")
+            for values in rows:
+                raw = dict(zip(result_cols, values))
+                norm = _ai_norm_metric_row(raw, instrument,
+                                           (metas or {}).get(table))
+                if norm is None:
+                    continue
+                sid = norm.get("session_id")
+                stamp = norm.get("timestamp")
+                try:
+                    day = floor_day(stamp) if stamp is not None else None
+                except Exception:
+                    day = None
+                if sid not in sids and day not in day_list:
+                    continue
+                key = (norm.get("instrument"), norm.get("client"),
+                       norm.get("session_id"), str(norm.get("timestamp")),
+                       str(norm.get("value")), str(norm.get("stream")))
+                if key in seen:
+                    continue
+                seen.add(key)
+                scoped.append(norm)
     return scoped
 
 
@@ -3544,36 +3575,6 @@ CAN_SOURCES = ("can",)
 def _config_revision(cfg):
     """Short stable revision of everything that changes aggregate outputs."""
     paths = cfg.get("paths", {})
-    try:
-        import importlib
-        modules = {}
-        for name in ("scripts.analytics.battery.battery_runtime",
-                     "scripts.analytics.battery.battery_common",
-                     "scripts.analytics.battery.battery_conditions",
-                     "scripts.analytics.battery.battery_energy",
-                     "scripts.analytics.battery.battery_electrical",
-                     "scripts.analytics.battery.battery_alerts",
-                     "scripts.analytics.battery.battery_rul",
-                     "scripts.analytics.battery.battery_reference"):
-            try:
-                module = importlib.import_module(name)
-            except Exception:
-                continue
-            version = getattr(module, "RUNTIME_VERSION", None)
-            if version is None:
-                version = getattr(module, "CODE_VERSION", None)
-            if version is None:
-                version = getattr(module, "ALGORITHM_VERSION", None)
-            if version is None:
-                continue
-            modules[name] = str(version)
-            try:
-                with open(module.__file__, "rb") as handle:
-                    modules[name + ":sha"] = hashlib.sha256(handle.read()).hexdigest()[:16]
-            except (OSError, TypeError):
-                pass
-    except Exception:
-        modules = {}
     material = {
         "rollup_format": ROLLUP_FORMAT_VERSION,
         "paths": {k: paths.get(k) for k in sorted(paths)},
@@ -3581,19 +3582,9 @@ def _config_revision(cfg):
         "trip_min_speed_kph": cfg.get("trip_min_speed_kph"),
         "charge_gap_min": cfg.get("charge_gap_min"),
         "signal_max_age_s": cfg.get("signal_max_age_s"),
-        "battery_modules": modules,
     }
     with open(__file__, "rb") as handle:
         material["aggregate_sha"] = hashlib.sha256(handle.read()).hexdigest()[:16]
-    path = cfg.get("battery_config", "")
-    digest = ""
-    try:
-        if path and os.path.isfile(path):
-            with open(path, "rb") as handle:
-                digest = hashlib.sha256(handle.read()).hexdigest()[:16]
-    except OSError:
-        digest = ""
-    material["battery_config_sha"] = digest
     digest = hashlib.sha256(
         json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
     return digest[:16]
@@ -3705,37 +3696,6 @@ def _commit_checkpoint(ctx, scope, hour_ns, generation, revision, now_ns):
                   str_lit(""), ns_to_sql_lit(now_ns)]])
 
 
-def _registered_scopes(ctx, cfg):
-    """CAN scopes from dirty/checkpoint metadata only; never discover raw."""
-    base_url, auth, db = ctx
-    filt = " WHERE source = 'can'"
-    if cfg.get("vehicle"):
-        filt += " AND vehicle = " + str_lit(cfg["vehicle"])
-    out = set()
-    for table in (DIRTY_TABLE, CHECKPOINT_TABLE):
-        try:
-            cols, rows = guarded_fetch(
-                base_url, auth, db,
-                "SELECT DISTINCT vehicle, source, decode_epoch FROM "
-                + table + filt, cfg["max_rows"])
-        except SqlError as e:
-            if is_missing_table(e):
-                continue
-            raise
-        idx = {c: i for i, c in enumerate(cols)}
-        for r in rows:
-            def col(name):
-                return r[idx[name]] if name in idx else None
-            scope = _scope_tuple((col("vehicle"), col("source"),
-                                  col("decode_epoch")))
-            if scope is not None and _is_can_scope(scope):
-                out.add(scope)
-    return out
-
-
-def _distinct_scopes(ctx, cfg):
-    """Known CAN scopes only; unnotified history is not discovered."""
-    return _registered_scopes(ctx, cfg)
 
 
 def _extend_vehicle_head(segments, raw_from, cutoff, gap_s, lookback_h):
@@ -3765,19 +3725,16 @@ def trip_section(ctx, cfg, *, window=None, scope=None):
 
 
 
-def _legacy_cfgs(cfg, coordinated):
+def _legacy_cfgs(cfg):
     """Legacy sections never process CAN, including unregistered scopes."""
-    coordinated = [s for s in coordinated if _is_can_scope(s)]
     sub = dict(cfg)
     sub.pop("battery_exclude_scopes", None)
     sub["exclude_scopes"] = list(
-        {tuple(s) for s in coordinated}
-        | {tuple(s) for s in (cfg.get("exclude_scopes") or [])})
+        {tuple(s) for s in (cfg.get("exclude_scopes") or [])})
     bat = dict(sub)
     bat["battery_exclude_sources"] = ["can"]
     bat["battery_exclude_scopes"] = list(
-        {tuple(s) for s in coordinated}
-        | {tuple(s) for s in (cfg.get("battery_exclude_scopes") or [])})
+        {tuple(s) for s in (cfg.get("battery_exclude_scopes") or [])})
     return sub, sub, bat
 
 
@@ -4081,8 +4038,10 @@ def vehicle_history_section(ctx, cfg, now=None):
     """Batch sealed-hour rollups, then checkpoint each successful trip generation."""
     now_ns = dt_to_ns(now or utcnow())
     seal_ns = floor_hour_ns(now_ns)
-    revision = _config_revision(cfg)
     pending = _load_pending_dirty(ctx, cfg, seal_ns)
+    if not pending:
+        return 0
+    revision = _config_revision(cfg)
     committed = 0
     eligible = {}
     for key in sorted(pending)[:DIRTY_MAX_WINDOWS]:
@@ -4211,19 +4170,7 @@ def run_all(ctx, cfg, progress=None):
     run_section("ai", lambda: ai_section(ctx, cfg))
     run_section("logs", lambda: log_section(ctx, cfg))
     run_section("home", lambda: home_section(ctx, cfg))
-    if progress is not None:
-        progress("vehicle_discovery")
-    started = time.monotonic()
-    try:
-        coordinated = sorted(_distinct_scopes(ctx, cfg), key=repr)
-    except Exception:
-        durations["vehicle_discovery"] = time.monotonic() - started
-        failed.extend(("vehicle_discovery", "vehicle", "trip_charge",
-                       "vehicle_history", "battery"))
-        sys.stderr.write("aggregate: vehicle discovery failed; dependent sections skipped\n")
-        return counts, failed, durations
-    durations["vehicle_discovery"] = time.monotonic() - started
-    legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
+    legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg)
     run_section("vehicle", lambda: vehicle_section(ctx, legacy))
     run_section("trip_charge", lambda: trip_section(ctx, legacy_trip))
     run_section("vehicle_history",

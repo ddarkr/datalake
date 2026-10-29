@@ -675,6 +675,33 @@ class SpooledActivityTest(unittest.TestCase):
                             "stream": (("counter", "one"),), "value": index})
         self.compare(traces, metrics=metrics)
 
+    def test_wall_union_cross_midnight_single_and_multiple_sessions(self):
+        def span(ident, client, session, start, end):
+            return {"trace_id": "t", "span_id": ident, "span_name": "invoke_agent",
+                    "timestamp": start, "timestamp_end": end,
+                    "span_attributes": {"client": client, "session.id": session}}
+
+        traces = [
+            span("1", "single", "s", dt(2026, 9, 20, 23, 59, 30), dt(2026, 9, 21, 0, 0, 30)),
+            span("2", "single", "s", dt(2026, 9, 21, 0, 0, 20), dt(2026, 9, 21, 0, 1)),
+            span("3", "multi", "a", dt(2026, 9, 20, 23, 59), dt(2026, 9, 21, 0, 0, 30)),
+            span("4", "multi", "b", dt(2026, 9, 21), dt(2026, 9, 21, 0, 1)),
+            span("5", "multi", "b", dt(2026, 9, 21, 0, 1), dt(2026, 9, 21, 0, 2)),
+        ]
+        sessions, days = act.summarize_activity(traces, [], [])
+        self.assertEqual(sessions[("single", "s")]["session_wall_seconds"], 90)
+        self.assertEqual(sessions[("multi", "a")]["session_wall_seconds"], 90)
+        self.assertEqual(sessions[("multi", "b")]["session_wall_seconds"], 120)
+        walls = {(day["client"], day["day_start"]): day["session_wall_seconds"]
+                 for day in days}
+        self.assertEqual(walls, {
+            ("single", dt(2026, 9, 20)): 30,
+            ("single", dt(2026, 9, 21)): 60,
+            ("multi", dt(2026, 9, 20)): 60,
+            ("multi", dt(2026, 9, 21)): 120,
+        })
+        self.compare(traces)
+
 
 if __name__ == "__main__":
     unittest.main()

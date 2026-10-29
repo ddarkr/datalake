@@ -990,7 +990,8 @@ def _merge_intervals(intervals):
 
 
 def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                  fields=None, scopes=None, exclude_scopes=None, exclude_sources=()):
+                  fields=None, scopes=None, exclude_scopes=None, exclude_sources=(),
+                  raw_observer=None):
     filt = _vehicle_filter(vehicle) + _field_predicate(fields)
     if exclude_sources:
         filt += " AND NOT COALESCE(source IN (" + ", ".join(
@@ -1009,6 +1010,8 @@ def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
         if is_missing_table(exc):
             return []
         raise
+    if raw_observer is not None:
+        raw_observer(rows)
     dtypes = {c.get("name"): c.get("data_type") for c in schema}
     idx = {c: i for i, c in enumerate(cols)}
     out = []
@@ -1064,7 +1067,8 @@ def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
 
 
 def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
-                        max_rows, scopes=None, exclude_scopes=None, exclude_sources=()):
+                        max_rows, scopes=None, exclude_scopes=None, exclude_sources=(),
+                        raw_observer=None):
     """Field-independent scope identities in a bounded interval.
 
     SELECT DISTINCT vehicle/source/decode_epoch only (no raw
@@ -1094,6 +1098,8 @@ def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
         if is_missing_table(exc):
             return set()
         raise
+    if raw_observer is not None:
+        raw_observer(rows)
     idx = {c: i for i, c in enumerate(cols)}
     out = set()
     for record in rows:
@@ -1111,7 +1117,8 @@ def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
 
 
 def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                 scopes=None, exclude_scopes=None, exclude_sources=()):
+                 scopes=None, exclude_scopes=None, exclude_sources=(),
+                 raw_observer=None):
     filt = _vehicle_filter(vehicle)
     if scopes:
         filt += " AND (" + _scope_predicate(scopes) + ")"
@@ -1130,6 +1137,8 @@ def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
         if is_missing_table(exc):
             return []
         raise
+    if raw_observer is not None:
+        raw_observer(rows)
     dtypes = {c.get("name"): c.get("data_type") for c in schema}
     idx = {c: i for i, c in enumerate(cols)}
     out = []
@@ -1366,9 +1375,9 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
                 analysis_cfg=None, exclude_sources=()):
     """Bounded disjoint fetches: no envelope over unrelated gaps.
 
-    Each merged inclusive interval uses one request per table, retaining
-    its full >=24h signal context. Cumulative raw rows and unique
-    discovered scope identities fail closed at max_rows.
+    Each merged inclusive interval is fetched in disjoint six-hour slices,
+    retaining its full >=24h signal context. Raw per-interval caps and
+    cumulative normalized rows and unique scope caps remain fail-closed.
     Exact exclusions apply in SQL before LIMIT, including union mode.
     The source_field predicate narrows fetched ROWS (exact required set),
     never scopes: a parallel field-independent DISTINCT tag query per
@@ -1423,11 +1432,35 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
                                   "partial" % (total[0], max_rows))
         tag_scopes.update(tags)
 
+    def _slices(start, end):
+        while start <= end:
+            last = min(end, start + 6 * HOUR_NS - 1)
+            yield start, last
+            start = last + 1
+
+    def _raw_cap(distinct=False):
+        count = [0]
+        seen = set()
+
+        def observe(rows):
+            if distinct:
+                seen.update(json.dumps(row, sort_keys=True) for row in rows)
+                count[0] = len(seen)
+            else:
+                count[0] += len(rows)
+            if count[0] > max_rows:
+                raise BatteryCapError("row cap exceeded (%d > %d): refusing partial"
+                                      % (count[0], max_rows))
+        return observe
+
     source_filter = {"exclude_sources": exclude_sources} if exclude_sources else {}
     for start, end, scopes in _intervals(event_q):
-        events.extend(_take(fetch_events(
-            base_url, auth, db, start, end, vehicle, max_rows,
-            scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
+        event_cap = _raw_cap()
+        for first, last in _slices(start, end):
+            events.extend(_take(fetch_events(
+                base_url, auth, db, first, last, vehicle, max_rows,
+                scopes=scopes, exclude_scopes=exclude_scopes,
+                raw_observer=event_cap, **source_filter)))
     if analysis_cfg is not None:
         # Excluded scopes never analyze, so their events cannot require
         # context. Malformed config propagates (fail closed).
@@ -1436,13 +1469,18 @@ def _fetch_plan(base_url, auth, db, windows, exclude_scopes,
                   not in exclude_scopes]
         fields = _required_signal_fields(analysis_cfg, events=proven)
     for cstart, cend, scopes in _intervals(signal_q):
-        signals.extend(_take(fetch_signals(
-            base_url, auth, db, cstart, cend, vehicle, max_rows,
-            fields=fields, scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
-        if fields is not None:
-            _take_tags(fetch_signal_scopes(
-                base_url, auth, db, cstart, cend, vehicle, max_rows,
-                scopes=scopes, exclude_scopes=exclude_scopes, **source_filter))
+        signal_cap = _raw_cap()
+        tag_cap = _raw_cap(distinct=True)
+        for first, last in _slices(cstart, cend):
+            signals.extend(_take(fetch_signals(
+                base_url, auth, db, first, last, vehicle, max_rows,
+                fields=fields, scopes=scopes, exclude_scopes=exclude_scopes,
+                raw_observer=signal_cap, **source_filter)))
+            if fields is not None:
+                _take_tags(fetch_signal_scopes(
+                    base_url, auth, db, first, last, vehicle, max_rows,
+                    scopes=scopes, exclude_scopes=exclude_scopes,
+                    raw_observer=tag_cap, **source_filter))
     signals = [s for s in signals if (s["vehicle"], s["source"],
                                       s["decode_epoch"]) not in exclude_scopes
                and s["source"] not in exclude_sources]

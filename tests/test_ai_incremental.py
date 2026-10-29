@@ -2350,8 +2350,67 @@ def test_session_history_lookup_matches_all_aliases_without_duplicates():
                             where + ' ORDER BY row_id').fetchall()
         assert actual == [(1,), (2,), (3,), (4,), (5,)], actual
 
+        # A single row can match aliases in different session batches.
+        from unittest.mock import patch
+        db.execute("DELETE FROM opentelemetry_traces")
+        sessions = ["s%03d" % i for i in range(65)]
+        db.executemany("INSERT INTO opentelemetry_traces VALUES (?, ?, ?, ?, ?)",
+                       [(i, sid, sessions[-1] if i == 0 else None, None, None)
+                        for i, sid in enumerate(sessions)])
+        columns = ["row_id", *aliases]
+        expected = db.execute("SELECT * FROM opentelemetry_traces ORDER BY row_id").fetchall()
+
+        def fetch(base, auth, database, statement, limit):
+            where = statement.split(" WHERE ", 1)[1]
+            rows = db.execute("SELECT * FROM opentelemetry_traces WHERE " + where).fetchall()
+            return columns, rows
+
+        with patch.object(agg, "guarded_fetch", side_effect=fetch):
+            _, actual = agg._ai_union_session_rows(
+                "", "", "", {"max_rows": 65}, "opentelemetry_traces",
+                columns, [], sessions)
+            assert sorted(map(tuple, actual)) == expected
+            try:
+                agg._ai_union_session_rows(
+                    "", "", "", {"max_rows": 64}, "opentelemetry_traces",
+                    columns, [], sessions)
+            except agg.SqlError:
+                pass
+            else:
+                raise AssertionError("distinct session rows must still obey the cap")
+
+
+def test_large_dirty_cohort_matches_full_cross_day_oracle():
+    saved = _guard()
+    real = install_fence()
+    try:
+        traces = [span(DAY1 + dt.timedelta(minutes=i), "t%d" % i,
+                       "p%d" % i, "s%03d" % i, "codex", 1, 1,
+                       call="r%d" % i) for i in range(130)]
+        logs = [clog(DAY2 + dt.timedelta(minutes=i), "s%03d" % i,
+                     "codex", "r%d" % i, 10, 3) for i in range(130)]
+        _reset()
+        FakeGreptime.store.append("traces", [dict(r) for r in traces])
+        srv = serve()
+        try:
+            ctx, cfg = _ctx(srv), _cfg()
+            seed_fenced(ctx, cfg)
+            FakeGreptime.store.append("logs", [dict(r) for r in logs])
+            agg.ai_section(ctx, cfg)
+            second = snapshot()
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        _assert_oracle(second, traces, logs, _cfg())
+    finally:
+        restore_fence(real)
+        _restore(saved)
+
+
+
 
 TESTS = (
+    test_large_dirty_cohort_matches_full_cross_day_oracle,
     test_session_history_lookup_matches_all_aliases_without_duplicates,
     test_failed_full_snapshot_discards_scratch_and_preserves_fence,
     test_scalar_dimensions_merge_and_v3_checkpoint_repairs_without_input,

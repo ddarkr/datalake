@@ -352,25 +352,30 @@ class CoordinatorLogicTest(unittest.TestCase):
         self.assertTrue(agg._is_can_scope(("v", "can", "e")))
         self.assertFalse(agg._is_can_scope(("v", "fleet", "e")))
 
-    def test_config_revision_covers_tuning_and_battery_code(self):
+    def test_config_revision_covers_tuning_not_battery_config(self):
         base = {"paths": {"speed": "A"}, "trip_gap_min": 10,
                 "trip_min_speed_kph": 1.0, "charge_gap_min": 30,
                 "signal_max_age_s": 300, "battery_config": "/nonexistent"}
         changed = dict(base, trip_gap_min=11)
         self.assertNotEqual(agg._config_revision(base),
                             agg._config_revision(changed))
+        self.assertEqual(agg._config_revision(base),
+                         agg._config_revision(dict(base, battery_config="/other")))
 
-    def test_legacy_cfgs_exclude_only_can_scopes(self):
-        cfg = {"exclude_scopes": [], "battery_exclude_scopes": []}
-        coordinated = [("v", "can", "e"), ("w", "fleet", "f")]
-        legacy, trip, bat = agg._legacy_cfgs(cfg, coordinated)
-        self.assertEqual(legacy["exclude_scopes"], [("v", "can", "e")])
-        self.assertEqual(trip["exclude_scopes"], [("v", "can", "e")])
-        self.assertEqual(bat["battery_exclude_scopes"], [("v", "can", "e")])
+    def test_empty_queue_does_not_compute_revision(self):
+        from unittest.mock import patch
+        with patch.object(agg, "_load_pending_dirty", return_value={}), \
+                patch.object(agg, "_config_revision", side_effect=AssertionError):
+            self.assertEqual(agg.vehicle_history_section(("", "", ""), {}), 0)
+
+    def test_legacy_cfgs_preserve_explicit_non_can_exclusions(self):
+        fleet = ("w", "fleet", "f")
+        cfg = {"exclude_scopes": [fleet], "battery_exclude_scopes": [fleet]}
+        legacy, trip, bat = agg._legacy_cfgs(cfg)
+        self.assertEqual(legacy["exclude_scopes"], [fleet])
+        self.assertEqual(trip["exclude_scopes"], [fleet])
+        self.assertEqual(bat["battery_exclude_scopes"], [fleet])
         self.assertEqual(bat["battery_exclude_sources"], ["can"])
-        plain, _, _ = agg._legacy_cfgs(cfg, [("w", "fleet", "f")])
-        self.assertEqual(plain["exclude_scopes"], [])
-        self.assertEqual(agg._legacy_cfgs(cfg, [])[2]["battery_exclude_sources"], ["can"])
 
 
 class DirtyBatchTest(unittest.TestCase):

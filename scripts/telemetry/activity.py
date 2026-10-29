@@ -639,10 +639,12 @@ def _merge_intervals(intervals):
         yield current
 
 
-def _clip_union_by_day(intervals):
+def _clip_union_by_day(intervals, pool=None):
     per_day = (intervals.store.container("dict")
                if isinstance(intervals, _ActivityList) else {})
     for start, end in _merge_intervals(intervals):
+        if pool is not None:
+            pool.append((start, end))
         day = _day_start(start)
         cursor = start
         while True:
@@ -1141,7 +1143,10 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
     for key, session in sessions.items():
         client, session_id = key
         if session["intervals"]:
-            wall_pool.setdefault(client, []).extend(session["intervals"])
+            client_wall = wall_pool.get(client)
+            intervals = sequence() if client_wall is None else client_wall[0]
+            session_days = _clip_union_by_day(session["intervals"], intervals)
+            wall_pool[client] = (intervals, session_days if client_wall is None else None)
         record = {
             "client": client,
             "session_id": session_id,
@@ -1240,8 +1245,7 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
             else:
                 record[field] = None
         if session["intervals"]:
-            record["session_wall_seconds"] = sum(
-                _clip_union_by_day(session["intervals"]).values())
+            record["session_wall_seconds"] = sum(session_days.values())
             prov["session_wall_seconds"] = _WALL_SRC
         else:
             record["session_wall_seconds"] = None
@@ -1261,8 +1265,9 @@ def _summarize_activity(trace_rows, log_rows, metric_rows, store=None):
         if (client, bucket, field) in selected_poison:
             daily_cells.setdefault((client, day), {})
 
-    for client, intervals in wall_pool.items():
-        for day, seconds in _clip_union_by_day(intervals).items():
+    for client, (intervals, session_days) in wall_pool.items():
+        days = session_days if session_days is not None else _clip_union_by_day(intervals)
+        for day, seconds in days.items():
             cell = daily_cells.setdefault((client, day), {})
             entry = cell.setdefault("session_wall_seconds", [0.0, set()])
             entry[0] = seconds

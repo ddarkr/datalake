@@ -115,7 +115,7 @@ services:
     - server
     cpus: ${AGG_CPUS:-1.0}
     labels:
-      datalake.aggregate-revision: '44'
+      datalake.aggregate-revision: '45'
     depends_on:
       greptimedb:
         condition: service_started
@@ -2258,6 +2258,7 @@ configs:
       """
 
       import base64
+      import contextvars
       import datetime as dt
       import hashlib
       import json
@@ -4313,10 +4314,7 @@ configs:
           otherwise only source-verified service names map (arbitrary names stay
           provenance, never identity)."""
           base_url, auth, db = ctx
-          _, catalog = fetch_rows(base_url, auth, db,
-              "SELECT table_name, create_options FROM information_schema.tables"
-              " WHERE table_schema = " + str_lit(db) +
-              " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+          catalog = _ai_metric_catalog(ctx)
           out = []
           for table, options in catalog:
               meta = dict(part.split("=", 1) for part in (options or "").split() if "=" in part)
@@ -4393,6 +4391,11 @@ configs:
                                    " WHERE scope = " + str_lit(AI_STATE_SCOPE))
           except SqlError as e:
               if is_missing_table(e):
+                  if _ai_ensure_schema(ctx):
+                      _, rows = fetch_rows(base_url, auth, db,
+                          "SELECT fence, price_digest, config_revision, input_digest FROM "
+                          + AI_STATE_TABLE + " WHERE scope = " + str_lit(AI_STATE_SCOPE))
+                      return tuple(rows[0][:4]) if rows and rows[0] else None
                   return None
               raise
           if not rows or not rows[0]:
@@ -4400,15 +4403,28 @@ configs:
           return tuple(rows[0][:4])
 
 
+      _AI_CATALOG = contextvars.ContextVar("ai_metric_catalog", default=None)
+
+
+      def _ai_metric_catalog(ctx):
+          cached = _AI_CATALOG.get()
+          if cached is not None and "rows" in cached:
+              return cached["rows"]
+          base_url, auth, db = ctx
+          _, catalog = fetch_rows(base_url, auth, db,
+              "SELECT table_name, create_options FROM information_schema.tables"
+              " WHERE table_schema = " + str_lit(db) +
+              " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+          if cached is not None:
+              cached["rows"] = catalog
+          return catalog
+
+
       def _ai_metric_tables(ctx, cfg):
           """[(table, instrument)] backing activity_metric_rows, via catalog."""
-          base_url, auth, db = ctx
           _ = cfg
           try:
-              _, catalog = fetch_rows(base_url, auth, db,
-                  "SELECT table_name, create_options FROM information_schema.tables"
-                  " WHERE table_schema = " + str_lit(db) +
-                  " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+              catalog = _ai_metric_catalog(ctx)
           except SqlError:
               return None
           out = []
@@ -4658,8 +4674,20 @@ configs:
 
 
       def ai_section(ctx, cfg):
+          token = _AI_CATALOG.set({})
           try:
-              if not cfg.get("ai_full_rebuild", False) and _ai_ensure_schema(ctx):
+              return _ai_section(ctx, cfg)
+          finally:
+              _AI_CATALOG.reset(token)
+
+
+      def _ai_section(ctx, cfg):
+          try:
+              if not cfg.get("ai_full_rebuild", False):
+                  if cfg.get("_ai_schema_ctx") != ctx:
+                      if not _ai_ensure_schema(ctx):
+                          return _ai_full(ctx, cfg)
+                      cfg["_ai_schema_ctx"] = ctx
                   return _ai_incremental(ctx, cfg)
               return _ai_full(ctx, cfg)
           except Exception as exc:
@@ -4912,12 +4940,8 @@ configs:
 
       def _ai_metric_metas(ctx):
           """{metric table: create_options meta} for unit translation."""
-          base_url, auth, db = ctx
           try:
-              _, catalog = fetch_rows(base_url, auth, db,
-                  "SELECT table_name, create_options FROM information_schema.tables"
-                  " WHERE table_schema = " + str_lit(db) +
-                  " AND create_options LIKE '%greptime.semantic.metric.original_name=%'")
+              catalog = _ai_metric_catalog(ctx)
           except SqlError:
               return None
           out = {}
@@ -4954,25 +4978,10 @@ configs:
           """Refetch dirty sessions' full event history + whole days; recompute."""
           base_url, auth, db = ctx
           sids = sorted({sid for _, sid in keys})
-          if sids:
-              scols, srows = guarded_fetch(
-                  base_url, auth, db,
-                  _ai_session_pred("opentelemetry_traces", None, sids), cfg["max_rows"])
-              try:
-                  lcols, lrows = guarded_fetch(
-                      base_url, auth, db,
-                      _ai_session_pred("opentelemetry_logs", None, sids), cfg["max_rows"])
-              except SqlError as e:
-                  if not is_missing_table(e):
-                      raise
-                  lcols, lrows = list(LOG_COLS), []
-              lrows = _ai_filter_logs(lcols, lrows, set(sids))
-          else:
-              # Sessionless delta (valid daily/tool usage, no session key):
-              # skip the session predicate (empty set is an error there) and
-              # let the dirty-day + cohort scans below supply the rows.
-              scols, srows = list(SPAN_COLS), []
-              lcols, lrows = list(LOG_COLS), []
+          scols, srows = _ai_union_session_rows(
+              base_url, auth, db, cfg, "opentelemetry_traces", list(SPAN_COLS), [], sids)
+          lcols, lrows = _ai_union_session_rows(
+              base_url, auth, db, cfg, "opentelemetry_logs", list(LOG_COLS), [], sids)
           days = set()
           for cols, rows, is_log in ((scols, srows, False), (lcols, lrows, True)):
               idx = {c: i for i, c in enumerate(cols)}
@@ -5093,23 +5102,35 @@ configs:
       def _ai_union_session_rows(base_url, auth, db, cfg, table, cols, rows,
                                  extra):
           """Append full history for cohort session ids to fetched rows."""
-          if not extra:
-              return cols, rows
-          try:
-              ecols, erows = guarded_fetch(
-                  base_url, auth, db,
-                  _ai_session_pred(table, None, sorted(extra)), cfg["max_rows"])
-          except SqlError as e:
-              if is_missing_table(e) and table == "opentelemetry_logs":
-                  return cols, rows
-              raise
-          if table == "opentelemetry_logs":
-              erows = _ai_filter_logs(ecols, erows, set(extra))
-          pos = {c: i for i, c in enumerate(ecols)}
           out = list(rows)
-          for row in erows:
-              out.append([row[pos[c]] if c in pos and pos[c] < len(row) else None
-                          for c in cols])
+          def identity(row):
+              return hashlib.sha256(json.dumps(
+                  row, sort_keys=True, default=str).encode()).digest()
+
+          seen = {identity(row) for row in out}
+          ordered = sorted(extra)
+          for start in range(0, len(ordered), 64):
+              batch = ordered[start:start + 64]
+              try:
+                  ecols, erows = guarded_fetch(
+                      base_url, auth, db,
+                      _ai_session_pred(table, None, batch), cfg["max_rows"])
+              except SqlError as e:
+                  if is_missing_table(e) and table == "opentelemetry_logs":
+                      return cols, out
+                  raise
+              if table == "opentelemetry_logs":
+                  erows = _ai_filter_logs(ecols, erows, set(batch))
+              pos = {c: i for i, c in enumerate(ecols)}
+              for row in erows:
+                  aligned = [row[pos[c]] if c in pos and pos[c] < len(row) else None
+                             for c in cols]
+                  key = identity(aligned)
+                  if key not in seen:
+                      seen.add(key)
+                      out.append(aligned)
+              if len(out) > cfg["max_rows"]:
+                  raise SqlError("ai session row cap exceeded: refusing partial write")
           return cols, out
 
 
@@ -5200,35 +5221,45 @@ configs:
               cols = _ai_metric_columns(ctx, table)
               if cols is None:
                   raise SqlError("ai metric columns unprovable for " + table)
-              where = _ai_metric_where(table, cols, sids, day_list)
-              if not where:
-                  continue
-              cols, rows, _marks = flight.flight_query(
-                  'SELECT * FROM "' + table.replace('"', '""') + '"' + where,
-                  endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
-                  password=cfg.get("password") or "", lower=None,
-                  max_rows=cfg["max_rows"])
-              for values in rows:
-                  raw = dict(zip(cols, values))
-                  norm = _ai_norm_metric_row(raw, instrument,
-                                             (metas or {}).get(table))
-                  if norm is None:
+              ids = sorted(sids)
+              batches = [(ids[i:i + 64], []) for i in range(0, len(ids), 64)]
+              batches += [([], day_list[i:i + 64])
+                          for i in range(0, len(day_list), 64)]
+              table_rows = set()
+              for batch_ids, batch_days in batches:
+                  where = _ai_metric_where(table, cols, batch_ids, batch_days)
+                  if not where:
                       continue
-                  sid = norm.get("session_id")
-                  stamp = norm.get("timestamp")
-                  try:
-                      day = floor_day(stamp) if stamp is not None else None
-                  except Exception:
-                      day = None
-                  if sid not in sids and day not in day_list:
-                      continue
-                  key = (norm.get("instrument"), norm.get("client"),
-                         norm.get("session_id"), str(norm.get("timestamp")),
-                         str(norm.get("value")), str(norm.get("stream")))
-                  if key in seen:
-                      continue
-                  seen.add(key)
-                  scoped.append(norm)
+                  result_cols, rows, _marks = flight.flight_query(
+                      'SELECT * FROM "' + table.replace('"', '""') + '"' + where,
+                      endpoint=endpoint, db=ctx[2], user=cfg.get("user") or "",
+                      password=cfg.get("password") or "", lower=None,
+                      max_rows=cfg["max_rows"])
+                  for values in rows:
+                      table_rows.add(repr(values))
+                      if len(table_rows) > cfg["max_rows"]:
+                          raise SqlError("ai metric row cap exceeded: refusing partial write")
+                  for values in rows:
+                      raw = dict(zip(result_cols, values))
+                      norm = _ai_norm_metric_row(raw, instrument,
+                                                 (metas or {}).get(table))
+                      if norm is None:
+                          continue
+                      sid = norm.get("session_id")
+                      stamp = norm.get("timestamp")
+                      try:
+                          day = floor_day(stamp) if stamp is not None else None
+                      except Exception:
+                          day = None
+                      if sid not in sids and day not in day_list:
+                          continue
+                      key = (norm.get("instrument"), norm.get("client"),
+                             norm.get("session_id"), str(norm.get("timestamp")),
+                             str(norm.get("value")), str(norm.get("stream")))
+                      if key in seen:
+                          continue
+                      seen.add(key)
+                      scoped.append(norm)
           return scoped
 
 
@@ -5744,36 +5775,6 @@ configs:
       def _config_revision(cfg):
           """Short stable revision of everything that changes aggregate outputs."""
           paths = cfg.get("paths", {})
-          try:
-              import importlib
-              modules = {}
-              for name in ("scripts.analytics.battery.battery_runtime",
-                           "scripts.analytics.battery.battery_common",
-                           "scripts.analytics.battery.battery_conditions",
-                           "scripts.analytics.battery.battery_energy",
-                           "scripts.analytics.battery.battery_electrical",
-                           "scripts.analytics.battery.battery_alerts",
-                           "scripts.analytics.battery.battery_rul",
-                           "scripts.analytics.battery.battery_reference"):
-                  try:
-                      module = importlib.import_module(name)
-                  except Exception:
-                      continue
-                  version = getattr(module, "RUNTIME_VERSION", None)
-                  if version is None:
-                      version = getattr(module, "CODE_VERSION", None)
-                  if version is None:
-                      version = getattr(module, "ALGORITHM_VERSION", None)
-                  if version is None:
-                      continue
-                  modules[name] = str(version)
-                  try:
-                      with open(module.__file__, "rb") as handle:
-                          modules[name + ":sha"] = hashlib.sha256(handle.read()).hexdigest()[:16]
-                  except (OSError, TypeError):
-                      pass
-          except Exception:
-              modules = {}
           material = {
               "rollup_format": ROLLUP_FORMAT_VERSION,
               "paths": {k: paths.get(k) for k in sorted(paths)},
@@ -5781,19 +5782,9 @@ configs:
               "trip_min_speed_kph": cfg.get("trip_min_speed_kph"),
               "charge_gap_min": cfg.get("charge_gap_min"),
               "signal_max_age_s": cfg.get("signal_max_age_s"),
-              "battery_modules": modules,
           }
           with open(__file__, "rb") as handle:
               material["aggregate_sha"] = hashlib.sha256(handle.read()).hexdigest()[:16]
-          path = cfg.get("battery_config", "")
-          digest = ""
-          try:
-              if path and os.path.isfile(path):
-                  with open(path, "rb") as handle:
-                      digest = hashlib.sha256(handle.read()).hexdigest()[:16]
-          except OSError:
-              digest = ""
-          material["battery_config_sha"] = digest
           digest = hashlib.sha256(
               json.dumps(material, sort_keys=True, default=str).encode()).hexdigest()
           return digest[:16]
@@ -5905,37 +5896,6 @@ configs:
                         str_lit(""), ns_to_sql_lit(now_ns)]])
 
 
-      def _registered_scopes(ctx, cfg):
-          """CAN scopes from dirty/checkpoint metadata only; never discover raw."""
-          base_url, auth, db = ctx
-          filt = " WHERE source = 'can'"
-          if cfg.get("vehicle"):
-              filt += " AND vehicle = " + str_lit(cfg["vehicle"])
-          out = set()
-          for table in (DIRTY_TABLE, CHECKPOINT_TABLE):
-              try:
-                  cols, rows = guarded_fetch(
-                      base_url, auth, db,
-                      "SELECT DISTINCT vehicle, source, decode_epoch FROM "
-                      + table + filt, cfg["max_rows"])
-              except SqlError as e:
-                  if is_missing_table(e):
-                      continue
-                  raise
-              idx = {c: i for i, c in enumerate(cols)}
-              for r in rows:
-                  def col(name):
-                      return r[idx[name]] if name in idx else None
-                  scope = _scope_tuple((col("vehicle"), col("source"),
-                                        col("decode_epoch")))
-                  if scope is not None and _is_can_scope(scope):
-                      out.add(scope)
-          return out
-
-
-      def _distinct_scopes(ctx, cfg):
-          """Known CAN scopes only; unnotified history is not discovered."""
-          return _registered_scopes(ctx, cfg)
 
 
       def _extend_vehicle_head(segments, raw_from, cutoff, gap_s, lookback_h):
@@ -5965,19 +5925,16 @@ configs:
 
 
 
-      def _legacy_cfgs(cfg, coordinated):
+      def _legacy_cfgs(cfg):
           """Legacy sections never process CAN, including unregistered scopes."""
-          coordinated = [s for s in coordinated if _is_can_scope(s)]
           sub = dict(cfg)
           sub.pop("battery_exclude_scopes", None)
           sub["exclude_scopes"] = list(
-              {tuple(s) for s in coordinated}
-              | {tuple(s) for s in (cfg.get("exclude_scopes") or [])})
+              {tuple(s) for s in (cfg.get("exclude_scopes") or [])})
           bat = dict(sub)
           bat["battery_exclude_sources"] = ["can"]
           bat["battery_exclude_scopes"] = list(
-              {tuple(s) for s in coordinated}
-              | {tuple(s) for s in (cfg.get("battery_exclude_scopes") or [])})
+              {tuple(s) for s in (cfg.get("battery_exclude_scopes") or [])})
           return sub, sub, bat
 
 
@@ -6281,8 +6238,10 @@ configs:
           """Batch sealed-hour rollups, then checkpoint each successful trip generation."""
           now_ns = dt_to_ns(now or utcnow())
           seal_ns = floor_hour_ns(now_ns)
-          revision = _config_revision(cfg)
           pending = _load_pending_dirty(ctx, cfg, seal_ns)
+          if not pending:
+              return 0
+          revision = _config_revision(cfg)
           committed = 0
           eligible = {}
           for key in sorted(pending)[:DIRTY_MAX_WINDOWS]:
@@ -6411,19 +6370,7 @@ configs:
           run_section("ai", lambda: ai_section(ctx, cfg))
           run_section("logs", lambda: log_section(ctx, cfg))
           run_section("home", lambda: home_section(ctx, cfg))
-          if progress is not None:
-              progress("vehicle_discovery")
-          started = time.monotonic()
-          try:
-              coordinated = sorted(_distinct_scopes(ctx, cfg), key=repr)
-          except Exception:
-              durations["vehicle_discovery"] = time.monotonic() - started
-              failed.extend(("vehicle_discovery", "vehicle", "trip_charge",
-                             "vehicle_history", "battery"))
-              sys.stderr.write("aggregate: vehicle discovery failed; dependent sections skipped\n")
-              return counts, failed, durations
-          durations["vehicle_discovery"] = time.monotonic() - started
-          legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg, coordinated)
+          legacy, legacy_trip, legacy_bat = _legacy_cfgs(cfg)
           run_section("vehicle", lambda: vehicle_section(ctx, legacy))
           run_section("trip_charge", lambda: trip_section(ctx, legacy_trip))
           run_section("vehicle_history",
@@ -7932,10 +7879,12 @@ configs:
               yield current
 
 
-      def _clip_union_by_day(intervals):
+      def _clip_union_by_day(intervals, pool=None):
           per_day = (intervals.store.container("dict")
                      if isinstance(intervals, _ActivityList) else {})
           for start, end in _merge_intervals(intervals):
+              if pool is not None:
+                  pool.append((start, end))
               day = _day_start(start)
               cursor = start
               while True:
@@ -8434,7 +8383,10 @@ configs:
           for key, session in sessions.items():
               client, session_id = key
               if session["intervals"]:
-                  wall_pool.setdefault(client, []).extend(session["intervals"])
+                  client_wall = wall_pool.get(client)
+                  intervals = sequence() if client_wall is None else client_wall[0]
+                  session_days = _clip_union_by_day(session["intervals"], intervals)
+                  wall_pool[client] = (intervals, session_days if client_wall is None else None)
               record = {
                   "client": client,
                   "session_id": session_id,
@@ -8533,8 +8485,7 @@ configs:
                   else:
                       record[field] = None
               if session["intervals"]:
-                  record["session_wall_seconds"] = sum(
-                      _clip_union_by_day(session["intervals"]).values())
+                  record["session_wall_seconds"] = sum(session_days.values())
                   prov["session_wall_seconds"] = _WALL_SRC
               else:
                   record["session_wall_seconds"] = None
@@ -8554,8 +8505,9 @@ configs:
               if (client, bucket, field) in selected_poison:
                   daily_cells.setdefault((client, day), {})
 
-          for client, intervals in wall_pool.items():
-              for day, seconds in _clip_union_by_day(intervals).items():
+          for client, (intervals, session_days) in wall_pool.items():
+              days = session_days if session_days is not None else _clip_union_by_day(intervals)
+              for day, seconds in days.items():
                   cell = daily_cells.setdefault((client, day), {})
                   entry = cell.setdefault("session_wall_seconds", [0.0, set()])
                   entry[0] = seconds
@@ -18728,7 +18680,8 @@ configs:
 
 
       def fetch_signals(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                        fields=None, scopes=None, exclude_scopes=None, exclude_sources=()):
+                        fields=None, scopes=None, exclude_scopes=None, exclude_sources=(),
+                        raw_observer=None):
           filt = _vehicle_filter(vehicle) + _field_predicate(fields)
           if exclude_sources:
               filt += " AND NOT COALESCE(source IN (" + ", ".join(
@@ -18747,6 +18700,8 @@ configs:
               if is_missing_table(exc):
                   return []
               raise
+          if raw_observer is not None:
+              raw_observer(rows)
           dtypes = {c.get("name"): c.get("data_type") for c in schema}
           idx = {c: i for i, c in enumerate(cols)}
           out = []
@@ -18802,7 +18757,8 @@ configs:
 
 
       def fetch_signal_scopes(base_url, auth, db, start_ns, end_ns, vehicle,
-                              max_rows, scopes=None, exclude_scopes=None, exclude_sources=()):
+                              max_rows, scopes=None, exclude_scopes=None, exclude_sources=(),
+                              raw_observer=None):
           """Field-independent scope identities in a bounded interval.
 
           SELECT DISTINCT vehicle/source/decode_epoch only (no raw
@@ -18832,6 +18788,8 @@ configs:
               if is_missing_table(exc):
                   return set()
               raise
+          if raw_observer is not None:
+              raw_observer(rows)
           idx = {c: i for i, c in enumerate(cols)}
           out = set()
           for record in rows:
@@ -18849,7 +18807,8 @@ configs:
 
 
       def fetch_events(base_url, auth, db, start_ns, end_ns, vehicle, max_rows,
-                       scopes=None, exclude_scopes=None, exclude_sources=()):
+                       scopes=None, exclude_scopes=None, exclude_sources=(),
+                       raw_observer=None):
           filt = _vehicle_filter(vehicle)
           if scopes:
               filt += " AND (" + _scope_predicate(scopes) + ")"
@@ -18868,6 +18827,8 @@ configs:
               if is_missing_table(exc):
                   return []
               raise
+          if raw_observer is not None:
+              raw_observer(rows)
           dtypes = {c.get("name"): c.get("data_type") for c in schema}
           idx = {c: i for i, c in enumerate(cols)}
           out = []
@@ -19104,9 +19065,9 @@ configs:
                       analysis_cfg=None, exclude_sources=()):
           """Bounded disjoint fetches: no envelope over unrelated gaps.
 
-          Each merged inclusive interval uses one request per table, retaining
-          its full >=24h signal context. Cumulative raw rows and unique
-          discovered scope identities fail closed at max_rows.
+          Each merged inclusive interval is fetched in disjoint six-hour slices,
+          retaining its full >=24h signal context. Raw per-interval caps and
+          cumulative normalized rows and unique scope caps remain fail-closed.
           Exact exclusions apply in SQL before LIMIT, including union mode.
           The source_field predicate narrows fetched ROWS (exact required set),
           never scopes: a parallel field-independent DISTINCT tag query per
@@ -19161,11 +19122,35 @@ configs:
                                         "partial" % (total[0], max_rows))
               tag_scopes.update(tags)
 
+          def _slices(start, end):
+              while start <= end:
+                  last = min(end, start + 6 * HOUR_NS - 1)
+                  yield start, last
+                  start = last + 1
+
+          def _raw_cap(distinct=False):
+              count = [0]
+              seen = set()
+
+              def observe(rows):
+                  if distinct:
+                      seen.update(json.dumps(row, sort_keys=True) for row in rows)
+                      count[0] = len(seen)
+                  else:
+                      count[0] += len(rows)
+                  if count[0] > max_rows:
+                      raise BatteryCapError("row cap exceeded (%d > %d): refusing partial"
+                                            % (count[0], max_rows))
+              return observe
+
           source_filter = {"exclude_sources": exclude_sources} if exclude_sources else {}
           for start, end, scopes in _intervals(event_q):
-              events.extend(_take(fetch_events(
-                  base_url, auth, db, start, end, vehicle, max_rows,
-                  scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
+              event_cap = _raw_cap()
+              for first, last in _slices(start, end):
+                  events.extend(_take(fetch_events(
+                      base_url, auth, db, first, last, vehicle, max_rows,
+                      scopes=scopes, exclude_scopes=exclude_scopes,
+                      raw_observer=event_cap, **source_filter)))
           if analysis_cfg is not None:
               # Excluded scopes never analyze, so their events cannot require
               # context. Malformed config propagates (fail closed).
@@ -19174,13 +19159,18 @@ configs:
                         not in exclude_scopes]
               fields = _required_signal_fields(analysis_cfg, events=proven)
           for cstart, cend, scopes in _intervals(signal_q):
-              signals.extend(_take(fetch_signals(
-                  base_url, auth, db, cstart, cend, vehicle, max_rows,
-                  fields=fields, scopes=scopes, exclude_scopes=exclude_scopes, **source_filter)))
-              if fields is not None:
-                  _take_tags(fetch_signal_scopes(
-                      base_url, auth, db, cstart, cend, vehicle, max_rows,
-                      scopes=scopes, exclude_scopes=exclude_scopes, **source_filter))
+              signal_cap = _raw_cap()
+              tag_cap = _raw_cap(distinct=True)
+              for first, last in _slices(cstart, cend):
+                  signals.extend(_take(fetch_signals(
+                      base_url, auth, db, first, last, vehicle, max_rows,
+                      fields=fields, scopes=scopes, exclude_scopes=exclude_scopes,
+                      raw_observer=signal_cap, **source_filter)))
+                  if fields is not None:
+                      _take_tags(fetch_signal_scopes(
+                          base_url, auth, db, first, last, vehicle, max_rows,
+                          scopes=scopes, exclude_scopes=exclude_scopes,
+                          raw_observer=tag_cap, **source_filter))
           signals = [s for s in signals if (s["vehicle"], s["source"],
                                             s["decode_epoch"]) not in exclude_scopes
                      and s["source"] not in exclude_sources]
