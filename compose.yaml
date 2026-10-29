@@ -780,7 +780,7 @@ services:
     - vehicle
     restart: unless-stopped
     labels:
-      datalake.recorder-revision: '3'
+      datalake.recorder-revision: '4'
     stop_grace_period: 90s
     depends_on:
       vehicle-setup:
@@ -30405,6 +30405,7 @@ configs:
           conn.execute("PRAGMA synchronous=FULL")
           conn.execute(DDL)
           conn.execute(SEEN_DDL)
+          conn.execute("CREATE INDEX IF NOT EXISTS seen_ids_seen_at ON seen_ids(seen_at)")
           # Additive migration: existing outbox files keep queued rows; new
           # nullable provenance columns default to NULL on old rows.
           have = {r[1] for r in conn.execute("PRAGMA table_info(outbox)")}
@@ -33596,6 +33597,7 @@ configs:
           conn.execute("PRAGMA synchronous=FULL")
           conn.execute(DDL)
           conn.execute(SEEN_DDL)
+          conn.execute("CREATE INDEX IF NOT EXISTS seen_ids_seen_at ON seen_ids(seen_at)")
           # Additive migration: existing outbox files keep queued rows; new
           # nullable provenance columns default to NULL on old rows.
           have = {r[1] for r in conn.execute("PRAGMA table_info(outbox)")}

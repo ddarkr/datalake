@@ -199,6 +199,7 @@ def open_outbox(path):
     conn.execute("PRAGMA synchronous=FULL")
     conn.execute(DDL)
     conn.execute(SEEN_DDL)
+    conn.execute("CREATE INDEX IF NOT EXISTS seen_ids_seen_at ON seen_ids(seen_at)")
     # Additive migration: existing outbox files keep queued rows; new
     # nullable provenance columns default to NULL on old rows.
     have = {r[1] for r in conn.execute("PRAGMA table_info(outbox)")}

@@ -378,6 +378,39 @@ class RecorderTest(unittest.TestCase):
             self.assertEqual(left, [("new-id",)])
             conn.close()
 
+    def test_seen_index_migration_and_expiry_redelivery(self):
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as d:
+                path = os.path.join(d, "o.sqlite")
+                if existing:
+                    with sqlite3.connect(path) as old:
+                        old.execute(rec.DDL)
+                        old.execute(rec.SEEN_DDL)
+                        old.execute("INSERT INTO seen_ids VALUES (?, ?)", ("old", 900))
+                conn = rec.open_outbox(path)
+                try:
+                    if not existing:
+                        conn.execute("INSERT INTO seen_ids VALUES (?, ?)", ("old", 900))
+                    conn.executemany("INSERT INTO seen_ids VALUES (?, ?)",
+                                     [("older", 100), ("boundary", 1000)])
+                    conn.commit()
+                    self.assertEqual(rec.prune_seen(conn, 1000, limit=1), 1)
+                    remaining = set(conn.execute("SELECT event_id FROM seen_ids"))
+                    self.assertIn(("boundary",), remaining)
+                    self.assertEqual(len(remaining & {("old",), ("older",)}), 1)
+                    self.assertEqual(rec.prune_seen(conn, 1000), 1)
+                    self.assertEqual(rec.prune_seen(conn, 1000), 0)
+                    self.assertEqual(conn.execute("SELECT event_id FROM seen_ids").fetchall(),
+                                     [("boundary",)])
+                    row = rec.make_row("v", "Vehicle.Speed", 100, "old",
+                                       _meta(), {}, 1.0, None, None, 1)
+                    self.assertTrue(rec.store_update(conn, {}, "Vehicle.Speed", row))
+                    with conn:
+                        conn.execute("DELETE FROM outbox WHERE event_id='old'")
+                    self.assertFalse(rec.store_update(conn, {}, "Vehicle.Speed", row))
+                finally:
+                    conn.close()
+
     def test_snapshot_batch_is_one_commit_with_late_cache(self):
         # One already-received snapshot batch commits once; last marks only
         # after commit, and rollback leaves last untouched for retry.
