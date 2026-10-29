@@ -146,6 +146,9 @@ test('shared otel contract and direct HTTP regression', async t => {
     // Direct send: one HTTP request per send, collector path/auth/body, no retry.
     const telemetry = createDirectTelemetry('codex', { endpoint, headers: { Authorization: 'Basic fixture-only' }, timeoutMs: 30000 });
     assert.equal(telemetry.enabled, true);
+    assert.equal(telemetry.matchesEndpoint(`${endpoint}/v1/traces`), true);
+    assert.equal(telemetry.matchesEndpoint('https://other.example/v1/traces'), false);
+    assert.equal(telemetry.endpoint, undefined);
     assert.equal(await telemetry.send(event), true);
     await telemetry.flush();
     assert.equal(requests.length, 1);
@@ -165,6 +168,7 @@ test('shared otel contract and direct HTTP regression', async t => {
     assert.equal(requests.length, count, 'invalid events make no HTTP attempt');
     const disabled = createDirectTelemetry('codex', { configPath: join(home, 'missing-config.json') });
     assert.equal(disabled.enabled, false);
+    assert.equal(disabled.matchesEndpoint('https://other.example/v1/traces'), false);
     assert.equal(await disabled.send(event), false);
     await disabled.flush();
 

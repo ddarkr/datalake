@@ -98,7 +98,7 @@ async function resolveTranscriptPath(payload) {
 }
 
 // 커서 기반 증분(Incremental) 턴 및 서브에이전트 이벤트 전송
-async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock, includeSummary = false) {
+async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, getBaseAttrs, clock, includeSummary = false) {
   const summary = { startTimeMs: clock, durationMs: 0, subagentCalls: 0 };
   if (!transcriptPath) return { turns: [], subagents: [], summary };
 
@@ -129,34 +129,55 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
     return ok === true;
   }
 
+  let file;
   try {
-    const raw = await readFile(transcriptPath, 'utf8');
-    const lines = raw.split('\n').filter(Boolean);
-    const steps = [];
-    let earliestTimestamp;
-    for (const line of lines) {
-      try {
-        const step = JSON.parse(line);
-        steps.push(step);
-        if (includeSummary && step.created_at) {
-          const timestamp = new Date(step.created_at).getTime();
-          earliestTimestamp = Math.min(earliestTimestamp ?? Infinity, timestamp);
-        }
-        if (includeSummary && Array.isArray(step.tool_calls)) {
-          for (const tc of step.tool_calls) {
-            if (tc.name === 'invoke_subagent') summary.subagentCalls++;
-          }
-        }
-      } catch {}
+    file = await open(transcriptPath, 'r');
+    const info = await file.stat();
+    const previous = cursor.transcript;
+    let offset = 0, parsedCount = 0, earliestTimestamp, subagentCalls = 0;
+    if (previous && previous.path === transcriptPath && previous.dev === info.dev &&
+        previous.ino === info.ino && Number.isSafeInteger(previous.offset) && previous.offset >= 0 &&
+        Number.isSafeInteger(previous.parsedCount) && previous.parsedCount >= 0 &&
+        Number.isSafeInteger(previous.subagentCalls) && previous.subagentCalls >= 0 && info.size >= previous.offset &&
+        !(info.size === previous.size && info.mtimeMs !== previous.mtimeMs)) {
+      const anchor = Buffer.alloc(Math.min(previous.offset, 256));
+      await file.read(anchor, 0, anchor.length, previous.offset - anchor.length);
+      if (createHash('sha256').update(anchor).digest('hex') === previous.anchor) {
+        offset = previous.offset;
+        parsedCount = previous.parsedCount;
+        earliestTimestamp = previous.earliestTimestamp === null ? NaN : previous.earliestTimestamp;
+        subagentCalls = previous.subagentCalls;
+      }
     }
-    if (earliestTimestamp !== undefined) {
-      summary.startTimeMs = earliestTimestamp;
-      summary.durationMs = Math.max(0, clock - earliestTimestamp);
+    const raw = Buffer.alloc(info.size - offset);
+    let bytes = 0;
+    while (bytes < raw.length) {
+      const result = await file.read(raw, bytes, raw.length - bytes, offset + bytes);
+      if (!result.bytesRead) break;
+      bytes += result.bytesRead;
     }
-
-    for (let i = 0; i < steps.length; i++) {
-      const step = steps[i];
-      const stepIndex = step.step_index ?? i;
+    const data = raw.subarray(0, bytes);
+    const end = data.lastIndexOf(10) + 1;
+    const complete = data.subarray(0, end).toString('utf8').split('\n').filter(Boolean);
+    const tail = data.subarray(end).toString('utf8');
+    const lines = tail ? [...complete, tail] : complete;
+    let checkpoint;
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      if (lineIndex === complete.length) checkpoint = { parsedCount, earliestTimestamp, subagentCalls };
+      const line = lines[lineIndex];
+      let step;
+      try { step = JSON.parse(line); } catch { continue; }
+      const stepIndex = step.step_index ?? parsedCount;
+      parsedCount++;
+      if (step.created_at) {
+        const timestamp = new Date(step.created_at).getTime();
+        earliestTimestamp = Math.min(earliestTimestamp ?? Infinity, timestamp);
+      }
+      if (Array.isArray(step.tool_calls)) {
+        for (const tc of step.tool_calls) {
+          if (tc.name === 'invoke_subagent') subagentCalls++;
+        }
+      }
 
       if (step.type === 'PLANNER_RESPONSE') {
         if (stepIndex > cursor.lastProcessedIndex) {
@@ -172,6 +193,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
                 for (let saIdx = 0; saIdx < subagentSpecs.length; saIdx++) {
                   const sa = subagentSpecs[saIdx];
                   const subagentId = `subagent:${sessionId}:${stepIndex}:${saIdx}`;
+                  if (attempted.has(subagentId)) continue;
                   const subagentEvent = {
                     kind: 'subagent',
                     sessionId: String(sessionId),
@@ -179,7 +201,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
                     startTimeMs: turnTime,
                     endTimeMs: turnTime + 500,
                     attributes: {
-                      ...baseAttrs,
+                      ...await getBaseAttrs(),
                       'coding_agent.agent.id': subagentId,
                       'coding_agent.agent.parent_id': String(sessionId),
                       'coding_agent.subagent.type': String(sa.Role || sa.TypeName || 'subagent').slice(0, 128),
@@ -202,7 +224,41 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
       }
     }
 
-  } catch {}
+    const nextOffset = offset + end;
+    const anchor = Buffer.alloc(Math.min(nextOffset, 256));
+    await file.read(anchor, 0, anchor.length, nextOffset - anchor.length);
+    cursor.transcript = {
+      path: transcriptPath, dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs,
+      offset: nextOffset, anchor: createHash('sha256').update(anchor).digest('hex'),
+      ...(checkpoint ?? { parsedCount, earliestTimestamp, subagentCalls }),
+    };
+    await save(cPath, cursor);
+  } catch {} finally { await file?.close().catch(() => {}); }
+  if (includeSummary) {
+    // Drain/checkpoint failures must not suppress the authoritative Stop summary.
+    try {
+      let earliestTimestamp;
+      let subagentCalls = 0;
+      for (const line of (await readFile(transcriptPath, 'utf8')).split('\n').filter(Boolean)) {
+        try {
+          const step = JSON.parse(line);
+          if (step.created_at) {
+            earliestTimestamp = Math.min(earliestTimestamp ?? Infinity, new Date(step.created_at).getTime());
+          }
+          if (Array.isArray(step.tool_calls)) {
+            for (const tc of step.tool_calls) {
+              if (tc.name === 'invoke_subagent') subagentCalls++;
+            }
+          }
+        } catch {}
+      }
+      if (earliestTimestamp !== undefined) {
+        summary.startTimeMs = earliestTimestamp;
+        summary.durationMs = Math.max(0, clock - earliestTimestamp);
+      }
+      summary.subagentCalls = subagentCalls;
+    } catch {}
+  }
 
   return { turns, subagents, summary };
 }
@@ -280,7 +336,8 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     return [];
   }
 
-  const baseAttrs = {
+  let baseAttrs;
+  const getBaseAttrs = async () => baseAttrs ??= {
     ...await repositoryContext(cwd),
     ...(model ? { 'gen_ai.request.model': String(model).slice(0, 128) } : {}),
   };
@@ -291,34 +348,33 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
   // 2. Stop 이벤트: 최종 세션 요약 및 남은 턴 증분 마감 전송
   if (isStop) {
     // 세션 종료 전 아직 전송되지 않은 증분 턴들 모두 전송
-    const { turns, subagents, summary } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock, true);
+    const { turns, subagents, summary } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, getBaseAttrs, clock, true);
     for (const event of turns) events.push(event);
     for (const event of subagents) events.push(event);
     const { startTimeMs: startTime, durationMs } = summary;
     const subagentCount = subagents.length + summary.subagentCalls;
 
-    const sessionEvent = {
-      kind: 'session',
-      sessionId: String(sessionId),
-      eventId: `session:${sessionId}:stop`,
-      startTimeMs: startTime,
-      endTimeMs: clock,
-      attributes: {
-        ...baseAttrs,
-        'coding_agent.session.duration_ms': durationMs,
-        'coding_agent.session.subagent_count': subagentCount,
-        'coding_agent.session.outcome': payload.terminationReason || 'model_stop',
-      },
-    };
-
     const stopPath = join(stateDir(sessionId), 'stop.json');
     let stopState;
     try { stopState = JSON.parse(await readFile(stopPath, 'utf8')); } catch {}
     if (!stopState) {
+      const sessionEvent = {
+        kind: 'session',
+        sessionId: String(sessionId),
+        eventId: `session:${sessionId}:stop`,
+        startTimeMs: startTime,
+        endTimeMs: clock,
+        attributes: {
+          ...await getBaseAttrs(),
+          'coding_agent.session.duration_ms': durationMs,
+          'coding_agent.session.subagent_count': subagentCount,
+          'coding_agent.session.outcome': payload.terminationReason || 'model_stop',
+        },
+      };
       stopState = { version: 3, event: sessionEvent, attempted: false };
       await save(stopPath, stopState);
     }
-    if ((!stopState.attempted && !stopState.queued) || stopState.event?.eventId !== sessionEvent.eventId) {
+    if ((!stopState.attempted && !stopState.queued) || stopState.event?.eventId !== `session:${sessionId}:stop`) {
       let ok = false;
       try { ok = await telemetry.send(stopState.event); } catch {}
       // Attempted once: never replayed by a repeated stop hook.
@@ -339,23 +395,23 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     const endTimeMs = clock;
     const durationMs = Math.max(1, endTimeMs - startTimeMs);
 
-    const toolEvent = toolState?.event ?? {
-      kind: 'tool.call',
-      sessionId: String(sessionId),
-      eventId,
-      startTimeMs,
-      endTimeMs,
-      error: isError,
-      attributes: {
-        ...baseAttrs,
-        'gen_ai.tool.name': String(toolName).slice(0, 128),
-        'duration_ms': durationMs,
-        ...(isError ? { 'error.type': 'tool_error' } : {}),
-      },
-    };
 
     // Keep the first completion body; a failed direct send is attempted once, never replayed.
     if (!toolState?.attempted && !toolState?.queued) {
+      const toolEvent = toolState?.event ?? {
+        kind: 'tool.call',
+        sessionId: String(sessionId),
+        eventId,
+        startTimeMs,
+        endTimeMs,
+        error: isError,
+        attributes: {
+          ...await getBaseAttrs(),
+          'gen_ai.tool.name': String(toolName).slice(0, 128),
+          'duration_ms': durationMs,
+          ...(isError ? { 'error.type': 'tool_error' } : {}),
+        },
+      };
       const snapshot = { version: 3, eventId, startTimeMs, toolName, event: toolEvent, attempted: false };
       await save(filePath, snapshot);
       let ok = false;
@@ -366,7 +422,7 @@ async function handleSerialized(payload, { telemetry, now = Date.now, cwd = proc
     }
 
     // 실시간 증분 턴 전송 (세션 중 강제 종료 방지)
-    const { turns, subagents } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, baseAttrs, clock);
+    const { turns, subagents } = await drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, getBaseAttrs, clock);
     for (const event of turns) events.push(event);
     for (const event of subagents) events.push(event);
   }

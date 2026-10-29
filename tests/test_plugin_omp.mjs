@@ -40,6 +40,32 @@ function message(timestamp = 1_700_000_000_010) {
   };
 }
 
+test('OMP disabled exporter registers no callbacks; injected exporter without enabled stays active', async () => {
+  const disabled = harness({ telemetry: { enabled: false, send: () => { throw Error('unexpected'); }, flush: async () => {} } });
+  assert.equal(disabled.event('session_start'), undefined);
+  assert.equal(disabled.event('session_shutdown'), undefined);
+  const active = harness();
+  active.event('session_start');
+  await active.event('session_shutdown');
+  assert.equal(active.emitted.filter(e => e.kind === 'session').length, 1);
+});
+
+test('OMP duplicate completion keeps state without projecting usage again', async () => {
+  const h = harness();
+  const m = message();
+  h.event('session_start');
+  h.event('message_start', { message: m });
+  h.event('message_end', { message: m });
+  const duplicate = { ...m, get usage() { throw Error('duplicate usage accessed'); } };
+  h.event('message_end', { message: duplicate });
+  h.event('tool_execution_start', { toolCallId: 'after-duplicate' });
+  h.event('tool_execution_end', { toolCallId: 'after-duplicate', toolName: 'Read' });
+  await h.event('session_shutdown');
+  const turn = h.emitted.find(e => e.kind === 'llm.turn');
+  assert.equal(h.emitted.filter(e => e.kind === 'llm.turn').length, 1);
+  assert.equal(h.emitted.find(e => e.kind === 'tool.call').parentEventId, turn.eventId);
+});
+
 test('OMP separates provider timing, observed first text and unambiguous input with scalar snapshots', async () => {
   let now = 100;
   const settings = { effort: 'high', tiers: { openai: 'priority' } };

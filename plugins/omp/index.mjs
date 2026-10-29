@@ -46,7 +46,9 @@ export function nativeTelemetryEnabled(env = process.env, pluginEndpoint) {
     const specific = env.OTEL_EXPORTER_OTLP_TRACES_ENDPOINT;
     const endpoint = new URL(specific ?? env.OTEL_EXPORTER_OTLP_ENDPOINT);
     if (specific === undefined) endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, '')}/v1/traces`;
-    return endpoint.href === new URL(pluginEndpoint).href;
+    return typeof pluginEndpoint === 'function'
+      ? pluginEndpoint(endpoint.href)
+      : endpoint.href === new URL(pluginEndpoint).href;
   } catch { return false; }
 }
 
@@ -73,10 +75,13 @@ export default function ompTelemetry(pi, options = {}) {
   const telemetry = options.telemetry ?? createDirectTelemetry('oh-my-pi', {
     configPath: options.configPath,
   });
+  if (telemetry.enabled === false) return;
   const clock = options.clock ?? Date.now;
   const repoContext = options.repositoryContext ?? repositoryContext;
-  let pluginEndpoint;
-  try { pluginEndpoint = loadConfig({ configPath: options.configPath })?.endpoint; } catch {}
+  let pluginEndpoint = telemetry.matchesEndpoint?.bind(telemetry);
+  if (options.telemetry && !pluginEndpoint) {
+    try { pluginEndpoint = loadConfig({ configPath: options.configPath })?.endpoint; } catch {}
+  }
   const nativeUsage = nativeTelemetryEnabled(options.env ?? process.env, pluginEndpoint);
   let current;
   const states = new Map();
@@ -239,7 +244,7 @@ export default function ompTelemetry(pi, options = {}) {
     }
     if (request) state.request = undefined;
     state.lastMessage = state.nativeUsage ? undefined : eventId;
-    if (state.nativeUsage) return;
+    if (state.nativeUsage || state.attempted.has(eventId)) return;
     const usage = usageAttributes(message.usage);
     const attributes = { ...request?.attributes, ...usage };
     if (Object.keys(usage).some(key => key.startsWith('gen_ai.usage.'))) {

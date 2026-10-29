@@ -55,8 +55,8 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
       let lineStart = position;
       let parts = [];
       let length = 0;
-      let oversized = false;
-      // ponytail: bound one hook to 64 MiB; a later hook resumes at the last complete line.
+      let oversized = cursor.discarding === true;
+      // ponytail: bound one hook to 64 MiB; later hooks resume from persisted progress.
       const end = Math.min(info.size, position + 64 * 1024 * 1024);
       while (position < end) {
         const { bytesRead } = await file.read(buffer, 0, Math.min(buffer.length, end - position), position);
@@ -128,8 +128,10 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
         }
         position += bytesRead;
       }
-      // Partial lines stay solely in the original file, never in plugin state.
-      cursor.offset = lineStart;
+      // Partial valid lines remain in the file. Oversized lines resume in discard mode
+      // so their tails can never be mistaken for independent records.
+      cursor.offset = oversized ? position : lineStart;
+      cursor.discarding = oversized;
       await save(cursorPath, cursor);
       return events;
     } finally {

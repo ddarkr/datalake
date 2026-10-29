@@ -3,7 +3,7 @@ import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { appendFile, mkdtemp, mkdir, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -222,6 +222,55 @@ test('numeric rollout increments are deduplicated, incremental and limited to th
   assert.equal(JSON.stringify(events).includes(secret), false);
   assert.equal((await persisted(stateDir)).includes(secret), false);
   assert.equal(Object.keys(events[0].attributes).some(key => /cost/i.test(key)), false);
+});
+
+test('oversized rollout lines advance across budgets and never parse their appended tail', async t => {
+  const dir = await temporary(t);
+  const transcript = join(dir, 'active.jsonl');
+  const stateDir = join(dir, 'state');
+  const input = { session_id: 'session-1', turn_id: 'turn-1', hook_event_name: 'Stop', transcript_path: transcript };
+  const { telemetry, events } = capture();
+  await writeFile(transcript, metadata('session-1') + context('turn-1'));
+  await appendFile(transcript, Buffer.alloc(65 * 1024 * 1024, 120));
+  await collectUsage(input, { telemetry, stateDir, prime: true });
+  const cursorName = (await readdir(stateDir)).find(name => name.endsWith('.json'));
+  let cursor = JSON.parse(await readFile(join(stateDir, cursorName), 'utf8'));
+  assert.equal(cursor.offset, 64 * 1024 * 1024);
+  assert.equal(cursor.discarding, true);
+  await collectUsage(input, { telemetry, stateDir });
+  cursor = JSON.parse(await readFile(join(stateDir, cursorName), 'utf8'));
+  assert.equal(cursor.offset, (await stat(transcript)).size);
+  assert.equal(cursor.discarding, true);
+  assert.deepEqual(events, []);
+  // The first complete-looking JSON is still part of the oversized line.
+  await appendFile(transcript, usage(tokens(999, 1)) + usage(tokens(20, 5)));
+  await collectUsage(input, { telemetry, stateDir });
+  await collectUsage(input, { telemetry, stateDir });
+  assert.equal(events.length, 1);
+  assert.equal(events[0].attributes['gen_ai.usage.input_tokens'], 20);
+  assert.equal(events[0].attributes['gen_ai.usage.output_tokens'], 5);
+});
+
+test('truncated or replaced rollout resets oversized discard state', async t => {
+  const dir = await temporary(t);
+  for (const mode of ['truncate', 'replace']) {
+    const transcript = join(dir, `${mode}.jsonl`);
+    const stateDir = join(dir, `${mode}-state`);
+    const input = { session_id: 'session-1', turn_id: 'turn-1', hook_event_name: 'Stop', transcript_path: transcript };
+    const { telemetry, events } = capture();
+    await writeFile(transcript, Buffer.alloc(9 * 1024 * 1024, 120));
+    await collectUsage(input, { telemetry, stateDir });
+    const replacement = metadata('session-1') + context('turn-1') + usage(tokens(20, 5));
+    if (mode === 'truncate') await writeFile(transcript, replacement);
+    else {
+      const next = join(dir, 'next.jsonl');
+      await writeFile(next, replacement);
+      await rename(next, transcript);
+    }
+    await collectUsage(input, { telemetry, stateDir });
+    assert.equal(events.length, 1, mode);
+    assert.equal(events[0].attributes['gen_ai.usage.input_tokens'], 20);
+  }
 });
 
 test('rollout version is observed metadata, never a tested-version fallback', async t => {

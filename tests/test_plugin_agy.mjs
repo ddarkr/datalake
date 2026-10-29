@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, writeFile, rm, stat, mkdir, symlink, readdir } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, stat, mkdir, symlink, readdir, rename } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -114,8 +114,96 @@ test('AGY defers Git metadata until event paths while preserving pre-hook checkp
     assert.equal(event.attributes['gen_ai.request.model'], 'fixture-model');
   }
   assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
+  assert.deepEqual(await invoke({ ...payload, stepIdx: 0 }), []);
+  assert.deepEqual(await invoke({ ...payload, terminationReason: 'model_stop' }), []);
+  assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
   assert.deepEqual(await invoke({ ...payload, invocationNum: 0 }, { isPostInvocation: true }), []);
   assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
+});
+
+test('AGY duplicate tool drains appended UTF-8 lines and resets on replacement', async t => {
+  const box = await sandbox(t, steps());
+  const { telemetry, accepted } = direct();
+  const payload = { conversationId: box.sessionId, transcriptPath: box.transcript, stepIdx: 1, toolName: 'Read' };
+  const invoke = extra => handleHook({ ...payload, ...extra }, { telemetry, cwd: box.path, now: () => 5000 });
+  await invoke();
+  const before = JSON.parse(await readFile(join(box.state, 'cursor.json'), 'utf8'));
+  const next = { type: 'PLANNER_RESPONSE', step_index: 3, created_at: new Date(2000).toISOString(),
+    tool_calls: [{ name: 'invoke_subagent', args: { Subagents: [{ Role: '탐색' }] } }] };
+  const line = Buffer.from(`${JSON.stringify(next)}\n`);
+  const split = line.indexOf(Buffer.from('탐색')) + 1;
+  await writeFile(box.transcript, line.subarray(0, split), { flag: 'a' });
+  await invoke();
+  assert.equal(accepted.filter(e => e.kind === 'subagent').length, 2);
+  assert.equal(JSON.parse(await readFile(join(box.state, 'cursor.json'), 'utf8')).transcript.offset, before.transcript.offset);
+  await writeFile(box.transcript, line.subarray(split), { flag: 'a' });
+  await invoke();
+  assert.equal(accepted.filter(e => e.kind === 'tool.call').length, 1);
+  assert.equal(accepted.filter(e => e.kind === 'subagent').at(-1).attributes['coding_agent.subagent.type'], '탐색');
+  const replacement = join(box.path, 'replacement');
+  const newer = { ...next, step_index: 4, content: 'padding'.repeat(100) };
+  await writeFile(replacement, `${JSON.stringify(newer)}\n`);
+  await rename(replacement, box.transcript);
+  await invoke();
+  assert.equal(accepted.filter(e => e.kind === 'subagent').length, 4);
+  const truncated = { ...next, step_index: 5, created_at: new Date(3000).toISOString() };
+  await writeFile(box.transcript, `${JSON.stringify(truncated)}\n`);
+  await invoke();
+  assert.equal(accepted.filter(e => e.kind === 'subagent').length, 5);
+  await invoke({ terminationReason: 'model_stop' });
+  const session = accepted.find(e => e.kind === 'session');
+  assert.equal(session.startTimeMs, 3000);
+  assert.equal(session.attributes['coding_agent.session.subagent_count'], 1);
+});
+
+test('AGY Stop retains summary when a malformed child interrupts the drain', async t => {
+  const transcript = steps();
+  transcript[1].tool_calls[0].args.Subagents = [null];
+  const box = await sandbox(t, transcript);
+  const { telemetry, accepted } = direct();
+  await handleHook({
+    conversationId: box.sessionId, transcriptPath: box.transcript,
+    terminationReason: 'model_stop',
+  }, { telemetry, cwd: box.path, now: () => 5000 });
+  const session = accepted.find(event => event.kind === 'session');
+  assert.equal(session.startTimeMs, 1000);
+  assert.equal(session.attributes['coding_agent.session.duration_ms'], 4000);
+  assert.equal(session.attributes['coding_agent.session.subagent_count'], 1);
+});
+
+test('AGY observes a complete final JSON line before its newline without double counting', async t => {
+  const box = await sandbox(t);
+  const { telemetry, accepted } = direct();
+  const step = { type: 'PLANNER_RESPONSE', step_index: 1, created_at: new Date(1000).toISOString(),
+    tool_calls: [{ name: 'invoke_subagent', args: { Subagents: [{ Role: 'Explore' }] } }] };
+  await writeFile(box.transcript, JSON.stringify(step));
+  const payload = { conversationId: box.sessionId, transcriptPath: box.transcript, toolName: 'Read' };
+  const invoke = extra => handleHook({ ...payload, ...extra }, { telemetry, cwd: box.path, now: () => 2000 });
+  await invoke();
+  assert.equal(accepted.filter(e => e.kind === 'subagent').length, 1);
+  await writeFile(box.transcript, '\n', { flag: 'a' });
+  await invoke();
+  await invoke({ terminationReason: 'model_stop' });
+  assert.equal(accepted.filter(e => e.kind === 'subagent').length, 1);
+  assert.equal(accepted.find(e => e.kind === 'session').attributes['coding_agent.session.subagent_count'], 1);
+});
+
+test('AGY Stop summarizes an earlier in-place rewrite even when the trailing anchor survives growth', async t => {
+  const first = { type: 'USER_INPUT', step_index: 0, created_at: new Date(1000).toISOString() };
+  const second = { type: 'USER_INPUT', step_index: 1, created_at: new Date(3000).toISOString(), content: 'x'.repeat(512) };
+  const box = await sandbox(t, [first, second]);
+  const { telemetry, accepted } = direct();
+  const payload = { conversationId: box.sessionId, transcriptPath: box.transcript, toolName: 'Read' };
+  const invoke = extra => handleHook({ ...payload, ...extra }, { telemetry, cwd: box.path, now: () => 7000 });
+  await invoke();
+  const original = await readFile(box.transcript, 'utf8');
+  const updated = original.replace(first.created_at, new Date(5000).toISOString())
+    + `${JSON.stringify({ type: 'USER_INPUT', step_index: 2, created_at: new Date(6000).toISOString() })}\n`;
+  await writeFile(box.transcript, updated);
+  await invoke({ terminationReason: 'model_stop' });
+  const session = accepted.find(event => event.kind === 'session');
+  assert.equal(session.startTimeMs, 3000);
+  assert.equal(session.attributes['coding_agent.session.duration_ms'], 4000);
 });
 
 for (const failure of ['false', 'throw']) {

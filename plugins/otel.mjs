@@ -279,6 +279,7 @@ export function createDirectTelemetry(client, options = {}) {
   const active = new Set();
   return {
     get enabled() { return Boolean(selected?.config); },
+    matchesEndpoint(endpoint) { return selected?.config?.endpoint === endpoint; },
     send(event, { timeoutMs = selected?.config?.timeoutMs } = {}) {
       if (!selected?.config) return Promise.resolve(false);
       let serialized;
