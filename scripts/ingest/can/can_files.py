@@ -31,6 +31,7 @@ import stat
 import threading
 import time
 import unicodedata
+from collections import deque
 from decimal import Decimal
 from pathlib import Path
 
@@ -676,6 +677,8 @@ class FileImporter:
         self._max_lines, self._max_bytes = max_lines, max_bytes
         self._lock = threading.Lock()
         self._last = None
+        self._active = deque()
+        self._since_scan = 16
         self._last_reclaim = ("", "", "")
         self._verified = {}
         with archive.connect() as conn:
@@ -723,6 +726,24 @@ class FileImporter:
     def import_once(self):
         """Import one bounded batch; True means archived bytes were consumed."""
         with self._lock:
+            # ponytail: at most 16 batches between discovery scans; lower the
+            # interval if new sessions need tighter latency under sustained load.
+            if self._active and self._since_scan < 16:
+                while self._active:
+                    key = self._active.popleft()
+                    paths = (self.root, self.root / key[0],
+                             self.root / key[0] / key[1], self.root.joinpath(*key))
+                    if any(path.is_symlink() or not path.is_dir() for path in paths):
+                        continue
+                    try:
+                        progressed = self._import_session(*key)
+                    except _SourceInvalid:
+                        progressed = False
+                    if progressed:
+                        self._active.append(key)
+                        self._since_scan += 1
+                        return True
+            self._since_scan = 0
             sessions = self._scan()
             if not sessions:
                 return False
@@ -735,6 +756,10 @@ class FileImporter:
                     progressed = False
                 self._last = key
                 if progressed:
+                    if key not in self._active:
+                        if len(self._active) == 64:
+                            self._active.popleft()
+                        self._active.append(key)
                     return True
             return False
 
@@ -957,22 +982,27 @@ class FileImporter:
                          (vehicle, collector, session, filename))
             conn.commit()
 
-    def _read_at(self, path, offset, size):
+    def _read_at(self, path, offset, size, max_lines=None):
         """Bounded nofollow pread; short reads end the window, never an error."""
         if size <= 0:
             return b""
         fd = _open_nofollow(path)
         try:
-            parts, total = [], 0
+            parts, total, lines = [], 0, 0
             while total < size:
                 try:
-                    piece = os.pread(fd, min(65536, size - total), offset + total)
+                    piece = os.pread(fd, min(4096 if max_lines else 65536,
+                                             size - total), offset + total)
                 except OSError:
                     raise _SourceInvalid("unreadable_offset")
                 if not piece:
                     break
                 parts.append(piece)
                 total += len(piece)
+                if max_lines is not None:
+                    lines += piece.count(b"\n")
+                    if lines >= max_lines:
+                        break
             return b"".join(parts)
         finally:
             os.close(fd)
@@ -1084,7 +1114,8 @@ class FileImporter:
         end = min(committed, cursor["file_offset"] + self._max_bytes)
         try:
             window = self._read_at(serial_path, cursor["file_offset"],
-                                   end - cursor["file_offset"])
+                                   end - cursor["file_offset"], self._max_lines)
+            end = cursor["file_offset"] + len(window)
         except _SourceInvalid:
             self._fail(vehicle, collector, session, SERIAL_FILE,
                        "unreadable_offset", cursor["file_offset"])

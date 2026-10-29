@@ -325,6 +325,8 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 파일 ACK와 raw DB 편입·디코딩·Greptime ACK는 서로 다른 완료 경계입니다.
 기존 `/status`의 raw counter는 **편입된 청크**이며 파일 수신 bytes의 지표가 아닙니다.
 
+파일 편입은 기본 512줄·1 MiB 한도 안에서 4 KiB씩 읽고 필요한 줄이 모이면 멈춥니다. 최근 진행한 세션은 최대 64개만 유지하며, 성공한 캐시 편입 16회 뒤에는 디렉터리를 다시 탐색합니다. 캐시에서 진행할 작업이 없으면 바로 탐색합니다. 새 세션은 탐색 순서에 따라 발견되므로 지속적으로 밀린 세션이 많으면 첫 편입까지 더 기다릴 수 있습니다. 재시작 시 다시 탐색하며 편입 cursor와 ACK·복구 조건은 바꾸지 않습니다.
+
 전환은 서버를 먼저 배포한 뒤 Pi uploader만 교체합니다. Pi 원본·기존 SQLite spool은
 보존하고 별도 `--state`에 작은 진행 정보만 저장합니다. 이전 spool의 import cursor는
 서버 ACK가 아니므로 재개 위치로 쓰지 않습니다. endpoint와 사설 HTTP opt-in을 함께

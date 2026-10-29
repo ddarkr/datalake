@@ -313,6 +313,52 @@ class FileImporterBehavior(unittest.TestCase):
         (directory / "serial_chunks.jsonl.committed").write_bytes(str(len(body)).encode())
         return body
 
+    def test_bounded_reads_discovery_fairness_and_restart(self):
+        fix = _Fixture(self)
+        lines = [_line(i, b"0") for i in range(1200)]
+        self._session(fix, "a", lines, capture=_capture())
+        path = fix.store.root / "synthetic" / "fixture" / "a" / SERIAL_FILE
+        serial_inode = path.stat().st_ino
+        pread = os.pread
+        serial_reads = []
+
+        def counted(fd, size, offset):
+            data = pread(fd, size, offset)
+            if os.fstat(fd).st_ino == serial_inode:
+                serial_reads.append(len(data))
+            return data
+
+        importer = FileImporter(fix.archive, max_lines=32)
+        with patch.object(can_files.os, "pread", side_effect=counted):
+            self.assertTrue(importer.import_once())
+        self.assertLessEqual(sum(serial_reads), 4096)
+        self._session(fix, "b", [_line(0, b"0")], capture=_capture())
+        for _ in range(17):
+            self.assertTrue(importer.import_once())
+        with fix.archive.connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id,next_seq FROM file_import_state ORDER BY session_id"
+            ).fetchall()
+        self.assertEqual(rows[1]["session_id"], "b")
+        self.assertEqual(rows[1]["next_seq"], 1)
+        restarted = FileImporter(fix.archive, max_lines=32)
+        _drain(restarted)
+        with fix.archive.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 1201)
+
+    def test_cached_session_revalidates_replaced_directory(self):
+        fix = _Fixture(self)
+        self._session(fix, "a", [_line(0, b"0"), _line(1, b"0")], capture=_capture())
+        importer = FileImporter(fix.archive, max_lines=1)
+        self.assertTrue(importer.import_once())
+        directory = fix.store.root / "synthetic" / "fixture" / "a"
+        moved = Path(fix.tmp.name) / "relocated"
+        directory.rename(moved)
+        directory.symlink_to(moved, target_is_directory=True)
+        self.assertFalse(importer.import_once())
+        with fix.archive.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 1)
+
     def test_growing_partial_prefix_and_bounded_drain(self):
         fix = _Fixture(self)
         lines = [_line(0, b"0.000000007"), _line(1, b"0.000000008")]
