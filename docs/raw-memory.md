@@ -39,6 +39,9 @@ content-addressed 객체를 HEAD로 검증한 뒤 재사용하며, 새 객체의
 - `RAW_PREFLIGHT_CHUNK_BYTES` (default 1 MiB, min 4096): gunzip/compare
   chunk for `gunzip_compare`. Multi-member gzip verifies every member;
   truncated members fail closed.
+  Compressed SHA-256, byte count and decompression are checked in the same
+  sequential read. Preflight and the final pre-deletion guard still each
+  perform their own complete check against the original manifest pins.
 - Ingress lines: `_LINE_MAX_BYTES` (1 MiB) caps one line buffer read in
   fixed 64 KiB binary chunks. Over-cap whitespace-only runs skip like
   blank lines; over-cap content, mid-file damage, newline-terminated
@@ -60,6 +63,21 @@ content-addressed 객체를 HEAD로 검증한 뒤 재사용하며, 새 객체의
   files + staged MF4), `peak_resident_frames` (max resident incl. match
   batches), `budget_frames`, `tmp_max_bytes` for the benchmark hook;
   sealed outputs never count as temporary.
+
+## Spool telemetry
+
+Recorder-owned create/write/rotation operations update file and UTF-8 byte
+counts incrementally. A background census starts immediately, then waits
+60 seconds after each completed attempt. Uploader/finalizer or external edits
+appear after a successful census, so their lag includes both the wait and scan
+time; errors can delay reconciliation further. The receive loop does not walk
+the spool for these metrics.
+
+The census overlays at most 1,024 distinct paths touched by the recorder while
+it scans. Overflow discards that census rather than retaining an unbounded
+journal or publishing an inconsistent baseline. These gauges are best-effort
+telemetry only: segment admission and finalization still perform fresh,
+fail-closed spool scans and never use cached counts to admit data.
 
 ## Semantics preserved
 

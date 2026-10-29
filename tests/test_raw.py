@@ -93,6 +93,93 @@ class SegmentTest(unittest.TestCase):
             self.assertTrue(os.path.exists(
                 os.path.join(dirs["closed"], "m3_x.jsonl")))
 
+    def test_spool_metrics_reconcile_external_changes(self):
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            external = os.path.join(spool, "closed", "external")
+            with open(external, "wb") as fh:
+                fh.write(b"old")
+            metrics = rec.SpoolMetrics(spool)
+            writer = rec.SegWriter(spool, "v", 600, 100, 1, 1, metrics)
+            writer.write("frame")
+            samples = []
+
+            class Stop:
+                def is_set(self):
+                    return len(samples) == 3
+
+                def wait(self, timeout):
+                    with rec._MLOCK:
+                        samples.append((rec._M["spool_files"],
+                                        rec._M["spool_bytes"]))
+                    if len(samples) == 1:
+                        os.unlink(external)
+                    elif len(samples) == 2:
+                        with open(external, "wb") as fh:
+                            fh.write(b"new-data")
+
+            rec.spool_metrics_worker(metrics, Stop())
+            self.assertEqual(samples, [(2, 9), (1, 6), (2, 14)])
+            writer.rotate()
+            with mock.patch.dict(os.environ, {"RAW_SPOOL_MAX_BYTES": "1"}):
+                with self.assertRaises(rec.NoSpace):
+                    writer.write("retained")
+
+    def test_incremental_metrics_reconcile_concurrent_rotation(self):
+        with tempfile.TemporaryDirectory() as spool:
+            rec.ensure_dirs(spool)
+            metrics = rec.SpoolMetrics(spool)
+            metrics.reconcile()
+            writer = rec.SegWriter(spool, "v", 600, 1000, 1, 1, metrics)
+            writer.write("가")
+            with rec._MLOCK:
+                self.assertEqual((rec._M["spool_files"], rec._M["spool_bytes"]), (1, 4))
+            path = writer.fh.name
+            getsize = os.path.getsize
+            def concurrent_change(p):
+                size = getsize(p)
+                if p == path:
+                    writer.write("more")
+                    writer.rotate()
+                return size
+            with mock.patch.object(rec.os.path, "getsize", side_effect=concurrent_change):
+                metrics.reconcile()
+            self.assertEqual(rec.spool_stats(spool), (1, 9))
+            with rec._MLOCK:
+                self.assertEqual((rec._M["spool_files"], rec._M["spool_bytes"]), (1, 9))
+
+    def test_streamed_gzip_pins_across_both_guards(self):
+        import gzip
+        import hashlib
+        with tempfile.TemporaryDirectory() as spool:
+            mf4, sidecar, manifest, closed = [
+                os.path.join(spool, name) for name in
+                ("x.mf4", "x.gz", "x.json", "x.closed")]
+            body = b"first\nsecond\n"
+            compressed = gzip.compress(b"first\n") + gzip.compress(b"second\n")
+            for path, data in ((mf4, b"mf4"), (sidecar, compressed),
+                               (closed, body)):
+                with open(path, "wb") as fh:
+                    fh.write(data)
+            digest = lambda data: hashlib.sha256(data).hexdigest()
+            with open(manifest, "w") as fh:
+                json.dump({"mf4_sha256": digest(b"mf4"),
+                           "ingress_sha256": digest(body),
+                           "ingress_sidecar_sha256": digest(compressed)}, fh)
+            ok, _, snap = upl.fail_closed_check(mf4, sidecar, manifest, closed)
+            self.assertTrue(ok)
+            self.assertTrue(upl.fail_closed_check(
+                mf4, sidecar, manifest, closed, snap)[0])
+            with open(sidecar, "wb") as fh:
+                fh.write(compressed[:-1])
+            self.assertFalse(upl.fail_closed_check(
+                mf4, sidecar, manifest, closed, snap)[0])
+            changed = gzip.compress(body, mtime=0)
+            with open(sidecar, "wb") as fh:
+                fh.write(changed)
+            self.assertFalse(upl.fail_closed_check(
+                mf4, sidecar, manifest, closed, snap)[0])
+
 
 def _write_ingress(cp, frames):
     with open(cp, "w", encoding="utf-8") as fh:

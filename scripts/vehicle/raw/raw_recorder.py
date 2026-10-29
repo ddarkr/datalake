@@ -30,6 +30,7 @@ Receive-only: recorder mode never calls bus.send(). Replay is a separate
 argv-gated CLI that transmits only on vcan* interfaces with explicit opt-in.
 """
 
+import contextlib
 import errno
 import hashlib
 import json
@@ -439,11 +440,85 @@ def spool_stats(spool):
     return nfiles, nbytes
 
 
+class SpoolMetrics:
+    """Best-effort telemetry, never an admission or finalization budget."""
+
+    def __init__(self, spool):
+        self.spool = spool
+        self.lock = threading.Lock()
+        self.changes = None
+        self.active_path = None
+        with _MLOCK:
+            _M["spool_files"] = _M["spool_bytes"] = 0
+
+    def changed(self, path, before, after):
+        # Called under lock, after the corresponding filesystem operation.
+        with _MLOCK:
+            _M["spool_files"] += int(after is not None) - int(before is not None)
+            _M["spool_bytes"] += (after or 0) - (before or 0)
+        # ponytail: discard an overflowing census instead of retaining an
+        # unbounded rotation journal; the next census retries reconciliation.
+        if self.changes is not None and self.changes is not False:
+            if len(self.changes) >= 1024 and path not in self.changes:
+                self.changes = False
+            else:
+                self.changes[path] = after
+
+    def reconcile(self):
+        with self.lock:
+            self.changes = {}
+            active_at_start = self.active_path
+        sizes, nf, nb = {}, 0, 0
+        def unreadable(error):
+            raise error
+        try:
+            for root, dirs, files in os.walk(self.spool, onerror=unreadable):
+                for name in files:
+                    path = os.path.join(root, name)
+                    try:
+                        size = os.path.getsize(path)
+                    except FileNotFoundError:
+                        continue
+                    nf += 1
+                    nb += size
+                    # Only the initial active file and paths touched during
+                    # this scan can be changed by this writer.
+                    with self.lock:
+                        if path == active_at_start or (
+                                self.changes is not False and path in self.changes):
+                            sizes[path] = size
+        except OSError:
+            with self.lock:
+                self.changes = None
+            raise
+        with self.lock:
+            changes, self.changes = self.changes, None
+            if changes is False:
+                return
+            for path, size in changes.items():
+                old = sizes.get(path)
+                nf += int(size is not None) - int(old is not None)
+                nb += (size or 0) - (old or 0)
+            with _MLOCK:
+                _M["spool_files"], _M["spool_bytes"] = nf, nb
+
+
+def spool_metrics_worker(metrics, stop):
+    """Census immediately and every 60s after completion, outside receive."""
+    while not stop.is_set():
+        try:
+            metrics.reconcile()
+        except OSError as ex:
+            print("spool metrics unavailable: %s" % ex, file=sys.stderr)
+        stop.wait(60.0)
+
+
+
 class SegWriter:
     """Append-only JSONL ingress segment with explicit fsync cadence."""
 
     def __init__(self, spool, vehicle, chunk_sec, chunk_bytes,
-                 fsync_n, fsync_sec):
+                 fsync_n, fsync_sec, metrics=None):
         self.dirs = seg_dirs(spool)
         self.spool = spool
         self.vehicle = vehicle
@@ -452,6 +527,8 @@ class SegWriter:
         self.fsync_n = fsync_n
         self.fsync_sec = fsync_sec
         self.fh = None
+        self.metrics = metrics
+        self.metric_bytes = 0
         self.stem = ""
         self.t0 = 0.0
         self.nbytes = 0
@@ -476,8 +553,13 @@ class SegWriter:
                 self.vehicle, utc_stamp(), self.capture_id, self.nseg)
             if not os.path.exists(os.path.join(adir, self.stem + ".jsonl")):
                 break
-        self.fh = open(os.path.join(adir, self.stem + ".jsonl"),
-                       "a", encoding="utf-8", buffering=1)
+        path = os.path.join(adir, self.stem + ".jsonl")
+        with self.metrics.lock if self.metrics else contextlib.nullcontext():
+            self.fh = open(path, "a", encoding="utf-8", buffering=1)
+            self.metric_bytes = os.fstat(self.fh.fileno()).st_size if self.metrics else 0
+            if self.metrics:
+                self.metrics.active_path = path
+                self.metrics.changed(path, None, self.metric_bytes)
         now = time.monotonic()
         self.t0 = now
         self.tlast = now
@@ -497,12 +579,18 @@ class SegWriter:
         """Append one line; returns closed segment path when rotation fires."""
         if self.fh is None:
             self._open()
-        try:
-            self.fh.write(line + "\n")
-        except OSError as ex:
-            if ex.errno == errno.ENOSPC:
-                raise NoSpace()
-            raise
+        with self.metrics.lock if self.metrics else contextlib.nullcontext():
+            try:
+                self.fh.write(line + "\n")
+            except OSError as ex:
+                if ex.errno == errno.ENOSPC:
+                    raise NoSpace()
+                raise
+            if self.metrics:
+                size = len(line) if line.isascii() else len(line.encode("utf-8"))
+                path = os.path.join(self.dirs["active"], self.stem + ".jsonl")
+                self.metrics.changed(path, self.metric_bytes, self.metric_bytes + size + 1)
+                self.metric_bytes += size + 1
         self.nbytes += len(line) + 1
         self.nsince += 1
         now = time.monotonic()
@@ -534,14 +622,23 @@ class SegWriter:
         self.fh.close()
         self.fh = None
         src = os.path.join(self.dirs["active"], self.stem + ".jsonl")
-        if self.nbytes == 0:
-            try:
-                os.unlink(src)
-            except OSError:
-                pass
-            return None
-        dst = os.path.join(self.dirs["closed"], self.stem + ".jsonl")
-        os.replace(src, dst)
+        with self.metrics.lock if self.metrics else contextlib.nullcontext():
+            if self.metrics:
+                self.metrics.active_path = None
+            if self.nbytes == 0:
+                try:
+                    os.unlink(src)
+                except OSError:
+                    pass
+                else:
+                    if self.metrics:
+                        self.metrics.changed(src, self.metric_bytes, None)
+                return None
+            dst = os.path.join(self.dirs["closed"], self.stem + ".jsonl")
+            os.replace(src, dst)
+            if self.metrics:
+                self.metrics.changed(src, self.metric_bytes, None)
+                self.metrics.changed(dst, None, self.metric_bytes)
         minc("closed")
         return dst
 
@@ -1398,10 +1495,13 @@ def run_recorder():
     stop = []
     signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
     signal.signal(signal.SIGINT, lambda *a: stop.append(1))
-    writer = SegWriter(spool, vehicle, chunk_sec, chunk_bytes, fsync_n, fsync_sec)
+    metrics_stop = threading.Event()
+    metrics = SpoolMetrics(spool)
+    threading.Thread(target=spool_metrics_worker, args=(metrics, metrics_stop),
+                     daemon=True).start()
+    writer = SegWriter(spool, vehicle, chunk_sec, chunk_bytes, fsync_n, fsync_sec, metrics)
     seq = 0
     room = {"ok": True, "t": 0.0}
-    last_stat = 0.0
     try:
         while not stop:
             try:
@@ -1442,12 +1542,8 @@ def run_recorder():
             minc("frames")
             if closed is not None:
                 fq.put(closed)
-            if now - last_stat > 5.0:
-                nf, nb = spool_stats(spool)
-                mset("spool_files", nf)
-                mset("spool_bytes", nb)
-                last_stat = now
     finally:
+        metrics_stop.set()
         try:
             closed = writer.rotate()
         except OSError:

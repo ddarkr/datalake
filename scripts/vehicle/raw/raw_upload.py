@@ -383,7 +383,8 @@ def _preflight_chunk_bytes():
 
 
 def gunzip_compare(sidecar_path, want_digest, closed_path=None,
-                   chunk_bytes=None):
+                   chunk_bytes=None, compressed_digest=None,
+                   compressed_size=None):
     """Streamed sidecar verification with bounded chunks: incremental
     gunzip + SHA-256, never a proportional bytes object. Multi-member
     gzip verifies every member (GzipFile streams members in order);
@@ -392,9 +393,24 @@ def gunzip_compare(sidecar_path, want_digest, closed_path=None,
     compared chunk-by-chunk. Returns (ok, reason); ok only on full-stream
     digest equality."""
     import gzip as _gzip
+    import zlib
     if chunk_bytes is None:
         chunk_bytes = _preflight_chunk_bytes()
     h = hashlib.sha256()
+    compressed = hashlib.sha256()
+    compressed_len = 0
+
+    class HashingReader:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def read(self, size=-1):
+            nonlocal compressed_len
+            data = self.raw.read(size)
+            compressed.update(data)
+            compressed_len += len(data)
+            return data
+
     closed_fh = None
     if closed_path is not None:
         try:
@@ -405,7 +421,7 @@ def gunzip_compare(sidecar_path, want_digest, closed_path=None,
     try:
         with open(sidecar_path, "rb") as raw:
             try:
-                with _gzip.GzipFile(fileobj=raw, mode="rb") as gz:
+                with _gzip.GzipFile(fileobj=HashingReader(raw), mode="rb") as gz:
                     while True:
                         plain = gz.read(chunk_bytes)
                         if not plain:
@@ -423,7 +439,7 @@ def gunzip_compare(sidecar_path, want_digest, closed_path=None,
                                                    " from sidecar")
                                 pos += len(have)
                                 closed_len += len(have)
-            except (OSError, EOFError) as ex:
+            except (OSError, EOFError, zlib.error) as ex:
                 return False, "sidecar gunzip failed: %s" % (ex,)
     finally:
         if closed_fh is not None:
@@ -431,6 +447,10 @@ def gunzip_compare(sidecar_path, want_digest, closed_path=None,
                 closed_fh.close()
             except OSError:
                 pass
+    if (compressed_size is not None and compressed_len != compressed_size or
+            compressed_digest is not None and
+            compressed.hexdigest() != compressed_digest):
+        return False, "sealed sidecar drifted from manifest pin"
     if h.hexdigest() != want_digest:
         return False, "sidecar content drifted from ingress pin"
     if closed_path is not None:
@@ -476,14 +496,13 @@ def fail_closed_check(mf4_path, sidecar_path, manifest_path, closed_path,
             with open(manifest_path, "rb") as fh:
                 if fh.read() != snap["manifest_bytes"]:
                     return False, "manifest drifted after preflight", None
-        for path, size, digest, label in (
-                (mf4_path, snap["sizes"][0], snap["mf4_digest"], "MF4"),
-                (sidecar_path, snap["sizes"][1], snap["sidecar_digest"],
-                 "sidecar")):
-            if os.path.getsize(path) != size or sha256_file(path) != digest:
-                return False, "sealed %s drifted from manifest pin" % label, None
-        ok, reason = gunzip_compare(sidecar_path, snap["ingress_digest"],
-                                    closed_path)
+        if (os.path.getsize(mf4_path) != snap["sizes"][0] or
+                sha256_file(mf4_path) != snap["mf4_digest"]):
+            return False, "sealed MF4 drifted from manifest pin", None
+        ok, reason = gunzip_compare(
+            sidecar_path, snap["ingress_digest"], closed_path,
+            compressed_digest=snap["sidecar_digest"],
+            compressed_size=snap["sizes"][1])
     except (OSError, ValueError) as ex:
         return False, "sealed triple unreadable: %s" % (ex,), None
     if not ok:
