@@ -305,6 +305,162 @@ def blocked_episode_race(path):
         assert (g.SOFT_BYTES, g.HARD_BYTES) == (50_000_000_000, 200_000_000_000)
 
 
+def planned_stop_alerts(path):
+    config = path / "telegram.json"
+    for prepared, result, matching, protected, stop_failed in (
+            (True, "success", True, False, False),
+            (False, "success", True, False, False),
+            (False, "signal", True, False, False),
+            (True, "watchdog", True, False, False),
+            (True, "timeout", True, False, False),
+            (True, "", True, False, False),
+            (True, "success", False, False, False),
+            (True, "success", True, True, False),
+            (True, "success", True, False, True)):
+        state = dict(version=2, project="planned-regression", used_bytes=1234,
+                     last=None, blocked=False, day=g.day_at(1000),
+                     day_used_bytes=1000, alerted=[])
+        g.save(path, state)
+        if protected:
+            g.latch(path, state, "daily hard download limit reached")
+        with patch.dict(os.environ, INVOCATION_ID="current", SERVICE_RESULT=result,
+                        MAINPID=str(os.getpid()) if prepared else ""):
+            g.main(["--state-dir", str(path), "prepare-stop"])
+            if not matching:
+                os.environ["INVOCATION_ID"] = "new-invocation"
+            with patch.object(g, "stop", side_effect=RuntimeError("stop failed") if stop_failed else None) as stopped, patch.object(g, "telegram") as sent:
+                try:
+                    g.main(["--state-dir", str(path), "trip", "--systemd-stop",
+                            "--project", state["project"], "--telegram-config", str(config)])
+                    assert not stop_failed
+                except RuntimeError:
+                    assert stop_failed
+                stopped.assert_called_once_with(state["project"], 10)
+                quiet = prepared and result == "success" and matching and not protected and not stop_failed
+                assert sent.call_count == int(not quiet)
+                current = g.load(path)
+                assert current["blocked"] and (path / "lease").read_text() == "0\n"
+                assert (current["used_bytes"], current["day_used_bytes"]) == (1234, 1000)
+                assert not (path / "planned-stop").exists()
+                if quiet:
+                    g.alert(path, config, True)
+                    assert sent.call_count == 0
+                    # No fresh marker: even a clean unexpected exit must alert.
+                    g.main(["--state-dir", str(path), "trip", "--systemd-stop",
+                            "--project", state["project"], "--telegram-config", str(config)])
+                    assert sent.call_count == 1
+                if protected:
+                    assert current["reason"] == "daily hard download limit reached"
+                if stop_failed:
+                    g.alert(path, config, True)
+                    assert sent.call_count == 2
+
+
+def condition_alerts(path):
+    import re
+    config = path / "telegram.json"
+    state = dict(version=2, project="condition-regression", used_bytes=4_000_000_000,
+                 day_used_bytes=2_981_714_767, day=g.day_at(1000), alerted=[],
+                 blocked=False, sample_at=939, last={}, startup_until=0,
+                 storage_used_bytes=0, storage_limit_bytes=1000)
+    g.save(path, state)
+    readings = {json.dumps({"operation": op}): 0 for op in ("read", "write")}
+    with patch.object(g.time, "time", return_value=1000), patch.object(g, "docker", return_value=""), patch.object(g, "database", return_value={"Id": "one", "State": {"StartedAt": "start"}}), patch.object(g, "disk_room", create=True), patch.object(g, "metrics", return_value=readings), patch.object(g, "stop"), patch.object(g, "telegram") as sent, patch.object(g, "notify"), patch.object(g.time, "sleep", side_effect=LookupError):
+        try:
+            g.main(["--state-dir", str(path), "run", "--metrics-url", "http://127.0.0.1:4000/metrics",
+                    "--interval", "2", "--timeout", "10", "--telegram-config", str(config)])
+        except LookupError:
+            pass
+        current = g.load(path)
+        assert current["observation_gap_seconds"] == 61
+        assert current["monitor_limits"]["gap_seconds"] == 60
+        assert current["day_used_bytes"] == state["day_used_bytes"] < g.SOFT_BYTES
+        text = sent.call_args.args[1]
+        assert "감시 관측 지연" in text and "중단 요건:" in text
+        assert [float(v) for v in re.findall(r"([\d.]+)초", text)] == [61, 60]
+        headers = {text.splitlines()[0]}
+    for error in ("TimeoutError: timed out",
+                  "HTTPError: HTTP Error 503: https://user:secret@example.invalid",
+                  "URLError: <urlopen error https://user:secret@example.invalid>",
+                  "ValueError: native counter reset",
+                  "ValueError: private https://user:secret@example.invalid"):
+        g.save(path, dict(state, monitor_limits={"metrics_timeout_seconds": 10}))
+        g.latch(path, g.load(path), "native metrics unavailable, stale, or reset: " + error)
+        with patch.object(g, "telegram") as sent:
+            g.alert(path, config, True)
+            text = sent.call_args.args[1]
+            assert "secret" not in text and "example.invalid" not in text
+            assert "중단 요건:" in text
+            headers.add(text.splitlines()[0])
+            if error.startswith("HTTPError"):
+                assert "503" in text
+            if error.startswith("TimeoutError"):
+                assert [float(v) for v in re.findall(r"([\d.]+)초", text)] == [10]
+    assert len(headers) == 6
+
+
+def transient_metrics(path):
+    read = json.dumps({"operation": "read"})
+    write = json.dumps({"operation": "write"})
+    base = dict(version=2, project="retry-regression", used_bytes=10,
+                day_used_bytes=10, month_used_bytes=10, month=g.day_at(1000)[:7],
+                day=g.day_at(1000), alerted=[], blocked=False, sample_at=990,
+                last={read: 10}, last_write={write: 0}, startup_until=0,
+                storage_used_bytes=0, storage_limit_bytes=1000)
+
+    def run(samples, times, initial=None):
+        g.save(path, dict(base if initial is None else initial))
+        g.atomic(path / "lease", "995\n")
+        clock = [times[0]]
+        index = [0]
+
+        def sleep(_):
+            index[0] += 1
+            if index[0] == len(times):
+                raise LookupError
+            clock[0] = times[index[0]]
+
+        with patch.object(g.time, "time", side_effect=lambda: clock[0]), patch.object(g, "docker", return_value=""), patch.object(g, "database", return_value={"Id": "one", "State": {"StartedAt": "start"}}), patch.object(g, "disk_room"), patch.object(g, "metrics", side_effect=samples), patch.object(g, "stop"), patch.object(g, "telegram"), patch.object(g, "notify"), patch.object(g.time, "sleep", side_effect=sleep):
+            try:
+                g.main(["--state-dir", str(path), "run", "--metrics-url", "http://127.0.0.1:4000/metrics",
+                        "--timeout", "10", "--telegram-config", str(path / "telegram.json")])
+            except LookupError:
+                pass
+        return g.load(path)
+
+    current = run([TimeoutError()], [1000])
+    assert not current["blocked"] and current["metrics_failure_count"] == 1
+    assert current["last"] == base["last"] and current["used_bytes"] == 10
+    assert (path / "lease").read_text() == "995\n"  # expired, never renewed by failure
+    current = run([TimeoutError(), ConnectionError(), {read: 30, write: 0}], [1000, 1002, 1004])
+    assert not current["blocked"] and current["used_bytes"] == 30
+    assert "metrics_failure_count" not in current
+    current = run([TimeoutError(), {read: 25, write: 0}], [1000, 1002])
+    assert not current["blocked"] and current["used_bytes"] == 25
+    assert "metrics_failure_count" not in current and int((path / "lease").read_text()) > 1002
+    current = run([TimeoutError()] * 3, [1000, 1002, 1004])
+    assert current["blocked"] and current["metrics_failure_count"] == 3
+    assert current["metrics_failure_at"] == 1004 and current["metrics_failure_age_seconds"] == 14
+    current = run([TimeoutError()], [1051])
+    assert current["blocked"] and current["observation_gap_seconds"] == 61
+    current = run([{read: 25, write: 0}], [1051])
+    assert current["blocked"] and current["used_bytes"] == 25  # charge late successful observation
+    current = run([{read: 25, write: 0}], [1050])
+    assert not current["blocked"] and current["used_bytes"] == 25  # exactly 60 seconds is allowed
+    current = run([TimeoutError(), {read: g.HARD_BYTES, write: 0}], [1000, 1002])
+    assert current["blocked"] and current["day_used_bytes"] == g.HARD_BYTES
+    for sample in (ValueError("cached metrics"), ValueError("native S3 read metrics missing"),
+                   {read: 9, write: 0},
+                   g.urllib.error.HTTPError("private", 403, "forbidden", {}, None)):
+        current = run([sample], [1000])
+        assert current["blocked"] and "metrics_failure_count" not in current
+    initial = dict(base, last=None, startup_until=999)
+    assert run([TimeoutError()], [1000], initial)["blocked"]
+    for code in (429, 500, 503):
+        current = run([g.urllib.error.HTTPError("private", code, "retry", {}, None)], [1000])
+        assert not current["blocked"] and current["metrics_failure_count"] == 1
+
+
 def daily_docker(path):
     """Real monitor/HTTP/Docker stop, without sending synthetic alerts to users."""
     path.mkdir(mode=0o700)
@@ -398,6 +554,15 @@ def main():
         episode_path = path / "episode"
         episode_path.mkdir(mode=0o700)
         blocked_episode_race(episode_path)
+        planned_path = path / "planned"
+        planned_path.mkdir(mode=0o700)
+        planned_stop_alerts(planned_path)
+        condition_path = path / "condition"
+        condition_path.mkdir(mode=0o700)
+        condition_alerts(condition_path)
+        transient_path = path / "transient"
+        transient_path.mkdir(mode=0o700)
+        transient_metrics(transient_path)
         unsafe.mkdir(mode=0o755)
         try:
             with g.locked(unsafe):

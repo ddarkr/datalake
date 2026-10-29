@@ -24,6 +24,7 @@ import tempfile
 import time
 import urllib.request
 import urllib.parse
+import urllib.error
 import uuid
 
 COVERAGE = "native Greptime OpenDAL S3 read bytes only; helper/account egress NOT covered"
@@ -32,6 +33,8 @@ HARD_BYTES = 200_000_000_000
 MONTH_BYTES = 2400 * 1024**3
 STORAGE_BYTES = 1200 * 1024**3
 MIN_FREE_BYTES = 1024**3
+MAX_METRICS_FAILURES = 3
+MAX_OBSERVATION_GAP = 60
 KST = timezone(timedelta(hours=9))
 
 
@@ -169,6 +172,32 @@ def observe(state, values):
     return state["day_used_bytes"] >= HARD_BYTES or state["month_used_bytes"] >= MONTH_BYTES
 
 
+def clear_metrics_failures(state):
+    for key in ("metrics_failure_count", "metrics_failure_at", "metrics_failure_age_seconds"):
+        state.pop(key, None)
+
+
+def retry_metrics(state, exc):
+    """Tolerate transport failures only after an established valid baseline."""
+    transient = (exc.code == 429 or 500 <= exc.code <= 599) if isinstance(exc, urllib.error.HTTPError) else isinstance(
+        exc, (TimeoutError, ConnectionError, urllib.error.URLError))
+    if not transient:
+        clear_metrics_failures(state)
+        return False
+    if state.get("last") is None:
+        return False
+    now = time.time()
+    count = state.get("metrics_failure_count", 0) + 1
+    age = now - state["sample_at"]
+    state.update(metrics_failure_count=count, metrics_failure_at=now,
+                 metrics_failure_age_seconds=age)
+    print(f"Metrics transient failure count={count}/{MAX_METRICS_FAILURES} age_seconds={age:.3f}", flush=True)
+    if age > MAX_OBSERVATION_GAP:
+        state["observation_gap_seconds"] = age
+        return False
+    return count < MAX_METRICS_FAILURES
+
+
 def observe_storage(state, values):
     """Conservative storage ceiling: baseline plus writes, never deletion credit."""
     if "storage_used_bytes" not in state:
@@ -273,6 +302,70 @@ def stop(project, grace):
 
 
 
+def stop_condition(state):
+    """Public cause/criterion only; never forward raw exception text."""
+    limits = state.get("monitor_limits", {})
+    reason = state.get("reason", "")
+
+    def seconds(value):
+        return f"{value:.3f}초" if type(value) in (int, float) and math.isfinite(value) and value >= 0 else "미기록"
+
+    causes = {
+        "daily hard download limit reached": ("일일 다운로드 한도 초과", f"일일 다운로드 ≥ {HARD_BYTES / 1e9:g} GB"),
+        "monthly hard download limit reached": ("월간 다운로드 한도 초과", "월간 다운로드 ≥ 설정된 월간 하드 한도"),
+        "storage hard limit reached": ("저장 용량 예산 초과", "보존 저장량 ≥ 설정된 저장 용량 예산"),
+        "storage inventory unknown": ("저장량 기준값 누락", "저장량 ledger 없이 감시 실행"),
+        "local storage unavailable or full": ("로컬 저장소 보호 차단", "데이터 볼륨 조회 실패 또는 최소 여유 공간 미달"),
+        "Greptime instance changed": ("Greptime 인스턴스 변경", "컨테이너 ID 또는 시작 시각이 승인된 기준과 다름"),
+        "unaccounted S3 helper running": ("계측 외 S3 작업 감지", "backup·can-backup·raw-uploader·redecode 실행 감지"),
+        "planned monitor stop": ("계획 정지", "계획정지 후 프로젝트 정지 확인 실패"),
+    }
+    if reason in causes:
+        return causes[reason]
+    if reason == "explicit trip / monitor stopped":
+        info = state.get("monitor_exit", {})
+        result = info.get("SERVICE_RESULT")
+        if result in ("success", "exit-code", "signal", "core-dump", "watchdog", "timeout", "oom-kill", "resources", "protocol"):
+            return "모니터 비정상 종료", f"계획정지 확인 없이 감시 종료; systemd 결과={result}"
+        return "명시적 차단 / 모니터 종료", "명시적인 trip 명령 또는 감시기 종료"
+    prefix = "native metrics unavailable, stale, or reset: "
+    if reason.startswith(prefix):
+        kind, _, detail = reason[len(prefix):].partition(": ")
+        if kind == "ValueError":
+            if detail == "monitor observation gap":
+                return "감시 관측 지연", (
+                    f"실제 관측 간격 {seconds(state.get('observation_gap_seconds'))}"
+                    f" > 허용 {seconds(limits.get('gap_seconds'))}")
+            errors = {
+                "native counter reset": ("계측 카운터 감소", "동일 인스턴스의 누적 다운로드 카운터가 이전 값보다 작음"),
+                "native metric series disappeared": ("계측 계열 소실", "이전 관측에 있던 S3 read 계열이 사라짐"),
+                "native S3 read metric missing": ("S3 read 계측 누락", "유효한 S3 read 계열이 응답에 없음"),
+                "native S3 read metrics missing": ("S3 read 계측 누락", "유효한 S3 read 계열이 응답에 없음"),
+                "native S3 write metrics missing or reset": ("S3 write 계측 이상", "S3 write 계열 누락 또는 카운터 감소"),
+                "stale native metrics": ("오래된 계측 표본", "계측 표본 시각이 허용 응답 시간보다 오래됨"),
+                "cached metrics": ("캐시된 계측 응답", "HTTP Age가 0이 아닌 응답"),
+                "metrics too large": ("계측 응답 크기 초과", "응답 크기 > 16 MiB"),
+                "invalid native bytes": ("잘못된 계측 값", "음수·비정수·유한하지 않은 다운로드 카운터"),
+                "duplicate native series": ("중복 계측 계열", "같은 label 조합의 S3 계열이 중복됨"),
+                "Greptime instance changed": causes["Greptime instance changed"],
+                "Greptime data volume unknown": ("데이터 볼륨 식별 실패", "/data mount가 정확히 하나가 아님"),
+                "Greptime data volume free-space floor reached": causes["local storage unavailable or full"],
+                "guard clock moved to an earlier day": ("감시 날짜 역행", "현재 KST 날짜가 저장된 날짜보다 과거임"),
+                "guard clock moved to an earlier month": ("감시 월 역행", "현재 KST 월이 저장된 월보다 과거임"),
+            }
+            if detail in errors:
+                return errors[detail]
+        if kind == "TimeoutError" or (kind == "URLError" and detail == "<urlopen error timed out>"):
+            return "계측 응답 시간 초과", f"응답 제한시간 {seconds(limits.get('metrics_timeout_seconds'))} 내 요청 미완료"
+        if kind == "HTTPError":
+            status = re.match(r"HTTP Error (\d{3}):", detail)
+            return "계측 HTTP 오류", f"계측 endpoint가 HTTP {status[1] if status else '오류'} 응답"
+        if kind in ("URLError", "ConnectionError", "ConnectionRefusedError",
+                    "ConnectionResetError", "ConnectionAbortedError", "BrokenPipeError"):
+            return "계측 접속 실패", "계측 endpoint에 연결하지 못함"
+    return "계측 또는 보호 상태 이상", "미분류 검증 실패; 호스트 state.json에서 원문 확인"
+
+
 def telegram(config, text):
     info = config.stat()
     if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o600:
@@ -297,6 +390,9 @@ def alert(directory, config, stopped):
     with locked(directory):
         state = load(directory)
         blocked = state["blocked"]
+        if (blocked and state.get("reason") == "planned monitor stop" and stopped
+                and not state.get("block_alert_attempt_level")):
+            return
         episode = state.get("block_episode")
         level = (("stopped" if stopped else "unconfirmed") if blocked else
                  "hard" if state["day_used_bytes"] >= HARD_BYTES else
@@ -317,18 +413,16 @@ def alert(directory, config, stopped):
                   "정지 미확인: 호스트/Docker 상태를 즉시 확인하세요.") if blocked or level == "hard" else "서비스는 계속 가동합니다."
         # Diagnostics may contain URLs/credentials. Only fixed cause labels
         # leave the host; retain the original reason in the private state.
-        reason = state.get("reason", "")
-        cause = {
-            "daily hard download limit reached": "일일 다운로드 한도 초과",
-            "monthly hard download limit reached": "월간 다운로드 한도 초과",
-            "storage hard limit reached": "저장 용량 예산 초과",
-            "Greptime instance changed": "Greptime 인스턴스 변경",
-            "unaccounted S3 helper running": "계측 외 S3 작업 감지",
-            "explicit trip / monitor stopped": "명시적 차단 / 모니터 종료",
-        }.get(reason, "계측 또는 보호 상태 이상")
+        cause, criterion = stop_condition(state)
+        if state.get("metrics_failure_count"):
+            criterion += (
+                f"; 연속 실패 {state['metrics_failure_count']}/{MAX_METRICS_FAILURES}"
+                f"; 마지막 유효 관측 후 {state['metrics_failure_age_seconds']:.3f}초"
+                f" / 허용 {MAX_OBSERVATION_GAP}초")
         if blocked:
-            action = f"보호 차단: {cause}\n{action}"
-        text = (f"[Datalake {'긴급' if blocked or level == 'hard' else '주의'}]\n"
+            action = f"보호 차단: {cause}\n중단 요건: {criterion}\n{action}"
+        title = f"긴급 — {cause}" if blocked else ("긴급" if level == "hard" else "주의")
+        text = (f"[Datalake {title}]\n"
                 f"{day} KST S3 다운로드 {state['day_used_bytes'] / 1e9:.3f} GB\n"
                 f"소프트 50 GB / 하드 200 GB (일일)\n"
                 f"월간 {state.get('month_used_bytes', state['used_bytes']) / 1024**3:.3f}"
@@ -363,8 +457,11 @@ def main(argv=None):
         if name == "arm":
             p.add_argument("--project", required=True)
     sub.add_parser("status")
+    sub.add_parser("prepare-stop", help="systemd ExecStop: record this live invocation's planned stop")
     trip = sub.add_parser("trip")
     trip.add_argument("--grace", type=int, default=10)
+    trip.add_argument("--systemd-stop", action="store_true",
+                      help="systemd ExecStopPost: classify this invocation's shutdown")
     trip.add_argument("--telegram-config", type=Path,
                       help="send stop outcome when state is readable; no retry worker")
     trip.add_argument("--project", required=True,
@@ -380,16 +477,44 @@ def main(argv=None):
     directory = args.state_dir.resolve()
     if hasattr(args, "grace") and not 0 <= args.grace <= 60:
         parser.error("grace must be 0..60 seconds")
+    if args.command == "prepare-stop":
+        invocation = os.environ.get("INVOCATION_ID")
+        pid = os.environ.get("MAINPID", "")
+        if invocation and pid.isdecimal() and int(pid) > 1:
+            try:
+                os.kill(int(pid), 0)
+            except ProcessLookupError:
+                return
+            with locked(directory):
+                atomic(directory / "planned-stop", invocation)
+        return
     if args.command == "trip":
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.project):
             parser.error("invalid exact Compose project")
         try:
             with locked(directory):
                 revoke(directory)
+                planned = False
+                if args.systemd_stop:
+                    marker = directory / "planned-stop"
+                    try:
+                        planned = (bool(os.environ.get("INVOCATION_ID"))
+                                   and marker.read_text() == os.environ["INVOCATION_ID"]
+                                   and os.environ.get("SERVICE_RESULT") == "success")
+                    except FileNotFoundError:
+                        pass
+                    finally:
+                        marker.unlink(missing_ok=True)
                 state = load(directory)
                 if state["project"] != args.project:
                     raise ValueError("trip project differs from persistent state; selected project stopped")
-                latch(directory, state, "explicit trip / monitor stopped")
+                if args.systemd_stop:
+                    state["monitor_exit"] = {"SERVICE_RESULT": os.environ.get("SERVICE_RESULT", "")}
+                reason = state.get("reason") if state["blocked"] else None
+                if reason == "planned monitor stop":
+                    reason = None
+                latch(directory, state, reason or (
+                    "planned monitor stop" if planned else "explicit trip / monitor stopped"))
         finally:
             # Storage failure must never bypass the host's explicit stop target.
             # Do not recreate malformed state or discard its usage evidence.
@@ -439,7 +564,9 @@ def main(argv=None):
             state.update(blocked=False, reason="authorized",
                          last=None, instance=None, startup_until=time.time() + args.startup_seconds)
             state["last_write"] = None
-            for key in ("block_episode", "block_alerted", "block_alert_attempt_at", "block_alert_attempt_level"):
+            clear_metrics_failures(state)
+            for key in ("block_episode", "block_alerted", "block_alert_attempt_at", "block_alert_attempt_level",
+                        "observation_gap_seconds", "monitor_exit"):
                 state.pop(key, None)
             save(directory, state)
             # run must start before DB: arm alone does not grant a lease.
@@ -450,12 +577,15 @@ def main(argv=None):
     if (args.interval <= 0 or args.timeout <= 0 or args.interval + args.timeout > 30
             or args.min_free_bytes < MIN_FREE_BYTES):
         parser.error("positive polling/timeout, combined maximum 30 seconds; minimum free space 1 GiB")
+    monitor_limits = {"gap_seconds": MAX_OBSERVATION_GAP,
+                      "metrics_timeout_seconds": args.timeout}
     # Separate process lock prevents two monitor instances without blocking trip.
     with (directory / "monitor.lock").open("a") as worker:
         fcntl.flock(worker, fcntl.LOCK_EX | fcntl.LOCK_NB)
         while True:
             with locked(directory):
                 state = load(directory)
+                state["monitor_limits"] = monitor_limits
                 containers = []
                 if not state["blocked"] and "storage_used_bytes" not in state:
                     latch(directory, state, "storage inventory unknown")
@@ -471,6 +601,8 @@ def main(argv=None):
                                for c in containers):
                             latch(directory, state, "unaccounted S3 helper running")
                 if not state["blocked"]:
+                    fresh = False
+                    fetching_metrics = False
                     try:
                         container = database(containers, args.metrics_url)
                         try:
@@ -485,17 +617,23 @@ def main(argv=None):
                             # already-known full or uninspectable data volume.
                             latch(directory, state, "local storage unavailable or full")
                             raise
+                        fetching_metrics = True
                         all_values = metrics(args.metrics_url, args.timeout, include_writes=True)
+                        fetching_metrics = False
                         values = {k: v for k, v in all_values.items()
                                   if json.loads(k)["operation"] == "read"}
                         writes = {k: v for k, v in all_values.items()
                                   if json.loads(k)["operation"] == "write"}
                         if not values:
                             raise ValueError("native S3 read metrics missing")
-                        if state.get("sample_at") and state.get("last") is not None and time.time() - state["sample_at"] > args.interval + args.timeout + 5:
-                            raise ValueError("monitor observation gap")
+                        gap = time.time() - state["sample_at"] if state.get("sample_at") and state.get("last") is not None else 0
                         storage_full = observe_storage(state, writes)
                         download_full = observe(state, values)
+                        fresh = True
+                        clear_metrics_failures(state)
+                        if gap > monitor_limits["gap_seconds"]:
+                            state["observation_gap_seconds"] = gap
+                            raise ValueError("monitor observation gap")
                         if storage_full or download_full:
                             reason = ("storage hard limit reached" if storage_full else
                                       "monthly hard download limit reached"
@@ -505,10 +643,16 @@ def main(argv=None):
                         else:
                             save(directory, state)
                     except Exception as exc:
-                        if state["blocked"] or state.get("last") is not None or time.time() >= state["startup_until"]:
+                        if not fetching_metrics:
+                            clear_metrics_failures(state)
+                        retry = fetching_metrics and retry_metrics(state, exc)
+                        if retry and not state["blocked"]:
+                            save(directory, state)
+                        elif state["blocked"] or state.get("last") is not None or time.time() >= state["startup_until"]:
                             latch(directory, state,
                                   f"native metrics unavailable, stale, or reset: {type(exc).__name__}: {exc}")
-                    if not state["blocked"]:
+                    if not state["blocked"] and (fresh or (
+                            state.get("last") is None and time.time() < state["startup_until"])):
                         atomic(directory / "lease", str(int(time.time() + args.interval + args.timeout + 5)) + "\n")
                 blocked = state["blocked"]
             stopped = False

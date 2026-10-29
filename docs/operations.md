@@ -79,7 +79,7 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 `scripts/storage/egress_guard.py`는 Compose 밖에서 실행하는 선택적 안전장치입니다. 한국 시간 하루의 DB native S3 read가 **50 GB 이상이면 Telegram 경고만**, **200 GB 이상이면 프로젝트 전체 정지와 긴급 알림**을 실행합니다. **KST 달력월 2400 GiB**에 도달해도 정지하며 다음 날 수동 재개로 우회할 수 없습니다. GB는 1,000,000,000 byte, GiB는 1,073,741,824 byte입니다. 정상 조회와 반복 다운로드는 구분하지 않습니다. 계측 중단·카운터 초기화·DB 인스턴스 변경도 프로젝트를 중지하고 잠급니다. `backup`, `can-backup`, `raw-uploader`, `redecode`는 DB 계측에 포함되지 않으므로 감시 중 실행하면 프로젝트를 중지합니다. 해당 작업에는 별도로 승인하고 계측하는 유지보수 창이 필요합니다.
 
-계측 실패의 예외 종류와 메시지는 `state.json`의 `reason`에 함께 보존합니다. `/metrics` 응답 시간은 실제 집계 부하에서 확인하세요. 아래 예시는 timeout 10초를 사용하며, timeout을 늘리면 계측 실패 감지와 정지도 그만큼 늦어집니다. 재시도하거나 계측 공백을 정상으로 간주하지는 않습니다.
+계측 요청의 일시적인 연결 오류·timeout·URLError·HTTP 429/5xx는 유효한 최초 관측 이후 연속 두 번까지 허용하며, **세 번째 연속 실패 또는 마지막 유효 관측 이후 60초 초과**이면 중지합니다. 아래 예시는 socket timeout 10초를 유지합니다. 정상 복구 시 기존 series별 기준값을 유지해 공백 중 증가분도 합산하며, 60초를 넘긴 정상 응답도 가능한 증가분을 먼저 합산한 뒤 중지합니다. HTTP 401/403/404, 잘못되거나 누락·오래된·캐시된 계측, 카운터/series 초기화, 인스턴스 변경 및 저장소·예산 이상은 즉시 차단합니다. 최초 관측 전에는 명시적으로 승인한 startup grace만 허용하고 만료 후 첫 실패에 차단합니다. 실패 관측은 일반 lease를 갱신하지 않습니다. 재시도 중에도 기존 주기로 대기하며, 안전한 실패 횟수·마지막 유효 관측의 나이를 journal에 남깁니다. 차단 시 `state.json`에는 예외 원문과 실패 횟수·시각·관측 나이를 보존하되 알림에는 URL·인증정보를 넣지 않습니다.
 
 **이 장치는 사업자 청구액이나 엄격한 네트워크 바이트 상한을 보장하지 않습니다.** 감지·종료 지연과 호스트/Docker 장애 동안 추가 다운로드가 가능합니다. 월간 합성 CI 예산을 실제 계정의 허용량으로 사용하지 마세요. 자동 GitOps 동기화도 별도로 중지해야 하며, `redeployAfterSync=false`만으로 재기동을 막을 수는 없습니다.
 
@@ -89,7 +89,9 @@ Linux Docker 호스트에 스크립트를 설치하고 root 소유 `0700` 영속
 
 Telegram 봇 토큰과 수신자 `chat_id`는 저장소 밖의 root 소유 `0600` JSON 파일 `/etc/datalake-egress-telegram.json`에 `token`(문자열), `chat_id`(정수)로 저장합니다. 혼동을 막기 위해 설정 확인용 테스트 문자는 보내지 않습니다. 사용량 경고는 단계별 하루 한 번이며, 보호 차단은 사용량과 무관하게 별도의 긴급 알림을 보냅니다. 소프트 경고를 이미 보냈어도 차단 알림은 생략하지 않으며, 정지 미확인에서 정지 확인으로 바뀌면 다시 알립니다. 같은 상태의 전송 실패는 60초 뒤 재시도하고, 수동 재개 뒤 새 차단은 새로 알립니다. 정지는 알림보다 먼저 실행하므로 Telegram 장애가 차단을 지연시키지 않습니다. 원인은 고정된 분류만 전송하며 상세 예외는 호스트의 `state.json`에 남깁니다. 전송 성공 직후 상태 저장 전에 프로세스가 죽으면 중복 알림이 발생할 수 있습니다.
 
-수동 `trip`과 systemd 종료 후에도 알리려면 `--telegram-config`를 전달하세요. 단발 `trip`은 정지 결과를 한 번 전송하며 자체 재시도 루프는 없습니다. 상태 파일이 손상돼 읽을 수 없거나 호스트·네트워크가 중단된 경우 알림을 보장하지 않습니다. 기존 version 2 상태는 그대로 읽으며 차단 알림 기록은 필요할 때 추가합니다.
+수동 `trip`은 `--telegram-config`를 전달하면 정지 결과를 한 번 전송하며 자체 재시도 루프는 없습니다. systemd의 계획정지는 아래 `prepare-stop`과 `trip --systemd-stop`을 함께 사용합니다. 살아 있는 MAINPID에서 기록한 INVOCATION_ID가 현재 종료와 일치하고 SERVICE_RESULT가 success이며 실제 정지까지 확인된 경우에만 알림을 생략합니다. 예고 없는 종료는 exit 0·SIGTERM도 알리고, watchdog·기존 보호 차단·정지 실패도 계속 긴급 알림을 보냅니다. 상태 파일이 손상됐거나 호스트·네트워크가 중단되면 알림은 보장하지 않습니다.
+
+긴급 알림은 제목에 실제 차단 분류를 넣고 `중단 요건`을 별도로 표시합니다. 관측 공백은 실제 간격과 허용 간격, 응답 timeout은 설정된 제한시간, HTTP 오류는 상태 코드를 표시하며 카운터 감소·계열 누락·캐시/오래된 응답·인스턴스 변경·감시기 종료를 구분합니다. 관측 지연은 일일 다운로드가 소프트 한도 미만이어도 차단되는 별도 조건입니다. `monitor_limits`와 차단 당시 `observation_gap_seconds`를 영속 상태에 보존하되 원문 예외·URL·자격 증명은 전송하지 않습니다. 알림 개선은 차단 기준이나 예산을 완화하지 않습니다.
 
 차단마다 영속 `block_episode`를 부여하며, 전송 성공은 그 회차에만 기록합니다.
 전송 중 수동 재개·재차단이 발생해도 이전 알림이 새 차단을 전달 완료로
@@ -123,7 +125,8 @@ Type=notify
 NotifyAccess=main
 User=root
 ExecStart=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress run --metrics-url http://127.0.0.1:4000/metrics --interval 2 --timeout 10 --grace 10 --telegram-config /etc/datalake-egress-telegram.json
-ExecStopPost=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress trip --project datalake --grace 10 --telegram-config /etc/datalake-egress-telegram.json
+ExecStop=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress prepare-stop
+ExecStopPost=/usr/bin/python3 /usr/local/libexec/datalake-egress-guard.py --state-dir /var/lib/datalake-egress trip --systemd-stop --project datalake --grace 10 --telegram-config /etc/datalake-egress-telegram.json
 WatchdogSec=300
 TimeoutStartSec=300
 TimeoutStopSec=150
