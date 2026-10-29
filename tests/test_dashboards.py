@@ -46,6 +46,56 @@ def test_dashboard_and_folder_uids_are_disjoint():
     # Grafana's browse tree indexes both resource types by UID.
     assert not folder_uids.intersection(dashboard_uids), "Folder/dashboard UID collision"
 
+def test_can_fleet_shared_path_counts_keep_range_and_absence():
+    dashboard = json.loads(_grafana_configs()["grafana-dash-can-vss"]["content"])
+    panels = {panel["id"]: panel for panel in dashboard["panels"]}
+    query = panels[3]["targets"][0]["rawSql"].replace(
+        "$$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE vehicle_signal (event_time INTEGER, source TEXT, path TEXT)")
+        assert db.execute(query).fetchone() == (None, None)
+        db.executemany("INSERT INTO vehicle_signal VALUES (?, ?, ?)", [
+            (1000, "can", "speed"), (1500, "can", "speed"),
+            (2000, "can", "soc"), (1500, "fleet", "speed"),
+            (2001, "fleet", "outside"), (1500, "other", "ignored"),
+            (1500, "fleet", None),
+        ])
+        assert db.execute(query).fetchone() == (2, 1)
+        db.execute("DELETE FROM vehicle_signal WHERE source = 'fleet'")
+        assert db.execute(query).fetchone() == (2, None)
+
+
+def test_overview_minute_aggregation_dedupe_status_and_window():
+    dashboard = json.loads(_grafana_configs()["grafana-dash-overview"]["content"])
+    panel = next(p for p in dashboard["panels"] if p["id"] == 7)
+    query = panel["targets"][0]["rawSql"].replace(
+        "$$__timeFilter(timestamp)", "timestamp BETWEEN 1 AND 200000")
+    query = (query.replace("$$__unixEpochTo()", "200000")
+             .replace("$${service:sqlstring}", "''")
+             .replace("$${operation:sqlstring}", "''")
+             .replace("$${kind:sqlstring}", "'All'")
+             .replace(" AS TIMESTAMP(6)", " AS INTEGER"))
+    with sqlite3.connect(":memory:") as db:
+        db.create_function("FROM_UNIXTIME", 1, lambda value: value)
+        db.create_function("date_trunc", 2, lambda unit, ts: ts // 60 * 60)
+        db.execute("CREATE TABLE opentelemetry_traces (trace_id TEXT, span_id TEXT, "
+                   "timestamp INTEGER, service_name TEXT, span_name TEXT, span_kind TEXT, "
+                   "span_status_code TEXT, duration_nano INTEGER)")
+        assert db.execute(query).fetchall() == []
+        row = ("t", "s", 30001, "svc", "op", "kind", "STATUS_CODE_OK", 5)
+        db.executemany("INSERT INTO opentelemetry_traces VALUES (?, ?, ?, ?, ?, ?, ?, ?)", [
+            row, row,  # exact retransmission
+            ("t", "s", 30001, "svc", "op", "kind", "STATUS_CODE_ERROR", 5),
+            ("t", "null", 30002, "svc", "op", "kind", None, 5),
+            ("t", "unset", 30060, "svc", "op", "kind", "STATUS_CODE_UNSET", 5),
+            ("t", "old", 27199, "svc", "op", "kind", "STATUS_CODE_ERROR", 5),
+            ("t", "future", 200001, "svc", "op", "kind", "STATUS_CODE_ERROR", 5),
+        ])
+        rows = db.execute(query).fetchall()
+        assert rows == [(30000, 3, 3 / 60, 50.0), (30060, 1, 1 / 60, None)]
+        assert sum(row[1] for row in rows) == 4
+
+
 def test_coverage_distinguishes_absence_from_observed_zero():
     configs = _grafana_configs()
     queries = []
@@ -2573,6 +2623,8 @@ def test_analysis_input_states_keep_boundary_and_invalid_transition():
 
 if __name__ == "__main__":
     test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors()
+    test_can_fleet_shared_path_counts_keep_range_and_absence()
+    test_overview_minute_aggregation_dedupe_status_and_window()
     test_overview_coverage_keeps_selected_and_historical_times_separate()
     test_analysis_input_latest_preserves_invalid_and_scope_identity()
     test_analysis_input_trends_keep_unit_and_quality_boundaries()
