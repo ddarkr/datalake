@@ -107,8 +107,11 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
   const cPath = cursorPath(sessionId);
 
   let cursor = { version: 3, lastProcessedIndex: -1 };
+  let cursorNeedsSave = true;
   try {
-    cursor = { version: 3, lastProcessedIndex: -1, ...JSON.parse(await readFile(cPath, 'utf8')) };
+    const stored = JSON.parse(await readFile(cPath, 'utf8'));
+    cursor = { version: 3, lastProcessedIndex: -1, ...stored };
+    cursorNeedsSave = stored?.version !== 3 || !Object.hasOwn(stored, 'lastProcessedIndex');
   } catch {}
   cursor.version = 3;
 
@@ -125,6 +128,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
     try { ok = await telemetry.send(event); } catch {}
     cursor.attemptedEventIds = [...attempted].filter(id => !cursor.sentEventIds?.includes(id) && !cursor.queuedEventIds?.includes(id));
     await save(cPath, cursor);
+    cursorNeedsSave = false;
     if (ok === true) output.push(event);
     return ok === true;
   }
@@ -219,6 +223,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
           }
           cursor.lastProcessedIndex = stepIndex;
           await save(cPath, cursor);
+          cursorNeedsSave = false;
         }
 
       }
@@ -227,12 +232,15 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
     const nextOffset = offset + end;
     const anchor = Buffer.alloc(Math.min(nextOffset, 256));
     await file.read(anchor, 0, anchor.length, nextOffset - anchor.length);
-    cursor.transcript = {
+    const transcript = {
       path: transcriptPath, dev: info.dev, ino: info.ino, size: info.size, mtimeMs: info.mtimeMs,
       offset: nextOffset, anchor: createHash('sha256').update(anchor).digest('hex'),
       ...(checkpoint ?? { parsedCount, earliestTimestamp, subagentCalls }),
     };
-    await save(cPath, cursor);
+    if (cursorNeedsSave || JSON.stringify(previous) !== JSON.stringify(transcript)) {
+      cursor.transcript = transcript;
+      await save(cPath, cursor);
+    }
   } catch {} finally { await file?.close().catch(() => {}); }
   if (includeSummary) {
     // Drain/checkpoint failures must not suppress the authoritative Stop summary.

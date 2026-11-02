@@ -104,6 +104,11 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
   const sessionId = identifier(input?.session_id);
   const hook = input?.hook_event_name;
   if (!sessionId || !events.has(hook)) return;
+  // Non-final batch zero proves streaming rather than completed SDK/-p output.
+  // Prompt hooks also fire for automation: this is NOT human input-to-response time.
+  if (hook === 'MessageDisplay' && (!identifier(input.prompt_id) ||
+      !identifier(input.turn_id) || !identifier(input.message_id) || input.index !== 0 ||
+      input.final !== false || typeof input.delta !== 'string' || input.delta.length === 0)) return;
   const stateDir = join(stateRoot, hash(sessionId));
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
   if (hook === 'MessageDisplay' || hook === 'UserPromptSubmit') {
@@ -118,11 +123,8 @@ export async function handleHook(input, { telemetry, stateRoot, now = Date.now()
         await save(path, { promptId, submittedAtMs: now, ambiguous: !!pending || !promptId });
         return;
       }
-      // Non-final batch zero proves streaming rather than completed SDK/-p output.
-      // Prompt hooks also fire for automation: this is NOT human input-to-response time.
-      if (!pending || pending.ambiguous || pending.observed || !promptId || promptId !== pending.promptId ||
-          !identifier(input.turn_id) || !identifier(input.message_id) || input.index !== 0 ||
-          input.final !== false || typeof input.delta !== 'string' || input.delta.length === 0 || now < pending.submittedAtMs) return;
+      if (!pending || pending.ambiguous || pending.observed || promptId !== pending.promptId ||
+          now < pending.submittedAtMs) return;
       await save(join(observationDir, 'ready.json'), {
         kind: 'interaction', sessionId, eventId: `display:${promptId}`,
         startTimeMs: pending.submittedAtMs, endTimeMs: now,

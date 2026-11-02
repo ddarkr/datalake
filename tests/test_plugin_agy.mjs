@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { mkdtemp, readFile, writeFile, rm, stat, mkdir, symlink, readdir, rename } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, rm, stat, mkdir, symlink, readdir, rename, open } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -119,6 +119,49 @@ test('AGY defers Git metadata until event paths while preserving pre-hook checkp
   assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
   assert.deepEqual(await invoke({ ...payload, invocationNum: 0 }, { isPostInvocation: true }), []);
   assert.equal((await readFile(gitLog, 'utf8')).trim().split('\n').length, 6);
+});
+
+test('AGY leaves an unchanged large cursor untouched while persisting progress and receipts', async t => {
+  const box = await sandbox(t, steps());
+  const { telemetry, accepted } = direct();
+  const payload = { conversationId: box.sessionId, transcriptPath: box.transcript, stepIdx: 1, toolName: 'Read' };
+  const invoke = () => handleHook(payload, { telemetry, cwd: box.path, now: () => 5000 });
+  const cursorPath = join(box.state, 'cursor.json');
+  await invoke();
+  const cursor = JSON.parse(await readFile(cursorPath, 'utf8'));
+  cursor.version = 2;
+  cursor.attemptedEventIds.push(...Array.from({ length: 1024 }, (_, i) => `historical:${i}`));
+  await writeFile(cursorPath, JSON.stringify(cursor));
+  await invoke();
+  assert.equal(JSON.parse(await readFile(cursorPath, 'utf8')).version, 3);
+  const held = await open(cursorPath, 'r');
+  t.after(() => held.close());
+  const before = await held.stat();
+  const eventsBefore = accepted.length;
+  for (let i = 0; i < 4; i++) await invoke();
+  const after = await stat(cursorPath);
+  assert.equal(after.ino, before.ino, 'unchanged cursor must not be atomically replaced');
+  assert.equal(after.mtimeMs, before.mtimeMs);
+  assert.equal(accepted.length, eventsBefore);
+
+  const next = { type: 'PLANNER_RESPONSE', step_index: 3,
+    tool_calls: [{ name: 'invoke_subagent', args: { Subagents: [{ Role: 'Explore' }] } }] };
+  await writeFile(box.transcript, `${JSON.stringify(next)}\n`, { flag: 'a' });
+  await invoke();
+  const advanced = JSON.parse(await readFile(cursorPath, 'utf8'));
+  assert.notEqual((await stat(cursorPath)).ino, before.ino);
+  assert.equal(advanced.transcript.offset, (await stat(box.transcript)).size);
+  assert.ok(advanced.attemptedEventIds.includes(`subagent:${box.sessionId}:3:0`));
+  await invoke();
+  assert.equal(accepted.filter(event => event.eventId === `subagent:${box.sessionId}:3:0`).length, 1);
+
+  const replacement = join(box.path, 'replacement');
+  await writeFile(replacement, `${JSON.stringify({ type: 'USER_INPUT', step_index: 4 })}\n`);
+  await rename(replacement, box.transcript);
+  await invoke();
+  const replaced = JSON.parse(await readFile(cursorPath, 'utf8'));
+  assert.equal(replaced.transcript.ino, (await stat(box.transcript)).ino);
+  assert.equal(replaced.transcript.offset, (await stat(box.transcript)).size);
 });
 
 test('AGY duplicate tool drains appended UTF-8 lines and resets on replacement', async t => {

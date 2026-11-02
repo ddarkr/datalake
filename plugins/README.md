@@ -250,6 +250,8 @@ claude plugin list --json
 시도한 것으로 기록하지 않고 checkpoint를 유지합니다. 이후 훅이 없으면 이 미시도
 이벤트가 전달된다고 보장하지 않으며, 이미 시도한 이벤트의 자동 재전송도 없습니다.
 
+`MessageDisplay` 중 첫 non-final batch 0이 아니거나 필수 ID·비어 있지 않은 문자열 delta가 없는 입력은 파일 접근 전에 생략합니다. 유효 후보의 prompt 연결·중복 판정과 checkpoint 갱신은 기존 잠금 안에서 처리하며, 무시된 후속 출력 때문에 첫 응답 기록을 바꾸지 않습니다.
+
 `--source plugin|native`는 사용량 소유자를 명시적으로 선택합니다(기본 `plugin`). `native`는 transcript LLM 사용량을 보내지 않고 상호작용 훅은 유지합니다. 선택은 `OTEL_*` 환경 변수가 제거되어도 남는 설치본 `config-path.json`에 저장되며, 재설치 때 생략하면 기존 선택을 유지합니다. 네이티브 OTel 활성화·인증 설정은 사용자가 별도로 해야 하며 설치기가 대신 켜지 않습니다. 새 `UserPromptSubmit`·`MessageDisplay` 훅은 같은 홈·설정으로 **재설치한 뒤 재시작 또는 `/reload-plugins`**해야 등록됩니다.
 
 ### AGY CLI (Antigravity)
@@ -265,6 +267,7 @@ node plugins/install.mjs agy --config "$DATALAKE_OTEL_CONFIG" --apply
 `PreToolUse`·`PreInvocation`처럼 시작 checkpoint만 기록하는 경로에서는 Git을 조회하지 않습니다. 전송할 이벤트를 구성할 때 저장소·브랜치를 조회하며 프로세스 사이에 메타데이터를 캐시하지 않습니다.
 
 `PostToolUse`는 저장된 byte cursor 이후의 transcript를 읽습니다. 파일 교체·관측된 축소·커서 경계 변경 시 다시 읽고, 완성되지 않은 UTF-8/JSON 줄은 다음 훅에 이어서 처리합니다. 이미 시도한 identity는 재전송하지 않습니다. `Stop`은 증분 이벤트 처리와 별개로 현재 transcript 전체를 한 번 읽어 세션 시작 시각·서브에이전트 호출 수를 계산합니다. 이 최종 조회는 과거 내용의 수정과 증분 drain 실패에도 요약을 보존하기 위해 유지하며, `PostToolUse`에서는 수행하지 않습니다.
+커서의 버전·진행 상태가 그대로이면 최종 `cursor.json` 재저장을 생략합니다. 전송 시도 기록과 변경된 커서는 기존 파일·디렉터리 동기화 절차로 저장합니다.
 
 도구 오류는 원문 대신 고정 분류 `error.type=tool_error`만 전송합니다. transcript cursor와 도구·Stop 관측 상태는 중복 시도를 막기 위한 소스 checkpoint이며 수집기 ACK가 아닙니다. HTTP 실패 때문에 같은 구간이나 완료 이벤트를 자동 재전송하지 않습니다.
 

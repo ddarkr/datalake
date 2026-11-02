@@ -506,6 +506,10 @@ test('Claude native ownership suppresses transcript usage but retains tools and 
   await run('SessionStart', 1000);
   await appendFile(transcript, JSON.stringify(record()) + '\n');
   await run('UserPromptSubmit', 1100, { prompt_id: 'prompt_1', prompt: secret });
+  for (const ignored of [{ index: 1 }, { final: true }, { delta: '' }]) {
+    await run('MessageDisplay', 1200, { prompt_id: 'prompt_1', turn_id: 'turn_1',
+      message_id: 'message_1', index: 0, final: false, delta: secret, ...ignored });
+  }
   await run('MessageDisplay', 1300, { prompt_id: 'prompt_1', turn_id: 'turn_1', message_id: 'message_1', index: 0, final: false, delta: secret });
   assert.equal(output.length, 0);
   await run('PreToolUse', 1400, { tool_use_id: 'tool_1', tool_name: 'Read' });
@@ -521,16 +525,19 @@ test('Claude native ownership suppresses transcript usage but retains tools and 
 });
 
 test('Claude omits ambiguous display batches and missing associations without inferring human origin', async t => {
-  for (const variant of ['final', 'empty', 'missing-prompt', 'mismatch', 'overlap', 'late-index']) {
+  for (const variant of ['final', 'empty', 'missing-prompt', 'mismatch', 'overlap', 'late-index',
+    'missing-display-prompt', 'missing-turn', 'missing-message', 'non-string']) {
     const stateRoot = await sandbox(t), { output, telemetry } = direct();
     const run = (hook_event_name, now, extra = {}) => handleHook({ session_id: 'session_1', hook_event_name, ...extra },
       { telemetry, stateRoot, now, context: async () => ({}) });
     await run('SessionStart', 1000);
     await run('UserPromptSubmit', 1100, variant === 'missing-prompt' ? {} : { prompt_id: 'prompt_1' });
     if (variant === 'overlap') await run('UserPromptSubmit', 1150, { prompt_id: 'prompt_2' });
-    await run('MessageDisplay', 1200, { prompt_id: variant === 'mismatch' ? 'other' : 'prompt_1',
-      turn_id: 'turn_1', message_id: 'message_1', index: variant === 'late-index' ? 1 : 0,
-      final: variant === 'final', delta: variant === 'empty' ? '' : secret });
+    await run('MessageDisplay', 1200, { prompt_id: variant === 'missing-display-prompt' ? undefined : variant === 'mismatch' ? 'other' : 'prompt_1',
+      turn_id: variant === 'missing-turn' ? undefined : 'turn_1',
+      message_id: variant === 'missing-message' ? undefined : 'message_1',
+      index: variant === 'late-index' ? 1 : 0, final: variant === 'final',
+      delta: variant === 'non-string' ? {} : variant === 'empty' ? '' : secret });
     await run('Stop', 1300);
     assert.equal(output.length, 0, variant);
   }
