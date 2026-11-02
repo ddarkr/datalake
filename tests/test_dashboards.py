@@ -65,6 +65,27 @@ def test_can_fleet_shared_path_counts_keep_range_and_absence():
         assert db.execute(query).fetchone() == (2, None)
 
 
+def test_dbc_shared_counts_preserve_can_absence_and_observed_zero():
+    dashboard = json.loads(_grafana_configs()["grafana-dash-dbc-health"]["content"])
+    panel = next(p for p in dashboard["panels"] if p["id"] == 2)
+    query = panel["targets"][0]["rawSql"].replace(
+        "$$__timeFilter(event_time)", "event_time BETWEEN 1000 AND 2000")
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE vehicle_signal (event_time INTEGER, source TEXT, "
+                   "vehicle_firmware TEXT, dbc_primary_commit TEXT, "
+                   "dbc_supplemental_commit TEXT, dbc_override_version TEXT, unit TEXT)")
+        assert db.execute(query).fetchone() == (None, None, None)
+        db.execute("INSERT INTO vehicle_signal VALUES (1000, 'fleet', NULL, NULL, NULL, NULL, NULL)")
+        assert db.execute(query).fetchone() == (1, None, 1)
+        db.execute("INSERT INTO vehicle_signal VALUES (2000, 'can', 'fw', 'primary', NULL, 'override', 'km/h')")
+        assert db.execute(query).fetchone() == (1, 0, 1)
+        db.executemany("INSERT INTO vehicle_signal VALUES (?, ?, ?, ?, ?, ?, ?)", [
+            (1500, "can", "", "primary", "", "", ""),
+            (2001, "can", None, None, None, None, None),
+        ])
+        assert db.execute(query).fetchone() == (2, 1, 2)
+
+
 def test_overview_minute_aggregation_dedupe_status_and_window():
     dashboard = json.loads(_grafana_configs()["grafana-dash-overview"]["content"])
     panel = next(p for p in dashboard["panels"] if p["id"] == 7)
@@ -2624,6 +2645,7 @@ def test_analysis_input_states_keep_boundary_and_invalid_transition():
 if __name__ == "__main__":
     test_dashboards_require_manual_refresh_and_do_not_discover_raw_selectors()
     test_can_fleet_shared_path_counts_keep_range_and_absence()
+    test_dbc_shared_counts_preserve_can_absence_and_observed_zero()
     test_overview_minute_aggregation_dedupe_status_and_window()
     test_overview_coverage_keeps_selected_and_historical_times_separate()
     test_analysis_input_latest_preserves_invalid_and_scope_identity()

@@ -17,6 +17,7 @@ import sys
 import urllib.parse
 from http.server import HTTPServer
 from unittest.mock import patch
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -312,6 +313,42 @@ class FileImporterBehavior(unittest.TestCase):
         (directory / "serial_chunks.jsonl").write_bytes(body)
         (directory / "serial_chunks.jsonl.committed").write_bytes(str(len(body)).encode())
         return body
+
+    def test_idle_preflight_and_capture_error_recovery(self):
+        fix = _Fixture(self)
+        first = _line(0, b"0")
+        self._session(fix, "s1", [first], capture=_capture())
+        importer = FileImporter(fix.archive)
+        self.assertTrue(importer.import_once())
+        self.assertFalse(importer.import_once())
+        statements, connections = [], []
+        connect = fix.archive.connect
+
+        @contextmanager
+        def traced_connect():
+            with connect() as conn:
+                connections.append(conn)
+                conn.set_trace_callback(statements.append)
+                yield conn
+
+        with patch.object(fix.archive, "connect", side_effect=traced_connect):
+            self.assertFalse(importer.import_once())
+        self.assertEqual(len(connections), 1)
+        self.assertFalse(any(sql.lstrip().upper().startswith("DELETE") for sql in statements))
+
+        directory = fix.store.root / "synthetic" / "fixture" / "s1"
+        (directory / "capture.json").write_bytes(b"invalid")
+        self.assertFalse(importer.import_once())
+        self.assertEqual(importer.errors()[0]["file"], "capture.json")
+        second = _line(1, b"1")
+        (directory / SERIAL_FILE).write_bytes(first + second)
+        (directory / (SERIAL_FILE + ".committed")).write_bytes(
+            str(len(first + second)).encode())
+        (directory / "capture.json").write_bytes(_capture())
+        self.assertTrue(importer.import_once())
+        self.assertEqual(importer.errors(), [])
+        with fix.archive.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 2)
 
     def test_bounded_reads_discovery_fairness_and_restart(self):
         fix = _Fixture(self)

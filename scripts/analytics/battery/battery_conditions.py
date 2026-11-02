@@ -483,14 +483,8 @@ def exposure_s(pairs, predicate, max_gap_ns, barriers=()):
         if dt < 0 or dt > max_gap_ns:
             rejected += 1
             continue
-        blocked = False
-        for barrier in blockers:
-            if t0 < barrier < t1:
-                blocked = True
-                break
-            if barrier >= t1:
-                break
-        if blocked:
+        bidx = bisect_right(blockers, t0)
+        if bidx < len(blockers) and blockers[bidx] < t1:
             rejected += 1
             continue
         try:
@@ -564,14 +558,8 @@ def id_stats(id_pairs, max_gap_ns, barriers=()):
         dt = t1 - t0
         if dt < 0 or dt > max_gap_ns:
             break
-        blocked = False
-        for barrier in blockers:
-            if t0 < barrier < t1:
-                blocked = True
-                break
-            if barrier >= t1:
-                break
-        if blocked:
+        bidx = bisect_right(blockers, t0)
+        if bidx < len(blockers) and blockers[bidx] < t1:
             break
         persistence += dt
     return {"switches": switches, "persistence_s": persistence / 1e9,
@@ -1608,6 +1596,7 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
         else:
             run = [latest]
             stop = None
+            blockers = sorted(therm_bar)
             for idx in range(len(therm_pts) - 1, 0, -1):
                 cur = therm_pts[idx]
                 before = therm_pts[idx - 1]
@@ -1621,7 +1610,8 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
                     gaps_rejected[0] += 1
                     stop = "gap_exceeded"
                     break
-                if any(before["t"] < b < cur["t"] for b in therm_bar):
+                bidx = bisect_right(blockers, before["t"])
+                if bidx < len(blockers) and blockers[bidx] < cur["t"]:
                     gaps_rejected[0] += 1
                     stop = "gap_exceeded:barrier"
                     break
@@ -1799,6 +1789,7 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
                          revision=rev("iso_trend", "sparse")))
     else:
         run = [iso_pts[-1]]
+        blockers = sorted(iso_bar)
         for idx in range(len(iso_pts) - 1, 0, -1):
             t0, _ = iso_pts[idx - 1]
             t1, _ = iso_pts[idx]
@@ -1806,7 +1797,8 @@ def _analyze_scope(scope, ordered, window, params, thresholds, thresh_errors,
             if dt < 0 or dt > gap:
                 gaps_rejected[0] += 1
                 break
-            if any(t0 < b < t1 for b in iso_bar):
+            bidx = bisect_right(blockers, t0)
+            if bidx < len(blockers) and blockers[bidx] < t1:
                 gaps_rejected[0] += 1
                 break
             run.append(iso_pts[idx - 1])

@@ -115,7 +115,7 @@ services:
     - server
     cpus: ${AGG_CPUS:-1.0}
     labels:
-      datalake.aggregate-revision: '45'
+      datalake.aggregate-revision: '48'
     depends_on:
       greptimedb:
         condition: service_started
@@ -314,7 +314,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.dashboard-revision: '63'
+      datalake.dashboard-revision: '64'
     depends_on:
       db-schema:
         condition: service_completed_successfully
@@ -428,7 +428,7 @@ services:
     profiles:
     - server
     labels:
-      datalake.storage-metrics-revision: '8'
+      datalake.storage-metrics-revision: '9'
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -474,7 +474,7 @@ services:
     profiles:
     - backup
     labels:
-      datalake.backup-revision: '8'
+      datalake.backup-revision: '9'
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -528,7 +528,7 @@ services:
     profiles:
     - backup
     labels:
-      datalake.backup-revision: '8'
+      datalake.backup-revision: '10'
     depends_on:
       backup-deps:
         condition: service_completed_successfully
@@ -594,7 +594,7 @@ services:
     profiles:
     - vehicle
     labels:
-      datalake.raw-recorder-revision: '5'
+      datalake.raw-recorder-revision: '6'
     working_dir: /app
     command:
     - /opt/venv/bin/python
@@ -836,7 +836,7 @@ services:
     - fleet
     restart: unless-stopped
     labels:
-      datalake.recorder-revision: '8'
+      datalake.recorder-revision: '9'
     stop_grace_period: 30s
     depends_on:
       fleet-deps:
@@ -996,7 +996,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '20'
+      datalake.can-receiver-revision: '21'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -1022,7 +1022,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '20'
+      datalake.can-receiver-revision: '21'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -1072,7 +1072,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '20'
+      datalake.can-receiver-revision: '21'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -5222,9 +5222,9 @@ configs:
               if cols is None:
                   raise SqlError("ai metric columns unprovable for " + table)
               ids = sorted(sids)
-              batches = [(ids[i:i + 64], []) for i in range(0, len(ids), 64)]
-              batches += [([], day_list[i:i + 64])
-                          for i in range(0, len(day_list), 64)]
+              batches = [(ids[i:i + 64],
+                          day_list[max(0, i - len(ids)):max(0, i + 64 - len(ids))])
+                         for i in range(0, len(ids) + len(day_list), 64)]
               table_rows = set()
               for batch_ids, batch_days in batches:
                   where = _ai_metric_where(table, cols, batch_ids, batch_days)
@@ -6695,7 +6695,8 @@ configs:
                   terminal_seen = False
                   try:
                       import tempfile
-                      stream_file = tempfile.TemporaryFile(prefix="flight-ipc-")
+                      stream_file = tempfile.SpooledTemporaryFile(
+                          max_size=1024 * 1024, mode="w+b", prefix="flight-ipc-")
                       for frame in frames:
                           if terminal_seen:
                               raise FlightError("frame after terminal watermark proof")
@@ -6714,6 +6715,9 @@ configs:
                               raise FlightError("data frame carries app_metadata")
                           if not header:
                               raise FlightError("data frame has empty IPC header")
+                          # Spill before a large frame is copied into the memory buffer.
+                          if stream_file.tell() + 8 + len(header) + len(body) > 1024 * 1024:
+                              stream_file.rollover()
                           stream_file.write(
                               struct.pack("<II", 0xFFFFFFFF, len(header))
                               + header + body)
@@ -10202,14 +10206,8 @@ configs:
               if dt < 0 or dt > max_gap_ns:
                   rejected += 1
                   continue
-              blocked = False
-              for barrier in blockers:
-                  if t0 < barrier < t1:
-                      blocked = True
-                      break
-                  if barrier >= t1:
-                      break
-              if blocked:
+              bidx = bisect_right(blockers, t0)
+              if bidx < len(blockers) and blockers[bidx] < t1:
                   rejected += 1
                   continue
               try:
@@ -10283,14 +10281,8 @@ configs:
               dt = t1 - t0
               if dt < 0 or dt > max_gap_ns:
                   break
-              blocked = False
-              for barrier in blockers:
-                  if t0 < barrier < t1:
-                      blocked = True
-                      break
-                  if barrier >= t1:
-                      break
-              if blocked:
+              bidx = bisect_right(blockers, t0)
+              if bidx < len(blockers) and blockers[bidx] < t1:
                   break
               persistence += dt
           return {"switches": switches, "persistence_s": persistence / 1e9,
@@ -11327,6 +11319,7 @@ configs:
               else:
                   run = [latest]
                   stop = None
+                  blockers = sorted(therm_bar)
                   for idx in range(len(therm_pts) - 1, 0, -1):
                       cur = therm_pts[idx]
                       before = therm_pts[idx - 1]
@@ -11340,7 +11333,8 @@ configs:
                           gaps_rejected[0] += 1
                           stop = "gap_exceeded"
                           break
-                      if any(before["t"] < b < cur["t"] for b in therm_bar):
+                      bidx = bisect_right(blockers, before["t"])
+                      if bidx < len(blockers) and blockers[bidx] < cur["t"]:
                           gaps_rejected[0] += 1
                           stop = "gap_exceeded:barrier"
                           break
@@ -11518,6 +11512,7 @@ configs:
                                revision=rev("iso_trend", "sparse")))
           else:
               run = [iso_pts[-1]]
+              blockers = sorted(iso_bar)
               for idx in range(len(iso_pts) - 1, 0, -1):
                   t0, _ = iso_pts[idx - 1]
                   t1, _ = iso_pts[idx]
@@ -11525,7 +11520,8 @@ configs:
                   if dt < 0 or dt > gap:
                       gaps_rejected[0] += 1
                       break
-                  if any(t0 < b < t1 for b in iso_bar):
+                  bidx = bisect_right(blockers, t0)
+                  if bidx < len(blockers) and blockers[bidx] < t1:
                       gaps_rejected[0] += 1
                       break
                   run.append(iso_pts[idx - 1])
@@ -15643,15 +15639,10 @@ configs:
           for tstamp, qval in q_series:
               if window[1] is not None and tstamp > window[1]:
                   break
-              best = None
-              for v_t, v_v in vol_pairs:
-                  if v_t <= tstamp and tstamp - v_t <= dcr_cal["max_skew_ns"]:
-                      best = (v_t, v_v)
-                  elif v_t > tstamp:
-                      break
-              if best is None:
+              idx = bisect.bisect_right(vol_pairs, tstamp, key=lambda p: p[0]) - 1
+              if idx < 0 or tstamp - vol_pairs[idx][0] > dcr_cal["max_skew_ns"]:
                   continue
-              v_t, vval = best
+              v_t, vval = vol_pairs[idx]
               if any(v_t < b <= tstamp for b in vol_barriers):
                   continue
               if any(v_t < b <= tstamp for b in cur_barriers):
@@ -20776,9 +20767,9 @@ configs:
     content: |
       {"uid":"datalake-vehicle-dbc-health","title":"수집 진단 · DBC","tags":["datalake","vehicle","diagnostics"],"timezone":"Asia/Seoul","schemaVersion":39,"version":9,"time":{"from":"now-30d","to":"now"},"links":[{"title":"배터리","type":"link","url":"/d/datalake-vehicle-battery","includeVars":true,"keepTime":true,"targetBlank":false},{"title":"차량 개요","type":"link","url":"/d/datalake-vehicle-overview","includeVars":true,"keepTime":true,"targetBlank":false},{"title":"충전","type":"link","url":"/d/datalake-vehicle-charging","includeVars":true,"keepTime":true,"targetBlank":false},{"title":"주행","type":"link","url":"/d/datalake-vehicle-drives","includeVars":true,"keepTime":true,"targetBlank":false},{"title":"수집 진단 · CAN/VSS","type":"link","url":"/d/datalake-vehicle-can-vss","includeVars":true,"keepTime":true,"targetBlank":false}],"description":"엔지니어링 진단용입니다. DBC 해석 계보, 원시 기록·업로드 상태, 검증 결과, CAN/Fleet 비교를 확인합니다.","refresh":"","panels":[
       {"id":1,"type":"table","title":"해석 버전 계보","description":"차량/수집 경로/해석 버전 계보입니다. 보조 커밋은 해당 DBC를 썼을 때만 있으며, 대체 오버라이드는 버전과 선택적 커밋을 보고합니다. 원본 산출물 해시는 불변 생성 매니페스트에 있습니다.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT vehicle, source, decode_epoch, vehicle_firmware, dbc_primary_commit, dbc_supplemental_commit, dbc_override_version, dbc_override_commit, mapping_revision, collector_version, COUNT(*) AS rows, CAST(MIN(event_time) AS TIMESTAMP(6)) AS first_seen, CAST(MAX(event_time) AS TIMESTAMP(6)) AS last_seen FROM vehicle_signal WHERE $$__timeFilter(event_time) GROUP BY vehicle, source, decode_epoch, vehicle_firmware, dbc_primary_commit, dbc_supplemental_commit, dbc_override_version, dbc_override_commit, mapping_revision, collector_version ORDER BY decode_epoch LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true,"queryText":"SELECT vehicle, source, decode_epoch, vehicle_firmware, dbc_primary_commit, dbc_supplemental_commit, dbc_override_version, dbc_override_commit, mapping_revision, collector_version, COUNT(*) AS rows, CAST(MIN(event_time) AS TIMESTAMP(6)) AS first_seen, CAST(MAX(event_time) AS TIMESTAMP(6)) AS last_seen FROM vehicle_signal WHERE $$__timeFilter(event_time) GROUP BY vehicle, source, decode_epoch, vehicle_firmware, dbc_primary_commit, dbc_supplemental_commit, dbc_override_version, dbc_override_commit, mapping_revision, collector_version ORDER BY decode_epoch LIMIT 500"}],"fieldConfig":{"defaults":{},"overrides":[{"matcher":{"id":"byName","options":"collector_version"},"properties":[{"id":"displayName","value":"수집기 버전"}]},{"matcher":{"id":"byName","options":"dbc_override_commit"},"properties":[{"id":"displayName","value":"DBC 대체 정의 커밋"}]},{"matcher":{"id":"byName","options":"dbc_override_version"},"properties":[{"id":"displayName","value":"DBC 대체 정의 버전"}]},{"matcher":{"id":"byName","options":"dbc_primary_commit"},"properties":[{"id":"displayName","value":"기본 DBC 커밋"}]},{"matcher":{"id":"byName","options":"dbc_supplemental_commit"},"properties":[{"id":"displayName","value":"보조 DBC 커밋"}]},{"matcher":{"id":"byName","options":"decode_epoch"},"properties":[{"id":"displayName","value":"해석 버전"}]},{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"first_seen"},"properties":[{"id":"displayName","value":"첫 관측"}]},{"matcher":{"id":"byName","options":"last_seen"},"properties":[{"id":"displayName","value":"마지막 관측"}]},{"matcher":{"id":"byName","options":"mapping_revision"},"properties":[{"id":"displayName","value":"신호 매핑 버전"}]},{"matcher":{"id":"byName","options":"rows"},"properties":[{"id":"displayName","value":"저장 행"}]},{"matcher":{"id":"byName","options":"source"},"properties":[{"id":"displayName","value":"수집원"},{"id":"mappings","value":[{"type":"value","options":{"OTel spans":{"text":"OTel 스팬"},"OTel logs":{"text":"OTel 로그"},"Vehicle signals":{"text":"차량 신호"},"AI sessions":{"text":"AI 세션"},"Vehicle events":{"text":"차량 이벤트"}}}]}]},{"matcher":{"id":"byName","options":"vehicle"},"properties":[{"id":"displayName","value":"차량"}]},{"matcher":{"id":"byName","options":"vehicle_firmware"},"properties":[{"id":"displayName","value":"차량 펌웨어"}]}]},"options":{"showHeader":true},"gridPos":{"h":8,"w":24,"x":0,"y":0}},
-      {"id":2,"type":"stat","title":"펌웨어 정보가 없는 행","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(CASE WHEN NULLIF(vehicle_firmware, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_firmware FROM vehicle_signal WHERE $$__timeFilter(event_time)","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true,"queryText":"SELECT SUM(CASE WHEN NULLIF(vehicle_firmware, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_firmware FROM vehicle_signal WHERE $$__timeFilter(event_time)"}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"rows_no_firmware"},"properties":[{"id":"displayName","value":"펌웨어 정보 없는 행"}]},{"matcher":{"id":"byName","options":"vehicle_firmware"},"properties":[{"id":"displayName","value":"차량 펌웨어"}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":8,"x":0,"y":8}},
-      {"id":3,"type":"stat","title":"DBC 출처가 없는 CAN 행","description":"선택 기간 CAN 행 중 DBC 출처가 없는 행 수입니다. Fleet 행은 DBC 판정에서 제외하며 출처 누락이 곧 해석 실패는 아닙니다.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(CASE WHEN (NULLIF(dbc_primary_commit, '') IS NULL OR (NULLIF(dbc_supplemental_commit, '') IS NULL AND NULLIF(dbc_override_version, '') IS NULL)) THEN 1 ELSE 0 END) AS rows_no_dbc FROM vehicle_signal WHERE $$__timeFilter(event_time) AND source = 'can'","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"dbc_override_version"},"properties":[{"id":"displayName","value":"DBC 대체 정의 버전"}]},{"matcher":{"id":"byName","options":"dbc_primary_commit"},"properties":[{"id":"displayName","value":"기본 DBC 커밋"}]},{"matcher":{"id":"byName","options":"dbc_supplemental_commit"},"properties":[{"id":"displayName","value":"보조 DBC 커밋"}]},{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"rows_no_dbc"},"properties":[{"id":"displayName","value":"DBC 출처 없는 행"}]},{"matcher":{"id":"byName","options":"source"},"properties":[{"id":"displayName","value":"수집원"},{"id":"mappings","value":[{"type":"value","options":{"OTel spans":{"text":"OTel 스팬"},"OTel logs":{"text":"OTel 로그"},"Vehicle signals":{"text":"차량 신호"},"AI sessions":{"text":"AI 세션"},"Vehicle events":{"text":"차량 이벤트"}}}]}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":8,"x":8,"y":8}},
-      {"id":4,"type":"stat","title":"단위 정보가 없는 행","description":"단위가 없는 플래그는 정상일 수 있습니다.","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(CASE WHEN NULLIF(unit, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_unit FROM vehicle_signal WHERE $$__timeFilter(event_time)","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true,"queryText":"SELECT SUM(CASE WHEN NULLIF(unit, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_unit FROM vehicle_signal WHERE $$__timeFilter(event_time)"}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"rows_no_unit"},"properties":[{"id":"displayName","value":"단위 정보 없는 행"}]},{"matcher":{"id":"byName","options":"unit"},"properties":[{"id":"displayName","value":"원본 단위"}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":8,"x":16,"y":8}},
+      {"id":2,"type":"stat","title":"펌웨어 정보가 없는 행","datasource":{"type":"mysql","uid":"greptime-mysql"},"targets":[{"refId":"A","format":"table","rawSql":"SELECT SUM(CASE WHEN NULLIF(vehicle_firmware, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_firmware, SUM(CASE WHEN source = 'can' THEN CASE WHEN (NULLIF(dbc_primary_commit, '') IS NULL OR (NULLIF(dbc_supplemental_commit, '') IS NULL AND NULLIF(dbc_override_version, '') IS NULL)) THEN 1 ELSE 0 END END) AS rows_no_dbc, SUM(CASE WHEN NULLIF(unit, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_unit FROM vehicle_signal WHERE $$__timeFilter(event_time)","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true,"queryText":"SELECT SUM(CASE WHEN NULLIF(vehicle_firmware, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_firmware, SUM(CASE WHEN source = 'can' THEN CASE WHEN (NULLIF(dbc_primary_commit, '') IS NULL OR (NULLIF(dbc_supplemental_commit, '') IS NULL AND NULLIF(dbc_override_version, '') IS NULL)) THEN 1 ELSE 0 END END) AS rows_no_dbc, SUM(CASE WHEN NULLIF(unit, '') IS NULL THEN 1 ELSE 0 END) AS rows_no_unit FROM vehicle_signal WHERE $$__timeFilter(event_time)"}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"rows_no_firmware"},"properties":[{"id":"displayName","value":"펌웨어 정보 없는 행"}]},{"matcher":{"id":"byName","options":"vehicle_firmware"},"properties":[{"id":"displayName","value":"차량 펌웨어"}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":8,"x":0,"y":8},"transformations":[{"id":"filterFieldsByName","options":{"include":{"names":["rows_no_firmware"]}}}]},
+      {"id":3,"type":"stat","title":"DBC 출처가 없는 CAN 행","description":"선택 기간 CAN 행 중 DBC 출처가 없는 행 수입니다. Fleet 행은 DBC 판정에서 제외하며 출처 누락이 곧 해석 실패는 아닙니다.","datasource":{"type":"datasource","uid":"-- Dashboard --"},"targets":[{"refId":"A","datasource":{"type":"datasource","uid":"-- Dashboard --"},"panelId":2,"withTransforms":false}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"dbc_override_version"},"properties":[{"id":"displayName","value":"DBC 대체 정의 버전"}]},{"matcher":{"id":"byName","options":"dbc_primary_commit"},"properties":[{"id":"displayName","value":"기본 DBC 커밋"}]},{"matcher":{"id":"byName","options":"dbc_supplemental_commit"},"properties":[{"id":"displayName","value":"보조 DBC 커밋"}]},{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"rows_no_dbc"},"properties":[{"id":"displayName","value":"DBC 출처 없는 행"}]},{"matcher":{"id":"byName","options":"source"},"properties":[{"id":"displayName","value":"수집원"},{"id":"mappings","value":[{"type":"value","options":{"OTel spans":{"text":"OTel 스팬"},"OTel logs":{"text":"OTel 로그"},"Vehicle signals":{"text":"차량 신호"},"AI sessions":{"text":"AI 세션"},"Vehicle events":{"text":"차량 이벤트"}}}]}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":8,"x":8,"y":8},"transformations":[{"id":"filterFieldsByName","options":{"include":{"names":["rows_no_dbc"]}}}]},
+      {"id":4,"type":"stat","title":"단위 정보가 없는 행","description":"단위가 없는 플래그는 정상일 수 있습니다.","datasource":{"type":"datasource","uid":"-- Dashboard --"},"targets":[{"refId":"A","datasource":{"type":"datasource","uid":"-- Dashboard --"},"panelId":2,"withTransforms":false}],"fieldConfig":{"defaults":{"noValue":"기록 없음","mappings":[{"type":"special","options":{"match":"null","result":{"text":"기록 없음","color":"gray"}}}]},"overrides":[{"matcher":{"id":"byName","options":"event_time"},"properties":[{"id":"displayName","value":"관측 시각"}]},{"matcher":{"id":"byName","options":"rows_no_unit"},"properties":[{"id":"displayName","value":"단위 정보 없는 행"}]},{"matcher":{"id":"byName","options":"unit"},"properties":[{"id":"displayName","value":"원본 단위"}]}]},"options":{"colorMode":"none","reduceOptions":{"calcs":["lastNotNull"],"fields":"","values":false},"orientation":"auto","textMode":"auto"},"gridPos":{"h":8,"w":8,"x":16,"y":8},"transformations":[{"id":"filterFieldsByName","options":{"include":{"names":["rows_no_unit"]}}}]},
       {"id":10,"type":"table","title":"CAN 신호별 품질·단위 (범위 내)","description":"선택 기간 CAN 수집의 정확한 경로·원본 신호·단위·품질별 행 수와 첫/마지막 관측입니다. Fleet 행은 포함하지 않습니다.","datasource":{"type":"mysql","uid":"greptime-mysql"},"gridPos":{"h":10,"w":24,"x":0,"y":16},"fieldConfig":{"defaults":{"noValue":"기록 없음"},"overrides":[]},"targets":[{"refId":"A","format":"table","rawSql":"SELECT path, source_field, unit, quality, COUNT(*) AS rows, CAST(MIN(event_time) AS TIMESTAMP(6)) AS first_seen, CAST(MAX(event_time) AS TIMESTAMP(6)) AS last_seen FROM vehicle_signal WHERE $$__timeFilter(event_time) AND source = 'can' GROUP BY path, source_field, unit, quality ORDER BY path, quality LIMIT 500","datasource":{"type":"mysql","uid":"greptime-mysql"},"rawQuery":true}]},
       {"id":5,"type":"text","title":"검증 범위","fieldConfig":{"defaults":{},"overrides":[]},"options":{"content":"원시 기록기 :9102는 청크 확정마다 스풀/유실/마무리 상태와 can_validation_*을 보고합니다. 검증은 해시가 확인된 해당 해석 버전 DBC를 쓰며, 체크섬·예상 신호·상호 신호 검사는 CAN_VALIDATION_* 규칙을 명시해야 합니다. 설정하지 않은 검사는 없는 것이지 정상 0이 아닙니다. 업로더 :9103은 로컬 적체, 검증된 업로드, 실제 버킷 현황을 보고합니다. VSS :9104는 내구성 있는 아웃박스 전달을 보고합니다. VEHICLE_METRICS_TARGETS를 닿을 수 있는 Pi/Tailnet 주소로 두세요. 비어 있으면 차량 수집을 하지 않습니다. 검증 라벨은 차량과 해석 버전을 가리키며, 정식 계보와 불변 매니페스트가 기준입니다. 원시 스풀/업로드·VSS·검증 계열이 비어 있으면 미설정 부재이며 실패도 0도 아닙니다.","mode":"markdown"},"gridPos":{"h":8,"w":24,"x":0,"y":26}},
       {"id":6,"type":"table","title":"원시 스풀/업로드 (Prom 즉시값; 차량 수집 선택 수집)","description":"차량 수집 작업 vehicle-raw-recorder(:9102)와 vehicle-raw-uploader(:9103)의 raw_recorder_*/raw_uploader_* 계열을 그대로 조회하며, VEHICLE_METRICS_TARGETS(비어 있으면 수집 안 함)가 구동합니다. 없으면 미설정(부재)이지 0도 장애도 아닙니다.","datasource":{"type":"prometheus","uid":"greptime-prom"},"targets":[{"refId":"A","expr":"{__name__=~\"raw_recorder_.*|raw_uploader_.*\",job=~\"vehicle-raw-recorder|vehicle-raw-uploader\"}","format":"table","instant":true,"datasource":{"type":"prometheus","uid":"greptime-prom"}}],"fieldConfig":{"defaults":{},"overrides":[{"matcher":{"id":"byName","options":"Time"},"properties":[{"id":"displayName","value":"시각"}]},{"matcher":{"id":"byName","options":"Value"},"properties":[{"id":"displayName","value":"측정값"}]},{"matcher":{"id":"byName","options":"instance"},"properties":[{"id":"displayName","value":"인스턴스"}]},{"matcher":{"id":"byName","options":"job"},"properties":[{"id":"displayName","value":"수집 작업"}]}]},"options":{"showHeader":true},"gridPos":{"h":8,"w":24,"x":0,"y":34}},
@@ -22847,7 +22838,7 @@ configs:
           corrupt COMPLETE -> generation marked corrupt (never a deletion target,
           never counted as recovery); missing sidecar/manifest/SST bytes -> incomplete.
           A tar whose LIST size differs from COMPLETE is also incomplete.
-          Returns (generations, problems) sorted oldest-first by COMPLETE created_utc."""
+          Returns (generations, pool_objects), sorted oldest-first by COMPLETE created_utc."""
           if not bp or not bp.strip("/"):
               raise IOError("backup prefix missing or empty (refusing to scope deletions)")
           objs = s3_list_all(client, bucket, bp)
@@ -22859,8 +22850,9 @@ configs:
               bid = rel.split("/")[0]
               if bid:
                   by_id.setdefault(bid, []).append(o)
+          pool_objects = [o for o in objs if o["Key"].startswith(pool_prefix(bp))]
           pool_sizes = {o["Key"][len(pool_prefix(bp)):]: o.get("Size", 0)
-                        for o in objs if o["Key"].startswith(pool_prefix(bp))}
+                        for o in pool_objects}
           if now_ns is None:
               now_ns = time.time_ns()
           gens = []
@@ -22936,7 +22928,7 @@ configs:
                                pool_bytes=pool_bytes,
                                control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
           gens.sort(key=lambda g: (g["created_ns"] is None, g["created_ns"] or 0, g["backup_id"]))
-          return gens, None
+          return gens, pool_objects
 
 
       def retention_plan(gens, settings, now_ns=None):
@@ -23118,8 +23110,8 @@ configs:
       @pool_serialized
       def reclaim_pool_orphans(client, bucket, bp):
           """Reserved canonical pool keys minus all verified live COMPLETE references."""
-          gens, _ = remote_generations(client, bucket, bp)
-          garbage, reason = pool_gc_plan(client, bucket, bp, gens)
+          gens, pool_objects = remote_generations(client, bucket, bp)
+          garbage, reason = pool_gc_plan(client, bucket, bp, gens, pool_objects)
           if reason:
               raise IOError("pool GC blocked: " + reason)
           targets = [o["Key"] for o in garbage]
@@ -23128,7 +23120,7 @@ configs:
           return len(targets)
 
 
-      def pool_gc_plan(client, bucket, bp, gens, removed_ids=()):
+      def pool_gc_plan(client, bucket, bp, gens, pool_objects, removed_ids=()):
           """Full surviving inventories prove references; auxiliary controls prove their own owner."""
           removed = set(removed_ids)
           referenced = set()
@@ -23140,12 +23132,11 @@ configs:
               if gen["complete"].get("sst_layout") == SHARED_LAYOUT:
                   referenced.update(obj["snapshot_key"] for obj in gen["complete"]["sst"])
           pp = pool_prefix(bp)
-          objects = s3_list_all(client, bucket, pp)
           if any(not re.fullmatch(r"[0-9a-f]{64}(?:\.json)?", o["Key"][len(pp):])
-                 for o in objects):
+                 for o in pool_objects):
               return [], "unknown object in shared SST pool"
           garbage = []
-          for obj in objects:
+          for obj in pool_objects:
               key = obj["Key"]
               data_key = key[:-5] if key.endswith(".json") else key
               if data_key in referenced:
@@ -23193,7 +23184,7 @@ configs:
 
 
       def execute_retention(client, bucket, bp, settings):
-          gens, _ = remote_generations(client, bucket, bp)
+          gens, pool_objects = remote_generations(client, bucket, bp)
           # Resume interrupted retirements first: a RETIRING marker is the
           # durable identity (marker body names the generation; resume
           # validates it, refuses active refs, confirms COMPLETE absence
@@ -23210,7 +23201,7 @@ configs:
                           g["created_ns"] is None
                           or now_ns - g["created_ns"] < settings["grace"] * 1_000_000_000)]
           keep, deletes, skipped = retention_plan(gens, settings, now_ns)
-          garbage, gc_reason = pool_gc_plan(client, bucket, bp, gens,
+          garbage, gc_reason = pool_gc_plan(client, bucket, bp, gens, pool_objects,
                                             [g["backup_id"] for g in deletes + retiring])
           gc_bytes = sum(o.get("Size", 0) for o in garbage)
           expect = sum(g["bytes"] for g in deletes) + gc_bytes
@@ -23242,8 +23233,8 @@ configs:
           for g in deletes:
               retire_generation(client, bucket, bp, g)
           # Re-read surviving inventories after retirement; never delete from a stale plan.
-          survivors, _ = remote_generations(client, bucket, bp)
-          garbage, gc_reason = pool_gc_plan(client, bucket, bp, survivors)
+          survivors, pool_objects = remote_generations(client, bucket, bp)
+          garbage, gc_reason = pool_gc_plan(client, bucket, bp, survivors, pool_objects)
           if gc_reason:
               sys.stdout.write("retention: pool-gc blocked (%s)\n" % gc_reason)
           else:
@@ -23809,10 +23800,17 @@ configs:
           return bk.remote_base(backup_prefix, backup_id)
 
       def write_can_tar(d, name, db_copy, staged_defs, manifest):
-          raw_manifest = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
-          if len(raw_manifest) > bk.CONTROL_CAP:
-              raise IOError("manifest exceeds control size limit (%d bytes)"
-                            % bk.CONTROL_CAP)
+          archive_digest = hashlib.sha256()
+
+          class HashingReader:
+              def __init__(self, raw):
+                  self.raw = raw
+
+              def read(self, size=-1):
+                  data = self.raw.read(size)
+                  archive_digest.update(data)
+                  return data
+
           path = os.path.join(d, name)
           tmp = path + ".tmp"
           try:
@@ -23822,7 +23820,7 @@ configs:
                   info.mode = 0o600
                   info.mtime = int(time.time())
                   with open(db_copy, "rb") as f:
-                      tar.addfile(info, f)
+                      tar.addfile(info, HashingReader(f))
                   dinfo = tarfile.TarInfo(CAN_DEFS)
                   dinfo.type = tarfile.DIRTYPE
                   dinfo.mode = 0o700
@@ -23835,6 +23833,11 @@ configs:
                       fi.mtime = int(time.time())
                       with open(fpath, "rb") as f:
                           tar.addfile(fi, f)
+                  manifest["archive"]["sha256"] = archive_digest.hexdigest()
+                  raw_manifest = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+                  if len(raw_manifest) > bk.CONTROL_CAP:
+                      raise IOError("manifest exceeds control size limit (%d bytes)"
+                                    % bk.CONTROL_CAP)
                   mi = tarfile.TarInfo(CAN_MANIFEST)
                   mi.size = len(raw_manifest)
                   mi.mode = 0o600
@@ -23951,7 +23954,6 @@ configs:
                   if problem is not None:
                       return bk.fail(label + " permissions unsafe (" + problem
                                      + "): refusing", code=2)
-              arch_sha = bk.sha256_file(db_copy)
               manifest = {
                   "tool": TOOL,
                   "backup_id": bid,
@@ -23964,7 +23966,7 @@ configs:
                            "raw_mode": raw_mode,
                            "defs_uid": defs_st.st_uid, "defs_gid": defs_st.st_gid,
                            "defs_mode": defs_mode},
-                  "archive": {"name": CAN_ARCHIVE, "sha256": arch_sha,
+                  "archive": {"name": CAN_ARCHIVE,
                               "size": os.path.getsize(db_copy),
                               "mode": src_mode, "uid": src_uid, "gid": src_gid,
                               "counts": counts},
@@ -24793,8 +24795,8 @@ configs:
               if re.fullmatch(r"[0-9]+", raw or ""):
                   reserve_bytes = int(raw)
           try:
-              db_bytes = os.path.getsize(path)
-              mtime = os.path.getmtime(path)
+              archive_stat = os.stat(path)
+              db_bytes, mtime = archive_stat.st_size, archive_stat.st_mtime
           except OSError:
               return {"datalake_receiver_archive_known": 0,
                       "datalake_receiver_archive_success": 0}
@@ -25787,6 +25789,7 @@ configs:
                       tail = fh.read(1)
               self.terminated = (tail == b"\n") if size else True
               self.torn = False
+              self.sha256 = hashlib.sha256()
 
           def _decode_line(self, line, last):
               if not line.strip():
@@ -25817,9 +25820,11 @@ configs:
               decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
               pending = ""
               over_ws = False
+              self.sha256 = hashlib.sha256()
               with open(self.path, "rb") as fh:
                   while True:
                       chunk = fh.read(_LINE_CHUNK_BYTES)
+                      self.sha256.update(chunk)
                       final = not chunk
                       try:
                           text = decoder.decode(chunk, final)
@@ -26822,7 +26827,7 @@ configs:
           return True
 
 
-      def _write_ingress_sidecar(path, closed_path, _frames=None):
+      def _write_ingress_sidecar(path, closed_path):
           """Copy the exact closed JSONL bytes to a gzipped sealed sidecar, so the
           full per-frame provenance (seq/twall_ns/tcan/DLC/payload) survives even
           though the standard MF4 groups cannot store it. Returns the sha256 of
@@ -26830,16 +26835,26 @@ configs:
           Byte copy only (bounded chunks); no frame list is needed."""
           import gzip
           tmp = path + ".tmp"
+          digest = hashlib.sha256()
+
+          class HashingWriter:
+              def __init__(self, raw):
+                  self.raw = raw
+
+              def write(self, data):
+                  written = self.raw.write(data)
+                  digest.update(memoryview(data)[:written])
+                  return written
+
           with open(closed_path, "rb") as src, open(tmp, "wb") as raw:
-              with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+              with gzip.GzipFile(filename="", mode="wb", fileobj=HashingWriter(raw),
                                  mtime=0) as gz:
                   for chunk in iter(lambda: src.read(1 << 20), b""):
                       gz.write(chunk)
           with open(tmp, "rb") as fh:
               os.fsync(fh.fileno())
-          digest = _sha256_file(tmp)
           os.replace(tmp, path)
-          return digest
+          return digest.hexdigest()
 
 
       def _fsync_dir(path):
@@ -26920,13 +26935,13 @@ configs:
           out = os.path.join(sealed_dir, stem + ".mf4")
           sidecar = os.path.join(sealed_dir, stem + ".ingress.jsonl.gz")
           manifest_path = out + ".manifest.json"
-          ingress_digest = _sha256_file(closed_path)
           capture_id = stem.split("_")[-2] if "_" in stem else ""
           # Crash-resume: a complete verified triple is immutable. If the manifest
           # verifies against the bytes on disk, reuse it; never rebuild or
           # overwrite a verified MF4.
           if os.path.exists(out) and os.path.exists(sidecar) and os.path.exists(
                   manifest_path):
+              ingress_digest = _sha256_file(closed_path)
               try:
                   with open(manifest_path, encoding="utf-8") as fh:
                       man = json.load(fh)
@@ -26974,6 +26989,7 @@ configs:
                   for frame in stream:
                       store.add(frame)
                   torn = stream.torn
+                  ingress_digest = stream.sha256.hexdigest()
               except CorruptSegment:
                   quarantine(spool, closed_path)
                   minc("finalize_errors")
@@ -27048,7 +27064,7 @@ configs:
               with open(stage, "rb") as fh:
                   os.fsync(fh.fileno())
               os.replace(stage, out)
-              sidecar_digest = _write_ingress_sidecar(sidecar, closed_path, store)
+              sidecar_digest = _write_ingress_sidecar(sidecar, closed_path)
               _write_manifest_bounds(manifest_path, nframes, bus, seq_first,
                                      seq_last, tw_first, tw_last, stem, capture_id,
                                      torn, mf4_digest, ingress_digest,
@@ -28799,8 +28815,8 @@ configs:
               if re.fullmatch(r"[0-9]+", raw or ""):
                   reserve_bytes = int(raw)
           try:
-              db_bytes = os.path.getsize(path)
-              mtime = os.path.getmtime(path)
+              archive_stat = os.stat(path)
+              db_bytes, mtime = archive_stat.st_size, archive_stat.st_mtime
           except OSError:
               return {"datalake_receiver_archive_known": 0,
                       "datalake_receiver_archive_success": 0}
@@ -32337,10 +32353,11 @@ configs:
       def prune_seen(conn, older_than_ns, max_seen_limit=MAX_SEEN_IDS):
           """Bound seen_ids table by age and absolute row limit to prevent unbounded disk growth."""
           conn.execute("DELETE FROM seen_ids WHERE seen_at < ?", (older_than_ns,))
-          conn.execute(
-              "DELETE FROM seen_ids WHERE rowid NOT IN ("
-              " SELECT rowid FROM seen_ids ORDER BY seen_at DESC LIMIT ?"
-              ")", (max_seen_limit,))
+          if conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0] > max_seen_limit:
+              conn.execute(
+                  "DELETE FROM seen_ids WHERE rowid NOT IN ("
+                  " SELECT rowid FROM seen_ids ORDER BY seen_at DESC LIMIT ?"
+                  ")", (max_seen_limit,))
           conn.commit()
 
 
@@ -34839,6 +34856,7 @@ configs:
                       tail = fh.read(1)
               self.terminated = (tail == b"\n") if size else True
               self.torn = False
+              self.sha256 = hashlib.sha256()
 
           def _decode_line(self, line, last):
               if not line.strip():
@@ -34869,9 +34887,11 @@ configs:
               decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
               pending = ""
               over_ws = False
+              self.sha256 = hashlib.sha256()
               with open(self.path, "rb") as fh:
                   while True:
                       chunk = fh.read(_LINE_CHUNK_BYTES)
+                      self.sha256.update(chunk)
                       final = not chunk
                       try:
                           text = decoder.decode(chunk, final)
@@ -35874,7 +35894,7 @@ configs:
           return True
 
 
-      def _write_ingress_sidecar(path, closed_path, _frames=None):
+      def _write_ingress_sidecar(path, closed_path):
           """Copy the exact closed JSONL bytes to a gzipped sealed sidecar, so the
           full per-frame provenance (seq/twall_ns/tcan/DLC/payload) survives even
           though the standard MF4 groups cannot store it. Returns the sha256 of
@@ -35882,16 +35902,26 @@ configs:
           Byte copy only (bounded chunks); no frame list is needed."""
           import gzip
           tmp = path + ".tmp"
+          digest = hashlib.sha256()
+
+          class HashingWriter:
+              def __init__(self, raw):
+                  self.raw = raw
+
+              def write(self, data):
+                  written = self.raw.write(data)
+                  digest.update(memoryview(data)[:written])
+                  return written
+
           with open(closed_path, "rb") as src, open(tmp, "wb") as raw:
-              with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+              with gzip.GzipFile(filename="", mode="wb", fileobj=HashingWriter(raw),
                                  mtime=0) as gz:
                   for chunk in iter(lambda: src.read(1 << 20), b""):
                       gz.write(chunk)
           with open(tmp, "rb") as fh:
               os.fsync(fh.fileno())
-          digest = _sha256_file(tmp)
           os.replace(tmp, path)
-          return digest
+          return digest.hexdigest()
 
 
       def _fsync_dir(path):
@@ -35972,13 +36002,13 @@ configs:
           out = os.path.join(sealed_dir, stem + ".mf4")
           sidecar = os.path.join(sealed_dir, stem + ".ingress.jsonl.gz")
           manifest_path = out + ".manifest.json"
-          ingress_digest = _sha256_file(closed_path)
           capture_id = stem.split("_")[-2] if "_" in stem else ""
           # Crash-resume: a complete verified triple is immutable. If the manifest
           # verifies against the bytes on disk, reuse it; never rebuild or
           # overwrite a verified MF4.
           if os.path.exists(out) and os.path.exists(sidecar) and os.path.exists(
                   manifest_path):
+              ingress_digest = _sha256_file(closed_path)
               try:
                   with open(manifest_path, encoding="utf-8") as fh:
                       man = json.load(fh)
@@ -36026,6 +36056,7 @@ configs:
                   for frame in stream:
                       store.add(frame)
                   torn = stream.torn
+                  ingress_digest = stream.sha256.hexdigest()
               except CorruptSegment:
                   quarantine(spool, closed_path)
                   minc("finalize_errors")
@@ -36100,7 +36131,7 @@ configs:
               with open(stage, "rb") as fh:
                   os.fsync(fh.fileno())
               os.replace(stage, out)
-              sidecar_digest = _write_ingress_sidecar(sidecar, closed_path, store)
+              sidecar_digest = _write_ingress_sidecar(sidecar, closed_path)
               _write_manifest_bounds(manifest_path, nframes, bus, seq_first,
                                      seq_last, tw_first, tw_last, stem, capture_id,
                                      torn, mf4_digest, ingress_digest,
@@ -40015,12 +40046,11 @@ configs:
                   conn.commit()
               raise _SourceInvalid(code)
 
-          def _cursor(self, vehicle, collector, session):
-              with self._connect() as conn:
-                  row = conn.execute(
-                      "SELECT meta_json,next_seq,last_t,file_offset FROM file_import_state "
-                      "WHERE vehicle=? AND collector_id=? AND session_id=?",
-                      (vehicle, collector, session)).fetchone()
+          def _cursor(self, conn, vehicle, collector, session):
+              row = conn.execute(
+                  "SELECT meta_json,next_seq,last_t,file_offset FROM file_import_state "
+                  "WHERE vehicle=? AND collector_id=? AND session_id=?",
+                  (vehicle, collector, session)).fetchone()
               if row is None:
                   return {"meta": None, "next_seq": 0, "last_t": None, "file_offset": 0}
               return {"meta": json.loads(row["meta_json"]), "next_seq": row["next_seq"],
@@ -40120,7 +40150,6 @@ configs:
                              str(exc), 0)
               if not capture["ready"]:
                   return False
-              self._clear_error(vehicle, collector, session, CAPTURE_FILE)
               state = self._verified.get((vehicle, collector, session))
               if state is not None and state[1] != capture.get("raw_hash"):
                   del self._verified[(vehicle, collector, session)]
@@ -40128,7 +40157,18 @@ configs:
                       "collector_id": collector, "session_id": session,
                       "started_ns": capture["started_ns"],
                       "vehicle_firmware": capture["firmware"]}
-              cursor = self._cursor(vehicle, collector, session)
+              with self._connect() as conn:
+                  cursor = self._cursor(conn, vehicle, collector, session)
+                  errors = {row["file"]: row for row in conn.execute(
+                      "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
+                      "AND collector_id=? AND session_id=? AND file IN (?,?)",
+                      (vehicle, collector, session, CAPTURE_FILE, SERIAL_FILE))}
+                  if CAPTURE_FILE in errors:
+                      conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
+                                   "AND collector_id=? AND session_id=? AND file=?",
+                                   (vehicle, collector, session, CAPTURE_FILE))
+                      conn.commit()
+                  known = errors.get(SERIAL_FILE)
               prior = cursor["meta"]
               if prior is not None and (
                       not isinstance(prior, dict)
@@ -40163,11 +40203,6 @@ configs:
               if size < committed or cursor["file_offset"] > committed:
                   self._fail(vehicle, collector, session, SERIAL_FILE,
                              "archive_truncated", cursor["file_offset"])
-              with self._connect() as conn:
-                  known = conn.execute(
-                      "SELECT error,fail_offset FROM file_import_errors WHERE vehicle=? "
-                      "AND collector_id=? AND session_id=? AND file=?",
-                      (vehicle, collector, session, SERIAL_FILE)).fetchone()
               # hash_mismatch is metadata-versioned: a corrected capture snapshot
               # must re-enter verification instead of hitting the stale skip.
               if known is not None and known["error"] in _DETERMINISTIC_ERRORS \

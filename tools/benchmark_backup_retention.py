@@ -628,9 +628,7 @@ def retention_eval(bk, client, env, pinned, mode):
             if bk.cmd_retention() != 0:
                 raise RuntimeError("retention enforcement failed")
             measured = client.io_since(mark)
-            generations, error = bk.remote_generations(client, bucket, prefix)
-            if error is not None:
-                raise RuntimeError(str(error))
+            generations, _ = bk.remote_generations(client, bucket, prefix)
             details = {"remaining": [g["backup_id"] for g in generations if g["status"] == "complete"]}
         else:
             guard = bk.shared_pool_lock(client, bucket, prefix) if hasattr(bk, "shared_pool_lock") else contextlib.nullcontext()
@@ -638,15 +636,16 @@ def retention_eval(bk, client, env, pinned, mode):
                 settings, error = bk.retention_settings()
                 if error is not None:
                     raise RuntimeError(str(error))
-                generations, error = bk.remote_generations(client, bucket, prefix)
-                if error is not None:
-                    raise RuntimeError(str(error))
+                generations, pool_objects = bk.remote_generations(client, bucket, prefix)
                 keep, victims, skipped = bk.retention_plan(generations, settings)
                 garbage, gc_reason = [], None
                 if hasattr(bk, "pool_gc_plan"):
                     removed = [g["backup_id"] for g in victims]
                     removed.extend(g["backup_id"] for g in generations if g.get("retiring"))
-                    garbage, gc_reason = bk.pool_gc_plan(client, bucket, prefix, generations, removed)
+                    if pool_objects is None:  # Older baseline API.
+                        garbage, gc_reason = bk.pool_gc_plan(client, bucket, prefix, generations, removed)
+                    else:
+                        garbage, gc_reason = bk.pool_gc_plan(client, bucket, prefix, generations, pool_objects, removed)
                 gc_bytes = sum(obj.get("Size", 0) for obj in garbage)
                 details = {"keep": sorted(keep), "delete_ids": [g["backup_id"] for g in victims],
                            "delete_bytes": sum(before.get(k, 0) for g in victims for k in g["keys"]) + gc_bytes,

@@ -3022,9 +3022,9 @@ def _ai_scoped_metrics(ctx, cfg, tables=None, keys=None, metric_rows=None,
         if cols is None:
             raise SqlError("ai metric columns unprovable for " + table)
         ids = sorted(sids)
-        batches = [(ids[i:i + 64], []) for i in range(0, len(ids), 64)]
-        batches += [([], day_list[i:i + 64])
-                    for i in range(0, len(day_list), 64)]
+        batches = [(ids[i:i + 64],
+                    day_list[max(0, i - len(ids)):max(0, i + 64 - len(ids))])
+                   for i in range(0, len(ids) + len(day_list), 64)]
         table_rows = set()
         for batch_ids, batch_days in batches:
             where = _ai_metric_where(table, cols, batch_ids, batch_days)

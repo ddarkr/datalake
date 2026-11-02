@@ -257,7 +257,8 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
             terminal_seen = False
             try:
                 import tempfile
-                stream_file = tempfile.TemporaryFile(prefix="flight-ipc-")
+                stream_file = tempfile.SpooledTemporaryFile(
+                    max_size=1024 * 1024, mode="w+b", prefix="flight-ipc-")
                 for frame in frames:
                     if terminal_seen:
                         raise FlightError("frame after terminal watermark proof")
@@ -276,6 +277,9 @@ def flight_query(sql, *, endpoint, db, user, password, lower=None,
                         raise FlightError("data frame carries app_metadata")
                     if not header:
                         raise FlightError("data frame has empty IPC header")
+                    # Spill before a large frame is copied into the memory buffer.
+                    if stream_file.tell() + 8 + len(header) + len(body) > 1024 * 1024:
+                        stream_file.rollover()
                     stream_file.write(
                         struct.pack("<II", 0xFFFFFFFF, len(header))
                         + header + body)

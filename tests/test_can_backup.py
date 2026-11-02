@@ -264,6 +264,10 @@ def test_file_mode_roundtrip_exact():
         src_mode = stat.S_IMODE(os.stat(db_path).st_mode)
         assert cb.cmd_backup() == 0
         tar = newest_tar(bdir)
+        with tarfile.open(tar, "r:gz") as archive:
+            manifest = json.load(archive.extractfile("manifest.json"))
+            snapshot = archive.extractfile("raw.sqlite3").read()
+        assert manifest["archive"]["sha256"] == hashlib.sha256(snapshot).hexdigest()
         assert stat.S_IMODE(os.stat(tar).st_mode) == 0o600
         assert cb.cmd_restore() == 0
         got = dump_state(os.path.join(raw_dir, "raw.sqlite3"), defs_dir)

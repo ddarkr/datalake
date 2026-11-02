@@ -462,8 +462,13 @@ class OutboxNonDestructiveOverflowAndBoundedTest(unittest.TestCase):
         conn.commit()
 
         fr.prune_seen(conn, older_than_ns=5, max_seen_limit=10)
-        count = conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0]
-        self.assertLessEqual(count, 10)
+        self.assertEqual(set(conn.execute("SELECT event_id FROM seen_ids")),
+                         {(f"id-{i}",) for i in range(10, 20)})
+        fr.prune_seen(conn, older_than_ns=15, max_seen_limit=10)
+        self.assertEqual(set(conn.execute("SELECT event_id FROM seen_ids")),
+                         {(f"id-{i}",) for i in range(15, 20)})
+        fr.prune_seen(conn, older_than_ns=15, max_seen_limit=0)
+        self.assertEqual(conn.execute("SELECT event_id FROM seen_ids").fetchall(), [])
         conn.close()
 
 

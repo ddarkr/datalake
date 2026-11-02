@@ -38,8 +38,11 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
   SQL 그대로다(아래 재계산 절).
 - 스톡 pyarrow Flight 클라이언트는 Greptime terminal NONE 프레임을
   읽지 못하므로 raw grpcio + 공식 protobuf + pyarrow IPC를 쓴다
-  (`scripts/database/greptime_flight.py`). IPC는 스풀 파일 +
-  `open_stream`으로 dictionary 배치까지 디코드한다. 일반 조회는
+  (`scripts/database/greptime_flight.py`). IPC 스풀은 1 MiB까지 메모리에
+  두고, 다음 프레임이 한도를 넘기면 복사 전에 임시파일로 전환한다.
+  이 한도는 IPC 스풀에만 적용되며 수신 프레임·디코드 결과의 메모리까지
+  제한하지는 않는다. EOF·워터마크 검증 후 `open_stream`으로 dictionary
+  배치까지 디코드한다. 일반 조회는
   max-row를 넘으면 실패하며, 전체 복구의 sink는 같은 값을 청크당
   상한으로 사용한다. 타임스탬프는 int64 ns 정밀도로 읽는다.
 
@@ -73,6 +76,9 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
   dirty day의 전체 계기를 scoped로 다시 읽어 누적 카운터의 기준점과
   손대지 않은 계기를 보존한다. 세션/날짜 범위 한정이며 무제한 전체
   스캔이 아니다.
+- 메트릭 재조회는 세션 ID와 dirty 날짜를 합쳐 최대 64개 조건씩 묶고,
+  같은 배치에서는 기존 OR 조건으로 한 번에 읽는다. 세션의 전체 이력과
+  dirty 날짜의 다른 계기를 보존하며, 배치 사이 중복은 전체 merge에서 제거한다.
 - 테이블 목록과 메타데이터는 같은 pass의 카탈로그 조회 결과를 공유한다.
   다음 pass에서는 새로 조회하므로 테이블 추가·삭제를 계속 발견한다.
 

@@ -3,6 +3,12 @@
 Finalize (`finalize_segment`) and upload preflight (`fail_closed_check`
 via `gunzip_compare`) never build proportional bytes/frame objects.
 
+Normal finalization hashes the original ingress bytes during parsing and the
+compressed bytes during gzip output, without separate hash-only reads.
+Whitespace and salvaged tail bytes remain part of the ingress digest.
+Complete-triple crash recovery still independently hashes existing files;
+MF4 round-trip validation and both uploader guards are unchanged.
+
 ## Budgets
 - `RAW_SPOOL_MAX_BYTES` (default 20 GiB, positive): recursive spool bytes,
   including quarantine and finalization files. Segment admission reserves

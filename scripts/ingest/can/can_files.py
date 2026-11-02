@@ -947,12 +947,11 @@ class FileImporter:
             conn.commit()
         raise _SourceInvalid(code)
 
-    def _cursor(self, vehicle, collector, session):
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT meta_json,next_seq,last_t,file_offset FROM file_import_state "
-                "WHERE vehicle=? AND collector_id=? AND session_id=?",
-                (vehicle, collector, session)).fetchone()
+    def _cursor(self, conn, vehicle, collector, session):
+        row = conn.execute(
+            "SELECT meta_json,next_seq,last_t,file_offset FROM file_import_state "
+            "WHERE vehicle=? AND collector_id=? AND session_id=?",
+            (vehicle, collector, session)).fetchone()
         if row is None:
             return {"meta": None, "next_seq": 0, "last_t": None, "file_offset": 0}
         return {"meta": json.loads(row["meta_json"]), "next_seq": row["next_seq"],
@@ -1052,7 +1051,6 @@ class FileImporter:
                        str(exc), 0)
         if not capture["ready"]:
             return False
-        self._clear_error(vehicle, collector, session, CAPTURE_FILE)
         state = self._verified.get((vehicle, collector, session))
         if state is not None and state[1] != capture.get("raw_hash"):
             del self._verified[(vehicle, collector, session)]
@@ -1060,7 +1058,18 @@ class FileImporter:
                 "collector_id": collector, "session_id": session,
                 "started_ns": capture["started_ns"],
                 "vehicle_firmware": capture["firmware"]}
-        cursor = self._cursor(vehicle, collector, session)
+        with self._connect() as conn:
+            cursor = self._cursor(conn, vehicle, collector, session)
+            errors = {row["file"]: row for row in conn.execute(
+                "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
+                "AND collector_id=? AND session_id=? AND file IN (?,?)",
+                (vehicle, collector, session, CAPTURE_FILE, SERIAL_FILE))}
+            if CAPTURE_FILE in errors:
+                conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
+                             "AND collector_id=? AND session_id=? AND file=?",
+                             (vehicle, collector, session, CAPTURE_FILE))
+                conn.commit()
+            known = errors.get(SERIAL_FILE)
         prior = cursor["meta"]
         if prior is not None and (
                 not isinstance(prior, dict)
@@ -1095,11 +1104,6 @@ class FileImporter:
         if size < committed or cursor["file_offset"] > committed:
             self._fail(vehicle, collector, session, SERIAL_FILE,
                        "archive_truncated", cursor["file_offset"])
-        with self._connect() as conn:
-            known = conn.execute(
-                "SELECT error,fail_offset FROM file_import_errors WHERE vehicle=? "
-                "AND collector_id=? AND session_id=? AND file=?",
-                (vehicle, collector, session, SERIAL_FILE)).fetchone()
         # hash_mismatch is metadata-versioned: a corrected capture snapshot
         # must re-enter verification instead of hitting the stale skip.
         if known is not None and known["error"] in _DETERMINISTIC_ERRORS \

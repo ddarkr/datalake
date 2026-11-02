@@ -81,6 +81,8 @@ GreptimeDB 1.2.1의 [디스크 캐시 분할](https://github.com/GreptimeTeam/gr
 
 계측 요청의 일시적인 연결 오류·timeout·URLError·HTTP 429/5xx는 유효한 최초 관측 이후 연속 두 번까지 허용하며, **세 번째 연속 실패 또는 마지막 유효 관측 이후 60초 초과**이면 중지합니다. 아래 예시는 socket timeout 10초를 유지합니다. 정상 복구 시 기존 series별 기준값을 유지해 공백 중 증가분도 합산하며, 60초를 넘긴 정상 응답도 가능한 증가분을 먼저 합산한 뒤 중지합니다. HTTP 401/403/404, 잘못되거나 누락·오래된·캐시된 계측, 카운터/series 초기화, 인스턴스 변경 및 저장소·예산 이상은 즉시 차단합니다. 최초 관측 전에는 명시적으로 승인한 startup grace만 허용하고 만료 후 첫 실패에 차단합니다. 실패 관측은 일반 lease를 갱신하지 않습니다. 재시도 중에도 기존 주기로 대기하며, 안전한 실패 횟수·마지막 유효 관측의 나이를 journal에 남깁니다. 차단 시 `state.json`에는 예외 원문과 실패 횟수·시각·관측 나이를 보존하되 알림에는 URL·인증정보를 넣지 않습니다.
 
+차단 중에도 매 회차 프로젝트를 다시 조회하되, 실행·일시정지·재시작 중인 컨테이너만 정지 대상으로 삼습니다. 이미 종료된 컨테이너에 정지를 반복 요청하지 않으며, 정지 도중 새로 생성된 컨테이너를 잡는 마지막 재조회와 감시 주기는 유지합니다.
+
 **이 장치는 사업자 청구액이나 엄격한 네트워크 바이트 상한을 보장하지 않습니다.** 감지·종료 지연과 호스트/Docker 장애 동안 추가 다운로드가 가능합니다. 월간 합성 CI 예산을 실제 계정의 허용량으로 사용하지 마세요. 자동 GitOps 동기화도 별도로 중지해야 하며, `redeployAfterSync=false`만으로 재기동을 막을 수는 없습니다.
 
 원본 TTL은 자동으로 줄이지 않습니다. 저장 예산은 `arm` 또는 차단된 상태의 `unblock`에 **새로 측정한 버킷 inventory 바이트**를 `--storage-used-bytes`로 전달해야 시작됩니다. 미확인 값을 0으로 입력하지 마세요. 기존 SDK의 `bucket_inventory()`로 측정할 수 있으며 LIST 비용·동시 쓰기 여부를 먼저 확인하세요. 이 기준값에 native S3 write 증가량을 보수적으로 더하고 삭제량은 빼지 않습니다. 첫 관측·명시적 재바인딩에서는 현재 write counter 전체를 더하므로 기존 객체와 중복 계산될 수 있습니다. 기본 `--storage-limit-bytes`는 1200 GiB이며, 실제 남은 계정 용량이 아닙니다. 저장 예산 도달·write 계측 누락·미확인 기준값은 lease 발급을 막습니다. DB `/data` 볼륨의 여유 공간도 매 관측 확인하며 기본 `--min-free-bytes`는 1 GiB입니다. 폴링·종료 지연 중 초과 쓰기가 가능하고, 외부 비협조 writer·버킷 과거 버전·사업자 청구량은 이 장치의 보장 범위 밖입니다.
@@ -327,6 +329,8 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 
 파일 편입은 기본 512줄·1 MiB 한도 안에서 4 KiB씩 읽고 필요한 줄이 모이면 멈춥니다. 최근 진행한 세션은 최대 64개만 유지하며, 성공한 캐시 편입 16회 뒤에는 디렉터리를 다시 탐색합니다. 캐시에서 진행할 작업이 없으면 바로 탐색합니다. 새 세션은 탐색 순서에 따라 발견되므로 지속적으로 밀린 세션이 많으면 첫 편입까지 더 기다릴 수 있습니다. 재시작 시 다시 탐색하며 편입 cursor와 ACK·복구 조건은 바꾸지 않습니다.
 
+편입 시도의 커서·오류 조회는 SQLite 연결 하나를 공유하고, capture 오류가 실제로 있을 때만 삭제합니다. 연결은 원본 수락 전에 닫으며 파일 검증과 ACK·커서 저장의 영속 트랜잭션은 유지합니다.
+
 전환은 서버를 먼저 배포한 뒤 Pi uploader만 교체합니다. Pi 원본·기존 SQLite spool은
 보존하고 별도 `--state`에 작은 진행 정보만 저장합니다. 이전 spool의 import cursor는
 서버 ACK가 아니므로 재개 위치로 쓰지 않습니다. endpoint와 사설 HTTP opt-in을 함께
@@ -364,11 +368,14 @@ CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 �
 signal 행의 전체 ACK 뒤 같은 시간창의 `vehicle_signal_dirty` 갱신까지 ACK되어야 outbox에서 제거합니다. 알림 실패는 `dirty_notify_failure`로 남고 signal 재전송은 같은 event ID로 중복 제거됩니다. 집계기는 dirty 알림이 있는 완료된 CAN 시간창만 처리하며 같은 generation의 checkpoint가 있으면 코드·설정 revision이 달라져도 재계산하지 않습니다. 처리 중 generation이 바뀌거나 분석이 실패하면 checkpoint를 완료하지 않습니다. 알림 없는 과거 데이터와 뒤늦은 무알림 입력은 자동 발견하지 않으며 원본 데이터는 삭제하지 않습니다. 이 확인은 해당 scope·시간창의 처리 기록이지 물리 교정 성공 증거가 아닙니다.
 
 `status`는 영속 누적 counter와 indexed cursor를 사용하며 원본 전체를 매번 세지 않습니다. `last_receive_ns`, `last_decode_ns`, `last_full_ack_ns`는 각각 raw 수신·해석·signal 및 dirty 알림 전체 ACK 시각입니다. storage-metrics는 raw volume을 read-only로 읽어 raw/WAL/outbox/파일시스템 여유와 제한된 오류 종류를 노출합니다. 누락·읽기 실패는 unknown이고 빈 정상 큐만 0입니다. 수신·디코드 commit 전 기본 64 MiB 여유에 staged write 예산을 더해 확인하며, 부족하면 `archive_disk_reserve`로 거부하고 기존 raw/outbox를 보존합니다. 이미 ACK된 outbox를 지우는 작업은 공간을 회수할 수 있도록 이 reserve 때문에 막지 않습니다.
+아카이브 파일의 크기·수정 시각은 scrape마다 한 번의 `stat` 결과에서 함께 읽습니다. SQLite 지표는 매번 새 읽기 전용 스냅샷으로 조회하며, 지표를 캐시하지 않습니다.
 기본 `status`는 트리거 유지 `decode_epoch_state` 한 테이블과 영속 counter(`raw_chunks`, `sessions_total`, `outbox_rows`)만 읽습니다(O(보존 epoch 수), 세션/raw/decode 전체 스캔 없음). `active_epoch`는 `register_epoch`가 선택한 명시적 epoch이며 최신 rowid 추정이 아닙니다. `remaining_chunks`는 영속 전체 raw에서 epoch 처리량을 뺀 파생값이므로 raw 수신은 배치당 한 번의 counter 증가만 수행합니다. 각 epoch는 현재 처리 backlog(`active_backlog_chunks`)·이전 epoch 잔여(`retained_backlog_chunks`)를 구분하며, `decoded_rows_exact`는 완료 행에 미완료 dense 청크의 이미 방출된 `partial_rows`를 더한 값입니다(처리 청크 수는 그대로). 세션별 신호 합계는 명시적 상세 조회(`status --detail`)에서만 집계합니다. exporter 라벨은 고정된 `active`/`retained`, 단계, 오류 종류만 사용하며 epoch·세션·차량 식별자를 노출하지 않습니다.
 
 #### CAN archive 백업과 새 볼륨 복원
 
 DB 오프라인 백업과 별개입니다. `can-backup`은 실행 중인 receiver·worker의 SQLite read transaction을 고정해 backup API로 복사하고 정의 바이트·epoch·cursor·outbox를 함께 검증합니다. live receiver·worker나 DB를 중지할 필요가 없습니다. `CAN_STORAGE_TYPE=File`은 로컬 보관만 하며, off-host 보관에는 `CAN_STORAGE_TYPE=S3`와 기존 S3 설정, live prefix와 겹치지 않는 `CAN_S3_BACKUP_PREFIX`를 지정합니다. tar·SHA256 sidecar·manifest·COMPLETE는 명시적 `ChecksumSHA256` PUT 응답과 HEAD checksum·크기로 검증합니다. 서버 checksum 부재·불일치·미지원은 로컬 archive를 보존하고 실패하며 metadata-only 성공이나 검증용 전체 GET fallback은 없습니다. 원격 자동 GC는 하지 않으며 복원 다운로드와 로컬 SHA256 검증은 유지합니다.
+
+스냅샷 SHA-256은 SQLite 사본을 tar에 넣으면서 계산해 해시만을 위한 전체 재읽기를 생략합니다. 고정 스냅샷 복사, 압축 archive의 별도 해시, 크기 제한과 복원 검증은 유지합니다.
 
 이 DB/definitions 백업 형식에는 `/data/files`의 직접 수신 파일·메타데이터 버전은 포함되지 않습니다. raw 볼륨을 일관되게 복사하더라도 이미 정리된 serial 원본은 복구할 수 없습니다. DB 백업 성공만으로 미편입 원본을 off-host에 보관했다고 판단하거나 Pi 원본을 지우는 근거로 사용하지 마세요.
 
@@ -428,6 +435,8 @@ Grafana의 기존 **수집 진단 · CAN / VSS** 대시보드는 `vehicle_signal
 - 단일 차량 선택에는 `TARGET_VIN`과 `VEHICLE_ID`를 사용합니다. 대상 VIN을 지정하지 않으면 `VEHICLE_ID_SALT`가 필수입니다.
 - 신호·경고·오류·연결 상태를 구독하며, CAN 입력과 다른 `source='fleet'`으로 저장합니다.
 - ZMQ는 비영속 전송입니다. SQLite outbox는 recorder가 수신·저장한 이후의 데이터만 보호합니다.
+
+Fleet의 중복 ID 정리는 기존 5분 주기·24시간 보존·최대 50,000개 한도를 유지합니다. 오래된 ID를 먼저 지운 뒤 남은 개수가 한도를 초과할 때만 정렬·추가 삭제하며, 같은 트랜잭션에서 확정합니다.
 
 수집 계약과 배터리 분석의 조건·제한은 [Tesla Fleet Telemetry 문서](tesla_fleet.md)를 참고하세요.
 
@@ -495,6 +504,7 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - 분류별 막대·범례·툴팁에는 도구명·클라이언트명·모델명 또는 차량/수집원/해석 버전/신호를 표시합니다. `호출 수`·`세션 수` 같은 지표명으로 모든 분류를 덮지 않습니다. Grafana의 표 형식 막대는 `${__data.fields.<분류 열>}`, 시계열은 `${__field.labels.<분류 열>}`을 사용하며, 입력·출력 토큰처럼 측정값이 여러 개면 모델명과 지표명을 함께 표시합니다. Compose 원본에서는 `$`를 `$$`로 이스케이프합니다. 합계 카드와 표의 지표명은 유지하고 실제 범례·툴팁을 확인하세요.
 - 전체 현황의 원본 트레이스 조사는 선택 범위의 마지막 48시간에 제한됩니다. 관측된 스팬 수는 사용자 HTTP 요청 수가 아니며, 허용 목록 밖의 HTTP 경로·SQL 본문·스팬 이벤트를 복원할 수 없습니다.
 - 전체 현황의 스팬 합계·분당 속도·오류율은 한 분 단위 SQL 결과를 공유하고 각 패널에서 필요한 열만 선택합니다. CAN/VSS의 CAN·Fleet 경로 수 카드도 한 결과를 공유합니다. 빈 입력은 기존처럼 `기록 없음`이며, 오류율의 분모에는 명시적 OK/ERROR만 포함합니다. 주행·충전의 전체 기간 원시 최신성 확인은 유지합니다. 선택 기간으로 제한하면 과거 관측의 늦은 수신이나 미래 입력을 놓칠 수 있습니다.
+- DBC 진단의 펌웨어·DBC·단위 누락 카드는 조건부 집계 SQL 하나를 공유합니다. DBC 누락은 CAN만 집계하며, CAN 입력이 없으면 `기록 없음`, CAN 입력에 누락이 없으면 실제 `0`으로 구분합니다.
 - 전체 현황의 수집 범위 표에서 `전체 보존 마지막 관측`은 CAN/Fleet만 제공합니다. 선택 기간 밖의 최근 관측도 표시하므로 `선택 기간 마지막 관측`과 구분하세요. 다른 수집원의 이 열은 NULL이며 전체 이력을 추가 조회하지 않습니다.
 - AI 응답 성능의 TTFT 표본 카드와 관측 범위 표는 한 SQL 결과를 공유합니다. 카드는 Grafana의 `-- Dashboard --` 데이터소스로 표 패널의 변환 전 결과를 읽습니다. 필터·시간 범위는 같고, 적격 TTFT가 없으면 카드는 `기록 없음`, 빈 관측 범위의 다섯 count는 0입니다. 단독 카드 보기에서도 원본 패널을 활성화하지만 초기 요청 횟수까지 한 번으로 보장하지는 않습니다.
 - 배터리 최고·최저 온도 카드는 한 SQL의 변환 전 결과를 공유합니다. 두 값의 관측 시각·판정 근거와 최신 무효 보고는 각각 유지하며, 최저 0°C를 누락으로 취급하거나 최고 온도 누락을 최저 값으로 채우지 않습니다. 필터·시간 범위는 같고 단독 최저 온도 카드에서도 원본 패널을 통해 조회합니다.
@@ -587,6 +597,7 @@ UID를 바꿀 때 provisioning 파일도 `home/home.json`에서 `home/home-overv
 - aggregate만 `AGG_CPUS=1.0` 기본 CPU quota를 적용합니다. 원본 이력을 잘라내거나 조회 timeout을 숨기지 않으며, 제한으로 pass가 느려질 수 있으므로 처리 cadence를 별도로 관측하세요. 임의의 메모리 hard limit은 두지 않습니다.
 - CAN 전체를 제외하는 일반 집계에 개별 CAN scope 제외 조건을 더하기 위한 registry 조회는 하지 않습니다. 자동 과거 발견·bootstrap·reconciliation·raw checklist·fingerprint 재검사와 sweep 테이블의 런타임 읽기·쓰기는 제거했습니다. 기존 테이블·기록과 원본은 삭제하지 않습니다. 수집 알림 없는 과거 CAN 데이터와 뒤늦은 무알림 입력은 자동으로 찾지 않습니다.
 - 일반 vehicle/trip/battery pass는 registry 등록 여부와 무관하게 `source='can'`을 SQL에서 제외합니다. CAN dirty 시간창은 분·시간 rollup과 주행·충전 요약만 갱신하며 자동 배터리 분석은 실행하지 않습니다. 비-CAN 배터리 분석은 `server`의 정기 aggregate pass에 포함되며 명시적 standalone 분석도 유지합니다.
+- 배터리 ICA 전압 매칭과 조건 분석의 무효 시각 경계 탐색은 정렬된 자료에서 이진 검색합니다. 최신 전압의 허용 시간차, 구간 양 끝의 포함·제외, 교정·계산식·알고리즘 버전은 유지하며 분석 입력을 줄이거나 실행 사이에 캐시하지 않습니다.
 - 이 변경은 egress 0이나 과금 안전을 보장하지 않습니다. 새 dirty generation의 집계와 다른 section의 조회, DB compaction은 여전히 raw/SST를 읽을 수 있습니다.
 - 각 section의 실패는 해당 section과 전체 pass의 실패로 기록하되, 다른 section의 실행을 막지 않습니다. 별도 `vehicle_discovery` 단계는 없습니다. 실패한 pass도 같은 monotonic 시작 간격으로 다음 주기에 재시도하며 crash-loop하지 않습니다. `AGG_RUN_ONCE=1`은 실패 시 nonzero로 종료합니다. 잘못된 시작 설정(예: 필수 인증 누락, DB 미준비)은 여전히 시작 실패입니다.
 - 차량 checkpoint는 scope·시간별 rollup과 주행·충전 요약이 성공하고 dirty generation 재확인이 일치한 뒤에만 저장합니다. 배터리 분석은 checkpoint의 완료 조건이 아닙니다. 뒤의 작업이 실패해도 앞서 성공한 checkpoint는 남습니다. 주행 raw 조회는 1시간씩 나누되 episode와 열린 주행의 시작 anchor 문맥은 유지합니다.
@@ -620,6 +631,7 @@ docker compose --env-file .env up -d
 - S3 모드는 SST를 `<S3_BACKUP_PREFIX>/_sst/` 공유 pool에 증분 저장합니다. 첫 실행에는 기존 SST를 모두 서버 측 COPY하고, 이후에는 bucket·live root/key·크기·원본 ETag가 같은 SST를 재사용해 신규 identity만 복사합니다. 각 세대의 manifest/COMPLETE는 전체 복원 목록을 담으므로 이전 세대 archive를 순차 적용하지 않습니다. 기존 full SST 백업도 복원할 수 있습니다. WAL·설정 tar와 DB offline 조건은 그대로입니다.
 - S3 SST는 소스 identity로 주소화한 공유 pool에 HEAD → 조건부 서버 측 COPY → HEAD 검증으로 보관합니다. 비교 가능한 서버 checksum은 대조하지만 primary SST의 checksum 부재는 조건부 identity COPY를 허용하며 내용 digest 증명은 아닙니다. 새 per-SST `.json` 없이 검증된 COMPLETE inventory를 guard당 한 번 읽어 재사용하고, 정규 pool 키로 orphan·GC 재시도를 발견합니다. 원본/복사본 전체 GET은 하지 않습니다. archive·sidecar·manifest·완료 표식 PUT은 응답과 HEAD의 명시적 `ChecksumSHA256` 일치를 요구하며 미지원은 로컬을 보존하고 실패합니다(GET fallback 없음). live prefix와 `S3_BACKUP_PREFIX`는 겹치면 안 됩니다.
 - backup/retention은 `_locks/` claim으로 직렬화하고 복원은 세대 `refs/`로 참조를 보호합니다. 승인된 retention만 남은 세대가 참조하지 않는 pool 객체를 정리합니다. 강제 종료 시 남은 claim/ref는 자동 만료시키지 않으며, 소유 작업의 종료를 확인하기 전에는 제거하지 마세요. 공급자의 강한 LIST/GET 일관성이 전제입니다.
+- retention/GC의 같은 잠금·평가 단계에서는 상위 prefix 조회에 포함된 SST pool 목록을 함께 사용합니다. 세대 삭제 뒤에는 새 목록으로 다시 평가하며, 참조 보호·보조 객체 검증·삭제 후 확인은 생략하지 않습니다.
 - inventory JSON(`manifest.json`의 archive 내/원격 사본과 `COMPLETE`)은 **각각 비압축 UTF-8 64 MiB 이하**여야 합니다. 백업 생성과 로컬·원격 복원에 같은 한도를 적용하며 초과한 백업은 성공으로 보고하지 않습니다. 8,000개 이상의 SST도 이 바이트 한도 안이면 복원할 수 있습니다. checksum sidecar는 1 MiB 이하입니다. JSON 읽기는 한도와 chunk 크기로 제한하고 원격 응답 스트림은 성공·실패 모두 닫습니다. **archive 전체나 SST 데이터 총량에는 이 JSON 한도를 적용하지 않습니다.**
 - `BACKUP_KEEP=7`과 `CAN_BACKUP_KEEP=7`은 실패 업로드를 포함한 **로컬 보관 세대의 하드 상한**입니다. 성공 뒤 기존 archive를 자동 삭제하지 않고 다음 생성을 거절합니다. 로컬 바이트는 각각 기본 100 GiB이며 `BACKUP_LOCAL_MAX_BYTES`와 `CAN_BACKUP_LOCAL_MAX_BYTES`로 조정합니다. 공유 SST 백업·retention의 잠금은 같은 backup prefix에만 적용하며, RAW·CAN 업로드나 다른 prefix의 작업을 버킷 단위로 직렬화하지 않습니다. 원격 저장량 하드 상한은 제공하지 않습니다. 자동 retention 평가·삭제는 없고 별도 승인된 명시적 `retention enforce`만 세대 retirement·미참조 pool GC를 수행합니다. [원격 보존 정책](backup-retention.md)을 확인하고 복구 prefix에 임의 만료 lifecycle을 설정하지 마세요.
 - `storage-cost-budget`은 합성 backup+RAW 비용 모델의 CI 게이트이며 운영 청구·배포 승인이 아닙니다. 정책(`config/cost-budget.json`)은 1200GiB, 월 4회, RAW 200GiB/월을 가정합니다. 가격은 decimal GB(1GB=10^9 bytes)로 계산하고 저장료는 `max($6/월, GB-month×$0.006)`, egress는 고정 1200GiB 기준 3배 allowance 뒤 `$0.01/GB`를 가정합니다. query·restore·other egress=0은 관측된 0이 아닌 모델 입력이며 CAN은 별도 게이트입니다. 계정의 다른 사용량과 실제 요금제·무료 allowance 범위를 확인해야 합니다([가격 출처](https://www.idrive.com/s3-storage-e2/faq-pricing#egress-policy), 정책 확인일 2026-10-14).

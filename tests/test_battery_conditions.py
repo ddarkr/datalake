@@ -319,6 +319,20 @@ def test_exposure_known_answer_both_endpoints():
     assert abs(res2["valid_covered_s"] - 7200.0) < 1e-9
 
 
+def test_barrier_endpoints_duplicates_and_strict_interior():
+    pairs = [(T0, 1.0), (T0 + 2, 1.0), (T0 + 2, 1.0), (T0 + 4, 1.0)]
+    for barriers, covered, used, persistence in (
+        ([T0 - 100, T0, T0 + 2, T0 + 4, T0 + 100], 4, 3, 4),
+        ([T0 + 1, T0 + 1], 2, 2, 2),
+        ([T0 + 3], 2, 2, 0),
+    ):
+        exposure = co.exposure_s(pairs, lambda v: v > 0, 2, barriers)
+        assert exposure["exposure_s"] == covered / 1e9
+        assert exposure["legs_used"] == used
+        assert exposure["legs_rejected"] == 3 - used
+        assert co.id_stats(pairs, 2, barriers)["persistence_s"] == persistence / 1e9
+
+
 def test_exposure_high_soc_end_to_end():
     rows = [cond(T0, "Soc", 90.0, "%"),
             cond(T0 + 1800000000000, "Soc", 92.0, "%"),

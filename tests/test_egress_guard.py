@@ -535,7 +535,45 @@ HTTPServer(('0.0.0.0', 4000), Handler).serve_forever()
         g.docker("rm", "-f", project)
 
 
+def active_stop_targets():
+    states = {"old": "exited", "live": "running", "paused": "paused", "retry": "restarting"}
+    actions = []
+
+    def docker(*args, **kwargs):
+        command = args[0]
+        if command == "ps":
+            return "\n".join(name for name, status in states.items()
+                             if args[1] == "-aq" or status != "exited")
+        if command == "stop":
+            for name in args[3:]:
+                assert states[name] != "exited", "idle container stop repeated"
+                states[name] = "exited"
+                actions.append(name)
+            return ""
+        if command == "inspect":
+            return json.dumps([{"Id": name, "State": {
+                "Running": states[name] != "exited",
+                "Restarting": states[name] == "restarting"}} for name in args[1:]])
+        raise AssertionError(args)
+
+    with patch.object(g, "docker", docker):
+        g.stop("fixture", 0)
+        assert set(actions) == {"live", "paused", "retry"}
+        actions.clear()
+        g.stop("fixture", 0)
+        assert actions == []
+    # A container created between the two queries must still fail closed.
+    with patch.object(g, "docker", side_effect=["", "recreated"]):
+        try:
+            g.stop("fixture", 0)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("recreated container was not detected")
+
+
 def main():
+    active_stop_targets()
     with tempfile.TemporaryDirectory() as tmp:
         path = Path(tmp)
         unsafe = path / "unsafe"

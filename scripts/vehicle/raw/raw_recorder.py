@@ -96,6 +96,7 @@ class IngressStream:
                 tail = fh.read(1)
         self.terminated = (tail == b"\n") if size else True
         self.torn = False
+        self.sha256 = hashlib.sha256()
 
     def _decode_line(self, line, last):
         if not line.strip():
@@ -126,9 +127,11 @@ class IngressStream:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="strict")
         pending = ""
         over_ws = False
+        self.sha256 = hashlib.sha256()
         with open(self.path, "rb") as fh:
             while True:
                 chunk = fh.read(_LINE_CHUNK_BYTES)
+                self.sha256.update(chunk)
                 final = not chunk
                 try:
                     text = decoder.decode(chunk, final)
@@ -1131,7 +1134,7 @@ def verify_sealed_mf4(mf4_path, frames):
     return True
 
 
-def _write_ingress_sidecar(path, closed_path, _frames=None):
+def _write_ingress_sidecar(path, closed_path):
     """Copy the exact closed JSONL bytes to a gzipped sealed sidecar, so the
     full per-frame provenance (seq/twall_ns/tcan/DLC/payload) survives even
     though the standard MF4 groups cannot store it. Returns the sha256 of
@@ -1139,16 +1142,26 @@ def _write_ingress_sidecar(path, closed_path, _frames=None):
     Byte copy only (bounded chunks); no frame list is needed."""
     import gzip
     tmp = path + ".tmp"
+    digest = hashlib.sha256()
+
+    class HashingWriter:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def write(self, data):
+            written = self.raw.write(data)
+            digest.update(memoryview(data)[:written])
+            return written
+
     with open(closed_path, "rb") as src, open(tmp, "wb") as raw:
-        with gzip.GzipFile(filename="", mode="wb", fileobj=raw,
+        with gzip.GzipFile(filename="", mode="wb", fileobj=HashingWriter(raw),
                            mtime=0) as gz:
             for chunk in iter(lambda: src.read(1 << 20), b""):
                 gz.write(chunk)
     with open(tmp, "rb") as fh:
         os.fsync(fh.fileno())
-    digest = _sha256_file(tmp)
     os.replace(tmp, path)
-    return digest
+    return digest.hexdigest()
 
 
 def _fsync_dir(path):
@@ -1229,13 +1242,13 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
     out = os.path.join(sealed_dir, stem + ".mf4")
     sidecar = os.path.join(sealed_dir, stem + ".ingress.jsonl.gz")
     manifest_path = out + ".manifest.json"
-    ingress_digest = _sha256_file(closed_path)
     capture_id = stem.split("_")[-2] if "_" in stem else ""
     # Crash-resume: a complete verified triple is immutable. If the manifest
     # verifies against the bytes on disk, reuse it; never rebuild or
     # overwrite a verified MF4.
     if os.path.exists(out) and os.path.exists(sidecar) and os.path.exists(
             manifest_path):
+        ingress_digest = _sha256_file(closed_path)
         try:
             with open(manifest_path, encoding="utf-8") as fh:
                 man = json.load(fh)
@@ -1283,6 +1296,7 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
             for frame in stream:
                 store.add(frame)
             torn = stream.torn
+            ingress_digest = stream.sha256.hexdigest()
         except CorruptSegment:
             quarantine(spool, closed_path)
             minc("finalize_errors")
@@ -1357,7 +1371,7 @@ def finalize_segment(closed_path, sealed_dir, spool=None,
         with open(stage, "rb") as fh:
             os.fsync(fh.fileno())
         os.replace(stage, out)
-        sidecar_digest = _write_ingress_sidecar(sidecar, closed_path, store)
+        sidecar_digest = _write_ingress_sidecar(sidecar, closed_path)
         _write_manifest_bounds(manifest_path, nframes, bus, seq_first,
                                seq_last, tw_first, tw_last, stem, capture_id,
                                torn, mf4_digest, ingress_digest,

@@ -531,10 +531,17 @@ def remote_base(backup_prefix, backup_id):
     return bk.remote_base(backup_prefix, backup_id)
 
 def write_can_tar(d, name, db_copy, staged_defs, manifest):
-    raw_manifest = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
-    if len(raw_manifest) > bk.CONTROL_CAP:
-        raise IOError("manifest exceeds control size limit (%d bytes)"
-                      % bk.CONTROL_CAP)
+    archive_digest = hashlib.sha256()
+
+    class HashingReader:
+        def __init__(self, raw):
+            self.raw = raw
+
+        def read(self, size=-1):
+            data = self.raw.read(size)
+            archive_digest.update(data)
+            return data
+
     path = os.path.join(d, name)
     tmp = path + ".tmp"
     try:
@@ -544,7 +551,7 @@ def write_can_tar(d, name, db_copy, staged_defs, manifest):
             info.mode = 0o600
             info.mtime = int(time.time())
             with open(db_copy, "rb") as f:
-                tar.addfile(info, f)
+                tar.addfile(info, HashingReader(f))
             dinfo = tarfile.TarInfo(CAN_DEFS)
             dinfo.type = tarfile.DIRTYPE
             dinfo.mode = 0o700
@@ -557,6 +564,11 @@ def write_can_tar(d, name, db_copy, staged_defs, manifest):
                 fi.mtime = int(time.time())
                 with open(fpath, "rb") as f:
                     tar.addfile(fi, f)
+            manifest["archive"]["sha256"] = archive_digest.hexdigest()
+            raw_manifest = json.dumps(manifest, indent=2, sort_keys=True).encode("utf-8")
+            if len(raw_manifest) > bk.CONTROL_CAP:
+                raise IOError("manifest exceeds control size limit (%d bytes)"
+                              % bk.CONTROL_CAP)
             mi = tarfile.TarInfo(CAN_MANIFEST)
             mi.size = len(raw_manifest)
             mi.mode = 0o600
@@ -673,7 +685,6 @@ def cmd_backup():
             if problem is not None:
                 return bk.fail(label + " permissions unsafe (" + problem
                                + "): refusing", code=2)
-        arch_sha = bk.sha256_file(db_copy)
         manifest = {
             "tool": TOOL,
             "backup_id": bid,
@@ -686,7 +697,7 @@ def cmd_backup():
                      "raw_mode": raw_mode,
                      "defs_uid": defs_st.st_uid, "defs_gid": defs_st.st_gid,
                      "defs_mode": defs_mode},
-            "archive": {"name": CAN_ARCHIVE, "sha256": arch_sha,
+            "archive": {"name": CAN_ARCHIVE,
                         "size": os.path.getsize(db_copy),
                         "mode": src_mode, "uid": src_uid, "gid": src_gid,
                         "counts": counts},

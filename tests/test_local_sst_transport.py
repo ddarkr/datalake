@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import types
+import tempfile
 import unittest
 import urllib.error
 from unittest.mock import patch
@@ -90,7 +91,7 @@ class LocalSstTransportTests(unittest.TestCase):
         self.assertIn(["flow.incremental_mode", "memtable_only"], extensions)
         self.assertIn(["flow.incremental_after_seqs", '{"7": 10}'], extensions)
 
-    def _snapshot_query(self, *, sink=None, fault=None):
+    def _snapshot_query(self, *, sink=None, fault=None, row_count=5, max_rows=2):
         try:
             import pyarrow as pa
         except ImportError:
@@ -99,8 +100,8 @@ class LocalSstTransportTests(unittest.TestCase):
         schema = pa.schema([("timestamp", pa.timestamp("ns")), ("value", pa.int64())])
         with pa.ipc.new_stream(buffer, schema) as writer:
             writer.write_batch(pa.record_batch(
-                [pa.array([1001, 1002, 1003, 1004, 1005], type=pa.timestamp("ns")),
-                 pa.array([1, 2, 3, 4, 5])], schema=schema))
+                [pa.array(range(1001, 1001 + row_count), type=pa.timestamp("ns")),
+                 pa.array(range(1, 1 + row_count))], schema=schema))
         messages = list(pa.ipc.MessageReader.open_stream(buffer.getvalue()))
         frames = [types.SimpleNamespace(
             data_header=message.metadata.to_pybytes(),
@@ -134,7 +135,7 @@ class LocalSstTransportTests(unittest.TestCase):
             try:
                 return flight.flight_query(
                     "SELECT * FROM raw", endpoint="localhost:4001", db="test",
-                    user="user", password="secret", max_rows=2,
+                    user="user", password="secret", max_rows=max_rows,
                     local_sst_only=False, row_sink=sink)
             finally:
                 self.assertEqual(closed, [True])
@@ -151,6 +152,21 @@ class LocalSstTransportTests(unittest.TestCase):
                          [[1001, 1], [1002, 2], [1003, 3], [1004, 4], [1005, 5]])
         with self.assertRaises(flight.RowCapExceeded):
             self._snapshot_query()
+
+    def test_large_frame_spills_before_exceeding_memory_budget(self):
+        class BoundedSpool(tempfile.SpooledTemporaryFile):
+            def write(self, data):
+                if not self._rolled and self.tell() + len(data) > self._max_size:
+                    raise MemoryError("in-memory IPC ceiling")
+                return super().write(data)
+
+        decoded = []
+        with patch.object(tempfile, "SpooledTemporaryFile", BoundedSpool):
+            cols, rows, upper = self._snapshot_query(
+                sink=lambda cols, chunk: decoded.extend(chunk),
+                row_count=200000, max_rows=32768)
+        self.assertEqual((cols, rows, upper), (["timestamp", "value"], [], {7: 12}))
+        self.assertEqual(decoded, [[1001 + i, 1 + i] for i in range(200000)])
 
     def test_snapshot_sink_never_sees_unproved_network_prefix(self):
         for fault in ("missing", "after"):

@@ -283,8 +283,8 @@ def database(containers, url):
 
 
 def stop(project, grace):
-    # Labels select only this exact project, including one-off/helper containers.
-    ids = docker("ps", "-aq", "--filter", "label=com.docker.compose.project=" + project).split()
+    # Active project containers include paused/restarting and one-off helpers.
+    ids = docker("ps", "-q", "--filter", "label=com.docker.compose.project=" + project).split()
     if ids:
         try:
             docker("stop", "--time", str(grace), *ids, timeout=grace + 30)

@@ -698,6 +698,26 @@ def test_ica_uses_requested_charge_window():
     assert abs(result["value"] - 1.0) < 1e-8
 
 
+def test_ica_latest_voltage_inclusive_skew_and_duplicate_timestamps():
+    step = 10**9
+    current = [(T0 + i * step, 10.0, True, False) for i in range(5)]
+    voltage = [(t, 3.0 + i * 0.1, True, False) for i, (t, *_) in enumerate(current)]
+    shifted = [point for t, v, _, _ in voltage
+               for point in ((t - 1, 100.0, True, False), (t - 1, v, True, False))]
+    scope, window = ("v", "fleet", "e1"), (T0 - 1, T0 + 4 * step)
+    calibration = {"min_span_v": 0.05, "max_gap_ns": step, "smooth_window": 1,
+                   "cc_tolerance_a": 0.0, "min_mean_current_a": 1.0}
+    expected = be._analyze_ica(scope, window, current, voltage, 1, calibration,
+                               {"max_skew_ns": 0}, "synthetic")
+    assert all(row["status"] == "derived" for row in expected)
+    assert be._analyze_ica(scope, window, current, shifted, 1, calibration,
+                           {"max_skew_ns": 1}, "synthetic") == expected
+    rejected = be._analyze_ica(scope, window, current, shifted, 1, calibration,
+                               {"max_skew_ns": 0}, "synthetic")
+    assert all(row["value"] is None and row["reason"] == "unsynchronized:ica_voltage_skew"
+               for row in rejected)
+
+
 def test_step_sequence_barriers_skew_clip_and_duplicates():
     # Numerical contract for the DCR V/I join; entries are
     # (ns, value, usable, ambiguous). A current barrier strictly inside

@@ -2380,6 +2380,62 @@ def test_session_history_lookup_matches_all_aliases_without_duplicates():
                 raise AssertionError("distinct session rows must still obey the cap")
 
 
+def test_scoped_metric_batches_share_session_and_day_selectors():
+    from unittest.mock import patch
+
+    columns = ["coding_agent_session_id", "greptime_timestamp", "greptime_value"]
+    queries = []
+    with sqlite3.connect(":memory:") as db:
+        db.execute('CREATE TABLE metrics (coding_agent_session_id TEXT, '
+                   'greptime_timestamp TEXT, greptime_value INTEGER)')
+
+        class Flight:
+            @staticmethod
+            def flight_query(statement, **kwargs):
+                queries.append(statement)
+                rows = db.execute(statement).fetchall()
+                return columns, [[sid, _norm_ts(stamp), value]
+                                 for sid, stamp, value in rows], {}
+
+        cfg = {"grpc_url": "local", "max_rows": 3}
+        ctx = ("", "", "test")
+        with (patch.object(agg, "_ai_flight", return_value=Flight),
+              patch.object(agg, "_ai_metric_tables", return_value=[("metrics", "tokens")]),
+              patch.object(agg, "_ai_metric_columns", return_value=columns),
+              patch.object(agg, "_ai_metric_metas", return_value={}),
+              patch.object(agg, "_ai_norm_metric_row",
+                           wraps=agg._ai_norm_metric_row) as normalize):
+            db.execute("INSERT INTO metrics VALUES (?, ?, ?)",
+                       ("s000", _fmt(DAY1 + dt.timedelta(hours=1)), 7))
+            result = agg._ai_scoped_metrics(ctx, cfg, keys={("codex", "s000")},
+                                            metric_rows=[], days={DAY1})
+            assert len(queries) == 1 and normalize.call_count == 1
+            assert [(r["session_id"], r["value"]) for r in result] == [("s000", 7)]
+
+            # 63 sessions + two days require two bounded queries. The DAY2
+            # session row matches both batches but counts once toward the cap.
+            db.executemany("INSERT INTO metrics VALUES (?, ?, ?)", [
+                ("s000", _fmt(DAY2 + dt.timedelta(hours=1)), 11),
+                ("other", _fmt(DAY2 + dt.timedelta(hours=2)), 13),
+            ])
+            queries.clear()
+            keys = {("codex", "s%03d" % i) for i in range(63)}
+            result = agg._ai_scoped_metrics(ctx, cfg, keys=keys, metric_rows=[],
+                                            days={DAY1, DAY2})
+            assert len(queries) == 2
+            assert all(q.count('"coding_agent_session_id" = ') +
+                       q.count("greptime_timestamp >=") <= 64 for q in queries)
+            assert sorted((r["session_id"], r["value"]) for r in result) == [
+                ("other", 13), ("s000", 7), ("s000", 11)]
+            try:
+                agg._ai_scoped_metrics(ctx, {**cfg, "max_rows": 2}, keys=keys,
+                                       metric_rows=[], days={DAY1, DAY2})
+            except agg.SqlError:
+                pass
+            else:
+                raise AssertionError("unique raw rows must still obey the cap")
+
+
 def test_large_dirty_cohort_matches_full_cross_day_oracle():
     saved = _guard()
     real = install_fence()
@@ -2410,6 +2466,7 @@ def test_large_dirty_cohort_matches_full_cross_day_oracle():
 
 
 TESTS = (
+    test_scoped_metric_batches_share_session_and_day_selectors,
     test_large_dirty_cohort_matches_full_cross_day_oracle,
     test_session_history_lookup_matches_all_aliases_without_duplicates,
     test_failed_full_snapshot_discards_scratch_and_preserves_fence,

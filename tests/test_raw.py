@@ -8,6 +8,7 @@ on server-ChecksumSHA256 + HEAD size + Metadata-sha256 ack of all three
 legs; all locals kept on any failure, manifest-pin drift fail-closed to
 quarantine, partial sets invisible), replay safety gate.
 """
+import hashlib
 import json
 import os
 import sys
@@ -203,6 +204,8 @@ class MF4Test(unittest.TestCase):
             stem = "m3_20260921T000000Z_deadbeef_001"
             cp = os.path.join(dirs["closed"], stem + ".jsonl")
             _write_ingress(cp, SYN)
+            with open(cp, "ab") as fh:
+                fh.write(b" \t\n{truncated")
             out = rec.finalize_segment(cp, dirs["sealed"], spool=spool)
             self.assertTrue(out.endswith(".mf4") and os.path.exists(out))
             # finalize never deletes: the closed JSONL stays until remote ack.
@@ -212,14 +215,20 @@ class MF4Test(unittest.TestCase):
             with open(out + ".manifest.json", encoding="utf-8") as fh:
                 man = json.load(fh)
             self.assertEqual(man["frames"], len(SYN))
+            self.assertTrue(man["torn_tail_salvaged"])
             self.assertEqual(
                 (man["seq_first"], man["seq_last"]), (1, len(SYN)))
             # Exact per-frame provenance: sidecar gunzips to the closed bytes.
             import gzip
             with open(sidecar, "rb") as fh:
-                body = gzip.decompress(fh.read())
+                compressed = fh.read()
+            body = gzip.decompress(compressed)
             with open(cp, "rb") as fh:
                 self.assertEqual(body, fh.read())
+            self.assertEqual(man["ingress_sha256"],
+                             hashlib.sha256(body).hexdigest())
+            self.assertEqual(man["ingress_sidecar_sha256"],
+                             hashlib.sha256(compressed).hexdigest())
             # Standard bus logging: MF4Reader must replay every payload byte.
             from can.io.mf4 import MF4Reader
             reader = MF4Reader(out)
@@ -1167,6 +1176,17 @@ class BoundedMemoryTest(unittest.TestCase):
             stream = rec.IngressStream(cp)
             self.assertEqual(len(list(stream)), 3)
             self.assertTrue(stream.torn)
+            with open(cp, "rb") as fh:
+                original = fh.read()
+            self.assertEqual(stream.sha256.hexdigest(),
+                             hashlib.sha256(original).hexdigest())
+            sidecar = os.path.join(spool, "s.jsonl.gz")
+            digest = rec._write_ingress_sidecar(sidecar, cp)
+            with open(sidecar, "rb") as fh:
+                compressed = fh.read()
+            import gzip
+            self.assertEqual(digest, hashlib.sha256(compressed).hexdigest())
+            self.assertEqual(gzip.decompress(compressed), original)
             with open(cp, "wb") as fh:
                 fh.write(("\n".join(good) + "\n{bad}\n").encode())
             with self.assertRaises(rec.CorruptSegment):

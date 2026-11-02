@@ -1722,8 +1722,7 @@ def test_retention_truncated_newer_tar_keeps_valid_recovery():
             raise AssertionError("generation classification must reuse LIST sizes")
 
         fake.get_object, fake.head_object = controls_only, no_head
-        gens, error = bk.remote_generations(fake, "test-bucket", "test-backups/")
-        assert error is None
+        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
         assert {g["backup_id"]: g["status"] for g in gens} == {
             ids[0]: "complete", ids[-1]: "incomplete"}
         settings, error = bk.retention_settings()
@@ -1741,8 +1740,7 @@ def test_shared_generation_missing_and_zero_size_pool_objects():
     ids, tmp, _env = retention_ids(fake, count=2)
     try:
         def generations():
-            gens, error = bk.remote_generations(fake, "test-bucket", "test-backups/")
-            assert error is None
+            gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
             assert {g["backup_id"] for g in gens} == set(ids)
             return gens
 
@@ -2949,9 +2947,9 @@ def test_pool_gc_dryrun_bytes_match_last_reference_deletion():
         fake.objects["test-root/c.sst"] = b"C" * 4096
         assert bk.cmd_backup() == 0
         second = _remote_bid(bdir)
-        gens, _ = bk.remote_generations(fake, "test-bucket", "test-backups/")
+        gens, pool_objects = bk.remote_generations(fake, "test-bucket", "test-backups/")
         doomed = next(g for g in gens if g["backup_id"] == first)
-        garbage, reason = bk.pool_gc_plan(fake, "test-bucket", "test-backups/", gens, [first])
+        garbage, reason = bk.pool_gc_plan(fake, "test-bucket", "test-backups/", gens, pool_objects, [first])
         assert reason is None and len(garbage) == 1
         assert garbage[0]["Key"] == next(o["snapshot_key"] for o in doomed["complete"]["sst"]
                                           if o["key"] == "b.sst")
@@ -2960,16 +2958,42 @@ def test_pool_gc_dryrun_bytes_match_last_reference_deletion():
                         BACKUP_REMOTE_INCOMPLETE_GRACE_SEC="0")
         setenv(settings)
         out = io.StringIO()
+        list_prefixes = []
+        original_list = fake.list_objects_v2
+
+        def record_list(**kw):
+            list_prefixes.append(kw["Prefix"])
+            return original_list(**kw)
+
+        fake.list_objects_v2 = record_list
         old, bk.sys.stdout = bk.sys.stdout, out
         try:
             assert bk.cmd_retention() == 0
         finally:
             bk.sys.stdout = old
+            fake.list_objects_v2 = original_list
+        assert "test-backups/" in list_prefixes
+        assert bk.pool_prefix("test-backups/") not in list_prefixes
         expected = doomed["bytes"] + sum(o["Size"] for o in garbage)
         mode = next(line for line in out.getvalue().splitlines() if line.startswith("retention: mode="))
         assert "bytes=%d" % expected in mode
         before = {key: len(blob) for key, blob in fake.objects.items()}
         setenv(dict(settings, BACKUP_REMOTE_RETENTION_MODE="enforce", BACKUP_REMOTE_RETENTION_APPROVE="1"))
+        original_retire = bk.retire_generation
+        stray = bk.pool_prefix("test-backups/") + "unknown"
+
+        def retire_with_stray(*args):
+            result = original_retire(*args)
+            fake.objects[stray] = b"stray"
+            return result
+
+        bk.retire_generation = retire_with_stray
+        try:
+            assert bk.cmd_retention() == 0
+        finally:
+            bk.retire_generation = original_retire
+        assert garbage[0]["Key"] in fake.objects
+        del fake.objects[stray]
         assert bk.cmd_retention() == 0
         assert sum(size for key, size in before.items() if key not in fake.objects) == expected
         assert bk.remote_complete_ids(fake, "test-bucket", "test-backups/") == [second]

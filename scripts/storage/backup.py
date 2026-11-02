@@ -1766,7 +1766,7 @@ def remote_generations(client, bucket, bp, now_ns=None):
     corrupt COMPLETE -> generation marked corrupt (never a deletion target,
     never counted as recovery); missing sidecar/manifest/SST bytes -> incomplete.
     A tar whose LIST size differs from COMPLETE is also incomplete.
-    Returns (generations, problems) sorted oldest-first by COMPLETE created_utc."""
+    Returns (generations, pool_objects), sorted oldest-first by COMPLETE created_utc."""
     if not bp or not bp.strip("/"):
         raise IOError("backup prefix missing or empty (refusing to scope deletions)")
     objs = s3_list_all(client, bucket, bp)
@@ -1778,8 +1778,9 @@ def remote_generations(client, bucket, bp, now_ns=None):
         bid = rel.split("/")[0]
         if bid:
             by_id.setdefault(bid, []).append(o)
+    pool_objects = [o for o in objs if o["Key"].startswith(pool_prefix(bp))]
     pool_sizes = {o["Key"][len(pool_prefix(bp)):]: o.get("Size", 0)
-                  for o in objs if o["Key"].startswith(pool_prefix(bp))}
+                  for o in pool_objects}
     if now_ns is None:
         now_ns = time.time_ns()
     gens = []
@@ -1855,7 +1856,7 @@ def remote_generations(client, bucket, bp, now_ns=None):
                          pool_bytes=pool_bytes,
                          control_bytes=sum(o.get("Size", 0) for o in by_id[bid])))
     gens.sort(key=lambda g: (g["created_ns"] is None, g["created_ns"] or 0, g["backup_id"]))
-    return gens, None
+    return gens, pool_objects
 
 
 def retention_plan(gens, settings, now_ns=None):
@@ -2037,8 +2038,8 @@ def retire_generation(client, bucket, bp, gen):
 @pool_serialized
 def reclaim_pool_orphans(client, bucket, bp):
     """Reserved canonical pool keys minus all verified live COMPLETE references."""
-    gens, _ = remote_generations(client, bucket, bp)
-    garbage, reason = pool_gc_plan(client, bucket, bp, gens)
+    gens, pool_objects = remote_generations(client, bucket, bp)
+    garbage, reason = pool_gc_plan(client, bucket, bp, gens, pool_objects)
     if reason:
         raise IOError("pool GC blocked: " + reason)
     targets = [o["Key"] for o in garbage]
@@ -2047,7 +2048,7 @@ def reclaim_pool_orphans(client, bucket, bp):
     return len(targets)
 
 
-def pool_gc_plan(client, bucket, bp, gens, removed_ids=()):
+def pool_gc_plan(client, bucket, bp, gens, pool_objects, removed_ids=()):
     """Full surviving inventories prove references; auxiliary controls prove their own owner."""
     removed = set(removed_ids)
     referenced = set()
@@ -2059,12 +2060,11 @@ def pool_gc_plan(client, bucket, bp, gens, removed_ids=()):
         if gen["complete"].get("sst_layout") == SHARED_LAYOUT:
             referenced.update(obj["snapshot_key"] for obj in gen["complete"]["sst"])
     pp = pool_prefix(bp)
-    objects = s3_list_all(client, bucket, pp)
     if any(not re.fullmatch(r"[0-9a-f]{64}(?:\.json)?", o["Key"][len(pp):])
-           for o in objects):
+           for o in pool_objects):
         return [], "unknown object in shared SST pool"
     garbage = []
-    for obj in objects:
+    for obj in pool_objects:
         key = obj["Key"]
         data_key = key[:-5] if key.endswith(".json") else key
         if data_key in referenced:
@@ -2112,7 +2112,7 @@ def cmd_retention(current_bid=None):
 
 
 def execute_retention(client, bucket, bp, settings):
-    gens, _ = remote_generations(client, bucket, bp)
+    gens, pool_objects = remote_generations(client, bucket, bp)
     # Resume interrupted retirements first: a RETIRING marker is the
     # durable identity (marker body names the generation; resume
     # validates it, refuses active refs, confirms COMPLETE absence
@@ -2129,7 +2129,7 @@ def execute_retention(client, bucket, bp, settings):
                     g["created_ns"] is None
                     or now_ns - g["created_ns"] < settings["grace"] * 1_000_000_000)]
     keep, deletes, skipped = retention_plan(gens, settings, now_ns)
-    garbage, gc_reason = pool_gc_plan(client, bucket, bp, gens,
+    garbage, gc_reason = pool_gc_plan(client, bucket, bp, gens, pool_objects,
                                       [g["backup_id"] for g in deletes + retiring])
     gc_bytes = sum(o.get("Size", 0) for o in garbage)
     expect = sum(g["bytes"] for g in deletes) + gc_bytes
@@ -2161,8 +2161,8 @@ def execute_retention(client, bucket, bp, settings):
     for g in deletes:
         retire_generation(client, bucket, bp, g)
     # Re-read surviving inventories after retirement; never delete from a stale plan.
-    survivors, _ = remote_generations(client, bucket, bp)
-    garbage, gc_reason = pool_gc_plan(client, bucket, bp, survivors)
+    survivors, pool_objects = remote_generations(client, bucket, bp)
+    garbage, gc_reason = pool_gc_plan(client, bucket, bp, survivors, pool_objects)
     if gc_reason:
         sys.stdout.write("retention: pool-gc blocked (%s)\n" % gc_reason)
     else:

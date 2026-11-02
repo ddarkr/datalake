@@ -1295,10 +1295,11 @@ def store_event_update(conn, row, max_rows=50000):
 def prune_seen(conn, older_than_ns, max_seen_limit=MAX_SEEN_IDS):
     """Bound seen_ids table by age and absolute row limit to prevent unbounded disk growth."""
     conn.execute("DELETE FROM seen_ids WHERE seen_at < ?", (older_than_ns,))
-    conn.execute(
-        "DELETE FROM seen_ids WHERE rowid NOT IN ("
-        " SELECT rowid FROM seen_ids ORDER BY seen_at DESC LIMIT ?"
-        ")", (max_seen_limit,))
+    if conn.execute("SELECT COUNT(*) FROM seen_ids").fetchone()[0] > max_seen_limit:
+        conn.execute(
+            "DELETE FROM seen_ids WHERE rowid NOT IN ("
+            " SELECT rowid FROM seen_ids ORDER BY seen_at DESC LIMIT ?"
+            ")", (max_seen_limit,))
     conn.commit()
 
 

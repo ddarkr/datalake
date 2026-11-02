@@ -301,8 +301,8 @@ def receiver_metrics(archive=None, reserve_bytes=None):
         if re.fullmatch(r"[0-9]+", raw or ""):
             reserve_bytes = int(raw)
     try:
-        db_bytes = os.path.getsize(path)
-        mtime = os.path.getmtime(path)
+        archive_stat = os.stat(path)
+        db_bytes, mtime = archive_stat.st_size, archive_stat.st_mtime
     except OSError:
         return {"datalake_receiver_archive_known": 0,
                 "datalake_receiver_archive_success": 0}

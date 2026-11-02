@@ -2179,15 +2179,10 @@ def _analyze_ica(scope, window, cur_timeline, vol_timeline, sign, ica_cal,
     for tstamp, qval in q_series:
         if window[1] is not None and tstamp > window[1]:
             break
-        best = None
-        for v_t, v_v in vol_pairs:
-            if v_t <= tstamp and tstamp - v_t <= dcr_cal["max_skew_ns"]:
-                best = (v_t, v_v)
-            elif v_t > tstamp:
-                break
-        if best is None:
+        idx = bisect.bisect_right(vol_pairs, tstamp, key=lambda p: p[0]) - 1
+        if idx < 0 or tstamp - vol_pairs[idx][0] > dcr_cal["max_skew_ns"]:
             continue
-        v_t, vval = best
+        v_t, vval = vol_pairs[idx]
         if any(v_t < b <= tstamp for b in vol_barriers):
             continue
         if any(v_t < b <= tstamp for b in cur_barriers):
