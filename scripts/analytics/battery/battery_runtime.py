@@ -1520,6 +1520,7 @@ def _dispatch_all(analysis_cfg, config_version, config_error, computed_at,
     for scope in sorted(scopes, key=repr):
         sig_scope = prepared.get(scope, bc.prepare_signals([]))
         ev_scope = ev_by_scope.get(scope, [])
+        ids_by_window = None
         for ws, we in per_scope_windows.get(scope, ()):
             window_cfg = dict(analysis_cfg)
             window_cfg["window_start_ns"] = ws
@@ -1647,13 +1648,19 @@ def _dispatch_all(analysis_cfg, config_version, config_error, computed_at,
                              for r in produced if isinstance(r, dict)}
             if failed_modules:
                 previous[scope]["failed"].add(ws)
+            if (failed_modules or recovered_modules) and ids_by_window is None:
+                ids_by_window = {}
+                for identity in sorted(previous[scope]["ids"]):
+                    metric, analysis_id, prev_ws, prev_epoch = identity
+                    ids_by_window.setdefault(prev_ws, []).append(identity)
+            if failed_modules:
                 all_rows.extend(invalidate_previous(
-                    previous[scope]["ids"], scope, (ws, we),
+                    ids_by_window.get(ws, ()), scope, (ws, we),
                     failed_modules, computed_at, config_version,
                     refreshed=refreshed))
             if recovered_modules:
                 all_rows.extend(recover_indicators(
-                    previous[scope]["ids"], scope, (ws, we),
+                    ids_by_window.get(ws, ()), scope, (ws, we),
                     recovered_modules, computed_at, config_version,
                     refreshed=refreshed))
     return all_rows

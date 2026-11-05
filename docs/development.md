@@ -225,6 +225,7 @@ SHA-256, CPU/wall 시간과 전체 child peak RSS를 비교합니다.
 
 AI 집계의 native Flight 경로는 `grpcio==1.84.0`, `pyarrow==25.0.1`, `protobuf==6.33.6`을 사용합니다. `aggregate-deps`가 Python ABI와 고정 버전을 확인해 전용 venv를 준비하며, 수집기 venv와 공유하지 않습니다. 로컬 AI 회귀에는 같은 버전을 설치하고 `python -m tests.test_ai_incremental`을 실행하세요.
 AI incremental 집계는 네 개의 trace 세션 식별자 별칭에 각각 `IN` 조건을 적용해 여러 세션의 전체 이력을 한 번에 조회합니다. 시간 범위를 자르지 않으므로 날짜를 넘는 세션과 늦게 들어온 이전 이벤트를 유지하며, 행 상한과 실패 시 fence 보존도 기존과 같습니다. 이 변경은 운영 S3 다운로드 감소나 특정 환경의 시간 제한 충족을 보장하지 않습니다.
+Trip/charge 대체 행은 기존 500행 INSERT 배치를 쓰고, 모든 INSERT가 성공한 뒤에만 이전 anchor를 삭제합니다. CAN dirty 시간창의 재계산·checkpoint는 시간창별로 유지합니다. 로그 일별 요약은 DB에서 group/count를 계산하지만 원본 행 수의 합에 기존 상한을 적용하므로, 작은 그룹 수로 상한을 우회하지 않습니다. Home retention 경계는 같은 호출의 동일 table/TTL/now에서만 공유합니다.
 
 
 집계 변경 후 스케줄러·DB·배터리 런타임·차량 집계 회귀를 실행합니다.
@@ -239,6 +240,7 @@ python -m tests.test_vehicle_aggregate
 별도로 격리된 native GreptimeDB 1.2.1에서 실제 SQL·시간 경계·조회 실패 후 다음 주기 재시도·종료 smoke가 필요합니다. 모의 DB 회귀만으로 native 동작을 증명하지 못하며, 격리 smoke 성공도 운영 장애 SQL의 원인 진단·배포·복구를 보장하지 않습니다.
 
 배터리의 V/I 동기화와 conditions/energy as-of 조회는 정렬된 시각을 이진 탐색합니다. 휴지 전압 판정은 전류의 유효성·임계값 초과와 샘플 간격 초과를 누적해 구간마다 다시 검사하지 않습니다. 같은 시각의 입력 처리, 무효 입력으로 끊긴 구간, skew/gap과 교정 조건은 유지합니다. 변경 시 정상 입력뿐 아니라 중복 시각·무효 장벽·구간 경계를 기존 구현과 비교하세요.
+Conditions barrier는 분석 호출 안의 집합에 추가하며, DCR·Energy·Alerts의 시각 범위는 정렬된 입력의 이진 탐색으로 제한합니다. RUL history는 순서를 유지해 한 번 분할하고, battery runtime은 같은 dispatch의 이전 identity를 한 번만 정렬·분류합니다. 과거 수정·교정 변경을 놓칠 수 있는 pass 간 결과 캐시는 사용하지 않습니다.
 
 대시보드 검사는 Grafana YAML을 프로세스당 한 번 파싱하고, 각 검사는 별도의 dashboard JSON을 디코드합니다. S3 벤치 계측기의 snapshot은 최근 5,000개 요청만 복사하지만 누적 카운터·잘린 요청 수와 진행 중 전송을 기다리는 조건은 유지합니다. 이 최적화는 실제 S3 요청이나 검증 범위를 줄이지 않습니다.
 

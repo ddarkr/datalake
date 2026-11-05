@@ -54,7 +54,7 @@ EnergyRemaining/SOC is separately labelled BMS-circular, never independent.
 Supplied endpoint uncertainty propagates against a fixed reference only.
 """
 
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 import math
 from datetime import datetime, timezone
 
@@ -1250,7 +1250,8 @@ def _promote_cal_error(row, cal_error):
 
 
 def _bounded_meter(pairs, start, end, gap):
-    span = [(t, value) for t, value in pairs if start <= t <= end]
+    span = pairs[bisect_left(pairs, start, key=lambda pair: pair[0]):
+                 bisect_right(pairs, end, key=lambda pair: pair[0])]
     if len(span) < 2 or span[0][0] != start or span[-1][0] != end:
         return None, "unmatched_boundary", span
     if any(b[0] - a[0] > gap for a, b in zip(span, span[1:])):
@@ -1316,7 +1317,8 @@ def _session_results(scope, window, ordered, signed_current, fields, gap, ecfg):
         value, reason, span = _bounded_meter(meter, start, end, gap)
         if session["incomplete_start"] or session["incomplete_end"]:
             value, reason = None, "incomplete_boundary:" + session["close_reason"]
-        soc_span = [(t, v) for t, v in soc if start <= t <= end]
+        soc_span = soc[bisect_left(soc, start, key=lambda pair: pair[0]):
+                       bisect_right(soc, end, key=lambda pair: pair[0])]
         soc0, soc1 = _asof(soc, start, skew), _asof(soc, end, skew)
         if any(v is None or not 0 <= v <= 100 for _, v in soc_span) or any(
                 b[0] - a[0] > gap for a, b in zip(soc_span, soc_span[1:])):

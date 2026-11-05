@@ -115,7 +115,7 @@ services:
     - server
     cpus: ${AGG_CPUS:-1.0}
     labels:
-      datalake.aggregate-revision: '48'
+      datalake.aggregate-revision: '49'
     depends_on:
       greptimedb:
         condition: service_started
@@ -4125,10 +4125,10 @@ configs:
                        inserts, deletes, row_fn):
           """Upsert every replacement before removing obsolete, group-scoped anchors."""
           v, src, epoch = key
-          kept = set()
-          for segment in inserts:
-              insert_rows(base_url, auth, db, table, columns, [row_fn(segment)])
-              kept.add(segment["_pk"])
+          kept = {segment["_pk"] for segment in inserts}
+          if inserts:
+              insert_rows(base_url, auth, db, table, columns,
+                          [row_fn(segment) for segment in inserts])
           for old_id in set(deletes) - kept:
               request_sql(base_url, auth, db,
                           "DELETE FROM " + table + " WHERE " + pk_col + " = " +
@@ -4978,10 +4978,11 @@ configs:
           """Refetch dirty sessions' full event history + whole days; recompute."""
           base_url, auth, db = ctx
           sids = sorted({sid for _, sid in keys})
+          trace_seen, log_seen = set(), set()
           scols, srows = _ai_union_session_rows(
-              base_url, auth, db, cfg, "opentelemetry_traces", list(SPAN_COLS), [], sids)
+              base_url, auth, db, cfg, "opentelemetry_traces", list(SPAN_COLS), [], sids, trace_seen)
           lcols, lrows = _ai_union_session_rows(
-              base_url, auth, db, cfg, "opentelemetry_logs", list(LOG_COLS), [], sids)
+              base_url, auth, db, cfg, "opentelemetry_logs", list(LOG_COLS), [], sids, log_seen)
           days = set()
           for cols, rows, is_log in ((scols, srows, False), (lcols, lrows, True)):
               idx = {c: i for i, c in enumerate(cols)}
@@ -5065,10 +5066,10 @@ configs:
               extra = sorted(set(cohort) - set(sids))
               scols, srows = _ai_union_session_rows(
                   base_url, auth, db, cfg, "opentelemetry_traces", scols, srows,
-                  extra)
+                  extra, trace_seen)
               lcols, lrows = _ai_union_session_rows(
                   base_url, auth, db, cfg, "opentelemetry_logs", lcols, lrows,
-                  extra)
+                  extra, log_seen)
               lrows = _ai_filter_logs(lcols, lrows, set(cohort))
           # Single global merge over the union of session history + dirty-day
           # rows: per-day remerges overwrite cross-day native matches (an Aug
@@ -5100,14 +5101,15 @@ configs:
 
 
       def _ai_union_session_rows(base_url, auth, db, cfg, table, cols, rows,
-                                 extra):
-          """Append full history for cohort session ids to fetched rows."""
+                                 extra, seen=None):
+          """Append cohort history; an optional seen set belongs to these same rows."""
           out = list(rows)
           def identity(row):
               return hashlib.sha256(json.dumps(
                   row, sort_keys=True, default=str).encode()).digest()
 
-          seen = {identity(row) for row in out}
+          if seen is None:
+              seen = {identity(row) for row in out}
           ordered = sorted(extra)
           for start in range(0, len(ordered), 64):
               batch = ordered[start:start + 64]
@@ -5162,19 +5164,24 @@ configs:
           return " WHERE " + " OR ".join("(" + o + ")" for o in ors)
 
 
-      def _ai_metric_columns(ctx, table):
-          """Native column names of one metric table, or None when unprovable."""
+      def _ai_metric_columns(ctx, tables):
+          """Native columns for each requested metric table, or fail closed."""
+          if not tables:
+              return {}
           base_url, auth, db = ctx
           try:
-              cols, _rows = fetch_rows(
+              _, rows = fetch_rows(
                   base_url, auth, db,
-                  "SELECT column_name FROM information_schema.columns"
+                  "SELECT table_name, column_name FROM information_schema.columns"
                   " WHERE table_schema = " + str_lit(db) +
-                  " AND table_name = " + str_lit(table))
+                  " AND table_name IN (" + ", ".join(str_lit(t) for t in sorted(set(tables))) + ")")
           except SqlError:
-              return None
-          names = [r[0] for r in (_rows or []) if r and isinstance(r[0], str)]
-          return names or None
+              return {}
+          result = {}
+          for row in rows or []:
+              if len(row) >= 2 and isinstance(row[0], str) and isinstance(row[1], str):
+                  result.setdefault(row[0], []).append(row[1])
+          return result
 
 
       def _ai_scoped_metrics(ctx, cfg, tables=None, keys=None, metric_rows=None,
@@ -5217,8 +5224,9 @@ configs:
                         str(row.get("value")), str(row.get("stream"))))
           tables = _ai_metric_tables(ctx, cfg) or []
           metas = _ai_metric_metas(ctx)
+          columns_by_table = _ai_metric_columns(ctx, [table for table, _ in tables])
           for table, instrument in tables:
-              cols = _ai_metric_columns(ctx, table)
+              cols = columns_by_table.get(table)
               if cols is None:
                   raise SqlError("ai metric columns unprovable for " + table)
               ids = sorted(sids)
@@ -5471,13 +5479,15 @@ configs:
               # delete: a failed batch keeps old anchors (restart converges).
               insert_rows(base_url, auth, db, "ai_session_summary",
                           session_cols, [row for _, row in pending])
-              for s, _ in pending:
-                  if (s["client"], s["session_id"]) not in stale:
-                      continue
-                  request_sql(base_url, auth, db,
-                              "DELETE FROM ai_session_summary WHERE session_id = " +
-                              str_lit(s["session_id"]) + " AND client = " +
-                              str_lit(s["client"]) + " AND session_start != " + ts_lit(s["session_start"]))
+              stale_predicates = [
+                  "(session_id = " + str_lit(s["session_id"]) + " AND client = " +
+                  str_lit(s["client"]) + " AND session_start != " +
+                  ts_lit(s["session_start"]) + ")"
+                  for s, _ in pending if (s["client"], s["session_id"]) in stale
+              ]
+              for offset in range(0, len(stale_predicates), 32):
+                  request_sql(base_url, auth, db, "DELETE FROM ai_session_summary WHERE " +
+                              " OR ".join(stale_predicates[offset:offset + 32]))
               total += len(pending)
           activity_cols = ["day_start", "client"] + list(ACTIVITY_FIELDS) + ["activity_sources"]
           activity_rows = []
@@ -5546,18 +5556,26 @@ configs:
       def log_section(ctx, cfg):
           base_url, auth, db = ctx
           cutoff = floor_day(utcnow() - dt.timedelta(hours=cfg["lookback_h"]))
-          cols, rows = guarded_fetch(
+          day = "date_bin('1d'::INTERVAL, timestamp)"
+          scope = "COALESCE(NULLIF(scope_name, ''), 'unknown')"
+          severity = "COALESCE(NULLIF(severity_text, ''), 'UNSPECIFIED')"
+          _, rows = guarded_fetch(
               base_url, auth, db,
-              "SELECT timestamp, severity_text, severity_number, scope_name"
-              " FROM opentelemetry_logs WHERE timestamp >= '" +
-              cutoff.strftime("%Y-%m-%d %H:%M:%S") + "'", cfg["max_rows"])
+              "SELECT " + day + ", " + scope + ", " + severity +
+              ", COUNT(*), SUM(CASE WHEN UPPER(" + severity +
+              ") = 'ERROR' OR severity_number >= 17 THEN 1 ELSE 0 END)"
+              " FROM opentelemetry_logs WHERE timestamp >= " + ts_lit(cutoff) +
+              " GROUP BY " + day + ", " + scope + ", " + severity, cfg["max_rows"])
+          if sum(row[3] for row in rows) > cfg["max_rows"]:
+              raise SqlError("row cap exceeded: refusing partial write")
           pending = []
           bound = retention_boundary(ctx, "otel", cfg.get("otel_ttl", ""), utcnow())
-          for g in summarize_logs(cols, rows):
-              if not fully_retained(g["day"], cfg.get("otel_ttl", ""), boundary=bound):
+          for stamp, scope_name, severity_text, count, errors in rows:
+              stamp = parse_ts(stamp)
+              if not fully_retained(stamp, cfg.get("otel_ttl", ""), boundary=bound):
                   continue
-              pending.append([ts_lit(g["day"]), str_lit(g["scope"]), str_lit(g["severity"]),
-                              num_lit(g["count"]), num_lit(g["errors"])])
+              pending.append([ts_lit(stamp), str_lit(scope_name), str_lit(severity_text),
+                              num_lit(count), num_lit(errors or None)])
           insert_rows(base_url, auth, db, "ai_log_daily",
                       ["day_start", "scope_name", "severity_text", "log_count",
                        "error_count"], pending)
@@ -6105,6 +6123,7 @@ configs:
           epoch = dt.datetime(1970, 1, 1)
           total = 0
           tables = {}
+          bounds = {}
           for source in cfg["home"]:
               table, tcol, ecol, vcol = (source[key] for key in
                                         ("table", "time_col", "entity_col", "value_col"))
@@ -6116,7 +6135,9 @@ configs:
                   raise
               if cov is None:
                   continue
-              bound = retention_boundary(ctx, table, cfg["home_raw_ttl"], now)
+              if table not in bounds:
+                  bounds[table] = retention_boundary(ctx, table, cfg["home_raw_ttl"], now)
+              bound = bounds[table]
               for resolution, interval, seconds in (("5m", "5m", 300),
                                                    ("1h", "1h", 3600), ("1d", "1d", 86400)):
                   step = dt.timedelta(seconds=seconds)
@@ -6256,8 +6277,7 @@ configs:
               observed = eligible[key]
               if _read_dirty_generation(ctx, scope, hour_ns) != observed:
                   continue
-              unit = {key: observed}
-              _trip_charge_scope_windows(ctx, cfg, unit)
+              _trip_charge_scope_windows(ctx, cfg, {key: observed})
               if _config_revision(cfg) != revision:
                   return committed
               if _read_dirty_generation(ctx, scope, hour_ns) != observed:
@@ -10789,7 +10809,7 @@ configs:
               max_id = _valid_id(_row_value(maxid_raw), max_id_field)
               min_id = _valid_id(_row_value(minid_raw), min_id_field)
               if max_id is None or min_id is None:
-                  barriers = set(barriers) | {tstamp}
+                  barriers.add(tstamp)
               points.append({
                   "t": tstamp,
                   "spread": spread,
@@ -11835,7 +11855,7 @@ configs:
       Supplied endpoint uncertainty propagates against a fixed reference only.
       """
 
-      from bisect import bisect_right
+      from bisect import bisect_left, bisect_right
       import math
       from datetime import datetime, timezone
 
@@ -13031,7 +13051,8 @@ configs:
 
 
       def _bounded_meter(pairs, start, end, gap):
-          span = [(t, value) for t, value in pairs if start <= t <= end]
+          span = pairs[bisect_left(pairs, start, key=lambda pair: pair[0]):
+                       bisect_right(pairs, end, key=lambda pair: pair[0])]
           if len(span) < 2 or span[0][0] != start or span[-1][0] != end:
               return None, "unmatched_boundary", span
           if any(b[0] - a[0] > gap for a, b in zip(span, span[1:])):
@@ -13097,7 +13118,8 @@ configs:
               value, reason, span = _bounded_meter(meter, start, end, gap)
               if session["incomplete_start"] or session["incomplete_end"]:
                   value, reason = None, "incomplete_boundary:" + session["close_reason"]
-              soc_span = [(t, v) for t, v in soc if start <= t <= end]
+              soc_span = soc[bisect_left(soc, start, key=lambda pair: pair[0]):
+                             bisect_right(soc, end, key=lambda pair: pair[0])]
               soc0, soc1 = _asof(soc, start, skew), _asof(soc, end, skew)
               if any(v is None or not 0 <= v <= 100 for _, v in soc_span) or any(
                       b[0] - a[0] > gap for a, b in zip(soc_span, soc_span[1:])):
@@ -15405,18 +15427,14 @@ configs:
       def _barrier_asof(pairs, barriers, t_ns, max_skew_ns):
           """Latest usable value at t<=t_ns within skew; None when a barrier
           stamp sits strictly inside (matched, t_ns] (never bridged)."""
-          best = None
-          for tstamp, val in pairs:
-              if tstamp <= t_ns and t_ns - tstamp <= max_skew_ns:
-                  best = (tstamp, val)
-              elif tstamp > t_ns:
-                  break
-          if best is None:
+          idx = bisect.bisect_right(pairs, t_ns, key=lambda pair: pair[0]) - 1
+          if idx < 0 or t_ns - pairs[idx][0] > max_skew_ns:
               return None
-          for b_t in barriers:
-              if best[0] < b_t <= t_ns:
-                  return None
-          return best[1]
+          tstamp, value = pairs[idx]
+          bidx = bisect.bisect_right(barriers, tstamp)
+          if bidx < len(barriers) and barriers[bidx] <= t_ns:
+              return None
+          return value
 
 
       def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
@@ -15465,9 +15483,9 @@ configs:
               field: (_usable_pairs(temp_timelines.get(field, [])),
                       [t for t, _, ok, _ in temp_timelines.get(field, []) if not ok])
               for field in temp_fields}
-          electrical_barriers = [
+          electrical_barriers = sorted(
               t for timeline in (cur_timeline, vol_timeline)
-              for t, _, ok, _ in timeline if not ok]
+              for t, _, ok, _ in timeline if not ok)
           soc_barriers = [t for t, _, ok, _ in soc_timelines.get(soc_field, [])
                           if not ok]
           valid_rs = []
@@ -15482,7 +15500,8 @@ configs:
                       break
                   if window[0] is not None and t_b < window[0]:
                       continue
-                  if any(t_a <= t <= t_b for t in electrical_barriers):
+                  bidx = bisect.bisect_left(electrical_barriers, t_a)
+                  if bidx < len(electrical_barriers) and electrical_barriers[bidx] <= t_b:
                       dominance["skew"] += 1
                       continue
                   ok, why = check_step_timing(
@@ -15890,9 +15909,12 @@ configs:
           """
           if decision_time_ns is None:
               return list(clean), []
-          kept = [row for row in clean
-                  if row[3] is not None and row[3] <= decision_time_ns]
-          dropped = [row for row in clean if row not in kept]
+          kept, dropped = [], []
+          for row in clean:
+              if row[3] is not None and row[3] <= decision_time_ns:
+                  kept.append(row)
+              else:
+                  dropped.append(row)
           return kept, dropped
 
 
@@ -15951,14 +15973,15 @@ configs:
               raise RULerror("slope_window must be an int >= 2")
           _check_records(records)
           samples = []
-          battery_ids = sorted({r["battery_id"] for r in records})
+          grouped = {}
+          for rec in records:
+              grouped.setdefault(rec["battery_id"], []).append(rec)
+          battery_ids = sorted(grouped)
           try:
               ordered = {}
               for battery_id in battery_ids:
                   ordered[battery_id] = sorted(
-                      (r for r in records
-                       if r.get("battery_id") == battery_id),
-                      key=lambda r: r.get("discharge_cycle", 0))
+                      grouped[battery_id], key=lambda r: r.get("discharge_cycle", 0))
           except TypeError as exc:
               raise RULerror("malformed: discharge_cycle must be comparable: %s"
                              % (exc,))
@@ -15981,7 +16004,8 @@ configs:
                       continue  # post-EOL negatives excluded; censored is None
                   if pos + 1 < min_history:
                       continue  # insufficient history at prediction time
-                  feats = history_features(clean[:pos + 1], slope_window)
+                  feats = history_features(clean[max(0, pos + 1 - slope_window):pos + 1],
+                                           slope_window)
                   samples.append({"battery_id": battery_id,
                                   "discharge_cycle": clean[pos][0],
                                   "features": feats, "target": float(target)})
@@ -16869,6 +16893,8 @@ configs:
       row; runtime should also include it in persisted logical identity.
       """
 
+      from bisect import bisect_left, bisect_right
+
       from scripts.analytics.battery import battery_common as bc
 
       ALGORITHM_VERSION = "1.2.2"
@@ -17481,6 +17507,7 @@ configs:
                           recurrence += 1
               scope_signals = sorted(
                   sig_by_scope.get(scope, []), key=lambda s: s["event_time_ns"])
+              scope_times = [s["event_time_ns"] for s in scope_signals]
               hist_canon = sorted(_canon(e) for e in obs)
               # Revision is per scope so influencing signals hash with their scope;
               # episodes are emitted first with a provisional revision, then the
@@ -17534,10 +17561,9 @@ configs:
                   else:
                       endref = max(ep["observation_event_times"])
                   hi = endref + skew
-                  inbounds = [s for s in scope_signals
-                              if lo <= s["event_time_ns"] <= hi
-                              and (fields is None
-                                   or s.get("source_field") in fields)]
+                  inbounds = [s for s in scope_signals[
+                      bisect_left(scope_times, lo):bisect_right(scope_times, hi)]
+                              if fields is None or s.get("source_field") in fields]
                   used_canons.extend(_canon(s) for s in inbounds)
                   ep_rows.append(bc.make_result(
                       METRIC_CONTEXT, float(len(inbounds)), "count", "derived",
@@ -17567,10 +17593,9 @@ configs:
                   else:
                       endref = max(ep["observation_event_times"])
                   hi = endref + skew
-                  inbounds = [s for s in scope_signals
-                              if lo <= s["event_time_ns"] <= hi
-                              and (fields is None
-                                   or s.get("source_field") in fields)]
+                  inbounds = [s for s in scope_signals[
+                      bisect_left(scope_times, lo):bisect_right(scope_times, hi)]
+                              if fields is None or s.get("source_field") in fields]
                   cond, _ = _condition_rows(
                       ep, inbounds, ws, we, vehicle, source, epoch,
                       dict_version, revision)
@@ -19201,6 +19226,7 @@ configs:
           for scope in sorted(scopes, key=repr):
               sig_scope = prepared.get(scope, bc.prepare_signals([]))
               ev_scope = ev_by_scope.get(scope, [])
+              ids_by_window = None
               for ws, we in per_scope_windows.get(scope, ()):
                   window_cfg = dict(analysis_cfg)
                   window_cfg["window_start_ns"] = ws
@@ -19328,13 +19354,19 @@ configs:
                                    for r in produced if isinstance(r, dict)}
                   if failed_modules:
                       previous[scope]["failed"].add(ws)
+                  if (failed_modules or recovered_modules) and ids_by_window is None:
+                      ids_by_window = {}
+                      for identity in sorted(previous[scope]["ids"]):
+                          metric, analysis_id, prev_ws, prev_epoch = identity
+                          ids_by_window.setdefault(prev_ws, []).append(identity)
+                  if failed_modules:
                       all_rows.extend(invalidate_previous(
-                          previous[scope]["ids"], scope, (ws, we),
+                          ids_by_window.get(ws, ()), scope, (ws, we),
                           failed_modules, computed_at, config_version,
                           refreshed=refreshed))
                   if recovered_modules:
                       all_rows.extend(recover_indicators(
-                          previous[scope]["ids"], scope, (ws, we),
+                          ids_by_window.get(ws, ()), scope, (ws, we),
                           recovered_modules, computed_at, config_version,
                           refreshed=refreshed))
           return all_rows

@@ -86,6 +86,8 @@ Scope scalars keep ``battery_alerts``. ``episode_id`` still rides every
 row; runtime should also include it in persisted logical identity.
 """
 
+from bisect import bisect_left, bisect_right
+
 from scripts.analytics.battery import battery_common as bc
 
 ALGORITHM_VERSION = "1.2.2"
@@ -698,6 +700,7 @@ def analyze(signals, events, config):
                     recurrence += 1
         scope_signals = sorted(
             sig_by_scope.get(scope, []), key=lambda s: s["event_time_ns"])
+        scope_times = [s["event_time_ns"] for s in scope_signals]
         hist_canon = sorted(_canon(e) for e in obs)
         # Revision is per scope so influencing signals hash with their scope;
         # episodes are emitted first with a provisional revision, then the
@@ -751,10 +754,9 @@ def analyze(signals, events, config):
             else:
                 endref = max(ep["observation_event_times"])
             hi = endref + skew
-            inbounds = [s for s in scope_signals
-                        if lo <= s["event_time_ns"] <= hi
-                        and (fields is None
-                             or s.get("source_field") in fields)]
+            inbounds = [s for s in scope_signals[
+                bisect_left(scope_times, lo):bisect_right(scope_times, hi)]
+                        if fields is None or s.get("source_field") in fields]
             used_canons.extend(_canon(s) for s in inbounds)
             ep_rows.append(bc.make_result(
                 METRIC_CONTEXT, float(len(inbounds)), "count", "derived",
@@ -784,10 +786,9 @@ def analyze(signals, events, config):
             else:
                 endref = max(ep["observation_event_times"])
             hi = endref + skew
-            inbounds = [s for s in scope_signals
-                        if lo <= s["event_time_ns"] <= hi
-                        and (fields is None
-                             or s.get("source_field") in fields)]
+            inbounds = [s for s in scope_signals[
+                bisect_left(scope_times, lo):bisect_right(scope_times, hi)]
+                        if fields is None or s.get("source_field") in fields]
             cond, _ = _condition_rows(
                 ep, inbounds, ws, we, vehicle, source, epoch,
                 dict_version, revision)

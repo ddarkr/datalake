@@ -129,6 +129,50 @@ def test_module_error_isolated_with_identity():
     assert filled[0]["revision"], filled[0]  # deterministic, never clock
 
 
+def test_dispatch_invalidates_previous_by_window_with_null_epoch():
+    scope = ("v", "fleet", None)
+    windows = [(n * br.HOUR_NS, (n + 1) * br.HOUR_NS - 1)
+               for n in (8, 9)]
+    ids = {
+        ("battery.conditions.z", "battery_conditions", windows[0][0], None),
+        ("battery.conditions.a", "battery_conditions", windows[0][0], None),
+        ("battery.conditions.b", "battery_conditions", windows[1][0], None),
+        ("battery.conditions.other", "battery_conditions", windows[1][0], "e1"),
+    }
+    previous = {scope: {"ids": ids, "failed": set()}}
+    rows = br._dispatch_all(
+        {}, None, "bad_config", 42, {scope}, {scope: windows}, previous,
+        {}, {}, [("battery_conditions", "conditions", None)], [], [])
+    expected = []
+    for window in windows:
+        expected.extend(br.invalidate_previous(
+            ids, scope, window, {"battery_conditions"}, 42))
+    actual = [r for r in rows if r.get("reason") ==
+              "invalidated:previous_success_stale_after_module_failure"]
+    assert actual == expected
+    assert previous[scope]["failed"] == {ws for ws, _ in windows}
+
+
+def test_dispatch_recovers_previous_indicators_by_window():
+    from unittest.mock import patch
+
+    scope = ("v", "fleet", None)
+    windows = [(n * br.HOUR_NS, (n + 1) * br.HOUR_NS - 1)
+               for n in (8, 9)]
+    ids = {("battery.dispatch.error", "battery_dispatch", ws, None)
+           for ws, _ in windows}
+    previous = {scope: {"ids": ids, "failed": set()}}
+    with patch.object(bc, "run_analyses", return_value=[]):
+        rows = br._dispatch_all(
+            {}, None, None, 42, {scope}, {scope: windows}, previous,
+            {}, {}, [], [], [])
+    expected = []
+    for window in windows:
+        expected.extend(br.recover_indicators(
+            ids, scope, window, {"battery_dispatch"}, 42))
+    assert rows == expected
+
+
 def test_module_failure_invalidates_previous_success():
     # Root bug: prior metric=battery.conditions.probe value=1 (estimated)
     # plus a new raising-module pseudo-name error left TWO latest rows and

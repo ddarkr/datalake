@@ -1945,18 +1945,14 @@ def _step_sequence(cur_timeline, vol_timeline, sign, max_skew_ns,
 def _barrier_asof(pairs, barriers, t_ns, max_skew_ns):
     """Latest usable value at t<=t_ns within skew; None when a barrier
     stamp sits strictly inside (matched, t_ns] (never bridged)."""
-    best = None
-    for tstamp, val in pairs:
-        if tstamp <= t_ns and t_ns - tstamp <= max_skew_ns:
-            best = (tstamp, val)
-        elif tstamp > t_ns:
-            break
-    if best is None:
+    idx = bisect.bisect_right(pairs, t_ns, key=lambda pair: pair[0]) - 1
+    if idx < 0 or t_ns - pairs[idx][0] > max_skew_ns:
         return None
-    for b_t in barriers:
-        if best[0] < b_t <= t_ns:
-            return None
-    return best[1]
+    tstamp, value = pairs[idx]
+    bidx = bisect.bisect_right(barriers, tstamp)
+    if bidx < len(barriers) and barriers[bidx] <= t_ns:
+        return None
+    return value
 
 
 def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
@@ -2005,9 +2001,9 @@ def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
         field: (_usable_pairs(temp_timelines.get(field, [])),
                 [t for t, _, ok, _ in temp_timelines.get(field, []) if not ok])
         for field in temp_fields}
-    electrical_barriers = [
+    electrical_barriers = sorted(
         t for timeline in (cur_timeline, vol_timeline)
-        for t, _, ok, _ in timeline if not ok]
+        for t, _, ok, _ in timeline if not ok)
     soc_barriers = [t for t, _, ok, _ in soc_timelines.get(soc_field, [])
                     if not ok]
     valid_rs = []
@@ -2022,7 +2018,8 @@ def _analyze_dcr(scope, window, cur_timeline, vol_timeline, soc_timelines,
                 break
             if window[0] is not None and t_b < window[0]:
                 continue
-            if any(t_a <= t <= t_b for t in electrical_barriers):
+            bidx = bisect.bisect_left(electrical_barriers, t_a)
+            if bidx < len(electrical_barriers) and electrical_barriers[bidx] <= t_b:
                 dominance["skew"] += 1
                 continue
             ok, why = check_step_timing(

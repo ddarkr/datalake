@@ -402,6 +402,33 @@ def test_cli_parser_contract():
     assert args.command == "predict" and args.history == "h.json"
 
 
+def test_asof_partition_and_training_prefix_validation():
+    clean = [(0, 2.0, 1.0, None), (1, 1.9, 1.0, 10),
+             (2, 1.8, 1.0, 11), (3, 1.7, 1.0, 10)]
+    assert rul._asof_history(clean, 10) == ([clean[1], clean[3]],
+                                            [clean[0], clean[2]])
+    assert rul._asof_history(clean, None) == (clean, [])
+    records, _ = lin_battery("B", 2.0, 0.01, 65)
+    samples = rul.samples_from_records(list(reversed(records)), 2, 3)
+    ordered = sorted(records, key=lambda r: r["discharge_cycle"])
+    validated = rul._clean_history([
+        {"discharge_cycle": r["discharge_cycle"],
+         "capacity_ah": r["capacity_ah"], "duration_s": r["duration_s"]}
+        for r in ordered])
+    for sample in samples:
+        pos = next(i for i, r in enumerate(ordered)
+                   if r["discharge_cycle"] == sample["discharge_cycle"])
+        assert sample["features"] == rul.history_features(validated[:pos + 1], 3)
+    invalid = [dict(r) for r in records]
+    invalid[1]["discharge_cycle"] = invalid[0]["discharge_cycle"]
+    try:
+        rul.samples_from_records(invalid, 5, 2)
+    except rul.RULerror as exc:
+        assert "strictly increase" in str(exc)
+    else:
+        raise AssertionError("earlier duplicate cycle must be rejected")
+
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:

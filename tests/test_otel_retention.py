@@ -11,6 +11,7 @@ and aggregate.py stay owned by #1.
 import datetime as dt
 import http.server
 import json
+import sqlite3
 import threading
 import time
 import urllib.parse
@@ -63,7 +64,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 else:
                     cols, rows = ["m"], []
             elif "FROM opentelemetry_logs" in stmt:
-                if Handler.log_cols is not None:
+                if " GROUP BY " in stmt:
+                    cols, rows = _group_logs(stmt, Handler.log_cols or [],
+                                             Handler.log_rows or [])
+                elif Handler.log_cols is not None:
                     cols, rows = Handler.log_cols, Handler.log_rows
                 else:
                     cols, rows = ["m"], []
@@ -82,6 +86,23 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+
+def _group_logs(stmt, columns, rows):
+    """Execute the grouped query against the fixture, not canned totals."""
+    with sqlite3.connect(":memory:") as db:
+        db.create_function("date_bin", 2, lambda _interval, stamp:
+                           agg.floor_day(agg.parse_ts(stamp)).strftime("%Y-%m-%d %H:%M:%S")
+                           if stamp is not None else None)
+        db.execute("CREATE TABLE opentelemetry_logs "
+                   "(timestamp TEXT, severity_text TEXT, severity_number INTEGER, scope_name TEXT)")
+        positions = {name: index for index, name in enumerate(columns)}
+        names = ("timestamp", "severity_text", "severity_number", "scope_name")
+        db.executemany("INSERT INTO opentelemetry_logs VALUES (?, ?, ?, ?)",
+                       [tuple(row[positions[name]] if name in positions else None
+                              for name in names) for row in rows])
+        result = db.execute(stmt.replace("'1d'::INTERVAL", "'1d'"))
+        return [column[0] for column in result.description], result.fetchall()
 
 
 def serve():
@@ -244,7 +265,64 @@ def test_ttl_boundary_log_section_keeps_expired_day():
         srv.shutdown()
 
 
+def test_log_groups_preserve_counts_nulls_and_raw_cap():
+    now = dt.datetime(2026, 9, 21, 12)
+    def row(stamp, severity, number, scope):
+        value = _log_row(stamp, "s", "call", 1, 1)
+        value[:4] = [stamp, severity, number, scope]
+        return value
+    raw = [
+        row("2026-09-21 09:00:00", None, None, None),
+        row("2026-09-21 09:00:00", None, None, None),
+        row("2026-09-21 10:00:00", "", 17, ""),
+        row("2026-09-21 11:00:00", "eRrOr", 0, "app"),
+        row("2026-09-21 11:01:00", "INFO", 16, "app"),
+        row("2026-09-21 11:02:00", "INFO", 17, "app"),
+        row("2026-09-21 11:03:00", "WARN", 16, "app"),
+        row("2026-09-14 11:00:00", "ERROR", 17, "expired"),
+        row(None, "ERROR", 17, "missing-time"),
+    ]
+    srv = serve()
+    orig_utcnow = agg.utcnow
+    try:
+        _reset(None, _log_payload(raw))
+        agg.utcnow = lambda: now
+        ctx = ("http://127.0.0.1:%d" % srv.server_port, "YXV0aA==", "db")
+        cfg = {"otel_ttl": "7d", "max_rows": 8, "lookback_h": 24 * 400}
+        assert agg.log_section(ctx, cfg) == 4
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE ai_log_daily "
+                       "(day_start TEXT, scope_name TEXT, severity_text TEXT, "
+                       "log_count INTEGER, error_count INTEGER)")
+            for statement in Handler.seen:
+                if statement.startswith("INSERT INTO ai_log_daily"):
+                    db.execute(statement)
+            actual = db.execute("SELECT * FROM ai_log_daily").fetchall()
+        actual = [(agg.parse_ts(stamp), scope, severity, count, errors)
+                  for stamp, scope, severity, count, errors in actual]
+        assert len(actual) == 4
+        assert set(actual) == {
+            (dt.datetime(2026, 9, 21), "app", "INFO", 2, 1),
+            (dt.datetime(2026, 9, 21), "app", "WARN", 1, None),
+            (dt.datetime(2026, 9, 21), "app", "eRrOr", 1, 1),
+            (dt.datetime(2026, 9, 21), "unknown", "UNSPECIFIED", 3, 1),
+        }
+        Handler.seen.clear()
+        try:
+            agg.log_section(ctx, dict(cfg, max_rows=7))
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("raw cap must include expired rows and duplicates")
+        assert not any(s.startswith(("INSERT", "DELETE")) for s in Handler.seen)
+    finally:
+        agg.utcnow = orig_utcnow
+        _reset()
+        srv.shutdown()
+
+
 _TESTS = (
+    test_log_groups_preserve_counts_nulls_and_raw_cap,
     test_invalid_ttl_rejected,
     test_ttl_boundary_exact_arithmetic,
     test_ttl_boundary_ai_section_keeps_expired_aggregates,

@@ -65,6 +65,10 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
   merge한다. 여러 세션 별칭 때문에 배치가 겹치는 동일 행은 합칠 때
   중복 제거한 뒤 전체 행 상한을 적용한다. 날짜를 임의로 잘라 과거
   native 매칭을 생략하지 않으며, 상한 초과 시 기존 전체 복구로 전환한다.
+- 같은 pass의 세션·날짜·cohort 결과를 합칠 때 이미 계산한 identity 집합을
+  재사용한다. 조회 범위·행 상한·중복 중 첫 행을 선택하는 순서는 바꾸지 않는다.
+- 이전 세션 anchor 삭제는 대체 행 INSERT가 모두 성공한 뒤 최대 32개 조건씩
+  묶는다. 대체 행 INSERT 실패 시 이전 anchor와 sequence fence를 보존한다.
 
 ## 메트릭
 
@@ -81,6 +85,8 @@ https/grpcs는 `grpc.secure_channel`, 평문 downgrade 없음).
   dirty 날짜의 다른 계기를 보존하며, 배치 사이 중복은 전체 merge에서 제거한다.
 - 테이블 목록과 메타데이터는 같은 pass의 카탈로그 조회 결과를 공유한다.
   다음 pass에서는 새로 조회하므로 테이블 추가·삭제를 계속 발견한다.
+  여러 metric 테이블의 컬럼도 한 번의 `information_schema.columns` 조회로
+  읽으며, 필요한 컬럼을 증명하지 못하면 기존 fail-closed 경로를 따른다.
 
 ## 상태
 

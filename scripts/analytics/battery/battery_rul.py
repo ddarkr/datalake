@@ -207,9 +207,12 @@ def _asof_history(clean, decision_time_ns):
     """
     if decision_time_ns is None:
         return list(clean), []
-    kept = [row for row in clean
-            if row[3] is not None and row[3] <= decision_time_ns]
-    dropped = [row for row in clean if row not in kept]
+    kept, dropped = [], []
+    for row in clean:
+        if row[3] is not None and row[3] <= decision_time_ns:
+            kept.append(row)
+        else:
+            dropped.append(row)
     return kept, dropped
 
 
@@ -268,14 +271,15 @@ def samples_from_records(records, min_history, slope_window):
         raise RULerror("slope_window must be an int >= 2")
     _check_records(records)
     samples = []
-    battery_ids = sorted({r["battery_id"] for r in records})
+    grouped = {}
+    for rec in records:
+        grouped.setdefault(rec["battery_id"], []).append(rec)
+    battery_ids = sorted(grouped)
     try:
         ordered = {}
         for battery_id in battery_ids:
             ordered[battery_id] = sorted(
-                (r for r in records
-                 if r.get("battery_id") == battery_id),
-                key=lambda r: r.get("discharge_cycle", 0))
+                grouped[battery_id], key=lambda r: r.get("discharge_cycle", 0))
     except TypeError as exc:
         raise RULerror("malformed: discharge_cycle must be comparable: %s"
                        % (exc,))
@@ -298,7 +302,8 @@ def samples_from_records(records, min_history, slope_window):
                 continue  # post-EOL negatives excluded; censored is None
             if pos + 1 < min_history:
                 continue  # insufficient history at prediction time
-            feats = history_features(clean[:pos + 1], slope_window)
+            feats = history_features(clean[max(0, pos + 1 - slope_window):pos + 1],
+                                     slope_window)
             samples.append({"battery_id": battery_id,
                             "discharge_cycle": clean[pos][0],
                             "features": feats, "target": float(target)})

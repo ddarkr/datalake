@@ -405,6 +405,28 @@ def test_invalid_event_timestamp_dropped():
     assert rows and rows[0]["status"] == "unavailable"
 
 
+def test_context_inclusive_bounds_and_duplicate_revision():
+    config = cfg(alerts={"context_skew_ns": 100})
+    for obs, upper in (
+            ([ev(1_500, started=1_000, ended=2_000, active=False, eid="c")], 2_100),
+            ([ev(1_500, started=1_000, active=True, eid="a")], 1_600),
+            ([ev(1_500, started=1_000, ended=2_000, eid="x"),
+              ev(1_600, started=1_000, ended=2_500, eid="y")], 2_600)):
+        boundary = [sig(900, unit=None), sig(upper, unit=None),
+                    sig(upper, unit=None)]
+        inside = al.analyze(boundary, obs, config)
+        outside = al.analyze([sig(899), *boundary, sig(upper + 1)], obs, config)
+        assert inside == outside
+        ctx = rows_by(inside, "battery.alerts.context")[0]
+        assert ctx["sample_count"] == 3
+        without_duplicate = rows_by(al.analyze(boundary[:-1], obs, config),
+                                    "battery.alerts.context")[0]
+        assert ctx["revision"] != without_duplicate["revision"]
+        conditions = rows_by(inside, "battery.alerts.condition")
+        assert sum(r["sample_count"] for r in conditions) == 3
+        assert all(r["unit"] is None for r in conditions)
+
+
 if __name__ == "__main__":
     names = sorted(n for n in list(globals()) if n.startswith("test_"))
     for name in names:

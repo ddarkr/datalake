@@ -502,6 +502,43 @@ def test_circuit_invalid_between_close_rows_blocks_paths():
         "invalid" in ica["reason"] or "segment" in ica["reason"]
 
 
+def test_dcr_asof_duplicate_skew_and_barrier_boundaries():
+    pairs = [(10, 1), (10, 2), (20, 3)]
+    assert be._barrier_asof(pairs, [10], 15, 5) == 2
+    assert be._barrier_asof(pairs, [15], 15, 5) is None
+    assert be._barrier_asof(pairs, [], 16, 5) is None
+    assert be._barrier_asof(pairs, [15], 20, 5) == 3
+    assert be._barrier_asof(pairs, [], 9, 5) is None
+
+
+def test_dcr_electrical_barriers_from_both_timelines_are_sorted():
+    current = [(10, 0, True, False), (20, -10, True, False)]
+    voltage = [(10, 400, True, False), (20, 399, True, False)]
+    soc = {"Soc": [(10, 50, True, False), (20, 50, True, False)]}
+    temp = {"Temp": [(10, 25, True, False), (20, 25, True, False)]}
+    cfg = {"max_skew_ns": 10, "min_step_ns": 0, "max_step_ns": 10,
+           "min_delta_a": 1, "max_soc_change": 1, "max_temp_change_c": 1}
+
+    def analyze(cur, vol):
+        return be._analyze_dcr(("v", "fleet", "e"), (1, 20), cur,
+                               vol, soc, temp, 1, cfg, "test", "Soc",
+                               ["Temp"])[0]
+
+    assert analyze(current, voltage)["status"] == "derived"
+    for cur, vol in (
+        (current[:1] + [(15, None, False, False)] + current[1:],
+         [(5, None, False, False)] + voltage),
+        ([(10, None, False, False)] + current,
+         [(5, None, False, False)] + voltage),
+        (current + [(25, None, False, False)],
+         [(5, None, False, False), (10, None, False, False)] + voltage),
+    ):
+        result = analyze(cur, vol)
+        assert result["status"] == "unavailable"
+        assert result["reason"] == "unsynchronized:step_timing_out_of_bounds"
+        assert result["evidence_count"] == 2
+
+
 def test_circuit_missing_battery_temp_is_explicit():
     rows = [r for r in circuit_rows()
             if r["source_field"] not in ("ModuleTempMin", "ModuleTempMax")]

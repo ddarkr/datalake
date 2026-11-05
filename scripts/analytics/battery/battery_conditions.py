@@ -1066,7 +1066,7 @@ def _sync_pair(ordered, max_field, min_field, max_id_field, min_id_field,
         max_id = _valid_id(_row_value(maxid_raw), max_id_field)
         min_id = _valid_id(_row_value(minid_raw), min_id_field)
         if max_id is None or min_id is None:
-            barriers = set(barriers) | {tstamp}
+            barriers.add(tstamp)
         points.append({
             "t": tstamp,
             "spread": spread,

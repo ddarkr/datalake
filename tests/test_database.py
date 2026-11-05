@@ -959,13 +959,9 @@ def test_session_batch_replacement_isolation_and_failure_keeps_anchor():
             if stmt.startswith("INSERT INTO"):
                 return {"output": [{"affectedrows": 1}]}
             if stmt.startswith("DELETE FROM ai_session_summary"):
-                sid = _lit(stmt.split("session_id = ", 1)[1])
-                client = _lit(stmt.split("client = ", 1)[1])
-                start = _lit(stmt.split("session_start != ", 1)[1])
                 with lock:
-                    db.execute("DELETE FROM store WHERE session_id = ?"
-                               " AND client = ? AND session_start != ?",
-                               (sid, client, start))
+                    db.execute(stmt.replace("DELETE FROM ai_session_summary",
+                                            "DELETE FROM store", 1))
                     db.commit()
                 return {"output": [{"affectedrows": 1}]}
             return {"output": [{"affectedrows": 1}]}
@@ -1542,7 +1538,45 @@ def test_trip_hour_chunks_preserve_context_and_refuse_total_cap():
     assert run(agg.HOUR_NS, len(rows) - 1) is None
 
 
+def test_plan_batches_keep_old_anchors_when_later_insert_fails():
+    statements = []
+    def sql(_base, _auth, _db, statement, **kwargs):
+        statements.append(statement)
+        if statement.startswith("INSERT") and len(statements) == 2:
+            raise agg.SqlError("second batch")
+    segments = [{"_pk": str(i)} for i in range(501)]
+    with patch.object(agg, "request_sql", side_effect=sql):
+        try:
+            agg._apply_plans("", "", "", "trip_summary", "trip_id", ["trip_id"],
+                             ("v", "can", "e"), segments, ["old"],
+                             lambda segment: [agg.str_lit(segment["_pk"])])
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("insert failure must propagate")
+    assert len(statements) == 2 and all(s.startswith("INSERT") for s in statements)
+
+
+
+def test_log_group_counts_enforce_raw_cap_before_writes():
+    import datetime as dt
+    groups = [["2026-09-21 00:00:00", "unknown", "UNSPECIFIED", 6, 0]]
+    with patch.object(agg, "guarded_fetch", return_value=([], groups)), \
+            patch.object(agg, "retention_boundary") as retention, \
+            patch.object(agg, "insert_rows") as insert, \
+            patch.object(agg, "utcnow", return_value=dt.datetime(2026, 9, 21, 12)):
+        try:
+            agg.log_section(("", "", ""), {"lookback_h": 30, "max_rows": 5})
+        except agg.SqlError:
+            pass
+        else:
+            raise AssertionError("raw cap must not become a group cap")
+        assert not retention.called and not insert.called
+
+
 if __name__ == "__main__":
+    test_log_group_counts_enforce_raw_cap_before_writes()
+    test_plan_batches_keep_old_anchors_when_later_insert_fails()
     test_late_unflushed_trip_and_charge_preserve_full_heads()
     test_trip_hour_chunks_preserve_context_and_refuse_total_cap()
     test_coordinator_earlier_unit_survives_later_failure_and_retry()

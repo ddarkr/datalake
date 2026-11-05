@@ -157,6 +157,18 @@ def test_estimated_soh_uses_partial_session_and_bms_nominal_reference():
     assert abs(fallback['value'] - 100.0) < 1e-9 and 'ref=new-pack-1' in fallback['reason']
 
 
+def test_bounded_meter_includes_duplicate_endpoints_and_barriers():
+    pairs = [(0, 0), (1, 1), (1, 1), (2, 2), (3, 3), (3, 3), (4, 4)]
+    value, reason, span = en._bounded_meter(pairs, 1, 3, 1)
+    assert (value, reason, span) == (2, "ok", pairs[1:6])
+    assert en._bounded_meter(pairs, 1, 4, 1)[2] == pairs[1:]
+    assert en._bounded_meter(pairs, 1, 5, 1)[1] == "unmatched_boundary"
+    assert en._bounded_meter([(1, 1), (2, None), (3, 3)], 1, 3, 1)[1] == "sparse"
+    assert en._bounded_meter([(1, 1), (1, 2), (3, 3)], 1, 3, 2)[1] == "ambiguous"
+    assert en._bounded_meter([(1, 3), (3, 2)], 1, 3, 2)[1] == "reset"
+    assert en._bounded_meter([(1, 1), (3, 3)], 1, 3, 1)[1] == "gap"
+
+
 def test_cross_hour_session_credited_only_at_closure():
     rows = full_discharge(T0+55*STEP)
     early = en.analyze(rows, [], dict(cal(), window_start_ns=T0, window_end_ns=T0+HOUR-1))

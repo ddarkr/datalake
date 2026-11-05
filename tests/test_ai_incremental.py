@@ -358,14 +358,10 @@ def route(stmt):
         return {"output": [{"affectedrows": len(stored) - len(survivors)}]}
     if stmt.startswith("SELECT"):
         if "information_schema.columns" in stmt:
-            m = re.search(r"table_name\s*=\s*'((?:''|[^'])*)'", stmt)
-            logical = m.group(1).replace("''", "'") if m else None
-            cols = ([c for c in FakeGreptime.metric_cols]
-                    if logical and any(t == logical for t, _ in F.catalog)
-                    else [])
-            rows = [[c] for c in cols]
+            rows = [[table, c] for table, _ in F.catalog
+                    for c in FakeGreptime.metric_cols]
             F.queries.append((stmt, len(rows)))
-            return _records(["column_name"], rows)
+            return _records(["table_name", "column_name"], rows)
         if "information_schema" in stmt:
             rows = [list(r) for r in F.catalog]
             F.queries.append((stmt, len(rows)))
@@ -437,14 +433,17 @@ def route(stmt):
         return {"output": [{"affectedrows": len(rows)}],
                 "execution_time_ms": 1}
     if stmt.startswith("DELETE FROM ai_session_summary"):
-        sid = _lit_arg(stmt, "session_id")
-        client = _lit_arg(stmt, "client")
-        start = _lit_arg(stmt, "session_start", op="!=")
+        stored = F.derived["ai_session_summary"]
+        with sqlite3.connect(":memory:") as db:
+            db.execute("CREATE TABLE ai_session_summary "
+                       "(client TEXT, session_id TEXT, session_start TEXT)")
+            db.executemany("INSERT INTO ai_session_summary VALUES (?, ?, ?)",
+                           [(r.get("client"), r.get("session_id"), r.get("session_start"))
+                            for r in stored])
+            db.execute(stmt)
+            survivors = {row[0] - 1 for row in db.execute("SELECT rowid FROM ai_session_summary")}
         F.derived["ai_session_summary"] = [
-            r for r in F.derived["ai_session_summary"]
-            if not (r.get("session_id") == sid
-                    and r.get("client") == client
-                    and r.get("session_start") != start)]
+            row for index, row in enumerate(stored) if index in survivors]
         F.queries.append((stmt, 1))
         return {"output": [{"affectedrows": 1}], "execution_time_ms": 1}
     if stmt.startswith(("ALTER TABLE", "CREATE TABLE", "ADMIN ")):
@@ -2370,6 +2369,14 @@ def test_session_history_lookup_matches_all_aliases_without_duplicates():
                 "", "", "", {"max_rows": 65}, "opentelemetry_traces",
                 columns, [], sessions)
             assert sorted(map(tuple, actual)) == expected
+            seen = set()
+            _, first = agg._ai_union_session_rows(
+                "", "", "", {"max_rows": 65}, "opentelemetry_traces",
+                columns, [], sessions[:64], seen)
+            _, combined = agg._ai_union_session_rows(
+                "", "", "", {"max_rows": 65}, "opentelemetry_traces",
+                columns, first, sessions[64:], seen)
+            assert sorted(map(tuple, combined)) == expected
             try:
                 agg._ai_union_session_rows(
                     "", "", "", {"max_rows": 64}, "opentelemetry_traces",
@@ -2401,7 +2408,7 @@ def test_scoped_metric_batches_share_session_and_day_selectors():
         ctx = ("", "", "test")
         with (patch.object(agg, "_ai_flight", return_value=Flight),
               patch.object(agg, "_ai_metric_tables", return_value=[("metrics", "tokens")]),
-              patch.object(agg, "_ai_metric_columns", return_value=columns),
+              patch.object(agg, "_ai_metric_columns", return_value={"metrics": columns}),
               patch.object(agg, "_ai_metric_metas", return_value={}),
               patch.object(agg, "_ai_norm_metric_row",
                            wraps=agg._ai_norm_metric_row) as normalize):
@@ -2465,7 +2472,22 @@ def test_large_dirty_cohort_matches_full_cross_day_oracle():
 
 
 
+def test_metric_column_lookup_keeps_tables_separate_and_missing_unprovable():
+    from unittest.mock import patch
+
+    with patch.object(agg, "fetch_rows", return_value=(
+            ["table_name", "column_name"],
+            [["one", "session_id"], ["two", "conversation_id"],
+             ["one", "greptime_timestamp"]])) as fetch:
+        columns = agg._ai_metric_columns(("", "", "db"), ["one", "two", "missing"])
+    assert fetch.call_count == 1
+    assert columns == {"one": ["session_id", "greptime_timestamp"],
+                       "two": ["conversation_id"]}
+    assert "missing" not in columns
+
+
 TESTS = (
+    test_metric_column_lookup_keeps_tables_separate_and_missing_unprovable,
     test_scoped_metric_batches_share_session_and_day_selectors,
     test_large_dirty_cohort_matches_full_cross_day_oracle,
     test_session_history_lookup_matches_all_aliases_without_duplicates,

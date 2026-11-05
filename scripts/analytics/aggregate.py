@@ -1925,10 +1925,10 @@ def _apply_plans(base_url, auth, db, table, pk_col, columns, key,
                  inserts, deletes, row_fn):
     """Upsert every replacement before removing obsolete, group-scoped anchors."""
     v, src, epoch = key
-    kept = set()
-    for segment in inserts:
-        insert_rows(base_url, auth, db, table, columns, [row_fn(segment)])
-        kept.add(segment["_pk"])
+    kept = {segment["_pk"] for segment in inserts}
+    if inserts:
+        insert_rows(base_url, auth, db, table, columns,
+                    [row_fn(segment) for segment in inserts])
     for old_id in set(deletes) - kept:
         request_sql(base_url, auth, db,
                     "DELETE FROM " + table + " WHERE " + pk_col + " = " +
@@ -2778,10 +2778,11 @@ def _ai_dirty_recompute(ctx, cfg, keys, prices, metric_rows=None,
     """Refetch dirty sessions' full event history + whole days; recompute."""
     base_url, auth, db = ctx
     sids = sorted({sid for _, sid in keys})
+    trace_seen, log_seen = set(), set()
     scols, srows = _ai_union_session_rows(
-        base_url, auth, db, cfg, "opentelemetry_traces", list(SPAN_COLS), [], sids)
+        base_url, auth, db, cfg, "opentelemetry_traces", list(SPAN_COLS), [], sids, trace_seen)
     lcols, lrows = _ai_union_session_rows(
-        base_url, auth, db, cfg, "opentelemetry_logs", list(LOG_COLS), [], sids)
+        base_url, auth, db, cfg, "opentelemetry_logs", list(LOG_COLS), [], sids, log_seen)
     days = set()
     for cols, rows, is_log in ((scols, srows, False), (lcols, lrows, True)):
         idx = {c: i for i, c in enumerate(cols)}
@@ -2865,10 +2866,10 @@ def _ai_dirty_recompute(ctx, cfg, keys, prices, metric_rows=None,
         extra = sorted(set(cohort) - set(sids))
         scols, srows = _ai_union_session_rows(
             base_url, auth, db, cfg, "opentelemetry_traces", scols, srows,
-            extra)
+            extra, trace_seen)
         lcols, lrows = _ai_union_session_rows(
             base_url, auth, db, cfg, "opentelemetry_logs", lcols, lrows,
-            extra)
+            extra, log_seen)
         lrows = _ai_filter_logs(lcols, lrows, set(cohort))
     # Single global merge over the union of session history + dirty-day
     # rows: per-day remerges overwrite cross-day native matches (an Aug
@@ -2900,14 +2901,15 @@ def _ai_dirty_recompute(ctx, cfg, keys, prices, metric_rows=None,
 
 
 def _ai_union_session_rows(base_url, auth, db, cfg, table, cols, rows,
-                           extra):
-    """Append full history for cohort session ids to fetched rows."""
+                           extra, seen=None):
+    """Append cohort history; an optional seen set belongs to these same rows."""
     out = list(rows)
     def identity(row):
         return hashlib.sha256(json.dumps(
             row, sort_keys=True, default=str).encode()).digest()
 
-    seen = {identity(row) for row in out}
+    if seen is None:
+        seen = {identity(row) for row in out}
     ordered = sorted(extra)
     for start in range(0, len(ordered), 64):
         batch = ordered[start:start + 64]
@@ -2962,19 +2964,24 @@ def _ai_metric_where(table, cols, sids, day_list):
     return " WHERE " + " OR ".join("(" + o + ")" for o in ors)
 
 
-def _ai_metric_columns(ctx, table):
-    """Native column names of one metric table, or None when unprovable."""
+def _ai_metric_columns(ctx, tables):
+    """Native columns for each requested metric table, or fail closed."""
+    if not tables:
+        return {}
     base_url, auth, db = ctx
     try:
-        cols, _rows = fetch_rows(
+        _, rows = fetch_rows(
             base_url, auth, db,
-            "SELECT column_name FROM information_schema.columns"
+            "SELECT table_name, column_name FROM information_schema.columns"
             " WHERE table_schema = " + str_lit(db) +
-            " AND table_name = " + str_lit(table))
+            " AND table_name IN (" + ", ".join(str_lit(t) for t in sorted(set(tables))) + ")")
     except SqlError:
-        return None
-    names = [r[0] for r in (_rows or []) if r and isinstance(r[0], str)]
-    return names or None
+        return {}
+    result = {}
+    for row in rows or []:
+        if len(row) >= 2 and isinstance(row[0], str) and isinstance(row[1], str):
+            result.setdefault(row[0], []).append(row[1])
+    return result
 
 
 def _ai_scoped_metrics(ctx, cfg, tables=None, keys=None, metric_rows=None,
@@ -3017,8 +3024,9 @@ def _ai_scoped_metrics(ctx, cfg, tables=None, keys=None, metric_rows=None,
                   str(row.get("value")), str(row.get("stream"))))
     tables = _ai_metric_tables(ctx, cfg) or []
     metas = _ai_metric_metas(ctx)
+    columns_by_table = _ai_metric_columns(ctx, [table for table, _ in tables])
     for table, instrument in tables:
-        cols = _ai_metric_columns(ctx, table)
+        cols = columns_by_table.get(table)
         if cols is None:
             raise SqlError("ai metric columns unprovable for " + table)
         ids = sorted(sids)
@@ -3271,13 +3279,15 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
         # delete: a failed batch keeps old anchors (restart converges).
         insert_rows(base_url, auth, db, "ai_session_summary",
                     session_cols, [row for _, row in pending])
-        for s, _ in pending:
-            if (s["client"], s["session_id"]) not in stale:
-                continue
-            request_sql(base_url, auth, db,
-                        "DELETE FROM ai_session_summary WHERE session_id = " +
-                        str_lit(s["session_id"]) + " AND client = " +
-                        str_lit(s["client"]) + " AND session_start != " + ts_lit(s["session_start"]))
+        stale_predicates = [
+            "(session_id = " + str_lit(s["session_id"]) + " AND client = " +
+            str_lit(s["client"]) + " AND session_start != " +
+            ts_lit(s["session_start"]) + ")"
+            for s, _ in pending if (s["client"], s["session_id"]) in stale
+        ]
+        for offset in range(0, len(stale_predicates), 32):
+            request_sql(base_url, auth, db, "DELETE FROM ai_session_summary WHERE " +
+                        " OR ".join(stale_predicates[offset:offset + 32]))
         total += len(pending)
     activity_cols = ["day_start", "client"] + list(ACTIVITY_FIELDS) + ["activity_sources"]
     activity_rows = []
@@ -3346,18 +3356,26 @@ def _ai_write(ctx, cfg, sessions, activity_days, spans, prices, bound, now,
 def log_section(ctx, cfg):
     base_url, auth, db = ctx
     cutoff = floor_day(utcnow() - dt.timedelta(hours=cfg["lookback_h"]))
-    cols, rows = guarded_fetch(
+    day = "date_bin('1d'::INTERVAL, timestamp)"
+    scope = "COALESCE(NULLIF(scope_name, ''), 'unknown')"
+    severity = "COALESCE(NULLIF(severity_text, ''), 'UNSPECIFIED')"
+    _, rows = guarded_fetch(
         base_url, auth, db,
-        "SELECT timestamp, severity_text, severity_number, scope_name"
-        " FROM opentelemetry_logs WHERE timestamp >= '" +
-        cutoff.strftime("%Y-%m-%d %H:%M:%S") + "'", cfg["max_rows"])
+        "SELECT " + day + ", " + scope + ", " + severity +
+        ", COUNT(*), SUM(CASE WHEN UPPER(" + severity +
+        ") = 'ERROR' OR severity_number >= 17 THEN 1 ELSE 0 END)"
+        " FROM opentelemetry_logs WHERE timestamp >= " + ts_lit(cutoff) +
+        " GROUP BY " + day + ", " + scope + ", " + severity, cfg["max_rows"])
+    if sum(row[3] for row in rows) > cfg["max_rows"]:
+        raise SqlError("row cap exceeded: refusing partial write")
     pending = []
     bound = retention_boundary(ctx, "otel", cfg.get("otel_ttl", ""), utcnow())
-    for g in summarize_logs(cols, rows):
-        if not fully_retained(g["day"], cfg.get("otel_ttl", ""), boundary=bound):
+    for stamp, scope_name, severity_text, count, errors in rows:
+        stamp = parse_ts(stamp)
+        if not fully_retained(stamp, cfg.get("otel_ttl", ""), boundary=bound):
             continue
-        pending.append([ts_lit(g["day"]), str_lit(g["scope"]), str_lit(g["severity"]),
-                        num_lit(g["count"]), num_lit(g["errors"])])
+        pending.append([ts_lit(stamp), str_lit(scope_name), str_lit(severity_text),
+                        num_lit(count), num_lit(errors or None)])
     insert_rows(base_url, auth, db, "ai_log_daily",
                 ["day_start", "scope_name", "severity_text", "log_count",
                  "error_count"], pending)
@@ -3905,6 +3923,7 @@ def home_section(ctx, cfg):
     epoch = dt.datetime(1970, 1, 1)
     total = 0
     tables = {}
+    bounds = {}
     for source in cfg["home"]:
         table, tcol, ecol, vcol = (source[key] for key in
                                   ("table", "time_col", "entity_col", "value_col"))
@@ -3916,7 +3935,9 @@ def home_section(ctx, cfg):
             raise
         if cov is None:
             continue
-        bound = retention_boundary(ctx, table, cfg["home_raw_ttl"], now)
+        if table not in bounds:
+            bounds[table] = retention_boundary(ctx, table, cfg["home_raw_ttl"], now)
+        bound = bounds[table]
         for resolution, interval, seconds in (("5m", "5m", 300),
                                              ("1h", "1h", 3600), ("1d", "1d", 86400)):
             step = dt.timedelta(seconds=seconds)
@@ -4056,8 +4077,7 @@ def vehicle_history_section(ctx, cfg, now=None):
         observed = eligible[key]
         if _read_dirty_generation(ctx, scope, hour_ns) != observed:
             continue
-        unit = {key: observed}
-        _trip_charge_scope_windows(ctx, cfg, unit)
+        _trip_charge_scope_windows(ctx, cfg, {key: observed})
         if _config_revision(cfg) != revision:
             return committed
         if _read_dirty_generation(ctx, scope, hour_ns) != observed:
