@@ -122,7 +122,7 @@ def test_coverage_distinguishes_absence_from_observed_zero():
     queries = []
     for name in ("grafana-dash-ai-usage", "grafana-dash-ai-sessions"):
         dashboard = json.loads(configs[name]["content"])
-        panel = next(p for p in dashboard["panels"] if p["id"] == 3)
+        panel = next(p for p in _all_battery_panels(dashboard["panels"]) if p["id"] == 3)
         query = panel["targets"][0]["rawSql"].replace("$$", "$")
         queries.append(query.replace("$__timeFilter(timestamp)", "timestamp BETWEEN 1000 AND 2000")
                        .replace("$__unixEpochTo()", "2000")
@@ -150,6 +150,27 @@ def test_coverage_distinguishes_absence_from_observed_zero():
                        [(1500,), (1500,), (3000,)])
         assert [db.execute(q).fetchone()[0] for q in queries] == [1, 1]
 
+def test_tool_summary_keeps_unknown_zero_and_filter_scope():
+    dashboard = json.loads(_grafana_configs()["grafana-dash-ai-tools"]["content"])
+    panel = next(p for p in dashboard["panels"] if p["id"] == 10)
+    query = (panel["targets"][0]["rawSql"]
+             .replace("$$__timeFilter(day_start)", "day_start BETWEEN 1000 AND 2000")
+             .replace("$${client:sqlstring}", "'client-a'")
+             .replace("$${tool:sqlstring}", "'read'"))
+    with sqlite3.connect(":memory:") as db:
+        db.execute("CREATE TABLE ai_tool_daily (day_start INTEGER, client TEXT, tool_name TEXT, calls INTEGER, errors INTEGER)")
+        assert db.execute(query).fetchone() == (None, None, None, None)
+        db.executemany("INSERT INTO ai_tool_daily VALUES (?, ?, ?, ?, ?)", [
+            (1500, "client-a", "read", 0, None),
+            (1500, "client-b", "read", 100, 50),
+            (1500, "client-a", "write", 100, 50),
+            (2001, "client-a", "read", 100, 50),
+        ])
+        assert db.execute(query).fetchone() == (0, 1, None, None)
+        db.execute("INSERT INTO ai_tool_daily VALUES (1500, 'client-a', 'read', 4, 1)")
+        assert db.execute(query).fetchone() == (4, 1, 1, 25.0)
+
+
 def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
     configs = _grafana_configs()
     dashboard = json.loads(configs["grafana-dash-ai-usage"]["content"])
@@ -163,16 +184,18 @@ def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
         db.execute("""CREATE TABLE ai_daily_summary (
             day_start INTEGER, cost_usd REAL,
             cost_estimated_usd REAL, cost_unpriced_calls INTEGER,
-            client TEXT, provider TEXT, model TEXT)""")
+            client TEXT, provider TEXT, model TEXT,
+            input_tokens INTEGER, output_tokens INTEGER)""")
         # Legacy/unprocessed row stays fully unknown.
-        db.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, NULL, NULL, NULL, NULL, NULL)")
+        db.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)")
         assert db.execute(query).fetchone()[:4] == (None, None, None, None)
         # Mixed reported + supplemental, explicit zero kept, unresolved counted.
-        db.execute("INSERT INTO ai_daily_summary VALUES (1500, 0.0, NULL, 0, NULL, NULL, NULL)")
-        db.execute("INSERT INTO ai_daily_summary VALUES (1500, 0.02, 0.015, 2, NULL, NULL, NULL)")
+        db.execute("INSERT INTO ai_daily_summary VALUES (1500, 0.0, NULL, 0, NULL, NULL, NULL, 0, NULL)")
+        db.execute("INSERT INTO ai_daily_summary VALUES (1500, 0.02, 0.015, 2, NULL, NULL, NULL, 5, 7)")
         total, reported, supplemental, unpriced = db.execute(query).fetchone()[:4]
         assert reported == 0.02 and supplemental == 0.015 and unpriced is None
         assert abs(total - 0.035) < 1e-9
+        assert db.execute(query).fetchone()[-2:] == (5, 7)
         # Unknown legacy coverage must not disappear beside evaluated rows.
         db.execute("DELETE FROM ai_daily_summary WHERE cost_unpriced_calls IS NULL")
         assert db.execute(query).fetchone()[3] == 2
@@ -181,8 +204,9 @@ def test_known_cost_total_adds_supplemental_without_zero_filling_unknown():
             only.execute("""CREATE TABLE ai_daily_summary (
                 day_start INTEGER, cost_usd REAL,
                 cost_estimated_usd REAL, cost_unpriced_calls INTEGER,
-                client TEXT, provider TEXT, model TEXT)""")
-            only.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, 0.015, 0, NULL, NULL, NULL)")
+                client TEXT, provider TEXT, model TEXT,
+                input_tokens INTEGER, output_tokens INTEGER)""")
+            only.execute("INSERT INTO ai_daily_summary VALUES (1500, NULL, 0.015, 0, NULL, NULL, NULL, NULL, NULL)")
             assert only.execute(query).fetchone()[:4] == (0.015, None, 0.015, 0)
 
 def _all_battery_panels(panels):
@@ -2654,6 +2678,7 @@ if __name__ == "__main__":
     test_last_reported_snapshots_keep_history_without_resurrecting_invalid()
     test_dashboard_and_folder_uids_are_disjoint()
     test_coverage_distinguishes_absence_from_observed_zero()
+    test_tool_summary_keeps_unknown_zero_and_filter_scope()
     test_known_cost_total_adds_supplemental_without_zero_filling_unknown()
     test_battery_dashboard_latest_revision_wins_before_status_filter()
     test_battery_dashboard_warning_overlap_keeps_started_before_range()

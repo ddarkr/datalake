@@ -242,6 +242,8 @@ python -m tests.test_vehicle_aggregate
 배터리의 V/I 동기화와 conditions/energy as-of 조회는 정렬된 시각을 이진 탐색합니다. 휴지 전압 판정은 전류의 유효성·임계값 초과와 샘플 간격 초과를 누적해 구간마다 다시 검사하지 않습니다. 같은 시각의 입력 처리, 무효 입력으로 끊긴 구간, skew/gap과 교정 조건은 유지합니다. 변경 시 정상 입력뿐 아니라 중복 시각·무효 장벽·구간 경계를 기존 구현과 비교하세요.
 Conditions barrier는 분석 호출 안의 집합에 추가하며, DCR·Energy·Alerts의 시각 범위는 정렬된 입력의 이진 탐색으로 제한합니다. RUL history는 순서를 유지해 한 번 분할하고, battery runtime은 같은 dispatch의 이전 identity를 한 번만 정렬·분류합니다. 과거 수정·교정 변경을 놓칠 수 있는 pass 간 결과 캐시는 사용하지 않습니다.
 
+Grafana의 AI 사용량·도구 요약과 배터리 분석 시각은 같은 화면의 공통 쿼리 결과를 공유합니다. AI 사용량·세션의 원시 스팬 진단은 접힌 행을 펼칠 때 조회하며, 원래 기간·필터·NULL 의미는 유지합니다. 실제 Grafana에서 공유 카드의 값·빈 필터·단독 panel 보기·진단 행 펼치기를 확인하세요.
+
 Trace privacy는 redaction 중 receipt client도 수집합니다. Receipt용 속성 해석 실패는 수신 지표만 생략하며, 기존 redaction·upstream 응답 의미를 바꾸지 않습니다.
 
 대시보드 검사는 Grafana YAML을 프로세스당 한 번 파싱하고, 각 검사는 별도의 dashboard JSON을 디코드합니다. S3 벤치 계측기의 snapshot은 최근 5,000개 요청만 복사하지만 누적 카운터·잘린 요청 수와 진행 중 전송을 기다리는 조건은 유지합니다. 이 최적화는 실제 S3 요청이나 검증 범위를 줄이지 않습니다.
