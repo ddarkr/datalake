@@ -60,28 +60,34 @@ class PrivacyServer(ThreadingMixIn, HTTPServer):
             self.slots.release()
 
 
-def redact(envelope):
+def redact(envelope, clients=None):
     for resource in envelope.get("resourceSpans", []):
+        if clients is not None:
+            try:
+                attrs = {a.get("key"): a.get("value", {}).get("stringValue")
+                         for a in resource.get("resource", {}).get("attributes", [])}
+                fallback = attrs.get("coding_agent.client") or attrs.get("service.name")
+            except (ValueError, TypeError, AttributeError):
+                clients.clear()
+                clients = None
         for scope in resource.get("scopeSpans", []):
             for span in scope.get("spans", []):
                 span.pop("events", None)
                 span.pop("links", None)
+                if clients is not None:
+                    try:
+                        label = next((a.get("value", {}).get("stringValue")
+                                      for a in span.get("attributes", [])
+                                      if a.get("key") == "coding_agent.client"), fallback)
+                        clients.add(label if label in CLIENTS else "other")
+                    except (ValueError, TypeError, AttributeError):
+                        clients.clear()
+                        clients = None
     return json.dumps(envelope, separators=(",", ":"), allow_nan=False).encode()
 
 
-def record_received(envelope):
+def record_received(clients):
     """Accepted by the redacted receiver, not confirmed persisted by the DB."""
-    clients = set()
-    for resource in envelope.get("resourceSpans", []):
-        attrs = {a.get("key"): a.get("value", {}).get("stringValue")
-                 for a in resource.get("resource", {}).get("attributes", [])}
-        fallback = attrs.get("coding_agent.client") or attrs.get("service.name")
-        for scope in resource.get("scopeSpans", []):
-            for span in scope.get("spans", []):
-                label = next((a.get("value", {}).get("stringValue")
-                              for a in span.get("attributes", [])
-                              if a.get("key") == "coding_agent.client"), fallback)
-                clients.add(label if label in CLIENTS else "other")
     now = time.time()
     with RECEIPT_LOCK:
         LAST_RECEIVED.update({client: max(now, LAST_RECEIVED.get(client, 0)) for client in clients})
@@ -159,7 +165,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(413)
                 return
             envelope = json.loads(body)
-            body = redact(envelope)
+            clients = set()
+            body = redact(envelope, clients)
         except (ValueError, TypeError, AttributeError, RecursionError, OSError, EOFError):
             self.respond(400)
             return
@@ -179,7 +186,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     rejected = json.loads(result or b"{}").get("partialSuccess", {}).get("rejectedSpans", 0)
                     if int(rejected) == 0:
-                        record_received(envelope)
+                        record_received(clients)
                 except (ValueError, TypeError, AttributeError):
                     pass  # A malformed ACK cannot establish successful reception.
             self.respond(status, result, content_type)

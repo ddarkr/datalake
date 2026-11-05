@@ -38,7 +38,7 @@ services:
     image: ${PYTHON_IMAGE:-python:3.12.8-slim-bookworm}
     profiles: [server]
     labels:
-      datalake.trace-privacy-revision: "3"
+      datalake.trace-privacy-revision: "4"
     user: "65534:65534"
     cap_drop: [ALL]
     security_opt: ["no-new-privileges:true"]

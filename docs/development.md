@@ -242,6 +242,8 @@ python -m tests.test_vehicle_aggregate
 배터리의 V/I 동기화와 conditions/energy as-of 조회는 정렬된 시각을 이진 탐색합니다. 휴지 전압 판정은 전류의 유효성·임계값 초과와 샘플 간격 초과를 누적해 구간마다 다시 검사하지 않습니다. 같은 시각의 입력 처리, 무효 입력으로 끊긴 구간, skew/gap과 교정 조건은 유지합니다. 변경 시 정상 입력뿐 아니라 중복 시각·무효 장벽·구간 경계를 기존 구현과 비교하세요.
 Conditions barrier는 분석 호출 안의 집합에 추가하며, DCR·Energy·Alerts의 시각 범위는 정렬된 입력의 이진 탐색으로 제한합니다. RUL history는 순서를 유지해 한 번 분할하고, battery runtime은 같은 dispatch의 이전 identity를 한 번만 정렬·분류합니다. 과거 수정·교정 변경을 놓칠 수 있는 pass 간 결과 캐시는 사용하지 않습니다.
 
+Trace privacy는 redaction 중 receipt client도 수집합니다. Receipt용 속성 해석 실패는 수신 지표만 생략하며, 기존 redaction·upstream 응답 의미를 바꾸지 않습니다.
+
 대시보드 검사는 Grafana YAML을 프로세스당 한 번 파싱하고, 각 검사는 별도의 dashboard JSON을 디코드합니다. S3 벤치 계측기의 snapshot은 최근 5,000개 요청만 복사하지만 누적 카운터·잘린 요청 수와 진행 중 전송을 기다리는 조건은 유지합니다. 이 최적화는 실제 S3 요청이나 검증 범위를 줄이지 않습니다.
 
 측정 조건·복구 경계·재현 명령은 [AI 증분 집계](ai-incremental.md), [Fleet/VSS 배치 저장](outbox-batching.md), [CAN pending 조회](can-pending.md), [RAW 메모리·임시 디스크](raw-memory.md), [백업 세대 보존](backup-retention.md), [OTel 보존·용량 정책](otel-retention.md)에 정리되어 있습니다. 합성 비교는 전체 재계산·원본 hash·빈 대상 복원을 먼저 확인하고, 운영 처리량이나 물리 장치 내구성으로 확대 해석하지 않습니다.

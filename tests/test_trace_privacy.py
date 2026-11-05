@@ -59,7 +59,7 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
             pass
 
         def do_POST(self):
-            self.rfile.read(int(self.headers["Content-Length"]))
+            self.__class__.received = self.rfile.read(int(self.headers["Content-Length"]))
             self.send_response(self.status)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
@@ -78,7 +78,7 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
         "attributes": [{"key": "coding_agent.client",
                         "value": {"stringValue": "omp"}}]}]}]}]}
 
-    def post(auth=True):
+    def post(auth=True, return_body=False):
         headers = {"Content-Type": "application/json"}
         if auth:
             headers["Authorization"] = "Basic synthetic"
@@ -86,7 +86,7 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
                                          json.dumps(payload).encode(), headers)
         try:
             with urllib.request.urlopen(request, timeout=5) as response:
-                return response.status
+                return (response.status, response.read()) if return_body else response.status
         except urllib.error.HTTPError as error:
             with error:
                 return error.code
@@ -117,6 +117,53 @@ def test_receipt_requires_ack_and_never_labels_private_clients():
             payload["resourceSpans"] = []
             assert post() == 200
             assert trace_privacy.LAST_RECEIVED == {"omp": 100, "other": 200}
+            payload["resourceSpans"] = [{
+                "resource": {"attributes": [{"key": "service.name",
+                                               "value": {"stringValue": "codex"}}]},
+                "scopeSpans": [{"spans": [
+                    {},
+                    {"attributes": [{"key": "coding_agent.client",
+                                     "value": {"stringValue": "agy"}}]},
+                ]}],
+            }]
+            Backend.response = b'{"partialSuccess":{"rejectedSpans":1}}'
+            assert post() == 200
+            assert trace_privacy.LAST_RECEIVED == {"omp": 100, "other": 200}
+            Backend.response = b"not-json"
+            assert post() == 200
+            assert trace_privacy.LAST_RECEIVED == {"omp": 100, "other": 200}
+            Backend.response = b"{}"
+            with patch("scripts.telemetry.trace_privacy.time.time", return_value=300):
+                assert post() == 200
+            assert trace_privacy.LAST_RECEIVED == {
+                "omp": 100, "other": 200, "codex": 300, "agy": 300}
+            valid = {
+                "resource": {"attributes": [{"key": "service.name",
+                                              "value": {"stringValue": "codex"}}]},
+                "scopeSpans": [{"spans": [{"events": [{"name": "private"}],
+                                             "links": [{"traceId": "private"}]}]}],
+            }
+            for malformed in (
+                {"resource": {"attributes": None},
+                 "scopeSpans": [{"spans": [{"events": [{"name": "private"}],
+                                              "links": [{"traceId": "private"}]}]}]},
+                {"scopeSpans": [{"spans": [{"attributes": None,
+                                              "events": [{"name": "private"}],
+                                              "links": [{"traceId": "private"}]}]}]},
+            ):
+                payload["resourceSpans"] = [valid, malformed]
+                with patch("scripts.telemetry.trace_privacy.time.time", return_value=400):
+                    assert post(return_body=True) == (200, b"{}")
+                assert trace_privacy.LAST_RECEIVED == {
+                    "omp": 100, "other": 200, "codex": 300, "agy": 300}
+                forwarded = json.loads(Backend.received)
+                for resource in forwarded["resourceSpans"]:
+                    span = resource["scopeSpans"][0]["spans"][0]
+                    assert "events" not in span and "links" not in span
+                assert forwarded["resourceSpans"][1].get("resource") == malformed.get("resource")
+            payload["resourceSpans"] = [valid, {"resource": {"attributes": None},
+                                                  "scopeSpans": None}]
+            assert post() == 400
     finally:
         trace_privacy.LAST_RECEIVED.clear()
         trace_privacy.LAST_RECEIVED.update(previous)
