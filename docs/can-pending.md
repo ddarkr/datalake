@@ -58,6 +58,16 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
   Cursor CAS, disk reserve and FULL/WAL durability remain.
 - Benchmarks import the shipped `candidate_sql()` rather than carrying a
   second current-query implementation.
+- Dense serial chunks find CR delimiters incrementally instead of splitting the
+  complete chunk on every resume; frame ordinals and trailing partials are unchanged.
+- File import opens SQLite only after capture metadata is ready and reuses that
+  connection for final-hash progress. Accepted raw chunks, pending membership,
+  file cursor and serial-error cleanup commit together; notification follows commit.
+- Raw pruning excludes prefixes already marked pruned. All-epoch decode/outbox
+  checks, byte budgets and the retry tail remain mandatory.
+- File PUT still checks tail readability before consuming the request body, but
+  that preflight does not compute an unused hash or retain a chunk list. The final
+  ACK/status streams the real tail hash. Tail reads and reclaim locking remain.
 - No raw deletion, no flush budget change.
 
 ## Crash / restart

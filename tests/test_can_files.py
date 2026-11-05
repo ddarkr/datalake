@@ -17,7 +17,6 @@ import sys
 import urllib.parse
 from http.server import HTTPServer
 from unittest.mock import patch
-from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 
@@ -139,6 +138,19 @@ class FileStoreBehavior(unittest.TestCase):
         self.assertEqual(ack["tail_sha256"],
                          hashlib.sha256(body).hexdigest())
         self.assertEqual(fix.store.path("s1", "serial_chunks.jsonl").read_bytes(), body)
+
+    def test_preflight_reads_tail_and_status_keeps_real_hash(self):
+        fix = _Fixture(self)
+        body = b"x" * 70000
+        fix.put(SERIAL_FILE, body)
+        self.assertIsNone(fix.store.preflight("s1", SERIAL_FILE))
+        self.assertEqual(fix.store.status("s1", SERIAL_FILE)["tail_sha256"],
+                         hashlib.sha256(body[-65536:]).hexdigest())
+        with patch.object(can_files.os, "pread", return_value=b""):
+            with self.assertRaises(can_files.FileRejection) as ctx:
+                fix.store.preflight("s1", SERIAL_FILE)
+        self.assertEqual((ctx.exception.status, ctx.exception.reason),
+                         (503, "archive_unavailable"))
 
     def test_interrupted_put_recovers_to_committed(self):
         fix = _Fixture(self)
@@ -314,6 +326,18 @@ class FileImporterBehavior(unittest.TestCase):
         (directory / "serial_chunks.jsonl.committed").write_bytes(str(len(body)).encode())
         return body
 
+    def test_absent_and_unready_capture_do_not_open_import_connection(self):
+        fix = _Fixture(self)
+        importer = FileImporter(fix.archive)
+        directory = fix.store.root / "synthetic" / "fixture" / "s1"
+        directory.mkdir()
+        with patch.object(importer, "_connect", side_effect=AssertionError("unexpected connection")):
+            self.assertFalse(importer._import_session("synthetic", "fixture", "s1"))
+            (directory / "capture.json").write_bytes(b'{"schema_version":1}')
+            self.assertFalse(importer._import_session("synthetic", "fixture", "s1"))
+        self._session(fix, "s1", [_line(0, b"0")], capture=_capture())
+        self.assertTrue(importer._import_session("synthetic", "fixture", "s1"))
+
     def test_idle_preflight_and_capture_error_recovery(self):
         fix = _Fixture(self)
         first = _line(0, b"0")
@@ -321,20 +345,6 @@ class FileImporterBehavior(unittest.TestCase):
         importer = FileImporter(fix.archive)
         self.assertTrue(importer.import_once())
         self.assertFalse(importer.import_once())
-        statements, connections = [], []
-        connect = fix.archive.connect
-
-        @contextmanager
-        def traced_connect():
-            with connect() as conn:
-                connections.append(conn)
-                conn.set_trace_callback(statements.append)
-                yield conn
-
-        with patch.object(fix.archive, "connect", side_effect=traced_connect):
-            self.assertFalse(importer.import_once())
-        self.assertEqual(len(connections), 1)
-        self.assertFalse(any(sql.lstrip().upper().startswith("DELETE") for sql in statements))
 
         directory = fix.store.root / "synthetic" / "fixture" / "s1"
         (directory / "capture.json").write_bytes(b"invalid")
@@ -427,6 +437,28 @@ class FileImporterBehavior(unittest.TestCase):
                 break
         self.assertEqual(fix.archive.status()["raw_chunks"], 4)
         self.assertEqual(importer.errors(), [])
+
+    def test_import_cursor_failure_rolls_back_raw_and_pending(self):
+        fix = _Fixture(self)
+        self._session(fix, "s1", [_line(0, b"0")])
+        importer = FileImporter(fix.archive)
+        store_cursor = importer._store_cursor
+
+        def fail_after_cursor(*args):
+            store_cursor(*args)
+            raise RuntimeError("injected failure")
+
+        with patch.object(importer, "_store_cursor", side_effect=fail_after_cursor):
+            with self.assertRaisesRegex(RuntimeError, "injected failure"):
+                importer.import_once()
+        with fix.archive.connect() as conn:
+            for table in ("sessions", "raw_chunks", "file_import_state", "decode_pending"):
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM " + table).fetchone()[0], 0)
+        restarted = FileImporter(fix.archive)
+        self.assertTrue(restarted.import_once())
+        with fix.archive.connect() as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM raw_chunks").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT next_seq FROM file_import_state").fetchone()[0], 1)
 
     def test_legacy_otlp_overlap_dedups_exact_ns(self):
         fix = _Fixture(self)

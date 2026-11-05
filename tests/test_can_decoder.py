@@ -12,6 +12,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from scripts.ingest.can.can_decoder import Decoder
 
@@ -172,6 +173,29 @@ class DecoderBehavior(unittest.TestCase):
                 self.assertLessEqual(batches, len(reference) + 2)
             with self.assertRaisesRegex(ValueError, "positive integer"):
                 decoder.decode_some(META, chunk0, None, 0)
+
+    def test_dense_resume_boundaries_and_cursor_validation(self):
+        with tempfile.TemporaryDirectory() as directory, patch(
+                "scripts.ingest.can.can_decoder.time.time_ns", return_value=123):
+            decoder = wide_decoder(directory)
+            for suffix in (b"", b"unfinished", b"x" * 4097, b"\r"):
+                chunk = {"seq": 0, "offset_ns": 0, "phase": "capture",
+                         "data": b"\r" + FRAMES[0] * 40 + b"x" * 4097 + b"\r" + suffix}
+                expected_rows, expected_state, expected_counts = decoder.decode(META, chunk, None)
+                rows, state, counts = [], None, {}
+                while True:
+                    batch, state, delta, done = decoder.decode_some(META, chunk, state, 1)
+                    rows.extend(batch)
+                    for key, value in delta.items():
+                        counts[key] = value if key == "tail_bytes" else counts.get(key, 0) + value
+                    if done:
+                        break
+                    self.assertEqual(state["resume_part"], len(rows) + 1)
+                    for invalid in (0, -1, chunk["data"].count(b"\r") + 1):
+                        bad_state = dict(state, resume_part=invalid)
+                        with self.assertRaisesRegex(ValueError, "out of range"):
+                            decoder.decode_some(META, chunk, bad_state, 1)
+                self.assertEqual((rows, state, counts), (expected_rows, expected_state, expected_counts))
 
     def test_oversize_discard_and_ns_ceiling(self):
         with tempfile.TemporaryDirectory() as directory:

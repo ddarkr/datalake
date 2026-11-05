@@ -479,22 +479,24 @@ class FileStore:
                 os.close(fd)
         return committed
 
-    def _tail_hex(self, data, committed):
+    def _tail_hex(self, data, committed, preflight=False):
         if committed == 0:
             return EMPTY_SHA256
         fd = _open_nofollow(data)
         try:
             start = max(0, committed - TAIL_HASH_BYTES)
-            parts, offset = [], start
+            offset = start
+            digest = None if preflight else hashlib.sha256()
             while offset < committed:
                 piece = os.pread(fd, min(65536, committed - offset), offset)
                 if not piece:
                     raise FileRejection(503, "archive_unavailable")
-                parts.append(piece)
+                if digest is not None:
+                    digest.update(piece)
                 offset += len(piece)
         finally:
             os.close(fd)
-        return hashlib.sha256(b"".join(parts)).hexdigest()
+        return None if digest is None else digest.hexdigest()
 
     def _reserve(self, additional):
         try:
@@ -505,7 +507,7 @@ class FileStore:
                 raise FileRejection(507, "archive_disk_reserve") from None
             raise FileRejection(503, "archive_unavailable") from None
 
-    def _status_capture(self, session_id, directory, data):
+    def _status_capture(self, session_id, directory, data, preflight=False):
         # The renamed capture file is the sole commit: no offset sidecar,
         # so a crash can never pair a newer larger body with an older size.
         if data.is_symlink():
@@ -517,9 +519,15 @@ class FileStore:
                 return _ack(session_id, CAPTURE_FILE, 0, EMPTY_SHA256)
             raise
         return _ack(session_id, CAPTURE_FILE, len(body),
-                    hashlib.sha256(body).hexdigest())
+                    None if preflight else hashlib.sha256(body).hexdigest())
 
     def status(self, session_id, filename):
+        return self._status(session_id, filename, preflight=False)
+
+    def preflight(self, session_id, filename):
+        self._status(session_id, filename, preflight=True)
+
+    def _status(self, session_id, filename, preflight):
         _check_names(session_id, filename)
         with self._lock, _file_lock(self._archive):
             directory = self._namespace(session_id, False)
@@ -527,10 +535,10 @@ class FileStore:
                 return _ack(session_id, filename, 0, EMPTY_SHA256)
             data = directory / filename
             if filename == CAPTURE_FILE:
-                return self._status_capture(session_id, directory, data)
+                return self._status_capture(session_id, directory, data, preflight)
             committed = self._recover(data, directory / (filename + ".committed"))
             return _ack(session_id, filename, committed,
-                        self._tail_hex(data, committed))
+                        self._tail_hex(data, committed, preflight))
 
     def put(self, session_id, filename, offset, digest, body):
         _check_names(session_id, filename)
@@ -965,21 +973,18 @@ class FileImporter:
                          (vehicle, collector, session, filename))
             conn.commit()
 
-    def _store_cursor(self, vehicle, collector, session, meta, next_seq, last_t, file_offset, filename=SERIAL_FILE):
-        with self._connect() as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            conn.execute(
-                "INSERT INTO file_import_state VALUES(?,?,?,?,?,?,?,?) "
-                "ON CONFLICT(vehicle,collector_id,session_id) DO UPDATE SET "
-                "meta_json=excluded.meta_json,next_seq=excluded.next_seq,"
-                "last_t=excluded.last_t,file_offset=excluded.file_offset,"
-                "updated_ns=excluded.updated_ns",
-                (vehicle, collector, session, json.dumps(meta, sort_keys=True),
-                 next_seq, last_t, file_offset, time.time_ns()))
-            conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
-                         "AND collector_id=? AND session_id=? AND file=?",
-                         (vehicle, collector, session, filename))
-            conn.commit()
+    def _store_cursor(self, conn, vehicle, collector, session, meta, next_seq, last_t, file_offset, filename=SERIAL_FILE):
+        conn.execute(
+            "INSERT INTO file_import_state VALUES(?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(vehicle,collector_id,session_id) DO UPDATE SET "
+            "meta_json=excluded.meta_json,next_seq=excluded.next_seq,"
+            "last_t=excluded.last_t,file_offset=excluded.file_offset,"
+            "updated_ns=excluded.updated_ns",
+            (vehicle, collector, session, json.dumps(meta, sort_keys=True),
+             next_seq, last_t, file_offset, time.time_ns()))
+        conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
+                     "AND collector_id=? AND session_id=? AND file=?",
+                     (vehicle, collector, session, filename))
 
     def _read_at(self, path, offset, size, max_lines=None):
         """Bounded nofollow pread; short reads end the window, never an error."""
@@ -1059,17 +1064,22 @@ class FileImporter:
                 "started_ns": capture["started_ns"],
                 "vehicle_firmware": capture["firmware"]}
         with self._connect() as conn:
-            cursor = self._cursor(conn, vehicle, collector, session)
-            errors = {row["file"]: row for row in conn.execute(
-                "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
-                "AND collector_id=? AND session_id=? AND file IN (?,?)",
-                (vehicle, collector, session, CAPTURE_FILE, SERIAL_FILE))}
-            if CAPTURE_FILE in errors:
-                conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
-                             "AND collector_id=? AND session_id=? AND file=?",
-                             (vehicle, collector, session, CAPTURE_FILE))
-                conn.commit()
-            known = errors.get(SERIAL_FILE)
+            return self._import_ready_session(
+                vehicle, collector, session, directory, serial_path, capture, meta, conn)
+
+    def _import_ready_session(self, vehicle, collector, session, directory,
+                              serial_path, capture, meta, conn):
+        cursor = self._cursor(conn, vehicle, collector, session)
+        errors = {row["file"]: row for row in conn.execute(
+            "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
+            "AND collector_id=? AND session_id=? AND file IN (?,?)",
+            (vehicle, collector, session, CAPTURE_FILE, SERIAL_FILE))}
+        if CAPTURE_FILE in errors:
+            conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
+                         "AND collector_id=? AND session_id=? AND file=?",
+                         (vehicle, collector, session, CAPTURE_FILE))
+            conn.commit()
+        known = errors.get(SERIAL_FILE)
         prior = cursor["meta"]
         if prior is not None and (
                 not isinstance(prior, dict)
@@ -1132,7 +1142,7 @@ class FileImporter:
             if final:
                 before = self._verified.get((vehicle, collector, session))
                 self._verify_final(vehicle, collector, session, serial_path,
-                                   capture, committed, cursor)
+                                   capture, committed, cursor, conn)
                 after = self._verified.get((vehicle, collector, session))
                 return after is not None and after != before
             return False
@@ -1167,34 +1177,35 @@ class FileImporter:
                        str(exc), cursor["file_offset"])
         if not chunks:
             return False
+        last_t = (str(last_stamp) if type(last_stamp) is int
+                  else format(last_stamp, "f"))
         try:
-            self._archive.accept(meta, chunks)
+            self._archive.accept(
+                meta, chunks,
+                transaction=lambda conn: self._store_cursor(
+                    conn, vehicle, collector, session, meta, seq, last_t, complete_end))
         except Exception as exc:
             if getattr(exc, "status", None) == 409:
                 self._fail(vehicle, collector, session, SERIAL_FILE,
                            "archive_conflict", cursor["file_offset"])
             raise
-        last_t = (str(last_stamp) if type(last_stamp) is int
-                  else format(last_stamp, "f"))
-        self._store_cursor(vehicle, collector, session, meta, seq, last_t, complete_end)
         if final and complete_end == committed:
             self._verify_final(vehicle, collector, session, serial_path,
                                capture, committed,
                                {"meta": meta, "next_seq": seq,
-                                "last_t": last_stamp, "file_offset": complete_end})
+                                "last_t": last_stamp, "file_offset": complete_end}, conn)
         return True
 
     def _verify_final(self, vehicle, collector, session, serial_path,
-                      capture, committed, cursor):
+                      capture, committed, cursor, conn):
         """Bounded incremental whole-file verification; one turn, one slice."""
         if not capture.get("raw_hash") or capture.get("chunks") is None:
             self._verified.pop((vehicle, collector, session), None)
             return
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT reclaimed,intent_end FROM file_reclaim_state "
-                "WHERE vehicle=? AND collector_id=? AND session_id=?",
-                (vehicle, collector, session)).fetchone()
+        row = conn.execute(
+            "SELECT reclaimed,intent_end FROM file_reclaim_state "
+            "WHERE vehicle=? AND collector_id=? AND session_id=?",
+            (vehicle, collector, session)).fetchone()
         if row is not None and (row["reclaimed"] or row["intent_end"]):
             self._verified.pop((vehicle, collector, session), None)
             return

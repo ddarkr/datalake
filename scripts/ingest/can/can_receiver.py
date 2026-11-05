@@ -608,7 +608,8 @@ class Archive:
                 candidates = conn.execute(
                     "SELECT s.id,MIN(MIN(d.next_seq),s.next_seq-?) AS stop "
                     "FROM sessions s JOIN decode_states d ON d.session=s.id "
-                    "GROUP BY s.id HAVING COUNT(*)=? AND stop>0", (tail, epochs)).fetchall()
+                    "LEFT JOIN raw_pruned p ON p.session=s.id "
+                    "GROUP BY s.id HAVING COUNT(*)=? AND stop>COALESCE(MAX(p.next_seq),0)", (tail, epochs)).fetchall()
                 for session, stop in candidates:
                     if tail == 0 and retained_bytes <= retry_bytes:
                         break
@@ -645,17 +646,17 @@ class Archive:
         if shutil.disk_usage(self.path.parent).free < self.disk_reserve_bytes + additional:
             raise Rejection(503, "archive_disk_reserve")
 
-    def accept(self, meta, chunks):
+    def accept(self, meta, chunks, *, transaction=None):
         """Commit all new chunks, or none; matching overlap is legal on ACK loss."""
         timing = self._stages.enabled
         start = time.monotonic() if timing else 0.0
         try:
-            return self._accept_inner(meta, chunks)
+            return self._accept_inner(meta, chunks, transaction)
         finally:
             if timing:
                 self.observe_stage("accept", time.monotonic() - start)
 
-    def _accept_inner(self, meta, chunks):
+    def _accept_inner(self, meta, chunks, transaction=None):
         encoded = _json(meta)
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
@@ -712,6 +713,8 @@ class Archive:
                 _meta_set(conn, "last_receive_ns", time.time_ns())
                 for (epoch,) in conn.execute("SELECT epoch FROM epochs"):
                     _reconcile_pending_session(conn, epoch, session_id)
+            if transaction is not None:
+                transaction(conn)
             lock_start = time.monotonic() if self._stages.enabled else 0.0
             conn.commit()
             if self._stages.enabled:
@@ -1980,7 +1983,10 @@ class Handler(BaseHTTPRequestHandler):
             if self.headers.get_all("Transfer-Encoding") or self.headers.get_all("Content-Encoding"):
                 raise Rejection(400, "invalid_content_encoding")
             try:
-                ack = self.server.files.status(session_id, filename)
+                if put:
+                    self.server.files.preflight(session_id, filename)
+                else:
+                    ack = self.server.files.status(session_id, filename)
             except FileRejection as exc:
                 raise Rejection(exc.status, exc.reason) from None
             except FileConfigurationError:

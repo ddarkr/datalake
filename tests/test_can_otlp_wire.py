@@ -130,6 +130,16 @@ class WireBehavior(unittest.TestCase):
         with self.assertRaises(WireError):
             decode_batch("not-bytes")
 
+    def test_nested_unknown_fields_and_groups_are_rejected(self):
+        payload = encode_batch(META, [chunk(0)])
+        for unknown in (b"\xa0\x06\x01", b"\xa3\x06\x08\x01\xa4\x06"):
+            request = ExportLogsServiceRequest.FromString(payload)
+            request.resource_logs[0].scope_logs[0].log_records[0].body.MergeFromString(unknown)
+            with self.assertRaisesRegex(WireError, "Unknown CAN envelope fields"):
+                decode_batch(request.SerializeToString())
+            with self.assertRaisesRegex(WireError, "Unknown OTLP response fields"):
+                check_response(unknown)
+
     def test_acknowledgement_semantics(self):
         check_response(success_response())
         with self.assertRaises(WireError):

@@ -996,7 +996,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '21'
+      datalake.can-receiver-revision: '22'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -1022,7 +1022,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '21'
+      datalake.can-receiver-revision: '22'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -1072,7 +1072,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '21'
+      datalake.can-receiver-revision: '22'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -36948,7 +36948,8 @@ configs:
                       candidates = conn.execute(
                           "SELECT s.id,MIN(MIN(d.next_seq),s.next_seq-?) AS stop "
                           "FROM sessions s JOIN decode_states d ON d.session=s.id "
-                          "GROUP BY s.id HAVING COUNT(*)=? AND stop>0", (tail, epochs)).fetchall()
+                          "LEFT JOIN raw_pruned p ON p.session=s.id "
+                          "GROUP BY s.id HAVING COUNT(*)=? AND stop>COALESCE(MAX(p.next_seq),0)", (tail, epochs)).fetchall()
                       for session, stop in candidates:
                           if tail == 0 and retained_bytes <= retry_bytes:
                               break
@@ -36985,17 +36986,17 @@ configs:
               if shutil.disk_usage(self.path.parent).free < self.disk_reserve_bytes + additional:
                   raise Rejection(503, "archive_disk_reserve")
 
-          def accept(self, meta, chunks):
+          def accept(self, meta, chunks, *, transaction=None):
               """Commit all new chunks, or none; matching overlap is legal on ACK loss."""
               timing = self._stages.enabled
               start = time.monotonic() if timing else 0.0
               try:
-                  return self._accept_inner(meta, chunks)
+                  return self._accept_inner(meta, chunks, transaction)
               finally:
                   if timing:
                       self.observe_stage("accept", time.monotonic() - start)
 
-          def _accept_inner(self, meta, chunks):
+          def _accept_inner(self, meta, chunks, transaction=None):
               encoded = _json(meta)
               with self.connect() as conn:
                   conn.execute("BEGIN IMMEDIATE")
@@ -37052,6 +37053,8 @@ configs:
                       _meta_set(conn, "last_receive_ns", time.time_ns())
                       for (epoch,) in conn.execute("SELECT epoch FROM epochs"):
                           _reconcile_pending_session(conn, epoch, session_id)
+                  if transaction is not None:
+                      transaction(conn)
                   lock_start = time.monotonic() if self._stages.enabled else 0.0
                   conn.commit()
                   if self._stages.enabled:
@@ -38320,7 +38323,10 @@ configs:
                   if self.headers.get_all("Transfer-Encoding") or self.headers.get_all("Content-Encoding"):
                       raise Rejection(400, "invalid_content_encoding")
                   try:
-                      ack = self.server.files.status(session_id, filename)
+                      if put:
+                          self.server.files.preflight(session_id, filename)
+                      else:
+                          ack = self.server.files.status(session_id, filename)
                   except FileRejection as exc:
                       raise Rejection(exc.status, exc.reason) from None
                   except FileConfigurationError:
@@ -38557,6 +38563,7 @@ configs:
       SHORT = re.compile(rb'([tr])([0-9A-Fa-f]{3})([0-8])([0-9A-Fa-f]*)')
       EXTENDED = re.compile(rb'([TR])([0-9A-Fa-f]{8})([0-8])([0-9A-Fa-f]*)')
       CONTROL = re.compile(rb'(?:[zZCO]|S6|V[0-9A-Fa-f]{4}|[EF][0-9A-Fa-f]{2}|N[0-9A-Fa-f]{4}|\x07)')
+      RECORD_END = re.compile(rb'\r|$$')
       BUFFER_LIMIT = 4096
       DECODER_VERSION = 'custom-can-v1'
       STRUCTURAL_FIELDS = (
@@ -38741,12 +38748,19 @@ configs:
               # three JSON strings for every unknown/control-only chunk.
               identity_prefix = _identity_prefix(meta['vehicle'], meta['collector_id'], meta['session_id'])
               event_time_atom = None
-              parts = data.split(b'\r')
-              if not first and not 0 < start < len(parts):
-                  raise ValueError('Decoder resume cursor is out of range.')
-              for index in range(start, len(parts)):
-                  part = parts[index]
-                  complete = index < len(parts) - 1
+              position = 0
+              if not first:
+                  if start <= 0:
+                      raise ValueError('Decoder resume cursor is out of range.')
+                  for _ in range(start):
+                      delimiter = data.find(b'\r', position)
+                      if delimiter < 0:
+                          raise ValueError('Decoder resume cursor is out of range.')
+                      position = delimiter + 1
+              for index, end in enumerate(RECORD_END.finditer(data, position), start):
+                  part = data[position:end.start()]
+                  complete = end.start() < len(data)
+                  position = end.end()
                   if state['discarding']:
                       counts['discarded_bytes'] += len(part)
                       if complete:
@@ -38859,7 +38873,7 @@ configs:
                           'quality': quality, 'envelope_id': envelope_id,
                           'config_version': self.epoch, 'connectivity': None,
                       })
-                  if max_rows is not None and rows and len(rows) >= max_rows and index + 2 < len(parts):
+                  if max_rows is not None and rows and len(rows) >= max_rows and data.find(b'\r', position) >= 0:
                       # Frame-atomic pause: rows stay whole, parser position persists.
                       state.update(resume_part=index + 1, resume_ingest_ns=ingest_time,
                                    resume_envelope=envelope_id)
@@ -39578,22 +39592,24 @@ configs:
                       os.close(fd)
               return committed
 
-          def _tail_hex(self, data, committed):
+          def _tail_hex(self, data, committed, preflight=False):
               if committed == 0:
                   return EMPTY_SHA256
               fd = _open_nofollow(data)
               try:
                   start = max(0, committed - TAIL_HASH_BYTES)
-                  parts, offset = [], start
+                  offset = start
+                  digest = None if preflight else hashlib.sha256()
                   while offset < committed:
                       piece = os.pread(fd, min(65536, committed - offset), offset)
                       if not piece:
                           raise FileRejection(503, "archive_unavailable")
-                      parts.append(piece)
+                      if digest is not None:
+                          digest.update(piece)
                       offset += len(piece)
               finally:
                   os.close(fd)
-              return hashlib.sha256(b"".join(parts)).hexdigest()
+              return None if digest is None else digest.hexdigest()
 
           def _reserve(self, additional):
               try:
@@ -39604,7 +39620,7 @@ configs:
                       raise FileRejection(507, "archive_disk_reserve") from None
                   raise FileRejection(503, "archive_unavailable") from None
 
-          def _status_capture(self, session_id, directory, data):
+          def _status_capture(self, session_id, directory, data, preflight=False):
               # The renamed capture file is the sole commit: no offset sidecar,
               # so a crash can never pair a newer larger body with an older size.
               if data.is_symlink():
@@ -39616,9 +39632,15 @@ configs:
                       return _ack(session_id, CAPTURE_FILE, 0, EMPTY_SHA256)
                   raise
               return _ack(session_id, CAPTURE_FILE, len(body),
-                          hashlib.sha256(body).hexdigest())
+                          None if preflight else hashlib.sha256(body).hexdigest())
 
           def status(self, session_id, filename):
+              return self._status(session_id, filename, preflight=False)
+
+          def preflight(self, session_id, filename):
+              self._status(session_id, filename, preflight=True)
+
+          def _status(self, session_id, filename, preflight):
               _check_names(session_id, filename)
               with self._lock, _file_lock(self._archive):
                   directory = self._namespace(session_id, False)
@@ -39626,10 +39648,10 @@ configs:
                       return _ack(session_id, filename, 0, EMPTY_SHA256)
                   data = directory / filename
                   if filename == CAPTURE_FILE:
-                      return self._status_capture(session_id, directory, data)
+                      return self._status_capture(session_id, directory, data, preflight)
                   committed = self._recover(data, directory / (filename + ".committed"))
                   return _ack(session_id, filename, committed,
-                              self._tail_hex(data, committed))
+                              self._tail_hex(data, committed, preflight))
 
           def put(self, session_id, filename, offset, digest, body):
               _check_names(session_id, filename)
@@ -40064,21 +40086,18 @@ configs:
                                (vehicle, collector, session, filename))
                   conn.commit()
 
-          def _store_cursor(self, vehicle, collector, session, meta, next_seq, last_t, file_offset, filename=SERIAL_FILE):
-              with self._connect() as conn:
-                  conn.execute("BEGIN IMMEDIATE")
-                  conn.execute(
-                      "INSERT INTO file_import_state VALUES(?,?,?,?,?,?,?,?) "
-                      "ON CONFLICT(vehicle,collector_id,session_id) DO UPDATE SET "
-                      "meta_json=excluded.meta_json,next_seq=excluded.next_seq,"
-                      "last_t=excluded.last_t,file_offset=excluded.file_offset,"
-                      "updated_ns=excluded.updated_ns",
-                      (vehicle, collector, session, json.dumps(meta, sort_keys=True),
-                       next_seq, last_t, file_offset, time.time_ns()))
-                  conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
-                               "AND collector_id=? AND session_id=? AND file=?",
-                               (vehicle, collector, session, filename))
-                  conn.commit()
+          def _store_cursor(self, conn, vehicle, collector, session, meta, next_seq, last_t, file_offset, filename=SERIAL_FILE):
+              conn.execute(
+                  "INSERT INTO file_import_state VALUES(?,?,?,?,?,?,?,?) "
+                  "ON CONFLICT(vehicle,collector_id,session_id) DO UPDATE SET "
+                  "meta_json=excluded.meta_json,next_seq=excluded.next_seq,"
+                  "last_t=excluded.last_t,file_offset=excluded.file_offset,"
+                  "updated_ns=excluded.updated_ns",
+                  (vehicle, collector, session, json.dumps(meta, sort_keys=True),
+                   next_seq, last_t, file_offset, time.time_ns()))
+              conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
+                           "AND collector_id=? AND session_id=? AND file=?",
+                           (vehicle, collector, session, filename))
 
           def _read_at(self, path, offset, size, max_lines=None):
               """Bounded nofollow pread; short reads end the window, never an error."""
@@ -40158,17 +40177,22 @@ configs:
                       "started_ns": capture["started_ns"],
                       "vehicle_firmware": capture["firmware"]}
               with self._connect() as conn:
-                  cursor = self._cursor(conn, vehicle, collector, session)
-                  errors = {row["file"]: row for row in conn.execute(
-                      "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
-                      "AND collector_id=? AND session_id=? AND file IN (?,?)",
-                      (vehicle, collector, session, CAPTURE_FILE, SERIAL_FILE))}
-                  if CAPTURE_FILE in errors:
-                      conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
-                                   "AND collector_id=? AND session_id=? AND file=?",
-                                   (vehicle, collector, session, CAPTURE_FILE))
-                      conn.commit()
-                  known = errors.get(SERIAL_FILE)
+                  return self._import_ready_session(
+                      vehicle, collector, session, directory, serial_path, capture, meta, conn)
+
+          def _import_ready_session(self, vehicle, collector, session, directory,
+                                    serial_path, capture, meta, conn):
+              cursor = self._cursor(conn, vehicle, collector, session)
+              errors = {row["file"]: row for row in conn.execute(
+                  "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
+                  "AND collector_id=? AND session_id=? AND file IN (?,?)",
+                  (vehicle, collector, session, CAPTURE_FILE, SERIAL_FILE))}
+              if CAPTURE_FILE in errors:
+                  conn.execute("DELETE FROM file_import_errors WHERE vehicle=? "
+                               "AND collector_id=? AND session_id=? AND file=?",
+                               (vehicle, collector, session, CAPTURE_FILE))
+                  conn.commit()
+              known = errors.get(SERIAL_FILE)
               prior = cursor["meta"]
               if prior is not None and (
                       not isinstance(prior, dict)
@@ -40231,7 +40255,7 @@ configs:
                   if final:
                       before = self._verified.get((vehicle, collector, session))
                       self._verify_final(vehicle, collector, session, serial_path,
-                                         capture, committed, cursor)
+                                         capture, committed, cursor, conn)
                       after = self._verified.get((vehicle, collector, session))
                       return after is not None and after != before
                   return False
@@ -40266,34 +40290,35 @@ configs:
                              str(exc), cursor["file_offset"])
               if not chunks:
                   return False
+              last_t = (str(last_stamp) if type(last_stamp) is int
+                        else format(last_stamp, "f"))
               try:
-                  self._archive.accept(meta, chunks)
+                  self._archive.accept(
+                      meta, chunks,
+                      transaction=lambda conn: self._store_cursor(
+                          conn, vehicle, collector, session, meta, seq, last_t, complete_end))
               except Exception as exc:
                   if getattr(exc, "status", None) == 409:
                       self._fail(vehicle, collector, session, SERIAL_FILE,
                                  "archive_conflict", cursor["file_offset"])
                   raise
-              last_t = (str(last_stamp) if type(last_stamp) is int
-                        else format(last_stamp, "f"))
-              self._store_cursor(vehicle, collector, session, meta, seq, last_t, complete_end)
               if final and complete_end == committed:
                   self._verify_final(vehicle, collector, session, serial_path,
                                      capture, committed,
                                      {"meta": meta, "next_seq": seq,
-                                      "last_t": last_stamp, "file_offset": complete_end})
+                                      "last_t": last_stamp, "file_offset": complete_end}, conn)
               return True
 
           def _verify_final(self, vehicle, collector, session, serial_path,
-                            capture, committed, cursor):
+                            capture, committed, cursor, conn):
               """Bounded incremental whole-file verification; one turn, one slice."""
               if not capture.get("raw_hash") or capture.get("chunks") is None:
                   self._verified.pop((vehicle, collector, session), None)
                   return
-              with self._connect() as conn:
-                  row = conn.execute(
-                      "SELECT reclaimed,intent_end FROM file_reclaim_state "
-                      "WHERE vehicle=? AND collector_id=? AND session_id=?",
-                      (vehicle, collector, session)).fetchone()
+              row = conn.execute(
+                  "SELECT reclaimed,intent_end FROM file_reclaim_state "
+                  "WHERE vehicle=? AND collector_id=? AND session_id=?",
+                  (vehicle, collector, session)).fetchone()
               if row is not None and (row["reclaimed"] or row["intent_end"]):
                   self._verified.pop((vehicle, collector, session), None)
                   return

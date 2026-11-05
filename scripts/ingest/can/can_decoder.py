@@ -14,6 +14,7 @@ import cantools
 SHORT = re.compile(rb'([tr])([0-9A-Fa-f]{3})([0-8])([0-9A-Fa-f]*)')
 EXTENDED = re.compile(rb'([TR])([0-9A-Fa-f]{8})([0-8])([0-9A-Fa-f]*)')
 CONTROL = re.compile(rb'(?:[zZCO]|S6|V[0-9A-Fa-f]{4}|[EF][0-9A-Fa-f]{2}|N[0-9A-Fa-f]{4}|\x07)')
+RECORD_END = re.compile(rb'\r|$')
 BUFFER_LIMIT = 4096
 DECODER_VERSION = 'custom-can-v1'
 STRUCTURAL_FIELDS = (
@@ -198,12 +199,19 @@ class Decoder:
         # three JSON strings for every unknown/control-only chunk.
         identity_prefix = _identity_prefix(meta['vehicle'], meta['collector_id'], meta['session_id'])
         event_time_atom = None
-        parts = data.split(b'\r')
-        if not first and not 0 < start < len(parts):
-            raise ValueError('Decoder resume cursor is out of range.')
-        for index in range(start, len(parts)):
-            part = parts[index]
-            complete = index < len(parts) - 1
+        position = 0
+        if not first:
+            if start <= 0:
+                raise ValueError('Decoder resume cursor is out of range.')
+            for _ in range(start):
+                delimiter = data.find(b'\r', position)
+                if delimiter < 0:
+                    raise ValueError('Decoder resume cursor is out of range.')
+                position = delimiter + 1
+        for index, end in enumerate(RECORD_END.finditer(data, position), start):
+            part = data[position:end.start()]
+            complete = end.start() < len(data)
+            position = end.end()
             if state['discarding']:
                 counts['discarded_bytes'] += len(part)
                 if complete:
@@ -316,7 +324,7 @@ class Decoder:
                     'quality': quality, 'envelope_id': envelope_id,
                     'config_version': self.epoch, 'connectivity': None,
                 })
-            if max_rows is not None and rows and len(rows) >= max_rows and index + 2 < len(parts):
+            if max_rows is not None and rows and len(rows) >= max_rows and data.find(b'\r', position) >= 0:
                 # Frame-atomic pause: rows stay whole, parser position persists.
                 state.update(resume_part=index + 1, resume_ingest_ns=ingest_time,
                              resume_envelope=envelope_id)
