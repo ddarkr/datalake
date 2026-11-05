@@ -231,6 +231,23 @@ test('AGY observes a complete final JSON line before its newline without double 
   assert.equal(accepted.find(e => e.kind === 'session').attributes['coding_agent.session.subagent_count'], 1);
 });
 
+test('AGY Stop streams UTF-8 across chunks and preserves newline-only records and final tail', async t => {
+  const box = await sandbox(t), { telemetry, accepted } = direct();
+  const prefix = '{"content":"';
+  const padded = prefix + 'x'.repeat(65535 - Buffer.byteLength(prefix)) + '한"}';
+  const invalid = JSON.stringify({ created_at: new Date(100).toISOString() }) + '\r' +
+    JSON.stringify({ created_at: new Date(200).toISOString() });
+  const last = JSON.stringify({ created_at: new Date(1000).toISOString(),
+    tool_calls: [{ name: 'invoke_subagent' }] });
+  await writeFile(box.transcript, `${padded}\n${invalid}\n${last}`);
+  await handleHook({ conversationId: box.sessionId, transcriptPath: box.transcript, terminationReason: 'model_stop' }, {
+    telemetry, cwd: box.path, now: () => 5000,
+  });
+  const session = accepted.find(event => event.kind === 'session');
+  assert.equal(session.startTimeMs, 1000);
+  assert.equal(session.attributes['coding_agent.session.subagent_count'], 1);
+});
+
 test('AGY Stop summarizes an earlier in-place rewrite even when the trailing anchor survives growth', async t => {
   const first = { type: 'USER_INPUT', step_index: 0, created_at: new Date(1000).toISOString() };
   const second = { type: 'USER_INPUT', step_index: 1, created_at: new Date(3000).toISOString(), content: 'x'.repeat(512) };

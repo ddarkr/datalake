@@ -3,7 +3,7 @@ import { execFile, spawn, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { createServer } from 'node:http';
-import { appendFile, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdtemp, mkdir, open, readFile, readdir, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -222,6 +222,30 @@ test('numeric rollout increments are deduplicated, incremental and limited to th
   assert.equal(JSON.stringify(events).includes(secret), false);
   assert.equal((await persisted(stateDir)).includes(secret), false);
   assert.equal(Object.keys(events[0].attributes).some(key => /cost/i.test(key)), false);
+});
+
+test('unchanged usage state retains its cursor while partial lines remain resumable', async t => {
+  const dir = await temporary(t);
+  const transcript = join(dir, 'active.jsonl'), stateDir = join(dir, 'state');
+  const input = { session_id: 'session-1', turn_id: 'turn-1', hook_event_name: 'Stop', transcript_path: transcript };
+  const { telemetry, events } = capture();
+  await writeFile(transcript, metadata('session-1') + context('turn-1'));
+  await collectUsage(input, { telemetry, stateDir });
+  const cursorPath = join(stateDir, (await readdir(stateDir)).find(name => name.endsWith('.json')));
+  const held = await open(cursorPath, 'r');
+  t.after(() => held.close());
+  const before = await held.stat();
+  const partial = usage(tokens(20, 5));
+  await appendFile(transcript, partial.slice(0, -1));
+  await collectUsage(input, { telemetry, stateDir });
+  await collectUsage(input, { telemetry, stateDir });
+  assert.equal((await stat(cursorPath)).ino, before.ino);
+  assert.deepEqual(events, []);
+  await appendFile(transcript, '\n');
+  await collectUsage(input, { telemetry, stateDir });
+  assert.notEqual((await stat(cursorPath)).ino, before.ino);
+  assert.equal(events.length, 1);
+  assert.equal(events[0].attributes['gen_ai.usage.input_tokens'], 20);
 });
 
 test('oversized rollout lines advance across budgets and never parse their appended tail', async t => {

@@ -184,6 +184,7 @@ node plugins/install.mjs codex \
 Codex는 현재 transcript의 숫자 사용량과 메타데이터를 직접 전송합니다. 관측 checkpoint와 중복 방지 상태는 전송 시도를 기록하며, 수집기 저장 증거가 아닙니다. 실패한 이벤트를 다음 훅에서 자동 재시도하지 않습니다.
 
 사용량 reader는 훅당 최대 64 MiB를 읽으며, 8 MiB를 넘는 줄은 버리는 중인 상태와 byte cursor를 함께 저장합니다. 한 줄이 읽기 예산보다 길어도 다음 훅에서 계속 전진하고, 줄바꿈을 만난 뒤에만 다음 JSON 기록을 해석합니다. 뒤따르는 정상 사용량을 같은 초대형 줄에 묶어 영구적으로 막지 않습니다. 이후 훅이 실행되지 않으면 나머지 기록의 처리를 보장하지는 않습니다.
+내용과 cursor 상태가 그대로인 훅은 cursor 파일을 다시 쓰지 않습니다. 최초 상태, 파일 교체·축소, 부분 줄과 discard 진행은 계속 저장합니다.
 
 ### OMP
 
@@ -266,7 +267,7 @@ node plugins/install.mjs agy --config "$DATALAKE_OTEL_CONFIG" --apply
 
 `PreToolUse`·`PreInvocation`처럼 시작 checkpoint만 기록하는 경로에서는 Git을 조회하지 않습니다. 전송할 이벤트를 구성할 때 저장소·브랜치를 조회하며 프로세스 사이에 메타데이터를 캐시하지 않습니다.
 
-`PostToolUse`는 저장된 byte cursor 이후의 transcript를 읽습니다. 파일 교체·관측된 축소·커서 경계 변경 시 다시 읽고, 완성되지 않은 UTF-8/JSON 줄은 다음 훅에 이어서 처리합니다. 이미 시도한 identity는 재전송하지 않습니다. `Stop`은 증분 이벤트 처리와 별개로 현재 transcript 전체를 한 번 읽어 세션 시작 시각·서브에이전트 호출 수를 계산합니다. 이 최종 조회는 과거 내용의 수정과 증분 drain 실패에도 요약을 보존하기 위해 유지하며, `PostToolUse`에서는 수행하지 않습니다.
+`PostToolUse`는 저장된 byte cursor 이후의 transcript를 읽습니다. 파일 교체·관측된 축소·커서 경계 변경 시 다시 읽고, 완성되지 않은 UTF-8/JSON 줄은 다음 훅에 이어서 처리합니다. 이미 시도한 identity는 재전송하지 않습니다. `Stop`은 증분 이벤트 처리와 별개로 현재 transcript 전체를 UTF-8 줄 스트림으로 읽어 세션 시작 시각·서브에이전트 호출 수를 계산합니다. 마지막 줄에 줄바꿈이 없어도 해석하며, 단일 줄 크기 제한을 새로 두지는 않습니다. 이 최종 조회는 과거 내용의 수정과 증분 drain 실패에도 요약을 보존하기 위해 유지하며, `PostToolUse`에서는 수행하지 않습니다.
 커서의 버전·진행 상태가 그대로이면 최종 `cursor.json` 재저장을 생략합니다. 전송 시도 기록과 변경된 커서는 기존 파일·디렉터리 동기화 절차로 저장합니다.
 
 도구 오류는 원문 대신 고정 분류 `error.type=tool_error`만 전송합니다. transcript cursor와 도구·Stop 관측 상태는 중복 시도를 막기 위한 소스 checkpoint이며 수집기 ACK가 아닙니다. HTTP 실패 때문에 같은 구간이나 완료 이벤트를 자동 재전송하지 않습니다.
@@ -282,6 +283,7 @@ OMP·opencode2의 이벤트 처리는 HTTP를 기다리지 않고 정상 종료 
 실패·오프라인·강제 종료 시 이벤트가 유실될 수 있습니다. 전송 실패 뒤 자동 복구하지 않으며, checkpoint나 프로세스 종료가 수집기 저장을 증명하지 않습니다. 서버 Alloy 큐는 서버에 도착한 이후만 보호합니다.
 
 설정은 JavaScript exporter 생성 때 읽습니다. 설정·인증·주소를 바꾼 장기 실행 호스트는 재시작·재로딩해야 합니다. 단기 훅은 다음 실행 때 새 설정을 읽습니다. 프롬프트·답변·추론·도구 인자/결과·파일 내용과 인증 헤더는 telemetry 본문에 넣지 않습니다.
+macOS process lock은 한 번의 native probe에서 boot UUID와 microsecond 시작 시각을 함께 읽습니다. PID 재사용·죽은 소유자 판정과 기존 파일·디렉터리 검증은 유지합니다.
 
 기존 `~/.local/state/doda-datalake/otel`, Codex·Claude data root의 `outbox/`, Hermes의 기존 SQLite 큐는 읽거나 재전송·삭제하지 않습니다. 실행 중인 이전 호스트·sender는 소스 갱신만으로 종료되지 않습니다. 기존 큐를 임의로 삭제하거나 잠금을 지우지 마세요. 설치본을 갱신하고 정상 재시작으로 전환하세요.
 

@@ -39,6 +39,27 @@ test('Source locks publish the shared incarnation and recover stale starts and b
   const path = await sandbox(t);
   const incarnation = await processIncarnation();
   assert.ok(incarnation);
+  if (process.platform === 'darwin') {
+    const { stdout } = await run('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid']);
+    assert.equal(incarnation.boot, stdout.trim().toLowerCase());
+    const script = `ObjC.import('Foundation');
+ObjC.bindFunction('proc_pidinfo', ['int', ['int', 'int', 'uint64_t', 'void *', 'int']]);
+ObjC.bindFunction('malloc', ['void *', ['unsigned long']]);
+ObjC.bindFunction('free', ['void', ['void *']]);
+function run(argv) {
+  var buffer = $.malloc(136);
+  if (!buffer) throw Error('allocation failed');
+  try {
+    if ($.proc_pidinfo(Number(argv[0]), 3, 0, buffer, 136) !== 136) throw Error('process probe failed');
+    return ObjC.unwrap($.NSData.dataWithBytesLength(buffer, 136).base64EncodedStringWithOptions(0));
+  } finally { $.free(buffer); }
+}`;
+    const result = await run('/usr/bin/osascript', ['-l', 'JavaScript', '-e', script, String(process.pid)]);
+    const info = Buffer.from(result.stdout.trim(), 'base64');
+    assert.equal(info.length, 136);
+    assert.equal(info.readUInt32LE(12), process.pid);
+    assert.equal(incarnation.start, `${info.readBigUInt64LE(120)}.${String(info.readBigUInt64LE(128)).padStart(6, '0')}`);
+  }
   await withStateLock(path, async () => {
     const published = JSON.parse(await readFile(join(path, 'hook.lock', 'owner.json'), 'utf8'));
     assert.equal(published.pid, process.pid);

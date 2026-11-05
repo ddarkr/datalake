@@ -46,6 +46,7 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
       const info = await file.stat();
       if (!info.isFile()) return [];
       let cursor = await load(cursorPath);
+      const previousState = cursor === undefined ? undefined : JSON.stringify(cursor);
       if (!cursor || cursor.ino !== info.ino || cursor.dev !== info.dev || cursor.offset > info.size) {
         cursor = { offset: 0, ino: info.ino, dev: info.dev, verified: false, total: [0, 0, 0, 0, 0] };
       }
@@ -132,7 +133,7 @@ export async function collectUsage(input, { telemetry, stateDir, prime = false }
       // so their tails can never be mistaken for independent records.
       cursor.offset = oversized ? position : lineStart;
       cursor.discarding = oversized;
-      await save(cursorPath, cursor);
+      if (previousState !== JSON.stringify(cursor)) await save(cursorPath, cursor);
       return events;
     } finally {
       await file?.close();

@@ -110,20 +110,31 @@ async function kernelText(path) {
 }
 
 // Darwin's ps start time truncates to seconds. Use the kernel's microsecond BSD start timeval instead.
-// Fixed system JXA bridges libproc without a dependency/build; only PID, status and start bytes leave it.
+// Fixed system JXA bridges libproc and libc without a dependency/build.
 const DARWIN_PROCESS = `ObjC.import('Foundation');
 ObjC.bindFunction('proc_pidinfo', ['int', ['int', 'int', 'uint64_t', 'void *', 'int']]);
+ObjC.bindFunction('sysctlbyname', ['int', ['char*', 'void *', 'void *', 'void *', 'unsigned long']]);
 ObjC.bindFunction('malloc', ['void *', ['unsigned long']]);
 ObjC.bindFunction('free', ['void', ['void *']]);
 function run(argv) {
-  var buffer = $.malloc(136);
-  if (!buffer) throw Error('process probe failed');
+  var buffer = $.malloc(136), boot = $.malloc(37), size = $.malloc(8);
+  if (!buffer || !boot || !size) {
+    if (buffer) $.free(buffer);
+    if (boot) $.free(boot);
+    if (size) $.free(size);
+    throw Error('process probe failed');
+  }
   try {
+    var capacity = $.NSData.alloc.initWithBase64EncodedStringOptions('JQAAAAAAAAA=', 0);
+    capacity.getBytesLength(size, 8);
+    if ($.sysctlbyname($('kern.bootsessionuuid').UTF8String, boot, size, null, 0) !== 0) throw Error('boot probe failed');
     if ($.proc_pidinfo(Number(argv[0]), 3, 0, buffer, 136) !== 136) throw Error('process probe failed');
     var data = $.NSData.dataWithBytesLength(buffer, 136);
     function part(offset, length) { return ObjC.unwrap(data.subdataWithRange($.NSMakeRange(offset, length)).base64EncodedStringWithOptions(0)); }
-    return JSON.stringify({pid: part(12, 4), state: part(4, 4), start: part(120, 16)});
-  } finally { $.free(buffer); }
+    return JSON.stringify({pid: part(12, 4), state: part(4, 4), start: part(120, 16),
+      boot: ObjC.unwrap($.NSData.dataWithBytesLength(boot, 37).base64EncodedStringWithOptions(0)),
+      size: ObjC.unwrap($.NSData.dataWithBytesLength(size, 8).base64EncodedStringWithOptions(0))});
+  } finally { $.free(buffer); $.free(boot); $.free(size); }
 }`;
 const probeOptions = { env: { PATH: '/usr/bin:/bin', LC_ALL: 'C' }, timeout: 1000, killSignal: 'SIGKILL', maxBuffer: 1024 };
 
@@ -141,19 +152,19 @@ async function processSnapshot(pid) {
     return { incarnation, zombie: fields[0] === 'Z' || fields[0] === 'X' || fields[0] === 'x' };
   }
   if (process.platform === 'darwin' && ['arm64', 'x64'].includes(process.arch)) {
-    const [proc, boot] = await Promise.all([
-      execFileAsync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', DARWIN_PROCESS, String(pid)], probeOptions),
-      execFileAsync('/usr/sbin/sysctl', ['-n', 'kern.bootsessionuuid'], probeOptions),
-    ]);
+    const proc = await execFileAsync('/usr/bin/osascript', ['-l', 'JavaScript', '-e', DARWIN_PROCESS, String(pid)], probeOptions);
     const value = JSON.parse(proc.stdout);
-    if (!keysAre(value, ['pid', 'state', 'start']) || typeof value.pid !== 'string'
-      || typeof value.state !== 'string' || typeof value.start !== 'string') throw invalid();
+    if (!keysAre(value, ['pid', 'state', 'start', 'boot', 'size']) || typeof value.pid !== 'string'
+      || typeof value.state !== 'string' || typeof value.start !== 'string'
+      || typeof value.boot !== 'string' || typeof value.size !== 'string') throw invalid();
     const actualPid = Buffer.from(value.pid, 'base64'), state = Buffer.from(value.state, 'base64'), start = Buffer.from(value.start, 'base64');
-    if (actualPid.length !== 4 || state.length !== 4 || start.length !== 16 || actualPid.readUInt32LE() !== pid) throw invalid();
+    const boot = Buffer.from(value.boot, 'base64'), size = Buffer.from(value.size, 'base64');
+    if (actualPid.length !== 4 || state.length !== 4 || start.length !== 16 || actualPid.readUInt32LE() !== pid
+      || boot.length !== 37 || size.length !== 8 || size.readBigUInt64LE() !== 37n || boot[36] !== 0) throw invalid();
     const status = state.readUInt32LE();
     const usec = start.readBigUInt64LE(8);
     if (status < 1 || status > 5 || usec > 999999n) throw invalid();
-    const incarnation = { platform: 'darwin', boot: boot.stdout.trim().toLowerCase(),
+    const incarnation = { platform: 'darwin', boot: boot.subarray(0, 36).toString('utf8').toLowerCase(),
       start: `${start.readBigUInt64LE()}.${String(usec).padStart(6, '0')}` };
     if (!validIncarnation(incarnation)) throw invalid();
     return { incarnation, zombie: status === 5 };

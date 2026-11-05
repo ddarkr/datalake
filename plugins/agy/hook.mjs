@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto';
+import { createReadStream } from 'node:fs';
 import { readFile, writeFile, unlink, mkdir, stat, rename, open } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, isAbsolute } from 'node:path';
@@ -97,6 +98,21 @@ async function resolveTranscriptPath(payload) {
   return undefined;
 }
 
+async function* transcriptLines(path) {
+  let parts = [];
+  for await (const chunk of createReadStream(path, { encoding: 'utf8' })) {
+    let start = 0, end;
+    while ((end = chunk.indexOf('\n', start)) !== -1) {
+      parts.push(chunk.slice(start, end));
+      yield parts.join('');
+      parts = [];
+      start = end + 1;
+    }
+    if (start < chunk.length) parts.push(chunk.slice(start));
+  }
+  if (parts.length) yield parts.join('');
+}
+
 // 커서 기반 증분(Incremental) 턴 및 서브에이전트 이벤트 전송
 async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model, getBaseAttrs, clock, includeSummary = false) {
   const summary = { startTimeMs: clock, durationMs: 0, subagentCalls: 0 };
@@ -120,13 +136,14 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
   // Attempted-identity checkpoint: legacy sent/queued IDs and prior direct attempts
   // all prove a prior attempt. A failed HTTP send is dropped with no replay, and the
   // checkpoint advances regardless of ACK, exactly like the Codex/Claude hooks.
-  const attempted = new Set([...(cursor.sentEventIds ?? []), ...(cursor.queuedEventIds ?? []), ...(cursor.attemptedEventIds ?? [])]);
+  const legacy = new Set([...(cursor.sentEventIds ?? []), ...(cursor.queuedEventIds ?? [])]);
+  const attempted = new Set([...legacy, ...(cursor.attemptedEventIds ?? [])]);
   async function attemptOnce(event, output) {
     if (attempted.has(event.eventId)) return true;
     attempted.add(event.eventId);
     let ok = false;
     try { ok = await telemetry.send(event); } catch {}
-    cursor.attemptedEventIds = [...attempted].filter(id => !cursor.sentEventIds?.includes(id) && !cursor.queuedEventIds?.includes(id));
+    cursor.attemptedEventIds = [...attempted].filter(id => !legacy.has(id));
     await save(cPath, cursor);
     cursorNeedsSave = false;
     if (ok === true) output.push(event);
@@ -247,7 +264,7 @@ async function drainIncrementalTurns(sessionId, transcriptPath, telemetry, model
     try {
       let earliestTimestamp;
       let subagentCalls = 0;
-      for (const line of (await readFile(transcriptPath, 'utf8')).split('\n').filter(Boolean)) {
+      for await (const line of transcriptLines(transcriptPath)) {
         try {
           const step = JSON.parse(line);
           if (step.created_at) {
