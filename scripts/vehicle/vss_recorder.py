@@ -287,28 +287,22 @@ def store_updates(conn, last, items):
     effects. Pure redelivery (nothing staged) rolls back instead of
     committing, so resnapshots cost no durable write; seen-only progress
     still commits via total_changes."""
-    staged = []
+    staged = {}
+    stored = 0
     before = conn.total_changes
     try:
         for path, row in items:
-            staged.append((path,) + _insert_update(conn, last, path, row))
-    except Exception:
+            is_new, key = _insert_update(conn, last, path, row)
+            staged[path] = key
+            stored += int(is_new)
+        if conn.total_changes == before:
+            conn.rollback()
+        else:
+            conn.commit()
+    except BaseException:
         conn.rollback()
         raise
-    if conn.total_changes == before:
-        conn.rollback()
-        for path, _, key in staged:
-            last[path] = key
-        return 0
-    try:
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    stored = 0
-    for path, is_new, key in staged:
-        last[path] = key
-        stored += 1 if is_new else 0
+    last.update(staged)
     return stored
 
 

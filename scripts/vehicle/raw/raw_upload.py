@@ -313,12 +313,9 @@ def inventory_loop(client, bucket, interval, stop):
         if interval < 0:
             raise ValueError("RAW_INVENTORY_INTERVAL_SEC must be nonnegative")
         return
-    while not stop:
+    while not stop.is_set():
         refresh_inventory(client, bucket)
-        for _ in range(interval * 2):
-            if stop:
-                break
-            time.sleep(0.5)
+        stop.wait(interval)
 
 
 def _load_manifest(manifest_path):
@@ -614,8 +611,8 @@ def main(argv):
     # Listen inside the container; Compose restricts the host-side interface.
     threading.Thread(target=lambda: ThreadingHTTPServer(("0.0.0.0", 9103), _H).serve_forever(),
                      daemon=True).start()
-    stop = []
-    signal.signal(signal.SIGTERM, lambda *a: stop.append(1))
+    stop = threading.Event()
+    signal.signal(signal.SIGTERM, lambda *a: stop.set())
     client = wrap_client(make_client())
     if inventory_interval > 0:
         threading.Thread(target=lambda: inventory_loop(
@@ -623,15 +620,12 @@ def main(argv):
     # Restart recovery is implicit: any sealed triple left behind (crash between
     # upload and delete) is re-uploaded to its deterministic key, verified,
     # then deleted. Staging *.tmp / manifest-less .mf4 are never touched here.
-    while not stop:
+    while not stop.is_set():
         try:
             run_once(client, bucket, spool, vehicle, retries)
         except Exception as ex:
             print("sweep error: %s" % type(ex).__name__, file=sys.stderr)
-        for _ in range(interval * 2):
-            if stop:
-                break
-            time.sleep(0.5)
+        stop.wait(interval)
     return 0
 
 

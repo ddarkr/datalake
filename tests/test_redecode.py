@@ -210,6 +210,7 @@ class RedecodeTest(unittest.TestCase):
             for i, ((can_id, data), ns) in enumerate(zip(payloads, self.twall))]
         self.mf4 = write_capture(os.path.join(d, "in.mf4"), records)
         _, self.frames = rd.verify_sealed_triple(self.mf4)
+        self.addCleanup(self.frames.destroy)
 
     def run_epoch(self, epoch):
         mapper = rd.load_mapper(self.mapping, self.dbcs)
@@ -254,6 +255,34 @@ class RedecodeTest(unittest.TestCase):
         self.assertEqual(n2, 0)
         count = self.conn.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]
         self.assertEqual(count, 8)
+
+    def test_spilled_frames_and_mid_file_failure_roll_back(self):
+        with mock.patch.dict(os.environ, {"RAW_FINALIZE_MEM_FRAMES": "1"}):
+            _, frames = rd.verify_sealed_triple(self.mf4)
+        self.addCleanup(frames.destroy)
+        self.assertTrue(frames.spilled)
+        mapper = rd.load_mapper(self.mapping, self.dbcs)
+        last = {}
+        insert = vr._insert_update
+        calls = 0
+
+        def failing_insert(*args):
+            nonlocal calls
+            calls += 1
+            if calls == 3:
+                raise OSError("injected failure")
+            return insert(*args)
+
+        with mock.patch.object(vr, "_insert_update", side_effect=failing_insert):
+            with self.assertRaises(OSError):
+                rd.redecode_mf4(self.mf4, mapper, "smoke-veh", EPOCH1,
+                                self.meta, self.units, self.conn, last, frames)
+        self.assertEqual(last, {})
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM outbox").fetchone()[0], 0)
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) FROM seen_ids").fetchone()[0], 0)
+        self.assertEqual(self.run_epoch(EPOCH1)[0], 8)
 
     def test_new_epoch_coexists(self):
         self.assertEqual(self.run_epoch(EPOCH1)[0], 8)
@@ -373,8 +402,10 @@ class RedecodeTest(unittest.TestCase):
                "REDECODE_INPUT_MANIFEST_URL": "",
                "REDECODE_INPUT_SIDECAR_URL": ""}
         with mock.patch.dict(os.environ, env):
-            [(path, frames)] = rd.resolve_inputs(work)
-            self.assertEqual(frames, self.frames)
+            [path] = rd.resolve_inputs(work)
+            _, frames = rd.verify_sealed_triple(path)
+            self.addCleanup(frames.destroy)
+            self.assertEqual(list(frames.ordered()), list(self.frames.ordered()))
             self.assertEqual(sha_file(path), sha_file(self.mf4))
             self.assertEqual(list(rd.iter_frames(path, frames)),
                              list(rd.iter_frames(self.mf4, self.frames)))
@@ -493,7 +524,9 @@ class RedecodeTest(unittest.TestCase):
             if old_url is not None:
                 os.environ["REDECODE_INPUT_URL"] = old_url
         self.assertEqual(len(got), 1)
-        self.assertEqual([f["twall_ns"] for f in got[0][1]], self.twall)
+        _, frames = rd.verify_sealed_triple(got[0])
+        self.addCleanup(frames.destroy)
+        self.assertEqual([f["twall_ns"] for f in frames.ordered()], self.twall)
 
     def test_float_equal_mixed_groups_preserve_capture_times(self):
         base = 1_789_983_110_123_456_780
@@ -511,6 +544,7 @@ class RedecodeTest(unittest.TestCase):
         ]
         path = write_capture(os.path.join(self._tmp.name, "mixed.mf4"), records)
         _, frames = rd.verify_sealed_triple(path)
+        self.addCleanup(frames.destroy)
         self.assertEqual(list(rd.iter_frames(path, frames)), [
             (0x100, speed_data(82.5, 40.0), base + 2),
             (0x200, charge_data(1, 12.34), base + 4),

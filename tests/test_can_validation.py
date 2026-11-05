@@ -258,6 +258,28 @@ def write_gen(tmp, primary, supp, epoch="test1"):
 
 
 class IdentityTest(unittest.TestCase):
+    def test_repeated_standard_and_extended_use_first_local_signal(self):
+        class Signal:
+            name = "S"
+            minimum = 0
+            def __init__(self, maximum):
+                self.maximum = maximum
+
+        class Message:
+            def __init__(self, *bounds):
+                self.signals = [Signal(bound) for bound in bounds]
+            def decode(self, data, decode_choices=False, scaling=True):
+                return {"S": data[0]}
+
+        db = ({(1, False): Message(10, 100),
+               (1, True): Message(100, 10)}, {"S"})
+        frames = [frame(1, b"\x32", i=i, ext=ext)
+                  for i, ext in enumerate((False, True, False, True))]
+        res = cv.validate_window(frames, db, {}, {}, ["S"], {})
+        self.assertEqual(res["frames"]["known"], 4)
+        self.assertEqual(res["invalid_values"], 2)
+        self.assertEqual(res["missing"], 0)
+
     def test_std_and_extended_are_distinct_identities(self):
         if not has_cantools():
             self.skipTest("cantools not installed")

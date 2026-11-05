@@ -612,18 +612,19 @@ class UploadTest(unittest.TestCase):
                     self.assertFalse(os.path.exists(path))
 
     def test_inventory_positive_cadence_and_negative_startup(self):
-        stop, sleeps = [], []
+        stop = upl.threading.Event()
+        waits = []
 
-        def sleep(seconds):
-            sleeps.append(seconds)
-            if len(sleeps) == 4:
-                stop.append(1)
+        def wait(seconds):
+            waits.append(seconds)
+            if len(waits) == 2:
+                stop.set()
 
         with mock.patch.object(upl, "refresh_inventory") as refresh, \
-                mock.patch.object(upl.time, "sleep", side_effect=sleep):
+                mock.patch.object(stop, "wait", side_effect=wait):
             upl.inventory_loop(object(), "b", 1, stop)
         self.assertEqual(refresh.call_count, 2)
-        self.assertEqual(sleeps, [0.5] * 4)
+        self.assertEqual(waits, [1, 1])
         with mock.patch.dict(os.environ, {"RAW_INVENTORY_INTERVAL_SEC": "-1"}), \
                 mock.patch.object(upl.threading, "Thread") as thread, \
                 mock.patch.object(upl, "make_client") as make, \

@@ -44,6 +44,7 @@ import shutil
 import tempfile
 import time
 import urllib.request
+import zlib
 
 try:
     from scripts.vehicle import vss_recorder as vr
@@ -126,9 +127,8 @@ def verify_sealed_triple(mf4_path):
     """Fail closed unless the adjacent capture manifest (RawUploader v2)
     and raw-ingress sidecar agree with the sealed MF4 bytes.
 
-    Returns (manifest, frames): validated ingress records carry exact
-    nanoseconds and complete frame identities. MF4 group ordering cannot
-    substitute another frame's timestamp."""
+    Returns (manifest, frames); the caller must destroy the bounded frame
+    store. Records carry exact nanoseconds and complete frame identities."""
     manifest_path = mf4_path + ".manifest.json"
     stem = os.path.basename(mf4_path)
     if stem.endswith(".mf4"):
@@ -160,53 +160,55 @@ def verify_sealed_triple(mf4_path):
     if sha256_file(sidecar_path).lower() != \
             man["ingress_sidecar_sha256"].lower():
         fail(f"sealed sidecar drifted from manifest pin: {sidecar_path}")
+    frames = rr.SortedFrameStore(tempfile.gettempdir(), "redecode",
+                                 rr._mem_frames_budget(), rr._tmp_max_bytes())
     try:
-        with open(sidecar_path, "rb") as fh:
-            body = gzip.decompress(fh.read())
-    except (OSError, EOFError) as ex:
-        fail(f"sidecar gunzip failed {sidecar_path}: {ex}")
-    if hashlib.sha256(body).hexdigest().lower() != \
-            man["ingress_sha256"].lower():
-        fail(f"sidecar content drifted from ingress pin: {sidecar_path}")
-    try:
-        text = body.decode("utf-8")
-    except UnicodeDecodeError as ex:
-        fail(f"sidecar ingress not UTF-8 {sidecar_path}: {ex}")
-    frames = []
-    for line in text.split("\n"):
-        if not line.strip():
-            continue
+        digest = hashlib.sha256()
         try:
-            obj = json.loads(line)
-        except ValueError as ex:
-            fail(f"sidecar ingress corrupt {sidecar_path}: {ex}")
-        ts = obj.get("twall_ns") if isinstance(obj, dict) else None
-        if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
-            fail(f"sidecar ingress bad twall_ns {sidecar_path}")
+            with gzip.open(sidecar_path, "rb") as fh:
+                for line in fh:
+                    digest.update(line)
+                    try:
+                        text = line.decode("utf-8")
+                    except UnicodeDecodeError as ex:
+                        fail(f"sidecar ingress not UTF-8 {sidecar_path}: {ex}")
+                    if not text.strip():
+                        continue
+                    try:
+                        obj = json.loads(text)
+                    except ValueError as ex:
+                        fail(f"sidecar ingress corrupt {sidecar_path}: {ex}")
+                    ts = obj.get("twall_ns") if isinstance(obj, dict) else None
+                    if not isinstance(ts, int) or isinstance(ts, bool) or ts <= 0:
+                        fail(f"sidecar ingress bad twall_ns {sidecar_path}")
+                    try:
+                        frames.add(rr.decode_frame(obj))
+                    except (TypeError, ValueError, KeyError) as ex:
+                        fail(f"sidecar ingress invalid {sidecar_path}: {ex}")
+        except (OSError, EOFError, zlib.error) as ex:
+            fail(f"sidecar gunzip failed {sidecar_path}: {ex}")
+        if digest.hexdigest().lower() != man["ingress_sha256"].lower():
+            fail(f"sidecar content drifted from ingress pin: {sidecar_path}")
+        count, _, _, _, _, first, last = frames.first_last()
+        if man.get("frames") is not None and man["frames"] != count:
+            fail(f"sidecar frame count {count} != manifest frames "
+                 f"{man['frames']}: {sidecar_path}")
+        for field, got in (("twall_ns_first", first), ("twall_ns_last", last)):
+            if man.get(field) is not None and man[field] != got:
+                fail(f"sidecar {field} {got} != manifest {man[field]}: "
+                     f"{sidecar_path}")
         try:
-            frames.append(rr.decode_frame(obj))
-        except (TypeError, ValueError, KeyError) as ex:
-            fail(f"sidecar ingress invalid {sidecar_path}: {ex}")
-    twall = sorted(frame["twall_ns"] for frame in frames)
-    if man.get("frames") is not None and man["frames"] != len(twall):
-        fail(f"sidecar frame count {len(twall)} != manifest frames "
-             f"{man['frames']}: {sidecar_path}")
-    # The capture manifest describes the chronological bounds.
-    for field, got in (("twall_ns_first", twall[0] if twall else None),
-                       ("twall_ns_last", twall[-1] if twall else None)):
-        if man.get(field) is not None and man[field] != got:
-            fail(f"sidecar {field} {got} != manifest {man[field]}: "
-                 f"{sidecar_path}")
-    try:
-        rr.verify_sealed_mf4(mf4_path, frames)
-    except (OSError, ValueError) as ex:
-        fail(f"MF4/ingress mismatch {mf4_path}: {ex}")
-    return man, frames
+            rr.verify_sealed_mf4(mf4_path, frames)
+        except (OSError, ValueError) as ex:
+            fail(f"MF4/ingress mismatch {mf4_path}: {ex}")
+        return man, frames
+    except BaseException:
+        frames.destroy()
+        raise
 
 
 def resolve_inputs(workdir):
-    """Return [(mf4_path, frames)]: every input hash-verified against
-    its capture manifest + raw-ingress sidecar before decode.
+    """Return verified MF4 paths, validating all triples before decode.
 
     URL mode downloads the sealed triple (MF4 + <mf4>.manifest.json +
     <stem>.ingress.jsonl.gz, the layout raw-upload stores) instead of a
@@ -245,13 +247,14 @@ def resolve_inputs(workdir):
                 if got.lower() != want.lower():
                     fail(f"input SHA256 mismatch: want {want} got {got}")
                 man, frames = verify_sealed_triple(dest)
+                frames.destroy()
                 if man["mf4_sha256"].lower() != want.lower():
                     fail("capture manifest pin differs from REDECODE_INPUT_SHA256")
                 # Publish the complete verified directory, never overwrite a
                 # caller's existing triple or expose a partly promoted one.
                 published = stage + ".verified"
                 os.rename(triple, published)
-                return [(os.path.join(published, stem + ".mf4"), frames)]
+                return [os.path.join(published, stem + ".mf4")]
         except OSError as ex:
             fail(f"cannot stage remote triple ({type(ex).__name__})")
     spool = e("REDECODE_SPOOL_DIR", "/spool/raw")
@@ -269,7 +272,8 @@ def resolve_inputs(workdir):
                                        stem + ".stage.tmp")):
             continue  # finalize still writing; invisible to the uploader too
         _, frames = verify_sealed_triple(p)
-        out.append((p, frames))
+        frames.destroy()
+        out.append(p)
     if not out:
         fail(f"no .mf4 inputs in {spool}/sealed and REDECODE_INPUT_URL unset")
     return out
@@ -341,69 +345,69 @@ def redecode_mf4(mf4_path, mapper, vehicle, epoch, meta, units, conn,
     (vehicle, path, time, epoch, value) so reruns IGNORE and a new
     epoch coexists.
     """
-    stored, skipped = 0, 0
-    batch = []
-    for can_id, data, ns in iter_frames(mf4_path, capture_frames):
-        try:
-            msg_def = mapper.get_message_by_frame_id(can_id)
-        except Exception:
-            skipped += 1
-            continue
-        try:
-            decoded = msg_def.decode(bytes(data), allow_truncated=True,
-                                     decode_containers=True)
-        except Exception:
-            skipped += 1
-            continue
-        # ponytail: same container-frame split as upstream canreader
-        frames = [(msg_def, decoded)] if isinstance(decoded, dict) else [
-            (m, d) for m, d in decoded if not isinstance(d, bytes)]
-        for mdef, signals in frames:
-            for sig_name, raw in signals.items():
-                try:
-                    signal = mdef.get_signal_by_name(sig_name)
-                except Exception:
-                    continue
-                # ponytail: same min/max range filter as upstream canreader
-                if isinstance(raw, (int, float)):
-                    if signal.minimum is not None and raw < signal.minimum:
-                        continue
-                    if signal.maximum is not None and raw > signal.maximum:
-                        continue
-                for mapping in mapper.get_dbc2vss_mappings(sig_name):
-                    if not mapping.time_condition_fulfilled(ns / 1e9):
-                        continue
+    skipped = [0]
+
+    def updates():
+        for can_id, data, ns in iter_frames(mf4_path, capture_frames):
+            try:
+                msg_def = mapper.get_message_by_frame_id(can_id)
+            except Exception:
+                skipped[0] += 1
+                continue
+            try:
+                decoded = msg_def.decode(bytes(data), allow_truncated=True,
+                                         decode_containers=True)
+            except Exception:
+                skipped[0] += 1
+                continue
+            # Same container-frame split as upstream canreader.
+            frames = [(msg_def, decoded)] if isinstance(decoded, dict) else [
+                (m, d) for m, d in decoded if not isinstance(d, bytes)]
+            for mdef, signals in frames:
+                for sig_name, raw in signals.items():
                     try:
-                        vss = mapping.transform_value(raw)
+                        signal = mdef.get_signal_by_name(sig_name)
                     except Exception:
-                        skipped += 1
                         continue
-                    if vss is None:
-                        continue
-                    try:
-                        if not mapping.change_condition_fulfilled(vss):
+                    if isinstance(raw, (int, float)):
+                        if signal.minimum is not None and raw < signal.minimum:
                             continue
-                    except Exception:
-                        skipped += 1
-                        continue
-                    try:
-                        got = vr.classify(vss)
-                    except vr.UnsupportedValue:
-                        skipped += 1
-                        continue
-                    if got is None:
-                        continue
-                    num, text, boolean = got
-                    row = vr.make_row(
-                        vehicle, mapping.vss_name, ns,
-                        vr.deterministic_event_id(
-                            vehicle, mapping.vss_name, ns, epoch,
-                            num, text, boolean),
-                        meta, units, num, text, boolean, time.time_ns())
-                    batch.append((mapping.vss_name, row))
-    if batch:
-        stored = vr.store_updates(conn, last, batch)
-    return stored, skipped
+                        if signal.maximum is not None and raw > signal.maximum:
+                            continue
+                    for mapping in mapper.get_dbc2vss_mappings(sig_name):
+                        if not mapping.time_condition_fulfilled(ns / 1e9):
+                            continue
+                        try:
+                            vss = mapping.transform_value(raw)
+                        except Exception:
+                            skipped[0] += 1
+                            continue
+                        if vss is None:
+                            continue
+                        try:
+                            if not mapping.change_condition_fulfilled(vss):
+                                continue
+                        except Exception:
+                            skipped[0] += 1
+                            continue
+                        try:
+                            got = vr.classify(vss)
+                        except vr.UnsupportedValue:
+                            skipped[0] += 1
+                            continue
+                        if got is None:
+                            continue
+                        num, text, boolean = got
+                        row = vr.make_row(
+                            vehicle, mapping.vss_name, ns,
+                            vr.deterministic_event_id(
+                                vehicle, mapping.vss_name, ns, epoch,
+                                num, text, boolean),
+                            meta, units, num, text, boolean, time.time_ns())
+                        yield mapping.vss_name, row
+
+    stored = vr.store_updates(conn, last, updates())
+    return stored, skipped[0]
 
 
 def main(argv=None):
@@ -429,7 +433,7 @@ def main(argv=None):
     batch = vr._positive_int(
         "REDECODE_BATCH_N", e("REDECODE_BATCH_N", "500"), 500)
     inputs = resolve_inputs(e("REDECODE_WORKDIR", "/tmp/redecode"))
-    remote_dir = os.path.dirname(inputs[0][0]) if e("REDECODE_INPUT_URL", "").strip() else None
+    remote_dir = os.path.dirname(inputs[0]) if e("REDECODE_INPUT_URL", "").strip() else None
     try:
         manifest = check_vehicle_artifacts(manifest_path, mapping_path, dbc_files)
         if manifest.get("decode_epoch") != epoch:
@@ -459,9 +463,13 @@ def main(argv=None):
         conn = vr.open_outbox(outbox_path)
         last = {}
         total, skipped = 0, 0
-        for path, capture_frames in inputs:
-            n, s = redecode_mf4(path, mapper, vehicle, epoch, meta, units,
-                                 conn, last, capture_frames)
+        for path in inputs:
+            _, capture_frames = verify_sealed_triple(path)
+            try:
+                n, s = redecode_mf4(path, mapper, vehicle, epoch, meta, units,
+                                     conn, last, capture_frames)
+            finally:
+                capture_frames.destroy()
             total, skipped = total + n, skipped + s
             print(f"redecode: file={os.path.basename(path)} "
                   f"stored={n} skipped={s} epoch={epoch}")

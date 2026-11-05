@@ -401,6 +401,7 @@ def validate_window(frames, db, checksums, ranges, expected, relations):
     invalid_values = checksum_failures = 0
     known_ids, unknown_ids = set(), set()
     latest = {}  # name -> (twall_ns, value); finite values only
+    signal_names = {}  # (can_id, is_extended_frame) -> first signal per name
     for f in frames:
         if f.get("err"):
             error += 1
@@ -423,9 +424,13 @@ def validate_window(frames, db, checksums, ranges, expected, relations):
         except Exception:
             decode_errors += 1
             continue
-        by_name = {}
-        for s in msg.signals:
-            by_name.setdefault(s.name, s)
+        identity = (cid, ext)
+        by_name = signal_names.get(identity)
+        if by_name is None:
+            by_name = {}
+            for s in msg.signals:
+                by_name.setdefault(s.name, s)
+            signal_names[identity] = by_name
         rule = checksums.get((cid, ext))
         if rule is not None and not _checksum_ok(rule, cid, data):
             checksum_failures += 1

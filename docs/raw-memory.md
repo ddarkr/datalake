@@ -20,6 +20,8 @@ RAW 업로드에는 원격 저장 예산 차단이나 버킷 전역 잠금이 �
 content-addressed 객체를 HEAD로 검증한 뒤 재사용하며, 새 객체의 PUT 응답과
 서버 checksum을 확인합니다. 확인하지 못한 로컬 파일은 보존합니다.
 `RAW_INVENTORY_INTERVAL_SEC=0`은 선택적 저장량 통계용 LIST를 끕니다.
+Idle upload and inventory waits share a stop event, so SIGTERM wakes them without
+half-second polling. This does not interrupt an in-flight upload or weaken ACK checks.
 
 - `RAW_FINALIZE_MEM_FRAMES` (default 20000, must be > 0): max resident
   decoded frames across sort AND identity match staging (match batches
@@ -148,10 +150,17 @@ must all pass before the complete directory is published.
 Failed downloads or validation remove only that staging directory. Existing
 workdir files are not overwritten. The CLI removes its verified download
 directory on exit, including decode/upload failures; the durable outbox is
-kept for retry. Direct `resolve_inputs` callers own the returned directory.
-This bounds download buffering, not the whole redecode process: sidecar
-decompression, the decoded frame list and identity matching still consume
-memory proportional to the capture.
+kept for retry. `resolve_inputs` returns verified MF4 paths, not retained frame
+lists; direct callers own the returned download directory.
+
+Every input triple is verified before the outbox opens, then each file is verified
+again when processed. Sidecar records use the same `SortedFrameStore` and
+`RAW_FINALIZE_MEM_FRAMES` / `RAW_TMP_MAX_BYTES` budgets as finalization. Decoded
+updates stream into one SQLite transaction per file; rollback also leaves the
+last-value cache unchanged. Spill directories are removed after each file.
+This trades extra verification and temporary SQLite IO for bounded frame/update
+staging. One JSONL record, library buffers and per-path state are not whole-process
+RSS bounds; no new line-size rejection is imposed on historical redecode inputs.
 
 
 Related: [vehicle operations](operations.md) for spool layout and ACK rules.
