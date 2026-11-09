@@ -1643,20 +1643,9 @@ class Worker(threading.Thread):
         except (sqlite3.Error, OSError):
             return False  # Fall through to decode_once, which surfaces the real error.
 
-    def _reclaim(self):
-        if self.importer is not None:
-            try:
-                self.importer.reclaim_once()
-            except Exception as exc:
-                self._error(classify_error(exc))
-
     def _upload(self):
         # One consumer owns ACK deletion; decoding can keep filling the durable outbox.
-        next_reclaim = time.monotonic() + self.interval
         while not self.stop_event.is_set():
-            if time.monotonic() >= next_reclaim:
-                self._reclaim()
-                next_reclaim = time.monotonic() + self.interval
             try:
                 done = self.archive.flush_once(self.greptime, self.outbox_limit, self.max_body_bytes)
                 if self.archive.prune_once():
@@ -1679,7 +1668,6 @@ class Worker(threading.Thread):
             self._wait_queue(self.archive.upload_ready, self._has_outbox)
 
     def run(self):
-        self._reclaim()  # Resolve any durable intent before importing new bytes.
         uploader = threading.Thread(target=self._upload, name="can-archive-uploader", daemon=True)
         uploader.start()
         try:

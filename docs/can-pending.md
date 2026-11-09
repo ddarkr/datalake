@@ -67,7 +67,7 @@ See also: [operations § can-receiver](operations.md#별도-can-uploader의-서�
   checks, byte budgets and the retry tail remain mandatory.
 - File PUT still checks tail readability before consuming the request body, but
   that preflight does not compute an unused hash or retain a chunk list. The final
-  ACK/status streams the real tail hash. Tail reads and reclaim locking remain.
+  ACK/status streams the real tail hash. Tail reads and receive locking remain.
 - No raw deletion, no flush budget change.
 
 ## Crash / restart

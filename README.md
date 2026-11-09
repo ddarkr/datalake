@@ -147,7 +147,7 @@ flowchart LR
 | `home`, `mqtt` | 서버의 선택적 홈 수집 경로 |
 | `vehicle` | 별도 Linux 장비의 CAN 원본·VSS 수집 |
 | `fleet` | 서버의 선택적 Fleet Telemetry 수신 |
-| `can-receiver` | 서버의 CAN 원본 파일·OTLP 내구성 수신(`can-receiver`), 파일 편입·DBC 디코딩·Greptime 적재 후 완료 범위 정리(`can-worker`) |
+| `can-receiver` | 서버의 CAN 원본 파일·OTLP 내구성 수신(`can-receiver`), 파일 편입·DBC 디코딩·Greptime 적재와 SQLite 처리 캐시 정리(`can-worker`). 원본 파일은 보존 |
 | `backup`, `redecode` | 오프라인 백업·복원 및 CAN 재해석 작업 |
 
 GreptimeDB는 standalone 구성입니다. 기본 저장소는 S3 호환 스토리지이며 로컬 파일 저장 모드도 있습니다. S3 모드에서도 로컬 볼륨이 필요하며, 버킷만으로 전체 DB를 복구할 수 있다고 가정하지 않습니다. 백업·복원은 DB 쓰기를 중지한 상태에서 별도로 수행합니다.

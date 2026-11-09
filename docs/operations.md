@@ -337,13 +337,11 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 `/v1/files`로 바꾸고 기존 batching 옵션을 제거해야 합니다. capture는 재시작하지 않습니다.
 기존 `/v1/logs`는 이전 클라이언트·복구 재전송용 수신 계약으로 계속 지원합니다.
 
-worker는 파일 편입 cursor와 모든 등록 epoch의 세션별 decode cursor를 확인하고, 전체 outbox가 비어 해당 구간이 만든 signal·dirty 알림이 모두 ACK된 serial prefix만 정리합니다. 신호를 만들지 않는 프레임도 처리된 구간이면 정리됩니다. 완료 metadata가 없는 기존 파일과 수집 중인 파일도 대상입니다. 정리 시 Linux의 hole punching으로 한 번에 최대 1 MiB씩 할당 공간을 회수하므로 논리 파일 크기와 offset은 유지됩니다. 실제 공간은 `stat`의 논리 크기가 아니라 `du` 등 할당량으로 확인하세요.
+worker는 시작 시와 운영 중 `serial_chunks.jsonl`의 공간을 회수하거나 원본을 삭제하지 않습니다. 파일 편입, 디코딩, Greptime ACK와 아래 SQLite 캐시 정리는 계속됩니다. `capture.json`, `events.jsonl`, serial 원본과 메타데이터를 보존할 수 있도록 `/data/files`의 디스크 여유 공간을 별도로 관리하세요. Pi의 protobuf 큐 용량을 서버 JSONL 최대 크기로 간주하지 마세요.
 
-미편입·미디코드·미ACK 구간과 재전송 검증용 마지막 최대 64 KiB는 남습니다. `capture.json`, metadata snapshot과 Greptime에 적재하지 않는 `events.jsonl`도 유지합니다. 파일 정리는 SQLite 캐시 상한과 별개입니다. 디스크는 장애 중 쌓이는 미처리 파일과 raw DB/outbox를 수용해야 하며, Pi의 protobuf 큐 용량을 서버 JSONL의 최대 크기로 간주하지 마세요.
+이전 버전에서 hole punching된 prefix는 이 변경으로 복구되지 않습니다. 기존 `file_reclaim_state`의 완료·진행 중 intent는 그대로 보존하며 해당 범위 재전송은 `409`로 거절하고 전체 원본 hash 검증 완료로 표시하지 않습니다. 기존 hole의 복구는 별도 작업입니다. Greptime에는 디코딩된 신호만 있으므로 유실된 미해석 frame·제어 기록의 대체본으로 간주하지 마세요.
 
-정리된 CAN 원본은 복구하거나 새 정의로 재해석할 수 없습니다. Greptime에는 디코딩된 신호만 저장되므로 미해석 frame·제어 기록 등은 원본 정리와 함께 사라집니다. 정리 전 최종 SHA256과 청크 수가 이미 도착했다면 전체 검증 완료를 기다리지만, 일부가 정리된 뒤 도착한 최종 SHA256은 전체 원본과 대조할 수 없습니다. 정리 실패나 hole punching 미지원 시 미ACK 구간은 유지하고 `file_reclaim_failure` 오류로 표시합니다.
-
-receiver와 worker는 정리와 수신을 같은 프로세스 간 잠금으로 조정합니다. 이 기능을 배포하거나 되돌릴 때는 두 역할을 모두 정상 종료하고 같은 버전으로 함께 시작하세요. 구버전 receiver와 신버전 worker를 동시에 실행하지 마세요.
+구버전 worker는 계속 원본을 정리할 수 있으므로 보존 버전으로 교체하기 전 다시 시작하지 마세요. receiver와 worker의 파일 수신 잠금 및 기존 상태를 유지하고 배포 시 실행 중인 코드 버전을 확인하세요.
 
 #### SQLite 원본 처리 캐시
 
@@ -355,7 +353,7 @@ worker는 signal·dirty 알림의 전체 ACK로 outbox가 비었을 때, 모든 
 
 `status.raw_chunks`는 누적 수신량, `retained_raw_chunks`는 실제 보존 청크, `pruned_chunks`는 정리량, `raw_bytes`는 보존 중인 payload bytes입니다. `max_database_bytes`는 설정된 본체 상한입니다. 정리된 순번의 인증된 재전송은 새로 저장하지 않고 ACK합니다. 해당 원본은 이미 없어 bytes 충돌 비교를 할 수 없으며, 보존 중인 순번의 충돌 검증은 유지합니다.
 
-정리된 과거의 새 epoch 재해석은 `re-decode_requires_unpruned_raw`로 거절합니다. `--raw-cache-mib 0`은 SQLite 캐시의 크기 제한과 자동 정리만 끄며, 위 `serial_chunks.jsonl` 파일 정리를 끄지 않습니다. 기본 `re-decode`와 프로그램에서 직접 만든 `Archive`는 SQLite의 무제한 모드이며, 정리된 원본을 복구하지는 못합니다.
+정리된 과거의 새 epoch 재해석은 `re-decode_requires_unpruned_raw`로 거절합니다. `--raw-cache-mib 0`은 SQLite 캐시의 크기 제한과 자동 정리를 끕니다. 기본 `re-decode`와 프로그램에서 직접 만든 `Archive`는 SQLite의 무제한 모드이며, 정리된 원본을 복구하지는 못합니다.
 
 
 CAN OTLP 요청은 최대 10,000레코드이며, 요청 본문은 gzip 해제 후에도 2 MiB 이하여야 합니다. 레코드 상한과 바이트 상한을 모두 만족해야 수신합니다.
@@ -400,7 +398,7 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 실패한 작업이 다른 복원의 결과를 삭제하지 않습니다. receiver/worker의
 offline 확인은 별도 조건이며, 이 잠금을 사용하지 않는 외부 writer는 보호하지 않습니다.
 
-`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 receiver·worker 및 GreptimeDB를 시작합니다. OTLP 영속 ACK·재시작, 파일 수신과 실제 signal·dirty ACK, 정리 후 디스크 회수·offset 및 tail hash 보존, 재전송 충돌과 추가 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
+`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 receiver·worker 및 GreptimeDB를 시작합니다. OTLP 영속 ACK·재시작, 파일 수신과 실제 signal·dirty ACK, 처리 후 원본 바이트·offset·tail hash 보존, 재전송과 추가 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver·worker 인계
 
@@ -408,7 +406,7 @@ offline 확인은 별도 조건이며, 이 잠금을 사용하지 않는 외부 
 2. **기존 receiver와 worker 둘 다** 정상 종료합니다. capture/uploader, DB, Grafana 등 다른 서비스를 중지하거나 재시작하지 않습니다. 파일 uploader는 원본·진행 정보를, 이전 OTLP uploader는 기존 spool을 보존한 채 서버 공백 동안 재시도합니다.
 3. `CAN_RECEIVER_RAW_VOLUME`을 기존 raw volume의 정확한 이름으로 지정합니다. 새 빈 raw volume으로 교체하거나 DB를 복사·삭제하지 않습니다. 기존 `/data/raw.sqlite3`와 WAL/SHM, `/data/files`, decode cursor·outbox·epoch를 그대로 사용하며 소유자 `10001:10001`와 private 모드를 확인합니다. 필요한 권한 조정은 writer를 멈춘 상태에서만 수행합니다.
 4. 동일한 정의 바이트를 private definitions volume에 공급합니다. 서버 이전을 이유로 새 epoch를 만들거나 `re-decode`를 실행하지 않습니다. 같은 raw·정의 볼륨으로 새 receiver와 worker를 시작합니다. **같은 raw archive에 구·신 receiver·worker를 병렬 실행하지 마세요.**
-5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 인계 자체는 원본을 삭제하지 않으며, 이후 SQLite 정리는 위 캐시 정책을 따릅니다. rollback도 새 receiver·worker를 종료한 뒤 동일 볼륨·정의로 기존 버전을 단독 기동합니다.
+5. `status`에서 기존 epoch·cursor가 이어지는지 확인하고, uploader endpoint·인증과 실제 ACK를 확인합니다. 인계 자체는 원본을 삭제하지 않으며, 이후 SQLite 정리는 위 캐시 정책을 따릅니다. rollback 시 원본을 회수하는 구버전 worker는 다시 시작하지 마세요.
 
 의도적으로 정의를 변경하는 재해석은 worker를 먼저 중지하고 새 정의를 검토한 뒤 아래처럼 같은 venv·볼륨의 단독 컨테이너에서 실행합니다. `re-decode`는 worker 역할 lock을 사용하므로 `can-worker` 실행 중에는 동시에 시작하지 마세요. 이 작업은 새 decode epoch를 명시적으로 등록하므로 단순 배포 인계와 구분합니다. 정의 파일 교체는 worker를 중지한 상태에서만 수행합니다. receiver는 계속 수신할 수 있으며 worker 시작 전에 받은 원본도 이후 처리됩니다.
 
