@@ -332,7 +332,7 @@ cold 증거는 재기동 완료 후 **실제 query window 안의 성공한 SST G
 
 `benchmark_greptime_egress.py`는 운영 `.env`나 원본을 사용하지 않습니다. 로컬 Docker의 GreptimeDB 1.2.1, SHA256으로 고정한 실제 MinIO 바이너리, S3 HTTP meter를 별도 프로젝트로 실행합니다. 호스트 포트는 loopback에만 바인딩하고, 종료 시 소유 컨테이너·볼륨·네트워크의 잔존 여부를 검사합니다. Python의 `PyYAML`과 `boto3`가 필요합니다.
 
-현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 간격은 `0m`, `schedule_compaction_after_edit=true`이며 인덱스 preload는 끄고 읽은 파일의 cache refill은 켭니다(`enable_refill_cache_on_read=true`). 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다. 아래 정책 비교는 이 기본 구성의 검증이 아닌 과거 연구입니다.
+현재 기본 구성은 stock GreptimeDB 1.2.1과 S3 주 저장소를 유지하고, `server`에 aggregate와 의존 서비스를 포함합니다. 자동 compaction 최소 예약 간격은 `30m`, `schedule_compaction_after_edit=true`이며 인덱스 preload는 끄고 읽은 파일의 cache refill은 켭니다(`enable_refill_cache_on_read=true`). 간격은 입력 종료 감지나 이후 자동 실행 보장이 아닙니다. 기본 page cache 512MB·write buffer 128MB·file write cache 10GiB와 명시적 override를 유지합니다. 선택한 목표는 전체 이력을 로컬에 복제하지 않고 제한된 작업 캐시로 정상 집계·유지보수를 수행하는 것입니다. 아래 정책 비교는 이 기본 구성의 검증이 아닌 과거 연구입니다.
 
 refill 복원 후 로컬 GreptimeDB·MinIO에서 200,000행을 이전 정상 기준 `94caf39`와 비교했습니다. flush·완료된 compaction·cold/warm 조회의 20개 정답 검증을 통과했고, cold GET은 양쪽 모두 145,909 bytes/7회, warm 두 pass는 0 bytes였습니다. 절대 비용 예산과 기존 20% 상대 회귀 기준은 완화하지 않았습니다. 일부 데이터만 읽는 첫 조회의 refill 비용, 캐시 부족·유실 시 재다운로드, 실제 운영 작업 집합과 청구액은 별도로 확인해야 합니다.
 
@@ -368,7 +368,7 @@ python3 tools/benchmark_greptime_egress.py --background-only --rows 200000 \
   --json-out /tmp/datalake-minimum-background-proof.json
 ```
 
-과거 세 후보 모두 같은 작은 64KiB 쓰기 캐시와 1MiB page cache, 실제 로컬 MinIO를 사용합니다. `legacy`는 제한 없는 자동 compaction·preload/refill과 반복 집계, `on_demand`는 자동 집계·선읽기만 제거, `deferred`는 compaction 최소 간격을 `36500d`로 명시적으로 고정합니다. 현재 기본값 `0m`과는 다릅니다. 같은 키를 네 차례 적재·flush한 뒤 재시작·캐시 유실 재시작을 수행합니다. routine 최초/최종 meter snapshot 사이의 연속 증가량을 사용하므로 phase 사이의 비동기 읽기도 포함합니다. compaction counter는 DB 재시작으로 초기화되는 구간을 나누어 계산합니다.
+과거 세 후보 모두 같은 작은 64KiB 쓰기 캐시와 1MiB page cache, 실제 로컬 MinIO를 사용합니다. `legacy`는 제한 없는 자동 compaction·preload/refill과 반복 집계, `on_demand`는 자동 집계·선읽기만 제거, `deferred`는 compaction 최소 간격을 `36500d`로 명시적으로 고정합니다. 현재 기본값 `30m`과는 다릅니다. 같은 키를 네 차례 적재·flush한 뒤 재시작·캐시 유실 재시작을 수행합니다. routine 최초/최종 meter snapshot 사이의 연속 증가량을 사용하므로 phase 사이의 비동기 읽기도 포함합니다. compaction counter는 DB 재시작으로 초기화되는 구간을 나누어 계산합니다.
 
 이후의 명시적 집계·원본 oracle·수동 compaction은 routine 다운로드에 숨기지 않고 별도 phase로 기록합니다. 수동 집계의 count/sum/min/max와 시간 요약 일치, 재시작·compaction 전후 마지막 덮어쓰기 NULL, 실제 CAN dirty coordinator와 오프라인 S3 백업을 확인합니다. `background_sst_files`는 compaction을 미뤄 증가하는 활성 SST 파일 수·크기를 남깁니다. 이 짧은 실증은 대규모 조회 성능·장기 보존 회수·월간 egress의 보장이 아니며, 수동 유지보수도 S3를 읽을 수 있습니다.
 
@@ -457,7 +457,7 @@ mirror 모드의 Metric logical-table 복구·DDL 메타데이터 조회도 로�
 
 새 로컬 시험 프로젝트에만 `-f compose.yaml -f tools/greptime_local/compose.yaml`을 명시적으로 추가할 수 있습니다. 이 override는 `GREPTIME_LOCAL_IMAGE`, `GREPTIME_SST_MIRROR_CAPACITY`, `GREPTIME_SST_MIRROR_OUTPUT_RESERVE`를 필수로 요구하고 native capability를 검사합니다. 집계와 의존 서비스는 기본 구성과 같이 `server` 프로필을 따릅니다. mirror 용량은 보존 이력·인덱스와 동시 출력 예산을 수용해야 하며, 부족하면 유지보수뿐 아니라 flush도 실패할 수 있습니다. 기존 S3 이력을 가진 볼륨에 설정만 켜면 로컬 입력이 생기지 않습니다. 기존 운영 이관·원격 이력 hydration·운영 재시작은 이 명령의 범위가 아닙니다.
 
-이 실험 override의 `GREPTIME_MIN_COMPACTION_INTERVAL=0m`은 현재 stock 기본값과 같습니다. 실증은 수동 `ADMIN compact_table` 없이 실제 flush 입력이 자동 병합·퇴역하는지와, ACK 직후 미flush 데이터의 SIGKILL/WAL 재시작에서 최신 NULL이 보존되는지도 검사합니다.
+이 실험 override의 `GREPTIME_MIN_COMPACTION_INTERVAL=0m`은 현재 기본값 `30m`과 다릅니다. 실증은 수동 `ADMIN compact_table` 없이 실제 flush 입력이 자동 병합·퇴역하는지와, ACK 직후 미flush 데이터의 SIGKILL/WAL 재시작에서 최신 NULL이 보존되는지도 검사합니다.
 
 고정 소스와 패치 `3cc650a827c7b1c1e238b3e1f050686f5ac49fcf277b4c09bdd7941c1c3aef0a`의 로컬 실측에서는 20,000행 초기 부하와 추가 요약 fixture로 20개 필수 case가 모두 통과했습니다. 자동·수동 유지보수 및 strict 집계의 payload/unknown GET은 각각 0바이트였고, metadata GET은 952,588바이트, 비조회 전체 HTTP 응답 body는 2,207,519바이트였습니다. 조회·비교 oracle·재해 복구 다운로드는 별도 계상하며 lifecycle 총계에서 제거하지 않았습니다. GC 후 활성 SST 129개의 원격·로컬 payload는 각각 29,973,451바이트였고 누락·퇴역 잔존 파일은 없었습니다. 이는 해당 유한 fixture의 관측값이며, 메타데이터 요청·archive 업로드·원격 복구 비용이나 장기 용량 한계가 사라졌다는 뜻은 아닙니다.
 

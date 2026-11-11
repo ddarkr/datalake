@@ -107,7 +107,7 @@ def main():
     write_cache_size = os.environ.get("GREPTIME_WRITE_CACHE_SIZE", "10GiB")
     write_buf = os.environ.get("GREPTIME_WRITE_BUFFER_SIZE", "128MB")
     flush_interval = os.environ.get("GREPTIME_AUTO_FLUSH_INTERVAL", "10m")
-    min_compaction_interval = os.environ.get("GREPTIME_MIN_COMPACTION_INTERVAL", "0m")
+    min_compaction_interval = os.environ.get("GREPTIME_MIN_COMPACTION_INTERVAL", "30m")
     mirror = os.environ.get("GREPTIME_LOCAL_SST_MIRROR", "0")
     mirror_capacity = os.environ.get("GREPTIME_SST_MIRROR_CAPACITY", "")
     mirror_reserve = os.environ.get("GREPTIME_SST_MIRROR_OUTPUT_RESERVE", "")
