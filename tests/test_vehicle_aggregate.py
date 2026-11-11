@@ -431,6 +431,57 @@ class DirtyBatchTest(unittest.TestCase):
         commit.assert_not_called()
 
 
+class LegacyMigrationTest(unittest.TestCase):
+    def test_bounded_sweep_retries_late_raw_and_preserves_failure(self):
+        import sqlite3
+        from unittest.mock import patch
+
+        ctx = ("legacy-test", "", "db")
+        with sqlite3.connect(":memory:") as db:
+            db.execute("""CREATE TABLE vehicle_agg (
+                vehicle TEXT, source TEXT, decode_epoch TEXT,
+                window_start TEXT, resolution TEXT, rollup_version INTEGER)""")
+            db.execute("""CREATE TABLE vehicle_signal (
+                vehicle TEXT, source TEXT, decode_epoch TEXT, event_time TEXT)""")
+            hour = "2026-09-20 10:00:00.000000000"
+            db.executemany("INSERT INTO vehicle_agg VALUES (?, ?, 'e', ?, '1h', NULL)",
+                           [("a", "fleet", hour), ("a", "fleet", hour),
+                            ("b", "fleet", hour), ("c", "can", hour)])
+            db.execute("INSERT INTO vehicle_signal VALUES ('b','fleet','e',?)", (hour,))
+            rebuilt = []
+
+            def fetch(_url, _auth, _db, sql):
+                result = db.execute(sql)
+                return [column[0] for column in result.description], result.fetchall()
+
+            def rebuild(_ctx, _cfg, windows):
+                scope, _ = windows[0]
+                rebuilt.append(scope)
+                db.execute("DELETE FROM vehicle_agg WHERE vehicle=? AND source=?",
+                           scope[:2])
+
+            with patch.object(agg, "_legacy_migrate_context", None), \
+                    patch.object(agg, "_legacy_migrate_cursor", None), \
+                    patch.object(agg, "LEGACY_MIGRATE_HOURS", 1), \
+                    patch.object(agg, "fetch_rows", side_effect=fetch), \
+                    patch.object(agg, "_rollup_hour_windows", side_effect=rebuild):
+                self.assertEqual(agg._migrate_legacy_hours(ctx, {}, set()), 0)
+                self.assertEqual(db.execute(
+                    "SELECT count(*) FROM vehicle_agg WHERE vehicle='a'"
+                ).fetchone()[0], 2)
+                with patch.object(agg, "_rollup_hour_windows",
+                                  side_effect=agg.SqlError("failed")):
+                    with self.assertRaises(agg.SqlError):
+                        agg._migrate_legacy_hours(ctx, {}, set())
+                self.assertEqual(agg._migrate_legacy_hours(ctx, {}, set()), 1)
+                db.execute("INSERT INTO vehicle_signal VALUES ('a','fleet','e',?)", (hour,))
+                self.assertEqual(agg._migrate_legacy_hours(ctx, {}, set()), 0)
+                self.assertEqual(agg._migrate_legacy_hours(ctx, {}, set()), 1)
+            self.assertEqual(rebuilt, [("b", "fleet", "e"), ("a", "fleet", "e")])
+            self.assertEqual(db.execute("SELECT vehicle FROM vehicle_agg").fetchall(),
+                             [("c",)])
+
+
 class RollupV2SqlTest(unittest.TestCase):
     def test_rollup_preserves_quality_nulls_and_corrected_scope(self):
         import sqlite3

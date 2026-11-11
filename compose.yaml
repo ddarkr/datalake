@@ -115,7 +115,7 @@ services:
     - server
     cpus: ${AGG_CPUS:-1.0}
     labels:
-      datalake.aggregate-revision: '49'
+      datalake.aggregate-revision: '50'
     depends_on:
       greptimedb:
         condition: service_started
@@ -5638,10 +5638,9 @@ configs:
           # the deletes and the rebuilds: corrected quality/unit/source_field
           # groups leave no stale rows, and all CAN sources are never touched
           # here. Per-resolution deletes match each sealed range, so no
-          # transient gap past the 1h seal. NULL-version legacy rows are the
-          # durable rediscovery marker for the migration below: v2 rows are
-          # deleted first, then rebuilt, and legacy rows only finally — a
-          # crash/failure leaves the marker behind for rediscovery.
+          # transient gap past the 1h seal. Legacy rows are cleaned after insertion,
+          # but v2 rows with all-NULL added key tags can overwrite a legacy row
+          # during insertion, before that cleanup.
           request_sql(base_url, auth, db,
                       "DELETE FROM vehicle_agg WHERE resolution = '1m'"
                       " AND rollup_version = 2"
@@ -5674,40 +5673,48 @@ configs:
       # path. The coordinator owns CAN scopes; this covers the rest, whose old
       # history lies far outside the ~30h lookback.
       LEGACY_MIGRATE_HOURS = 24
-      LEGACY_MIGRATE_LIST = 200
-      LEGACY_EXPIRED_VERSION = -1
+      _legacy_migrate_cursor = None
+      _legacy_migrate_context = None
 
 
       def _migrate_legacy_hours(ctx, cfg, excluded):
-          """Rebuild NULL-version hours that still hold retained raw rows.
+          """Revisit bounded pages of non-CAN legacy hours, including late raw.
 
-          Discovery reads legacy 1h rows only (1h rows exist for every legacy
-          hour, one bounded query, oldest first), floored at the global raw
-          MIN(event_time) so universally raw-expired history costs one query and
-          is preserved as explicitly legacy. Per candidate hour: skip CAN scopes
-          (coordinator-owned); skip when no raw row survives (marked
-          rollup_version=-1 at most once — values and key untouched — so the hour
-          is never reselected; documented: it will NOT auto-retry if historical
-          raw arrives later, only the normal lookback covers new raw); else
-          marker-safe rebuild via _rollup_hour_windows (legacy rows deleted only
-          after both v2 resolutions are written, so any failure leaves the NULL marker
-          for rediscovery). Failures propagate like every other section. Returns
-          rebuilt hour count."""
+          The in-memory cursor wraps at the end and resets on restart. Empty raw
+          probes leave legacy rows untouched; a later sweep can discover late input.
+          A failed probe or rebuild leaves the cursor at the preceding page.
+          """
+          global _legacy_migrate_cursor, _legacy_migrate_context
           base_url, auth, db = ctx
+          if _legacy_migrate_context != ctx:
+              _legacy_migrate_context = ctx
+              _legacy_migrate_cursor = None
           scope_filter = " AND source NOT IN (" + ",".join(
               str_lit(source) for source in CAN_SOURCES) + ")"
           if excluded:
               scope_filter += " AND NOT (" + _dirty_scope_predicate(excluded) + ")"
+          after = ""
+          if _legacy_migrate_cursor is not None:
+              hour, vehicle, source, epoch = _legacy_migrate_cursor
+              columns = ("window_start", "vehicle", "source", "decode_epoch")
+              values = (ns_to_sql_lit(hour), str_lit(vehicle), str_lit(source),
+                        str_lit(epoch))
+              after = " AND (" + " OR ".join(
+                  "(" + " AND ".join(
+                      [columns[j] + " = " + values[j] for j in range(i)]
+                      + [columns[i] + " > " + values[i]]) + ")"
+                  for i in range(len(columns))) + ")"
           try:
               cols, rows = fetch_rows(
                   base_url, auth, db,
-                  "SELECT vehicle, source, decode_epoch, window_start"
+                  "SELECT DISTINCT vehicle, source, decode_epoch, window_start"
                   " FROM vehicle_agg WHERE resolution = '1h'"
                   " AND rollup_version IS NULL AND decode_epoch IS NOT NULL"
-                  " AND window_start >= (SELECT date_bin('1h'::INTERVAL,"
-                  " MIN(event_time)) FROM vehicle_signal)"
-                  + scope_filter + " ORDER BY window_start LIMIT "
-                  + str(LEGACY_MIGRATE_LIST))
+                  " AND decode_epoch <> '' AND vehicle IS NOT NULL AND vehicle <> ''"
+                  " AND source IS NOT NULL AND source <> ''"
+                  + scope_filter + after
+                  + " ORDER BY window_start, vehicle, source, decode_epoch LIMIT "
+                  + str(LEGACY_MIGRATE_HOURS))
           except SqlError as e:
               if is_missing_table(e):
                   return 0
@@ -5726,10 +5733,7 @@ configs:
               if scope in excluded or _is_can_scope(scope):
                   continue
               key = (scope, floor_hour_ns(hour))
-              if key not in candidates:
-                  candidates.append(key)
-              if len(candidates) >= LEGACY_MIGRATE_HOURS:
-                  break
+              candidates.append(key)
           migrated = 0
           for scope, hour_ns in candidates:
               v, src, epoch = scope
@@ -5746,28 +5750,16 @@ configs:
                   if is_missing_table(e):
                       return migrated
                   raise
-              if not probe:
-                  _mark_legacy_expired(ctx, scope, hour_ns)
-                  continue
-              _rollup_hour_windows(ctx, cfg, [(scope, hour_ns)])
-              migrated += 1
+              if probe:
+                  _rollup_hour_windows(ctx, cfg, [(scope, hour_ns)])
+                  migrated += 1
+          if candidates:
+              scope, hour_ns = candidates[-1]
+              _legacy_migrate_cursor = (hour_ns, *scope)
+          else:
+              _legacy_migrate_cursor = None
           return migrated
 
-
-      def _mark_legacy_expired(ctx, scope, hour_ns):
-          """Preserve raw-expired legacy values without repeatedly migrating them."""
-          base_url, auth, db = ctx
-          columns = ("window_start, resolution, vehicle, path, source, decode_epoch,"
-                     " source_field, quality, unit_key, avg_value, min_value,"
-                     " max_value, sample_count, unit")
-          request_sql(
-              base_url, auth, db,
-              "INSERT INTO vehicle_agg (" + columns + ", rollup_version) SELECT "
-              + columns + ", " + str(LEGACY_EXPIRED_VERSION)
-              + " FROM vehicle_agg WHERE rollup_version IS NULL"
-              + " AND window_start >= " + ns_to_sql_lit(hour_ns)
-              + " AND window_start < " + ns_to_sql_lit(hour_ns + HOUR_NS)
-              + " AND (" + _dirty_scope_predicate([scope]) + ")")
 
 
       # --- Durable CAN dirty-window coordinator (Analytics-owned schema) ---
@@ -6176,11 +6168,9 @@ configs:
       def _rollup_hour_windows(ctx, cfg, scopes_hours):
           """Read the exact dirty (scope, hour) union once for both resolutions.
 
-          The NULL-version legacy rows are the durable rediscovery marker: the
-          first DELETE removes only rollup_version=2 rows in the exact scope/hour
-          window, then one INSERT writes both resolutions, and only finally are legacy
-          rows deleted. A crash/failure before the final cleanup leaves the NULL rows
-          behind, so the hour is rediscovered and rebuilt on the next pass.
+          Existing v2 rows are deleted before both resolutions are inserted; legacy
+          rows are cleaned afterward. Because rollup_version is not a key, an INSERT
+          with all-NULL added key tags can overwrite a legacy row before cleanup.
           Returns hours successfully rolled."""
           base_url, auth, db = ctx
           by_hour = {}
