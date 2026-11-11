@@ -319,6 +319,13 @@ Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보
 `capture.json`은 최대 64 KiB 전체 스냅샷이고, 다른 두 파일은 append-only입니다.
 파일·저장 위치를 동기화한 뒤에만 ACK합니다. 보존 중인 범위의 ACK 유실 재전송은 같은 바이트인지 확인하고, 이미 정리된 범위는 `409`로 거절해 uploader가 다시 `GET`으로 재개합니다.
 
+Pi 정리용 선택적 `X-CAN-Verify-SHA256: check` 요청은 검증 후보일 때만
+`X-CAN-Verify-Ready`와 서버 파일 상태를 나타내는 `X-CAN-Verify-Token`을 반환합니다.
+`range` 요청은 같은 토큰과 offset·길이를 받아 최대 4 MiB 구간의 SHA-256을 반환합니다.
+클라이언트는 모든 구간을 대조하고 마지막에 토큰이 유지됐는지 확인합니다. 과거 회수,
+진행 중 intent, 파일 변경 또는 검증 불가 상태에서는 증거를 반환하지 않습니다.
+기존 GET JSON과 요청 제한시간은 바뀌지 않습니다.
+
 수신 파일과 메타데이터 버전은 기존 raw 볼륨의 `/data/files` 아래에 저장합니다.
 수신 프로세스는 JSONL·CAN을 파싱하지 않습니다. `can-worker`의 importer가 완성된 줄을
 정확한 정수 ns로 읽어 기존 `Archive.accept`에 편입하므로, 이전 OTLP로 받은 같은

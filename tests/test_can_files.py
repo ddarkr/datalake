@@ -137,6 +137,65 @@ class FileStoreBehavior(unittest.TestCase):
                          hashlib.sha256(body).hexdigest())
         self.assertEqual(fix.store.path("s1", "serial_chunks.jsonl").read_bytes(), body)
 
+    def test_range_proof_requires_stable_unreclaimed_commit(self):
+        fix = _Fixture(self)
+        body = b"prefix" * 20000
+        fix.put(SERIAL_FILE, body)
+        with patch.object(can_files.os, "pread", side_effect=AssertionError("read in check")):
+            token, size, digest = fix.store.verified_serial("s1", SERIAL_FILE)
+        self.assertEqual((size, digest), (len(body), None))
+        self.assertEqual(fix.store.verified_serial("s1", SERIAL_FILE, token, 3, 50),
+                         (token, len(body), hashlib.sha256(body[3:53]).hexdigest()))
+        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 0))
+        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, len(body), 1))
+        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, "0" * 64, 0, 1))
+        self.assertIsNone(fix.store.verified_serial("missing", SERIAL_FILE))
+        self.assertIsNone(fix.store.verified_serial("s1", "capture.json"))
+        fix.put(SERIAL_FILE, b"", session="empty")
+        empty = fix.store.verified_serial("empty", SERIAL_FILE)
+        self.assertEqual((empty[1], empty[2]), (0, None))
+        self.assertEqual(fix.store.verified_serial("empty", SERIAL_FILE), empty)
+        # New sessions must not invalidate proof for an unchanged file.
+        self.assertEqual(fix.store.verified_serial("s1", SERIAL_FILE)[0], token)
+        self.assertEqual(fix.store.verified_serial("s1", SERIAL_FILE, token, 3, 50),
+                         (token, len(body), hashlib.sha256(body[3:53]).hexdigest()))
+        data = fix.store.path("s1", SERIAL_FILE)
+        with data.open("ab") as stream:
+            stream.write(b"uncommitted")
+        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE))
+        fix.store.status("s1", SERIAL_FILE)
+        token, _, _ = fix.store.verified_serial("s1", SERIAL_FILE)
+        for reclaimed, intent in ((1, 0), (0, 1)):
+            with fix.archive.connect() as conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO file_reclaim_state "
+                    "(vehicle,collector_id,session_id,reclaimed,intent_end) "
+                    "VALUES(?,?,?,?,?)", ("synthetic", "fixture", "s1", reclaimed, intent))
+                conn.commit()
+            self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE))
+            self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 1))
+        with fix.archive.connect() as conn:
+            conn.execute("DELETE FROM file_reclaim_state")
+            conn.commit()
+        original_pread = os.pread
+        changed = False
+
+        def changing_read(fd, size, offset):
+            nonlocal changed
+            if not changed:
+                changed = True
+                fix.put(SERIAL_FILE, b"new", offset=len(body))
+            return original_pread(fd, size, offset)
+
+        with patch.object(can_files.os, "pread", side_effect=changing_read):
+            self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 1))
+        self.assertTrue(changed)
+        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 1))
+        sidecar = data.with_name(SERIAL_FILE + ".committed")
+        sidecar.unlink()
+        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE))
+
+
     def test_preflight_reads_tail_and_status_keeps_real_hash(self):
         fix = _Fixture(self)
         body = b"x" * 70000
@@ -304,6 +363,66 @@ class LiveFileHttp(unittest.TestCase):
                 ack = json.loads(payload)
                 self.assertEqual((status, ack["offset"], ack["tail_sha256"]),
                                  (200, 1, hashlib.sha256(b"x").hexdigest()))
+                target = "/v1/files/s1/serial_chunks.jsonl"
+                conn.request("GET", target, headers={"Authorization": AUTH_HEADER, **IDENT,
+                             "X-CAN-Verify-SHA256": "check"})
+                response = conn.getresponse()
+                self.assertEqual(response.getheader("X-CAN-Verify-Ready"), "1")
+                token = response.getheader("X-CAN-Verify-Token")
+                self.assertRegex(token, r"^[0-9a-f]{64}$")
+                self.assertIsNone(response.getheader("X-CAN-Verified-SHA256"))
+                response.read()
+                headers = {"Authorization": AUTH_HEADER, **IDENT,
+                           "X-CAN-Verify-SHA256": "range",
+                           "X-CAN-Verify-Token": token,
+                           "X-CAN-Verify-Offset": "0", "X-CAN-Verify-Length": "1"}
+                conn.request("GET", target, headers=headers)
+                response = conn.getresponse()
+                self.assertEqual(response.getheader("X-CAN-Verify-Token"), token)
+                self.assertEqual(response.getheader("X-CAN-Verified-SHA256"),
+                                 hashlib.sha256(b"x").hexdigest())
+                self.assertIsNone(response.getheader("X-CAN-Verify-Ready"))
+                response.read()
+                conn.request("GET", target, headers={"Authorization": AUTH_HEADER, **IDENT,
+                             "X-CAN-Verify-SHA256": "check"})
+                response = conn.getresponse()
+                self.assertEqual(response.getheader("X-CAN-Verify-Token"), token)
+                self.assertEqual(json.loads(response.read())["offset"], 1)
+                for overrides, expected_status in (
+                    ({"X-CAN-Verify-Length": "0"}, 400),
+                    ({"X-CAN-Verify-Length": str(4 * 1024 * 1024 + 1)}, 400),
+                    ({"X-CAN-Verify-Token": "invalid"}, 400),
+                    ({"X-CAN-Verify-Offset": "1"}, 200),
+                    ({"X-CAN-Verify-Token": "0" * 64}, 200),
+                ):
+                    conn.request("GET", target, headers={**headers, **overrides})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, expected_status)
+                    self.assertIsNone(response.getheader("X-CAN-Verified-SHA256"))
+                    self.assertIsNone(response.getheader("X-CAN-Verify-Token"))
+                    response.read()
+                conn.putrequest("GET", target)
+                for key, value in headers.items():
+                    conn.putheader(key, value)
+                conn.putheader("X-CAN-Verify-Offset", "0")
+                conn.endheaders()
+                response = conn.getresponse()
+                self.assertEqual(response.status, 400)
+                self.assertIsNone(response.getheader("X-CAN-Verify-Token"))
+                response.read()
+                for target, verify in (
+                    (target, "1"),
+                    ("/v1/files/s1/capture.json", "check"),
+                    ("/v1/files/missing/serial_chunks.jsonl", "check"),
+                ):
+                    conn.request("GET", target, headers={"Authorization": AUTH_HEADER, **IDENT,
+                                 "X-CAN-Verify-SHA256": verify})
+                    response = conn.getresponse()
+                    self.assertEqual(response.status, 200)
+                    self.assertIsNone(response.getheader("X-CAN-Verify-Ready"))
+                    self.assertIsNone(response.getheader("X-CAN-Verify-Token"))
+                    self.assertIsNone(response.getheader("X-CAN-Verified-SHA256"))
+                    response.read()
             finally:
                 conn.close()
                 server.shutdown()

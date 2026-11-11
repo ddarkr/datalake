@@ -512,6 +512,92 @@ class FileStore:
     def status(self, session_id, filename):
         return self._status(session_id, filename, preflight=False)
 
+    def verified_serial(self, session_id, filename, token=None, offset=0, length=0):
+        """Check a snapshot, or hash one bounded range of that same snapshot."""
+        _check_names(session_id, filename)
+        if filename != SERIAL_FILE:
+            return None
+        fd = None
+
+        def identity(info):
+            return (info.st_dev, info.st_ino, info.st_size,
+                    info.st_mtime_ns, info.st_ctime_ns)
+
+        def snapshot():
+            directory = self._namespace(session_id, False)
+            if directory is None:
+                return None
+            levels = (self.root, directory.parent.parent, directory.parent, directory)
+            dirs = tuple(os.stat(p, follow_symlinks=False) for p in levels)
+            if any(not stat.S_ISDIR(info.st_mode) for info in dirs):
+                return None
+            namespace = tuple((info.st_dev, info.st_ino) for info in dirs)
+            data = directory / filename
+            sidecar = directory / (filename + ".committed")
+            side_fd = _open_nofollow(sidecar)
+            try:
+                side_before = identity(os.fstat(side_fd))
+                raw = os.read(side_fd, 33)
+                side_after = identity(os.fstat(side_fd))
+                side_path = identity(os.stat(sidecar, follow_symlinks=False))
+            finally:
+                os.close(side_fd)
+            if (side_before != side_after or side_before != side_path
+                    or side_before[2] != len(raw)
+                    or not re.fullmatch(rb"[0-9]{1,19}", raw)):
+                return None
+            data_fd = identity(os.fstat(fd))
+            data_path = identity(os.stat(data, follow_symlinks=False))
+            if data_fd != data_path or data_fd[2] != int(raw):
+                return None
+            with self._archive.connect() as conn:
+                row = conn.execute(
+                    "SELECT reclaimed,intent_end FROM file_reclaim_state "
+                    "WHERE vehicle=? AND collector_id=? AND session_id=?",
+                    (self.vehicle, self.collector_id, session_id)).fetchone()
+            reclaim = tuple(row) if row is not None else None
+            if reclaim is not None and reclaim != (0, 0):
+                return None
+            return namespace, data_fd, side_before, raw.decode("ascii"), reclaim
+
+        try:
+            with self._lock, _file_lock(self._archive):
+                directory = self._namespace(session_id, False)
+                if directory is None:
+                    return None
+                fd = _open_nofollow(directory / filename)
+                before = snapshot()
+            if before is None:
+                return None
+            fingerprint = hashlib.sha256(json.dumps(
+                (self.vehicle, self.collector_id, session_id, filename, before),
+                separators=(",", ":")).encode("ascii")).hexdigest()
+            digest = None
+            if token is not None:
+                if (token != fingerprint or type(offset) is not int
+                        or type(length) is not int or offset < 0
+                        or not 1 <= length <= MAX_FILE_RANGE
+                        or offset + length > before[1][2]):
+                    return None
+                digest = hashlib.sha256()
+                remaining = length
+                while remaining:
+                    chunk = os.pread(fd, min(1024 * 1024, remaining), offset)
+                    if not chunk:
+                        return None
+                    digest.update(chunk)
+                    offset += len(chunk)
+                    remaining -= len(chunk)
+            with self._lock, _file_lock(self._archive):
+                if snapshot() != before:
+                    return None
+            return fingerprint, before[1][2], digest.hexdigest() if digest else None
+        except (FileRejection, OSError):
+            return None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
     def preflight(self, session_id, filename):
         self._status(session_id, filename, preflight=True)
 
