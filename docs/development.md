@@ -137,6 +137,9 @@ node --test tests/test_plugin_*.mjs
 python -m tests.test_egress_guard --docker
 ```
 
+가드 회귀는 초기 S3 write 계열이 없을 때도 유효한 read를 원장에 기록하고,
+write 부재가 시작 유예를 넘거나 관찰된 write가 사라지면 차단하는지 확인합니다.
+
 수정된 전체 복구 검사는 수집·정규화·출력 중 실패 뒤 임시 SQLite 폐기와 fence 보존,
 재시도한 네 파생 출력의 oracle 일치를 확인합니다. CAN은 200,001개 완료 이력 뒤의
 오래된 새 generation·500개 배치·coordination table 누락 실패를 검사합니다.

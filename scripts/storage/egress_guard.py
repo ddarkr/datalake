@@ -602,6 +602,7 @@ def main(argv=None):
                             latch(directory, state, "unaccounted S3 helper running")
                 if not state["blocked"]:
                     fresh = False
+                    startup_pending = False
                     fetching_metrics = False
                     try:
                         container = database(containers, args.metrics_url)
@@ -627,9 +628,14 @@ def main(argv=None):
                         if not values:
                             raise ValueError("native S3 read metrics missing")
                         gap = time.time() - state["sample_at"] if state.get("sample_at") and state.get("last") is not None else 0
-                        storage_full = observe_storage(state, writes)
                         download_full = observe(state, values)
-                        fresh = True
+                        if (not writes and state.get("last_write") is None
+                                and (time.time() < state["startup_until"] or download_full)):
+                            startup_pending = True
+                            storage_full = False
+                        else:
+                            storage_full = observe_storage(state, writes)
+                        fresh = not startup_pending
                         clear_metrics_failures(state)
                         if gap > monitor_limits["gap_seconds"]:
                             state["observation_gap_seconds"] = gap
@@ -645,13 +651,15 @@ def main(argv=None):
                     except Exception as exc:
                         if not fetching_metrics:
                             clear_metrics_failures(state)
-                        retry = fetching_metrics and retry_metrics(state, exc)
+                        retry = (fetching_metrics and retry_metrics(state, exc)
+                                 and (state.get("last_write") is not None
+                                      or time.time() < state["startup_until"]))
                         if retry and not state["blocked"]:
                             save(directory, state)
                         elif state["blocked"] or state.get("last") is not None or time.time() >= state["startup_until"]:
                             latch(directory, state,
                                   f"native metrics unavailable, stale, or reset: {type(exc).__name__}: {exc}")
-                    if not state["blocked"] and (fresh or (
+                    if not state["blocked"] and (fresh or startup_pending or (
                             state.get("last") is None and time.time() < state["startup_until"])):
                         atomic(directory / "lease", str(int(time.time() + args.interval + args.timeout + 5)) + "\n")
                 blocked = state["blocked"]

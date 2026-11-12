@@ -461,6 +461,104 @@ def transient_metrics(path):
         assert not current["blocked"] and current["metrics_failure_count"] == 1
 
 
+def startup_write_metrics(path):
+    read = json.dumps({"operation": "read"})
+    write = json.dumps({"operation": "write"})
+    container = {"Id": "one", "State": {"StartedAt": "start"}}
+    base = dict(version=2, project="startup-regression", used_bytes=0,
+                day_used_bytes=0, month_used_bytes=0, month=g.day_at(1000)[:7],
+                day=g.day_at(1000), alerted=[], blocked=False, last=None,
+                last_write=None, instance=None, startup_until=1010,
+                storage_used_bytes=100, storage_limit_bytes=1000)
+
+    def run(sample, now):
+        with patch.object(g.time, "time", return_value=now), patch.object(g, "docker", return_value=""), patch.object(g, "database", return_value=container), patch.object(g, "disk_room"), patch.object(g, "metrics", side_effect=[sample]), patch.object(g, "stop"), patch.object(g, "telegram"), patch.object(g, "notify"), patch.object(g.time, "sleep", side_effect=LookupError):
+            try:
+                g.main(["--state-dir", str(path), "run", "--metrics-url", "http://127.0.0.1:4000/metrics",
+                        "--timeout", "10", "--telegram-config", str(path / "telegram.json")])
+            except LookupError:
+                pass
+        return g.load(path)
+
+    g.save(path, dict(base))
+    state = run({read: 30}, 1000)
+    assert not state["blocked"] and state["used_bytes"] == state["day_used_bytes"] == state["month_used_bytes"] == 30
+    assert state["instance"] == ["one", "start"] and state["last"] == {read: 30}
+    assert state["last_write"] is None and state["storage_used_bytes"] == 100
+    assert int((path / "lease").read_text()) > 1000
+    # Each run reopens the persisted state, as after a monitor restart.
+    state = run({read: 40}, 1002)
+    assert state["used_bytes"] == 40 and not state["blocked"]
+    state = run({read: 45, write: 25}, 1004)
+    assert state["used_bytes"] == 45 and state["storage_used_bytes"] == 125
+    assert state["last_write"] == {write: 25} and not state["blocked"]
+    state = run({read: 50, write: 30}, 1006)
+    assert state["used_bytes"] == 50 and state["storage_used_bytes"] == 130
+
+    g.save(path, dict(base))
+    run({read: 30}, 1000)
+    lease = (path / "lease").read_text()
+    delayed = run(TimeoutError(), 1002)
+    assert not delayed["blocked"] and delayed["used_bytes"] == 30
+    assert delayed["metrics_failure_count"] == 1 and (path / "lease").read_text() == lease
+    recovered = run({read: 35}, 1004)
+    assert recovered["used_bytes"] == 35 and "metrics_failure_count" not in recovered
+
+    g.save(path, dict(base))
+    run({read: 30, write: 0}, 1000)
+    failed = run({read: 31}, 1002)
+    assert failed["blocked"] and failed["used_bytes"] == 31
+    assert failed["last_write"] == {write: 0}
+    assert run({read: 100, write: 50}, 1004)["used_bytes"] == 31
+
+    for bad in ({read: 55}, {read: 55, write: 29}):
+        g.save(path, dict(state))
+        failed = run(bad, 1008)
+        assert failed["blocked"] and failed["used_bytes"] == 55
+        assert failed["last"] == {read: 55} and failed["last_write"] == {write: 30}
+        assert (path / "lease").read_text() == "0\n"
+
+    g.save(path, dict(base))
+    run({read: 30}, 1000)
+    expired = run({read: 40}, 1010)
+    assert expired["blocked"] and expired["used_bytes"] == 40
+    assert (path / "lease").read_text() == "0\n"
+    g.save(path, dict(base))
+    run({read: 30}, 1000)
+    assert run(TimeoutError(), 1010)["blocked"]
+
+    for initial, sample, reason in (
+            (dict(base), {read: g.HARD_BYTES}, "daily hard download limit reached"),
+            (dict(base, used_bytes=g.MONTH_BYTES - 10, month_used_bytes=g.MONTH_BYTES - 10),
+             {read: 10}, "monthly hard download limit reached"),
+            (dict(base), {read: 5, write: 900}, "storage hard limit reached")):
+        g.save(path, initial)
+        limited = run(sample, 1000)
+        assert limited["blocked"] and limited["reason"] == reason
+        assert limited["last"] == {read: sample[read]}
+        assert (path / "lease").read_text() == "0\n"
+
+    for bad in ({write: 1}, {read: 29}):
+        g.save(path, dict(base))
+        run({read: 30}, 1000)
+        failed = run(bad, 1002)
+        assert failed["blocked"] and failed["used_bytes"] == 30
+
+    for identity in ({"Id": "two", "State": {"StartedAt": "start"}},
+                     {"Id": "one", "State": {"StartedAt": "later"}}):
+        g.save(path, dict(base))
+        run({read: 30}, 1000)
+        original = dict(container)
+        container.update(identity)
+        try:
+            changed = run({read: 40}, 1002)
+            assert changed["blocked"] and changed["instance"] == ["one", "start"]
+            assert changed["used_bytes"] == 30
+        finally:
+            container.clear()
+            container.update(original)
+
+
 def daily_docker(path):
     """Real monitor/HTTP/Docker stop, without sending synthetic alerts to users."""
     path.mkdir(mode=0o700)
@@ -601,6 +699,9 @@ def main():
         transient_path = path / "transient"
         transient_path.mkdir(mode=0o700)
         transient_metrics(transient_path)
+        startup_path = path / "startup"
+        startup_path.mkdir(mode=0o700)
+        startup_write_metrics(startup_path)
         unsafe.mkdir(mode=0o755)
         try:
             with g.locked(unsafe):
