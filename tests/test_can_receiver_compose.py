@@ -375,13 +375,12 @@ def main():
                 request = urllib.request.Request(url, data=body, method="PUT", headers={
                     "Authorization": status_auth, "Content-Type": "application/octet-stream",
                     "X-CAN-Vehicle": "fixture", "X-CAN-Collector": "fixture",
-                    "X-CAN-Offset": str(offset), "X-CAN-SHA256": hashlib.sha256(body).hexdigest()})
+                    "X-CAN-Offset": str(offset)})
                 with urllib.request.urlopen(request, timeout=30) as response:
                     assert response.status == 200
                     ack = json.load(response)
-                assert ack == {"version": 1, "session_id": "fixture-files", "file": name,
-                               "offset": len(full),
-                               "tail_sha256": hashlib.sha256(full[-65536:]).hexdigest()}, ack
+                assert ack == {"version": 2, "session_id": "fixture-files", "file": name,
+                               "offset": len(full)}, ack
 
             def get_file(name):
                 url = endpoint.removesuffix("/v1/logs") + "/v1/files/fixture-files/" + name
@@ -424,7 +423,6 @@ def main():
             assert file_hash("serial_chunks.jsonl") == hashlib.sha256(original).hexdigest()
             ack = get_file("serial_chunks.jsonl")
             assert ack["offset"] == len(original)
-            assert ack["tail_sha256"] == hashlib.sha256(original[-65536:]).hexdigest()
             put_file("serial_chunks.jsonl", 0, original[:split], original)
             extra = b'{"seq":1,"t_s":1,"phase":"capture","data_b64":"dDEyMzIwMjAwDQ=="}\n'
             put_file("serial_chunks.jsonl", ack["offset"], extra, original + extra)
@@ -442,8 +440,8 @@ def main():
             assert file_hash("serial_chunks.jsonl") == hashlib.sha256(original + extra).hexdigest()
             assert file_hash("capture.json") == hashlib.sha256(capture).hexdigest()
             assert file_hash("events.jsonl") == hashlib.sha256(events).hexdigest()
-            assert get_file("capture.json")["tail_sha256"] == hashlib.sha256(capture).hexdigest()
-            assert get_file("events.jsonl")["tail_sha256"] == hashlib.sha256(events).hexdigest()
+            assert get_file("capture.json")["offset"] == len(capture)
+            assert get_file("events.jsonl")["offset"] == len(events)
             print("direct files: worker-off durable ACK, partial restart/replay, exact ns and real Greptime ACK passed")
 
             print("split receiver+worker: offline durability, %d chunks/%d rows, dense resume,"

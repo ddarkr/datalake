@@ -1,7 +1,7 @@
 """Behavioral direct-file receive + worker-only import tests (Main runs).
 
-Covers exact bytes/hash, interrupted PUT recovery, lost-ACK replay, mismatch
-no-advance, path/symlink/auth/disk bounds, growing partial JSONL, snapshot
+Covers exact bytes, interrupted PUT recovery, lost-ACK replay,
+offset conflicts, path/symlink/auth/disk bounds, growing partial JSONL, snapshot
 replacement, legacy OTLP overlap dedup with exact nanoseconds,
 invalid-source isolation, and crash replay. No live data, no services.
 """
@@ -20,7 +20,7 @@ from pathlib import Path
 
 from scripts.ingest.can import can_files
 from scripts.ingest.can.can_files import (
-    EMPTY_SHA256, FileImporter, FileStore, _parse_capture,
+    FileImporter, FileStore, _parse_capture,
     _parse_chunk,
 )
 from scripts.ingest.can.can_receiver import Archive, Greptime, Receiver, Worker
@@ -61,8 +61,7 @@ class _Fixture:
         self.store = FileStore(self.archive, "synthetic", "fixture")
 
     def put(self, filename, body, offset=0, session="s1"):
-        digest = hashlib.sha256(body).hexdigest()
-        return self.store.put(session, filename, offset, digest, body)
+        return self.store.put(session, filename, offset, body)
 
 
 SERIAL_FILE = "serial_chunks.jsonl"
@@ -124,90 +123,16 @@ class StrictParsing(unittest.TestCase):
         self.assertTrue(ok["ready"])
 
 class FileStoreBehavior(unittest.TestCase):
-    def test_exact_bytes_hash_and_status(self):
+    def test_exact_bytes_and_status(self):
         fix = _Fixture(self)
         self.assertEqual(fix.store.status("new", "serial_chunks.jsonl"),
-                         {"version": 1, "session_id": "new",
-                          "file": "serial_chunks.jsonl", "offset": 0,
-                          "tail_sha256": EMPTY_SHA256})
+                         {"version": 2, "session_id": "new",
+                          "file": "serial_chunks.jsonl", "offset": 0})
         body = _line(0, b"0.000000007")
         ack = fix.put("serial_chunks.jsonl", body)
         self.assertEqual(ack["offset"], len(body))
-        self.assertEqual(ack["tail_sha256"],
-                         hashlib.sha256(body).hexdigest())
         self.assertEqual(fix.store.path("s1", "serial_chunks.jsonl").read_bytes(), body)
 
-    def test_range_proof_requires_stable_unreclaimed_commit(self):
-        fix = _Fixture(self)
-        body = b"prefix" * 20000
-        fix.put(SERIAL_FILE, body)
-        with patch.object(can_files.os, "pread", side_effect=AssertionError("read in check")):
-            token, size, digest = fix.store.verified_serial("s1", SERIAL_FILE)
-        self.assertEqual((size, digest), (len(body), None))
-        self.assertEqual(fix.store.verified_serial("s1", SERIAL_FILE, token, 3, 50),
-                         (token, len(body), hashlib.sha256(body[3:53]).hexdigest()))
-        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 0))
-        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, len(body), 1))
-        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, "0" * 64, 0, 1))
-        self.assertIsNone(fix.store.verified_serial("missing", SERIAL_FILE))
-        self.assertIsNone(fix.store.verified_serial("s1", "capture.json"))
-        fix.put(SERIAL_FILE, b"", session="empty")
-        empty = fix.store.verified_serial("empty", SERIAL_FILE)
-        self.assertEqual((empty[1], empty[2]), (0, None))
-        self.assertEqual(fix.store.verified_serial("empty", SERIAL_FILE), empty)
-        # New sessions must not invalidate proof for an unchanged file.
-        self.assertEqual(fix.store.verified_serial("s1", SERIAL_FILE)[0], token)
-        self.assertEqual(fix.store.verified_serial("s1", SERIAL_FILE, token, 3, 50),
-                         (token, len(body), hashlib.sha256(body[3:53]).hexdigest()))
-        data = fix.store.path("s1", SERIAL_FILE)
-        with data.open("ab") as stream:
-            stream.write(b"uncommitted")
-        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE))
-        fix.store.status("s1", SERIAL_FILE)
-        token, _, _ = fix.store.verified_serial("s1", SERIAL_FILE)
-        for reclaimed, intent in ((1, 0), (0, 1)):
-            with fix.archive.connect() as conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO file_reclaim_state "
-                    "(vehicle,collector_id,session_id,reclaimed,intent_end) "
-                    "VALUES(?,?,?,?,?)", ("synthetic", "fixture", "s1", reclaimed, intent))
-                conn.commit()
-            self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE))
-            self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 1))
-        with fix.archive.connect() as conn:
-            conn.execute("DELETE FROM file_reclaim_state")
-            conn.commit()
-        original_pread = os.pread
-        changed = False
-
-        def changing_read(fd, size, offset):
-            nonlocal changed
-            if not changed:
-                changed = True
-                fix.put(SERIAL_FILE, b"new", offset=len(body))
-            return original_pread(fd, size, offset)
-
-        with patch.object(can_files.os, "pread", side_effect=changing_read):
-            self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 1))
-        self.assertTrue(changed)
-        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE, token, 0, 1))
-        sidecar = data.with_name(SERIAL_FILE + ".committed")
-        sidecar.unlink()
-        self.assertIsNone(fix.store.verified_serial("s1", SERIAL_FILE))
-
-
-    def test_preflight_reads_tail_and_status_keeps_real_hash(self):
-        fix = _Fixture(self)
-        body = b"x" * 70000
-        fix.put(SERIAL_FILE, body)
-        self.assertIsNone(fix.store.preflight("s1", SERIAL_FILE))
-        self.assertEqual(fix.store.status("s1", SERIAL_FILE)["tail_sha256"],
-                         hashlib.sha256(body[-65536:]).hexdigest())
-        with patch.object(can_files.os, "pread", return_value=b""):
-            with self.assertRaises(can_files.FileRejection) as ctx:
-                fix.store.preflight("s1", SERIAL_FILE)
-        self.assertEqual((ctx.exception.status, ctx.exception.reason),
-                         (503, "archive_unavailable"))
 
     def test_interrupted_put_recovers_to_committed(self):
         fix = _Fixture(self)
@@ -219,27 +144,43 @@ class FileStoreBehavior(unittest.TestCase):
         ack = fix.store.status("s1", "serial_chunks.jsonl")
         self.assertEqual((ack["offset"], data.read_bytes()), (len(body), body))
 
-    def test_lost_ack_replay_and_mismatch(self):
+    def test_lost_ack_replay_and_offset_conflicts(self):
         fix = _Fixture(self)
         body = _line(0, b"0.000000007")
         first = fix.put("serial_chunks.jsonl", body)
         replay = fix.put("serial_chunks.jsonl", body, offset=0)
         self.assertEqual(replay, first)
+        self.assertEqual(fix.put("serial_chunks.jsonl", b"z", offset=0), first)
+        self.assertEqual(fix.store.path("s1", SERIAL_FILE).read_bytes(), body)
         with self.assertRaises(Exception) as ctx:
             fix.put("serial_chunks.jsonl", body + b"x", offset=0)
         self.assertEqual(ctx.exception.status, 409)
+        self.assertEqual(fix.put("serial_chunks.jsonl", _line(9, b"9"), offset=1), first)
+        self.assertEqual(fix.store.path("s1", SERIAL_FILE).read_bytes(), body)
         with self.assertRaises(Exception) as ctx:
-            fix.put("serial_chunks.jsonl", _line(9, b"9"), offset=1)
+            fix.put("serial_chunks.jsonl", b"x", offset=len(body) + 1)
         self.assertEqual(ctx.exception.status, 409)
 
-    def test_digest_mismatch_no_advance(self):
+    def test_concurrent_distinct_files(self):
         fix = _Fixture(self)
-        body = _line(0, b"0.000000007")
-        with self.assertRaises(Exception) as ctx:
-            fix.store.put("s1", "serial_chunks.jsonl", 0,
-                          "0" * 64, body)
-        self.assertEqual(ctx.exception.status, 409)
-        self.assertEqual(fix.store.status("s1", "serial_chunks.jsonl")["offset"], 0)
+        names = ["events.jsonl", SERIAL_FILE]
+        barrier = threading.Barrier(2)
+        receipts = {}
+
+        def upload(name):
+            barrier.wait()
+            receipts[name] = fix.put(name, name.encode())
+
+        threads = [threading.Thread(target=upload, args=(name,)) for name in names]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        for name in names:
+            self.assertEqual(receipts[name], {"version": 2, "session_id": "s1",
+                                              "file": name, "offset": len(name)})
+            self.assertEqual(fix.store.path("s1", name).read_bytes(), name.encode())
+
 
     def test_bounds_paths_symlinks_and_auth_surface(self):
         fix = _Fixture(self)
@@ -284,15 +225,13 @@ class FileStoreBehavior(unittest.TestCase):
         self.assertEqual(ack["offset"], len(first))
         second = _capture(firmware="v2")
         ack = fix.put("capture.json", second)
-        self.assertEqual((ack["offset"], ack["tail_sha256"]),
-                         (len(second), hashlib.sha256(second).hexdigest()))
+        self.assertEqual(ack["offset"], len(second))
         self.assertEqual(fix.store.path("s1", "capture.json").read_bytes(), second)
         snapshots = list((fix.store.root / "synthetic" / "fixture"
                           / "s1" / "snapshots").glob("*.json"))
         self.assertEqual(len(snapshots), 2)
         with self.assertRaises(Exception) as ctx:
-            fix.store.put("s1", "capture.json", 3,
-                          hashlib.sha256(second).hexdigest(), second)
+            fix.store.put("s1", "capture.json", 3, second)
         self.assertEqual(ctx.exception.status, 409)
 
 
@@ -343,8 +282,7 @@ class LiveFileHttp(unittest.TestCase):
                         b"Content-Type: application/octet-stream\r\n"
                         b"Content-Length: 70000\r\n"
                         b"X-CAN-Vehicle: synthetic\r\nX-CAN-Collector: fixture\r\n"
-                        b"X-CAN-Offset: 0\r\nX-CAN-SHA256: " + hashlib.sha256(b"x").hexdigest().encode()
-                        + b"\r\nConnection: close\r\n\r\n")
+                        b"X-CAN-Offset: 0\r\nConnection: close\r\n\r\n")
                     reply = b""
                     while b"\r\n\r\n" not in reply:
                         chunk = raw.recv(4096)
@@ -356,73 +294,32 @@ class LiveFileHttp(unittest.TestCase):
                 self.assertIn(b" 413 ", reply.split(b"\r\n", 1)[0])
                 status, _ = call("PUT", "/v1/files/s1/serial_chunks.jsonl", body=b"x",
                                  extra={"Content-Type": "application/octet-stream",
-                                        "X-CAN-Offset": "0",
-                                        "X-CAN-SHA256": hashlib.sha256(b"x").hexdigest()})
+                                        "X-CAN-Offset": "0"})
                 self.assertEqual(status, 200)
                 status, payload = call("GET", "/v1/files/s1/serial_chunks.jsonl")
                 ack = json.loads(payload)
-                self.assertEqual((status, ack["offset"], ack["tail_sha256"]),
-                                 (200, 1, hashlib.sha256(b"x").hexdigest()))
-                target = "/v1/files/s1/serial_chunks.jsonl"
-                conn.request("GET", target, headers={"Authorization": AUTH_HEADER, **IDENT,
-                             "X-CAN-Verify-SHA256": "check"})
-                response = conn.getresponse()
-                self.assertEqual(response.getheader("X-CAN-Verify-Ready"), "1")
-                token = response.getheader("X-CAN-Verify-Token")
-                self.assertRegex(token, r"^[0-9a-f]{64}$")
-                self.assertIsNone(response.getheader("X-CAN-Verified-SHA256"))
-                response.read()
-                headers = {"Authorization": AUTH_HEADER, **IDENT,
-                           "X-CAN-Verify-SHA256": "range",
-                           "X-CAN-Verify-Token": token,
-                           "X-CAN-Verify-Offset": "0", "X-CAN-Verify-Length": "1"}
-                conn.request("GET", target, headers=headers)
-                response = conn.getresponse()
-                self.assertEqual(response.getheader("X-CAN-Verify-Token"), token)
-                self.assertEqual(response.getheader("X-CAN-Verified-SHA256"),
-                                 hashlib.sha256(b"x").hexdigest())
-                self.assertIsNone(response.getheader("X-CAN-Verify-Ready"))
-                response.read()
-                conn.request("GET", target, headers={"Authorization": AUTH_HEADER, **IDENT,
-                             "X-CAN-Verify-SHA256": "check"})
-                response = conn.getresponse()
-                self.assertEqual(response.getheader("X-CAN-Verify-Token"), token)
-                self.assertEqual(json.loads(response.read())["offset"], 1)
-                for overrides, expected_status in (
-                    ({"X-CAN-Verify-Length": "0"}, 400),
-                    ({"X-CAN-Verify-Length": str(4 * 1024 * 1024 + 1)}, 400),
-                    ({"X-CAN-Verify-Token": "invalid"}, 400),
-                    ({"X-CAN-Verify-Offset": "1"}, 200),
-                    ({"X-CAN-Verify-Token": "0" * 64}, 200),
-                ):
-                    conn.request("GET", target, headers={**headers, **overrides})
-                    response = conn.getresponse()
-                    self.assertEqual(response.status, expected_status)
-                    self.assertIsNone(response.getheader("X-CAN-Verified-SHA256"))
-                    self.assertIsNone(response.getheader("X-CAN-Verify-Token"))
-                    response.read()
-                conn.putrequest("GET", target)
-                for key, value in headers.items():
-                    conn.putheader(key, value)
-                conn.putheader("X-CAN-Verify-Offset", "0")
-                conn.endheaders()
-                response = conn.getresponse()
-                self.assertEqual(response.status, 400)
-                self.assertIsNone(response.getheader("X-CAN-Verify-Token"))
-                response.read()
-                for target, verify in (
-                    (target, "1"),
-                    ("/v1/files/s1/capture.json", "check"),
-                    ("/v1/files/missing/serial_chunks.jsonl", "check"),
-                ):
-                    conn.request("GET", target, headers={"Authorization": AUTH_HEADER, **IDENT,
-                                 "X-CAN-Verify-SHA256": verify})
-                    response = conn.getresponse()
-                    self.assertEqual(response.status, 200)
-                    self.assertIsNone(response.getheader("X-CAN-Verify-Ready"))
-                    self.assertIsNone(response.getheader("X-CAN-Verify-Token"))
-                    self.assertIsNone(response.getheader("X-CAN-Verified-SHA256"))
-                    response.read()
+                self.assertEqual((status, ack), (200, {
+                    "version": 2, "session_id": "s1",
+                    "file": SERIAL_FILE, "offset": 1}))
+                # Four persistent uploader connections must leave capacity for
+                # a separate status request.
+                held = []
+                try:
+                    for index in range(4):
+                        peer = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=5)
+                        held.append(peer)
+                        peer.request("PUT", f"/v1/files/parallel{index}/{SERIAL_FILE}",
+                                     body=b"x", headers={"Authorization": AUTH_HEADER, **IDENT,
+                                                         "Content-Type": "application/octet-stream",
+                                                         "X-CAN-Offset": "0"})
+                        response = peer.getresponse()
+                        self.assertEqual(response.status, 200)
+                        self.assertEqual(json.loads(response.read())["offset"], 1)
+                    status, payload = call("GET", "/v1/files/s1/serial_chunks.jsonl")
+                    self.assertEqual((status, json.loads(payload)["offset"]), (200, 1))
+                finally:
+                    for peer in held:
+                        peer.close()
             finally:
                 conn.close()
                 server.shutdown()
@@ -602,7 +499,7 @@ class FileImporterBehavior(unittest.TestCase):
         self.assertEqual(errors[("bad", "serial_chunks.jsonl")], "invalid_chunk")
         self.assertFalse(importer.import_once())
 
-    def test_restart_resumes_cursor_and_final_hash(self):
+    def test_restart_resumes_cursor(self):
         fix = _Fixture(self)
         lines = [_line(0, b"0.000000007"), _line(1, b"0.000000008")]
         body = self._session(fix, "s1", lines)
@@ -612,9 +509,20 @@ class FileImporterBehavior(unittest.TestCase):
         self.assertTrue(second.import_once())
         self.assertFalse(second.import_once())
         self.assertEqual(fix.archive.status()["raw_chunks"], 2)
-        self.assertEqual(hashlib.sha256(body).hexdigest(),
-                         json.loads((fix.store.root / "synthetic" / "fixture"
-                                     / "s1" / "capture.json").read_bytes())["raw_file_sha256"])
+
+    def test_legacy_hash_mismatch_does_not_block_import(self):
+        fix = _Fixture(self)
+        self._session(fix, "s1", [_line(0, b"0")],
+                      capture=_capture(raw_hash="legacy-unchecked"))
+        with fix.archive.connect() as conn:
+            conn.execute("INSERT INTO file_import_errors VALUES(?,?,?,?,?,?,?,?)",
+                         ("synthetic", "fixture", "s1", SERIAL_FILE,
+                          "hash_mismatch", 1, 0, 0))
+            conn.commit()
+        importer = FileImporter(fix.archive)
+        self.assertTrue(importer.import_once())
+        self.assertEqual(importer.errors(), [])
+        self.assertEqual(fix.archive.status()["raw_chunks"], 1)
 
     def test_metadata_crash_boundaries(self):
         fix = _Fixture(self)
@@ -632,12 +540,10 @@ class FileImporterBehavior(unittest.TestCase):
         third = _capture(extra={"note": "v3"})
         fix.put("capture.json", third)
         self.assertEqual(stale.read_bytes(), b"torn")
-        ok = fix.store.root / "synthetic" / "fixture" / "s1" / "snapshots" \
-            / (hashlib.sha256(third).hexdigest() + ".json")
-        self.assertEqual(ok.read_bytes(), third)
-        # Same-digest PUT repairs a torn snapshot body before committing.
+        self.assertIn(third, [p.read_bytes() for p in stale.parent.glob("*.json")])
         fix.put("capture.json", second)
-        self.assertEqual(stale.read_bytes(), second)
+        self.assertEqual(stale.read_bytes(), b"torn")
+        self.assertIn(second, [p.read_bytes() for p in stale.parent.glob("*.json")])
 
     def test_partial_tail_waits_and_oversized_rejects(self):
         fix = _Fixture(self)
@@ -677,7 +583,7 @@ class FileImporterBehavior(unittest.TestCase):
         (directory / "serial_chunks.jsonl.committed").write_bytes(str(len(body)).encode())
         _drain(importer)
         self.assertEqual(fix.archive.status()["raw_chunks"], 4)
-        # Late final metadata after EOF still verifies the consumed prefix.
+        # Late final metadata does not trigger a whole-file rehash.
         late_dir = fix.store.root / "synthetic" / "fixture" / "late"
         late_dir.mkdir(parents=True, mode=0o700, exist_ok=True)
         (late_dir / "capture.json").write_bytes(_capture())
@@ -693,32 +599,8 @@ class FileImporterBehavior(unittest.TestCase):
         (late_dir / "capture.json").write_bytes(
             _capture(raw_hash="0" * 64, extra={"chunks": 4, "complete": True}))
         _drain(late)
-        self.assertEqual(late.errors()[0]["error"], "hash_mismatch")
-        (late_dir / "capture.json").write_bytes(
-            _capture(raw_hash=hashlib.sha256(body).hexdigest(),
-                     extra={"chunks": 4, "complete": False}))
-        _drain(late)
         self.assertEqual(late.errors(), [])
 
-    def test_bounded_verifier_resumes_after_restart(self):
-        fix = _Fixture(self)
-        lines = [_line(i, b"%d" % (7 + i)) for i in range(6)]
-        body = self._session(fix, "s1", lines)
-        first = FileImporter(fix.archive, max_bytes=10 ** 9)
-        _drain(first)
-        key = ("synthetic", "fixture", "s1")
-        self.assertIn(key, first._verified)
-        done_offset = first._verified[key][2]
-        self.assertEqual(done_offset, len(body))
-        # A fresh importer restarts the bounded rehash from zero and
-        # re-verifies the same committed bytes one slice at a time.
-        second = FileImporter(fix.archive, max_bytes=1)
-        for _ in range(len(body) + 2):
-            second.import_once()
-        state = second._verified.get(key)
-        self.assertIsNotNone(state)
-        self.assertEqual((state[0], state[2]), (len(body), len(body)))
-        self.assertFalse(second.import_once())
 
 class FilePreservationBehavior(unittest.TestCase):
     def test_worker_import_ack_and_restart_preserve_originals(self):
@@ -776,7 +658,7 @@ class FilePreservationBehavior(unittest.TestCase):
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
 
-    def test_historical_intent_blocks_replay_and_whole_file_verification(self):
+    def test_historical_intent_blocks_replay(self):
         fix = _Fixture(self)
         body = _line(0, b"0")
         fix.put("capture.json", _capture(raw_hash=hashlib.sha256(body).hexdigest(),
@@ -789,7 +671,6 @@ class FilePreservationBehavior(unittest.TestCase):
             conn.commit()
         importer = FileImporter(fix.archive)
         _drain(importer)
-        self.assertNotIn(("synthetic", "fixture", "s1"), importer._verified)
         with self.assertRaises(can_files.FileRejection) as conflict:
             fix.put(SERIAL_FILE, body)
         self.assertEqual((conflict.exception.status, conflict.exception.reason), (409, "offset_conflict"))

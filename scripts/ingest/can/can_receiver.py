@@ -1712,7 +1712,7 @@ class Worker(threading.Thread):
             uploader.join()
 
 
-SERVER_CONCURRENCY = 4
+SERVER_CONCURRENCY = 8
 
 
 class Receiver(HTTPServer):
@@ -1972,7 +1972,6 @@ class Handler(BaseHTTPRequestHandler):
                 raise Rejection(403, "identity_mismatch")
             if self.headers.get_all("Transfer-Encoding") or self.headers.get_all("Content-Encoding"):
                 raise Rejection(400, "invalid_content_encoding")
-            proof = None
             if not put:
                 lengths = self.headers.get_all("Content-Length", [])
                 if len(lengths) > 1 or (lengths and lengths[0] != "0"):
@@ -1981,37 +1980,13 @@ class Handler(BaseHTTPRequestHandler):
                 if put:
                     self.server.files.preflight(session_id, filename)
                 else:
-                    verify = self.headers.get_all("X-CAN-Verify-SHA256", [])
-                    if len(verify) > 1:
-                        raise Rejection(400, "invalid_file_verification")
-                    if verify == ["check"]:
-                        proof = self.server.files.verified_serial(session_id, filename)
-                    elif verify == ["range"]:
-                        tokens = self.headers.get_all("X-CAN-Verify-Token", [])
-                        offsets = self.headers.get_all("X-CAN-Verify-Offset", [])
-                        sizes = self.headers.get_all("X-CAN-Verify-Length", [])
-                        if (len(tokens) != 1 or not re.fullmatch(r"[0-9a-f]{64}", tokens[0])
-                                or len(offsets) != 1 or not re.fullmatch(r"[0-9]{1,19}", offsets[0])
-                                or len(sizes) != 1 or not re.fullmatch(r"[0-9]{1,19}", sizes[0])
-                                or not 1 <= int(sizes[0]) <= MAX_FILE_RANGE):
-                            raise Rejection(400, "invalid_file_verification")
-                        proof = self.server.files.verified_serial(
-                            session_id, filename, tokens[0], int(offsets[0]), int(sizes[0]))
                     ack = self.server.files.status(session_id, filename)
             except FileRejection as exc:
                 raise Rejection(exc.status, exc.reason) from None
             except FileConfigurationError:
                 raise Rejection(503, "archive_unavailable") from None
             if not put:
-                headers = None
-                if proof is not None and proof[1] == ack["offset"]:
-                    if verify == ["check"]:
-                        headers = {"X-CAN-Verify-Ready": "1",
-                                   "X-CAN-Verify-Token": proof[0]}
-                    else:
-                        headers = {"X-CAN-Verify-Token": proof[0],
-                                   "X-CAN-Verified-SHA256": proof[2]}
-                self.reply(200, _json(ack).encode(), headers=headers)
+                self.reply(200, _json(ack).encode())
                 return
             lengths = self.headers.get_all("Content-Length", [])
             if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
@@ -2026,18 +2001,15 @@ class Handler(BaseHTTPRequestHandler):
             if len(types) != 1 or types[0].split(";", 1)[0].strip().lower() != "application/octet-stream":
                 raise Rejection(415, "unsupported_content_type")
             offsets = self.headers.get_all("X-CAN-Offset", [])
-            digests = self.headers.get_all("X-CAN-SHA256", [])
             if len(offsets) != 1 or not re.fullmatch(r"[0-9]{1,19}", offsets[0]):
                 raise Rejection(400, "invalid_file_offset")
-            if len(digests) != 1 or not re.fullmatch(r"[0-9a-f]{64}", digests[0]):
-                raise Rejection(400, "invalid_file_hash")
             body = self.rfile.read(length) if length else b""
             if len(body) != length:
                 self._expected_remainder = length - len(body)
                 raise Rejection(400, "truncated_request")
             self._expected_remainder = 0
             try:
-                ack = self.server.files.put(session_id, filename, int(offsets[0]), digests[0], body)
+                ack = self.server.files.put(session_id, filename, int(offsets[0]), body)
             except FileRejection as exc:
                 raise Rejection(exc.status, exc.reason) from None
             except FileConfigurationError:

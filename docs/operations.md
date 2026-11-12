@@ -313,18 +313,13 @@ docker compose --env-file .env --profile can-receiver exec can-receiver \
 
 Pi uploader는 `/v1/files/<session_id>/<filename>`에 원본 bytes를 직접 보냅니다.
 허용 파일은 `capture.json`, `serial_chunks.jsonl`, `events.jsonl`이며 동일한 Basic 인증과
-`X-CAN-Vehicle`·`X-CAN-Collector` 경계를 적용합니다. `GET`은 내구성 저장 offset과
-마지막 최대 64 KiB의 SHA256을 반환합니다. `PUT`은 `Content-Length`,
-`X-CAN-Offset`, `X-CAN-SHA256`으로 범위를 검증하며 최대 4 MiB입니다.
+`X-CAN-Vehicle`·`X-CAN-Collector` 경계를 적용합니다. `GET`과 `PUT` ACK는 파일 식별자와
+내구성 저장 offset을 포함하는 version 2 JSON입니다. `PUT`은 `Content-Length`와
+`X-CAN-Offset`을 사용하며 최대 4 MiB입니다. 파일·저장 위치를 동기화한 뒤에만 ACK합니다.
 `capture.json`은 최대 64 KiB 전체 스냅샷이고, 다른 두 파일은 append-only입니다.
-파일·저장 위치를 동기화한 뒤에만 ACK합니다. 보존 중인 범위의 ACK 유실 재전송은 같은 바이트인지 확인하고, 이미 정리된 범위는 `409`로 거절해 uploader가 다시 `GET`으로 재개합니다.
-
-Pi 정리용 선택적 `X-CAN-Verify-SHA256: check` 요청은 검증 후보일 때만
-`X-CAN-Verify-Ready`와 서버 파일 상태를 나타내는 `X-CAN-Verify-Token`을 반환합니다.
-`range` 요청은 같은 토큰과 offset·길이를 받아 최대 4 MiB 구간의 SHA-256을 반환합니다.
-클라이언트는 모든 구간을 대조하고 마지막에 토큰이 유지됐는지 확인합니다. 과거 회수,
-진행 중 intent, 파일 변경 또는 검증 불가 상태에서는 증거를 반환하지 않습니다.
-기존 GET JSON과 요청 제한시간은 바뀌지 않습니다.
+요청에 따라 전송 범위 SHA-256, 서버 기저장 내용 비교 및 업로드 후 전체 파일 해시 검증은
+수행하지 않습니다. 이미 저장됐다고 ACK한 구간의 손상이나 과거에 비워진 원본을 감지할 수
+없으며, Pi는 전체 ACK 후 해당 원본을 삭제할 수 있습니다.
 
 수신 파일과 메타데이터 버전은 기존 raw 볼륨의 `/data/files` 아래에 저장합니다.
 수신 프로세스는 JSONL·CAN을 파싱하지 않습니다. `can-worker`의 importer가 완성된 줄을
@@ -336,17 +331,20 @@ Pi 정리용 선택적 `X-CAN-Verify-SHA256: check` 요청은 검증 후보일 �
 
 파일 편입은 기본 512줄·1 MiB 한도 안에서 4 KiB씩 읽고 필요한 줄이 모이면 멈춥니다. 최근 진행한 세션은 최대 64개만 유지하며, 성공한 캐시 편입 16회 뒤에는 디렉터리를 다시 탐색합니다. 캐시에서 진행할 작업이 없으면 바로 탐색합니다. 새 세션은 탐색 순서에 따라 발견되므로 지속적으로 밀린 세션이 많으면 첫 편입까지 더 기다릴 수 있습니다. 재시작 시 다시 탐색하며 편입 cursor와 ACK·복구 조건은 바꾸지 않습니다.
 
-편입 시도의 커서·오류 조회는 SQLite 연결 하나를 공유하고, capture 오류가 실제로 있을 때만 삭제합니다. 연결은 원본 수락 전에 닫으며 파일 검증과 ACK·커서 저장의 영속 트랜잭션은 유지합니다.
+편입 시도의 커서·오류 조회는 SQLite 연결 하나를 공유하고, capture 오류가 실제로 있을 때만 삭제합니다. 연결은 원본 수락 전에 닫으며 요청 경계 검사와 ACK·커서 저장의 영속 트랜잭션은 유지합니다.
 
-전환은 서버를 먼저 배포한 뒤 Pi uploader만 교체합니다. Pi 원본·기존 SQLite spool은
-보존하고 별도 `--state`에 작은 진행 정보만 저장합니다. 이전 spool의 import cursor는
-서버 ACK가 아니므로 재개 위치로 쓰지 않습니다. endpoint와 사설 HTTP opt-in을 함께
-`/v1/files`로 바꾸고 기존 batching 옵션을 제거해야 합니다. capture는 재시작하지 않습니다.
+파일 ACK version 2는 기존 version 1과 호환되지 않습니다. 전환 시 이전 Pi 상태 파일을 별도로
+보존하고 서버 수신기·worker와 uploader를 교체합니다. Pi를 먼저 전환할 수는 있지만 v2 서버가
+준비되기 전에는 전송되지 않으며 v1 ACK는 거부됩니다. 실패 시 양쪽 버전과 상태를 함께 복구하며
+capture는 재시작하지 않습니다. v1에서 ACK된
+capture.json은 이행 시 inode와 크기가 같으면 완료로 간주하므로, 이행 전에 같은 inode와
+크기로 바뀐 내용은 감지하지 못합니다. 이전 SQLite spool의 import cursor는 서버 ACK가
+아니므로 재개 위치로 쓰지 않습니다.
 기존 `/v1/logs`는 이전 클라이언트·복구 재전송용 수신 계약으로 계속 지원합니다.
 
 worker는 시작 시와 운영 중 `serial_chunks.jsonl`의 공간을 회수하거나 원본을 삭제하지 않습니다. 파일 편입, 디코딩, Greptime ACK와 아래 SQLite 캐시 정리는 계속됩니다. `capture.json`, `events.jsonl`, serial 원본과 메타데이터를 보존할 수 있도록 `/data/files`의 디스크 여유 공간을 별도로 관리하세요. Pi의 protobuf 큐 용량을 서버 JSONL 최대 크기로 간주하지 마세요.
 
-이전 버전에서 hole punching된 prefix는 이 변경으로 복구되지 않습니다. 기존 `file_reclaim_state`의 완료·진행 중 intent는 그대로 보존하며 해당 범위 재전송은 `409`로 거절하고 전체 원본 hash 검증 완료로 표시하지 않습니다. 기존 hole의 복구는 별도 작업입니다. Greptime에는 디코딩된 신호만 있으므로 유실된 미해석 frame·제어 기록의 대체본으로 간주하지 마세요.
+이전 버전에서 hole punching된 prefix는 이 변경으로 복구되지 않습니다. 기존 `file_reclaim_state`의 완료·진행 중 intent는 보존하며 이미 회수된 범위의 재전송은 `409`로 거절합니다. 해시 검증을 제거했으므로 ACK만으로 빈 prefix를 감지하지 못하며 Pi 원본이 삭제될 수 있습니다. Greptime의 디코딩된 신호는 유실된 미해석 frame·제어 기록의 대체본이 아닙니다.
 
 구버전 worker는 계속 원본을 정리할 수 있으므로 보존 버전으로 교체하기 전 다시 시작하지 마세요. receiver와 worker의 파일 수신 잠금 및 기존 상태를 유지하고 배포 시 실행 중인 코드 버전을 확인하세요.
 

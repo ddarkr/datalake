@@ -996,7 +996,7 @@ services:
     profiles:
     - can-receiver
     labels:
-      datalake.can-receiver-revision: '24'
+      datalake.can-receiver-revision: '26'
     volumes:
     - receiver-venv:/opt/venv
     - receiver-code:/app
@@ -1022,7 +1022,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '24'
+      datalake.can-receiver-revision: '26'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -1072,7 +1072,7 @@ services:
       can-receiver-deps:
         condition: service_completed_successfully
     labels:
-      datalake.can-receiver-revision: '24'
+      datalake.can-receiver-revision: '26'
     user: 10001:10001
     read_only: true
     tmpfs:
@@ -38072,7 +38072,7 @@ configs:
                   uploader.join()
 
 
-      SERVER_CONCURRENCY = 4
+      SERVER_CONCURRENCY = 8
 
 
       class Receiver(HTTPServer):
@@ -38332,7 +38332,6 @@ configs:
                       raise Rejection(403, "identity_mismatch")
                   if self.headers.get_all("Transfer-Encoding") or self.headers.get_all("Content-Encoding"):
                       raise Rejection(400, "invalid_content_encoding")
-                  proof = None
                   if not put:
                       lengths = self.headers.get_all("Content-Length", [])
                       if len(lengths) > 1 or (lengths and lengths[0] != "0"):
@@ -38341,37 +38340,13 @@ configs:
                       if put:
                           self.server.files.preflight(session_id, filename)
                       else:
-                          verify = self.headers.get_all("X-CAN-Verify-SHA256", [])
-                          if len(verify) > 1:
-                              raise Rejection(400, "invalid_file_verification")
-                          if verify == ["check"]:
-                              proof = self.server.files.verified_serial(session_id, filename)
-                          elif verify == ["range"]:
-                              tokens = self.headers.get_all("X-CAN-Verify-Token", [])
-                              offsets = self.headers.get_all("X-CAN-Verify-Offset", [])
-                              sizes = self.headers.get_all("X-CAN-Verify-Length", [])
-                              if (len(tokens) != 1 or not re.fullmatch(r"[0-9a-f]{64}", tokens[0])
-                                      or len(offsets) != 1 or not re.fullmatch(r"[0-9]{1,19}", offsets[0])
-                                      or len(sizes) != 1 or not re.fullmatch(r"[0-9]{1,19}", sizes[0])
-                                      or not 1 <= int(sizes[0]) <= MAX_FILE_RANGE):
-                                  raise Rejection(400, "invalid_file_verification")
-                              proof = self.server.files.verified_serial(
-                                  session_id, filename, tokens[0], int(offsets[0]), int(sizes[0]))
                           ack = self.server.files.status(session_id, filename)
                   except FileRejection as exc:
                       raise Rejection(exc.status, exc.reason) from None
                   except FileConfigurationError:
                       raise Rejection(503, "archive_unavailable") from None
                   if not put:
-                      headers = None
-                      if proof is not None and proof[1] == ack["offset"]:
-                          if verify == ["check"]:
-                              headers = {"X-CAN-Verify-Ready": "1",
-                                         "X-CAN-Verify-Token": proof[0]}
-                          else:
-                              headers = {"X-CAN-Verify-Token": proof[0],
-                                         "X-CAN-Verified-SHA256": proof[2]}
-                      self.reply(200, _json(ack).encode(), headers=headers)
+                      self.reply(200, _json(ack).encode())
                       return
                   lengths = self.headers.get_all("Content-Length", [])
                   if len(lengths) != 1 or not re.fullmatch(r"[0-9]+", lengths[0]):
@@ -38386,18 +38361,15 @@ configs:
                   if len(types) != 1 or types[0].split(";", 1)[0].strip().lower() != "application/octet-stream":
                       raise Rejection(415, "unsupported_content_type")
                   offsets = self.headers.get_all("X-CAN-Offset", [])
-                  digests = self.headers.get_all("X-CAN-SHA256", [])
                   if len(offsets) != 1 or not re.fullmatch(r"[0-9]{1,19}", offsets[0]):
                       raise Rejection(400, "invalid_file_offset")
-                  if len(digests) != 1 or not re.fullmatch(r"[0-9a-f]{64}", digests[0]):
-                      raise Rejection(400, "invalid_file_hash")
                   body = self.rfile.read(length) if length else b""
                   if len(body) != length:
                       self._expected_remainder = length - len(body)
                       raise Rejection(400, "truncated_request")
                   self._expected_remainder = 0
                   try:
-                      ack = self.server.files.put(session_id, filename, int(offsets[0]), digests[0], body)
+                      ack = self.server.files.put(session_id, filename, int(offsets[0]), body)
                   except FileRejection as exc:
                       raise Rejection(exc.status, exc.reason) from None
                   except FileConfigurationError:
@@ -39150,7 +39122,7 @@ configs:
       """Durable original-file receive store and worker-only file importer.
 
       Serve role stores exact Pi original bytes (capture.json snapshot plus
-      serial_chunks.jsonl / events.jsonl append streams) with offset/hash ACKs.
+      serial_chunks.jsonl / events.jsonl append streams) with offset ACKs.
       The receive path never parses JSON, base64, protobuf, or gzip: it only
       appends bytes at the committed offset and fsyncs payload, offset state, and
       directories before acknowledging.
@@ -39171,7 +39143,6 @@ configs:
       import contextlib
       import errno
       import fcntl
-      import hashlib
       import json
       import os
       import re
@@ -39179,6 +39150,7 @@ configs:
       import threading
       import time
       import unicodedata
+      import uuid
       from collections import deque
       from decimal import Decimal
       from pathlib import Path
@@ -39188,12 +39160,10 @@ configs:
       SERIAL_FILE = "serial_chunks.jsonl"
       MAX_FILE_RANGE = 4 * 1024 * 1024
       MAX_CAPTURE_BYTES = 64 * 1024
-      TAIL_HASH_BYTES = 65536
       MAX_LINE_BYTES = 128 * 1024
       MAX_CHUNK_BYTES = 65536
       MAX_ENCODED_BYTES = 4 * ((MAX_CHUNK_BYTES + 2) // 3)
       INT64_MAX = 2 ** 63 - 1
-      EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
       MAX_OFFSET_DEC = Decimal("9223372036.854775807")
       _IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z")
       _UTC = re.compile(
@@ -39223,13 +39193,10 @@ configs:
 
       # Deterministic failures: same cursor offset can never succeed, so later
       # turns skip the session without re-reading it (bytes are retained).
-      # hash_mismatch is terminal for one metadata version (bytes never change
-      # under a committed offset); a corrected capture snapshot invalidates the
-      # verifier and clears the error via _clear_error on the ready parse.
       # archive_truncated is transient (a resumed upload may still grow the file).
       _DETERMINISTIC_ERRORS = frozenset({
           "invalid_capture", "invalid_chunk", "line_too_long",
-          "identity_conflict", "archive_conflict", "hash_mismatch",
+          "identity_conflict", "archive_conflict",
       })
 
 
@@ -39395,16 +39362,7 @@ configs:
               raise _SourceInvalid("invalid_capture")
           else:
               firmware = capture["vehicle_firmware"]
-          raw_hash = capture.get("raw_file_sha256")
-          if raw_hash is not None and (
-                  type(raw_hash) is not str or not re.fullmatch(r"[0-9a-f]{64}", raw_hash)):
-              raise _SourceInvalid("invalid_capture")
-          declared = capture.get("chunks")
-          if declared is not None and (type(declared) is not int or declared < 0):
-              raise _SourceInvalid("invalid_capture")
-          return {"ready": True, "started_ns": started_ns,
-                  "firmware": firmware, "raw_hash": raw_hash,
-                  "chunks": declared, "complete": capture.get("complete")}
+          return {"ready": True, "started_ns": started_ns, "firmware": firmware}
 
 
       def _parse_chunk(line, seq, previous, started_ns):
@@ -39453,9 +39411,9 @@ configs:
               raise FileRejection(404, "not_found")
 
 
-      def _ack(session_id, filename, offset, tail_sha256):
-          return {"version": 1, "session_id": session_id, "file": filename,
-                  "offset": offset, "tail_sha256": tail_sha256}
+      def _ack(session_id, filename, offset):
+          return {"version": 2, "session_id": session_id, "file": filename,
+                  "offset": offset}
 
 
       def _fsync_dir(path):
@@ -39616,24 +39574,6 @@ configs:
                       os.close(fd)
               return committed
 
-          def _tail_hex(self, data, committed, preflight=False):
-              if committed == 0:
-                  return EMPTY_SHA256
-              fd = _open_nofollow(data)
-              try:
-                  start = max(0, committed - TAIL_HASH_BYTES)
-                  offset = start
-                  digest = None if preflight else hashlib.sha256()
-                  while offset < committed:
-                      piece = os.pread(fd, min(65536, committed - offset), offset)
-                      if not piece:
-                          raise FileRejection(503, "archive_unavailable")
-                      if digest is not None:
-                          digest.update(piece)
-                      offset += len(piece)
-              finally:
-                  os.close(fd)
-              return None if digest is None else digest.hexdigest()
 
           def _reserve(self, additional):
               try:
@@ -39653,99 +39593,13 @@ configs:
                   body = self._read_exact(data, MAX_CAPTURE_BYTES)
               except FileRejection as exc:
                   if exc.status == 404:
-                      return _ack(session_id, CAPTURE_FILE, 0, EMPTY_SHA256)
+                      return _ack(session_id, CAPTURE_FILE, 0)
                   raise
-              return _ack(session_id, CAPTURE_FILE, len(body),
-                          None if preflight else hashlib.sha256(body).hexdigest())
+              return _ack(session_id, CAPTURE_FILE, len(body))
 
           def status(self, session_id, filename):
               return self._status(session_id, filename, preflight=False)
 
-          def verified_serial(self, session_id, filename, token=None, offset=0, length=0):
-              """Check a snapshot, or hash one bounded range of that same snapshot."""
-              _check_names(session_id, filename)
-              if filename != SERIAL_FILE:
-                  return None
-              fd = None
-
-              def identity(info):
-                  return (info.st_dev, info.st_ino, info.st_size,
-                          info.st_mtime_ns, info.st_ctime_ns)
-
-              def snapshot():
-                  directory = self._namespace(session_id, False)
-                  if directory is None:
-                      return None
-                  levels = (self.root, directory.parent.parent, directory.parent, directory)
-                  dirs = tuple(os.stat(p, follow_symlinks=False) for p in levels)
-                  if any(not stat.S_ISDIR(info.st_mode) for info in dirs):
-                      return None
-                  namespace = tuple((info.st_dev, info.st_ino) for info in dirs)
-                  data = directory / filename
-                  sidecar = directory / (filename + ".committed")
-                  side_fd = _open_nofollow(sidecar)
-                  try:
-                      side_before = identity(os.fstat(side_fd))
-                      raw = os.read(side_fd, 33)
-                      side_after = identity(os.fstat(side_fd))
-                      side_path = identity(os.stat(sidecar, follow_symlinks=False))
-                  finally:
-                      os.close(side_fd)
-                  if (side_before != side_after or side_before != side_path
-                          or side_before[2] != len(raw)
-                          or not re.fullmatch(rb"[0-9]{1,19}", raw)):
-                      return None
-                  data_fd = identity(os.fstat(fd))
-                  data_path = identity(os.stat(data, follow_symlinks=False))
-                  if data_fd != data_path or data_fd[2] != int(raw):
-                      return None
-                  with self._archive.connect() as conn:
-                      row = conn.execute(
-                          "SELECT reclaimed,intent_end FROM file_reclaim_state "
-                          "WHERE vehicle=? AND collector_id=? AND session_id=?",
-                          (self.vehicle, self.collector_id, session_id)).fetchone()
-                  reclaim = tuple(row) if row is not None else None
-                  if reclaim is not None and reclaim != (0, 0):
-                      return None
-                  return namespace, data_fd, side_before, raw.decode("ascii"), reclaim
-
-              try:
-                  with self._lock, _file_lock(self._archive):
-                      directory = self._namespace(session_id, False)
-                      if directory is None:
-                          return None
-                      fd = _open_nofollow(directory / filename)
-                      before = snapshot()
-                  if before is None:
-                      return None
-                  fingerprint = hashlib.sha256(json.dumps(
-                      (self.vehicle, self.collector_id, session_id, filename, before),
-                      separators=(",", ":")).encode("ascii")).hexdigest()
-                  digest = None
-                  if token is not None:
-                      if (token != fingerprint or type(offset) is not int
-                              or type(length) is not int or offset < 0
-                              or not 1 <= length <= MAX_FILE_RANGE
-                              or offset + length > before[1][2]):
-                          return None
-                      digest = hashlib.sha256()
-                      remaining = length
-                      while remaining:
-                          chunk = os.pread(fd, min(1024 * 1024, remaining), offset)
-                          if not chunk:
-                              return None
-                          digest.update(chunk)
-                          offset += len(chunk)
-                          remaining -= len(chunk)
-                  with self._lock, _file_lock(self._archive):
-                      if snapshot() != before:
-                          return None
-                  return fingerprint, before[1][2], digest.hexdigest() if digest else None
-              except (FileRejection, OSError):
-                  return None
-              finally:
-                  if fd is not None:
-                      os.close(fd)
 
           def preflight(self, session_id, filename):
               self._status(session_id, filename, preflight=True)
@@ -39755,26 +39609,21 @@ configs:
               with self._lock, _file_lock(self._archive):
                   directory = self._namespace(session_id, False)
                   if directory is None:
-                      return _ack(session_id, filename, 0, EMPTY_SHA256)
+                      return _ack(session_id, filename, 0)
                   data = directory / filename
                   if filename == CAPTURE_FILE:
                       return self._status_capture(session_id, directory, data, preflight)
                   committed = self._recover(data, directory / (filename + ".committed"))
-                  return _ack(session_id, filename, committed,
-                              self._tail_hex(data, committed, preflight))
+                  return _ack(session_id, filename, committed)
 
-          def put(self, session_id, filename, offset, digest, body):
+          def put(self, session_id, filename, offset, body):
               _check_names(session_id, filename)
               if type(offset) is not int or offset < 0:
                   raise FileRejection(400, "invalid_file_offset")
-              if type(digest) is not str or not re.fullmatch(r"[0-9a-f]{64}", digest):
-                  raise FileRejection(400, "invalid_file_hash")
               if type(body) is not bytes:
                   raise FileRejection(400, "invalid_file_body")
               if len(body) > (MAX_CAPTURE_BYTES if filename == CAPTURE_FILE else MAX_FILE_RANGE):
                   raise FileRejection(413, "request_too_large")
-              if hashlib.sha256(body).hexdigest() != digest:
-                  raise FileRejection(409, "sha_mismatch")
               with self._lock, _file_lock(self._archive):
                   directory = self._namespace(session_id, True)
                   data = directory / filename
@@ -39802,25 +39651,11 @@ configs:
                           finally:
                               os.close(fd)
                           self._write_atomic(directory, sidecar, b"0")
-                      return _ack(session_id, filename, committed,
-                                  self._tail_hex(data, committed))
+                      return _ack(session_id, filename, committed)
                   if offset != committed:
                       if offset + len(body) > committed:
                           raise FileRejection(409, "offset_conflict")
-                      try:
-                          fd = _open_nofollow(data)
-                      except FileRejection as exc:
-                          if exc.status == 404:
-                              raise FileRejection(409, "offset_conflict") from None
-                          raise
-                      try:
-                          retained = os.pread(fd, len(body), offset)
-                      finally:
-                          os.close(fd)
-                      if retained != body:
-                          raise FileRejection(409, "chunk_conflict")
-                      return _ack(session_id, filename, committed,
-                                  self._tail_hex(data, committed))
+                      return _ack(session_id, filename, committed)
                   self._reserve(len(body))
                   fd = _open_nofollow(data, write=True, create=True)
                   try:
@@ -39839,8 +39674,7 @@ configs:
                       os.close(fd)
                   committed += len(body)
                   self._write_atomic(directory, sidecar, str(committed).encode("ascii"))
-                  return _ack(session_id, filename, committed,
-                              self._tail_hex(data, committed))
+                  return _ack(session_id, filename, committed)
 
           def _write_atomic(self, directory, target, body):
               """Stage + fsync + rename + dirsync; torn files are never committed."""
@@ -39875,25 +39709,12 @@ configs:
               if offset != 0:
                   raise FileRejection(409, "offset_conflict")
               self._reserve(len(body))
-              digest = hashlib.sha256(body).hexdigest()
               snapshots = directory / "snapshots"
               _private_dir(snapshots, False)
-              snapshot = snapshots / (digest + ".json")
-              if snapshot.is_symlink():
-                  raise FileRejection(404, "not_found")
-              try:
-                  if not snapshot.is_file():
-                      self._write_atomic(snapshots, snapshot, body)
-                  elif self._read_exact(snapshot, MAX_CAPTURE_BYTES) != body:
-                      # Torn snapshot from a crashed direct create: repair from
-                      # the verified PUT body instead of trusting stale bytes.
-                      self._write_atomic(snapshots, snapshot, body)
-              except FileRejection as exc:
-                  if exc.status == 404:
-                      raise
-                  raise FileRejection(503, "archive_unavailable") from None
+              snapshot = snapshots / (uuid.uuid4().hex + ".json")
+              self._write_atomic(snapshots, snapshot, body)
               self._write_atomic(directory, data, body)
-              return _ack(session_id, CAPTURE_FILE, len(body), digest)
+              return _ack(session_id, CAPTURE_FILE, len(body))
 
 
       class FileImporter:
@@ -39910,7 +39731,6 @@ configs:
               self._last = None
               self._active = deque()
               self._since_scan = 16
-              self._verified = {}
               with archive.connect() as conn:
                   conn.executescript(_FILE_SCHEMA)
                   conn.commit()
@@ -40110,19 +39930,16 @@ configs:
                              str(exc), 0)
               if not capture["ready"]:
                   return False
-              state = self._verified.get((vehicle, collector, session))
-              if state is not None and state[1] != capture.get("raw_hash"):
-                  del self._verified[(vehicle, collector, session)]
               meta = {"schema_version": 1, "vehicle": vehicle,
                       "collector_id": collector, "session_id": session,
                       "started_ns": capture["started_ns"],
                       "vehicle_firmware": capture["firmware"]}
               with self._connect() as conn:
                   return self._import_ready_session(
-                      vehicle, collector, session, directory, serial_path, capture, meta, conn)
+                      vehicle, collector, session, directory, serial_path, meta, conn)
 
           def _import_ready_session(self, vehicle, collector, session, directory,
-                                    serial_path, capture, meta, conn):
+                                    serial_path, meta, conn):
               cursor = self._cursor(conn, vehicle, collector, session)
               errors = {row["file"]: row for row in conn.execute(
                   "SELECT file,error,fail_offset FROM file_import_errors WHERE vehicle=? "
@@ -40168,17 +39985,12 @@ configs:
               if size < committed or cursor["file_offset"] > committed:
                   self._fail(vehicle, collector, session, SERIAL_FILE,
                              "archive_truncated", cursor["file_offset"])
-              # hash_mismatch is metadata-versioned: a corrected capture snapshot
-              # must re-enter verification instead of hitting the stale skip.
+              if known is not None and known["error"] == "hash_mismatch":
+                  self._clear_error(vehicle, collector, session, SERIAL_FILE)
               if known is not None and known["error"] in _DETERMINISTIC_ERRORS \
-                      and known["fail_offset"] == cursor["file_offset"] \
-                      and not (known["error"] == "hash_mismatch"
-                               and self._verified.get((vehicle, collector, session)) is None):
+                      and known["fail_offset"] == cursor["file_offset"]:
                   return False
-              # Declared final record count gates completion only: an absent
-              # count never blocks prefix import, a wrong count never passes.
-              declared = capture.get("chunks")
-              final = declared is not None and capture.get("raw_hash") is not None
+              # Import only complete records up to the committed offset.
               end = min(committed, cursor["file_offset"] + self._max_bytes)
               try:
                   window = self._read_at(serial_path, cursor["file_offset"],
@@ -40189,16 +40001,6 @@ configs:
                              "unreadable_offset", cursor["file_offset"])
                   window = b""
               if not window:
-                  # Nothing new, but late-arriving final metadata still needs
-                  # verification against the already-consumed prefix. Progress
-                  # is True when a verify slice advanced, so bounded rehash
-                  # turns keep cycling until the verdict lands.
-                  if final:
-                      before = self._verified.get((vehicle, collector, session))
-                      self._verify_final(vehicle, collector, session, serial_path,
-                                         capture, committed, cursor, conn)
-                      after = self._verified.get((vehicle, collector, session))
-                      return after is not None and after != before
                   return False
               if window.endswith(b"\n"):
                   complete, complete_end = window, end
@@ -40243,59 +40045,7 @@ configs:
                       self._fail(vehicle, collector, session, SERIAL_FILE,
                                  "archive_conflict", cursor["file_offset"])
                   raise
-              if final and complete_end == committed:
-                  self._verify_final(vehicle, collector, session, serial_path,
-                                     capture, committed,
-                                     {"meta": meta, "next_seq": seq,
-                                      "last_t": last_stamp, "file_offset": complete_end}, conn)
               return True
-
-          def _verify_final(self, vehicle, collector, session, serial_path,
-                            capture, committed, cursor, conn):
-              """Bounded incremental whole-file verification; one turn, one slice."""
-              if not capture.get("raw_hash") or capture.get("chunks") is None:
-                  self._verified.pop((vehicle, collector, session), None)
-                  return
-              row = conn.execute(
-                  "SELECT reclaimed,intent_end FROM file_reclaim_state "
-                  "WHERE vehicle=? AND collector_id=? AND session_id=?",
-                  (vehicle, collector, session)).fetchone()
-              if row is not None and (row["reclaimed"] or row["intent_end"]):
-                  self._verified.pop((vehicle, collector, session), None)
-                  return
-              if cursor["next_seq"] != capture["chunks"]:
-                  return
-              key = (vehicle, collector, session)
-              state = self._verified.get(key)
-              if state is not None and state[:2] != (committed, capture["raw_hash"]):
-                  state = None
-              if state is not None and state[2] == committed:
-                  return
-              offset, digest = (0, hashlib.sha256()) if state is None else (state[2], state[3].copy())
-              step = min(self._max_bytes, 1048576)
-              try:
-                  piece = self._read_at(serial_path, offset, min(step, committed - offset))
-              except _SourceInvalid:
-                  self._fail(vehicle, collector, session, SERIAL_FILE,
-                             "archive_truncated", cursor["file_offset"])
-                  return
-              if len(piece) != min(step, committed - offset):
-                  self._fail(vehicle, collector, session, SERIAL_FILE,
-                             "archive_truncated", cursor["file_offset"])
-                  return
-              digest.update(piece)
-              offset += len(piece)
-              if offset < committed:
-                  self._verified[key] = (committed, capture["raw_hash"], offset, digest)
-                  return
-              self._verified[key] = (committed, capture["raw_hash"], offset, digest)
-              if digest.hexdigest() != capture["raw_hash"]:
-                  # Suppressible: a corrected capture snapshot clears the error
-                  # via _clear_error on the next turn's ready parse.
-                  self._fail(vehicle, collector, session, SERIAL_FILE,
-                             "hash_mismatch", committed)
-                  return
-              self._clear_error(vehicle, collector, session, SERIAL_FILE)
 volumes:
   greptime-data: null
   greptime-etc: null
