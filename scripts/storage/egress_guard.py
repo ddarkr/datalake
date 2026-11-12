@@ -628,7 +628,12 @@ def main(argv=None):
                         if not values:
                             raise ValueError("native S3 read metrics missing")
                         gap = time.time() - state["sample_at"] if state.get("sample_at") and state.get("last") is not None else 0
-                        download_full = observe(state, values)
+                        try:
+                            download_full = observe(state, values)
+                        except ValueError:
+                            # Preserve storage accounting when a read counter resets.
+                            observe_storage(state, writes)
+                            raise
                         if (not writes and state.get("last_write") is None
                                 and (time.time() < state["startup_until"] or download_full)):
                             startup_pending = True

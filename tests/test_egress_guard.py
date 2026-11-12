@@ -518,6 +518,11 @@ def startup_write_metrics(path):
         assert failed["last"] == {read: 55} and failed["last_write"] == {write: 30}
         assert (path / "lease").read_text() == "0\n"
 
+    g.save(path, dict(state))
+    failed = run({read: 49, write: 35}, 1008)
+    assert failed["blocked"] and failed["used_bytes"] == 50
+    assert failed["storage_used_bytes"] == 135 and failed["last_write"] == {write: 35}
+
     g.save(path, dict(base))
     run({read: 30}, 1000)
     expired = run({read: 40}, 1010)
