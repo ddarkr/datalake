@@ -403,7 +403,7 @@ BACKUP_OFFLINE_CONFIRMED=1 \
 실패한 작업이 다른 복원의 결과를 삭제하지 않습니다. receiver/worker의
 offline 확인은 별도 조건이며, 이 잠금을 사용하지 않는 외부 writer는 보호하지 않습니다.
 
-`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 receiver·worker 및 GreptimeDB를 시작합니다. OTLP 영속 ACK·재시작, 파일 수신과 실제 signal·dirty ACK, 처리 후 원본 바이트·offset·tail hash 보존, 재전송과 추가 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
+`python -m tests.test_can_receiver_compose`는 별도 Docker 프로젝트와 합성 정의로 실제 receiver·worker 및 GreptimeDB를 시작합니다. OTLP 영속 ACK·재시작, 파일 수신과 실제 signal·dirty ACK, 처리 후 원본 바이트·offset 보존, 재전송과 추가 적재를 검사한 뒤 소유 볼륨만 제거합니다. 운영 원본과 자격 증명을 사용하지 않습니다.
 
 #### 기존 receiver·worker 인계
 
